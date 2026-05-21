@@ -6,6 +6,8 @@ import jwt from 'jsonwebtoken';
 import { Server } from 'socket.io';
 import { createServer } from 'http';
 import 'dotenv/config';
+import * as util from './utils.js';
+import { QuadTree, Rectangle, Point } from './quadtree.js';
 
 const app = express();
 const httpServer = createServer(app);
@@ -137,252 +139,268 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 });
 
 // --- AGARSTAKE SPELMOTOR (MULTIPLAYER) ---
-const WORLD_SIZE = 5000;
-const PLAYER_START_MASS = 20;
-const MIN_MASS_TO_SPLIT = 35;
-const MIN_MASS_TO_EJECT = 30;
-const MERGE_COOLDOWN = 15000; // 15 sekunder
-const VIRUS_COUNT = 20;
+const c = {
+    worldWidth: 5000,
+    worldHeight: 5000,
+    foodCount: 500,
+    virusCount: 20,
+    playerStartMass: 20,
+    maxCells: 16,
+    minMassSplit: 35,
+    minMassEject: 30,
+    ejectMass: 12,
+    ejectMassGain: 10,
+    massLossRate: 1.002, 
+    mergeTimer: 15, // sekunder
+    speedMult: 2.1,
+    houseFee: 0.15 // 15% går till plattformen vid kills
+};
 
-let players = {};
-let food = [];
-let viruses = [];
-let ejectedMass = [];
+let gamePlayers = [];
+let gameFood = [];
+let gameViruses = [];
+let gameEjected = [];
+const qt = new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4);
 
-// Initiera mat
-for (let i = 0; i < 300; i++) {
-    food.push({ id: i, x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE, color: `hsl(${Math.random() * 360}, 70%, 50%)` });
+function addFood(n) {
+    for (let i = 0; i < n; i++) {
+        gameFood.push({
+            id: Math.random().toString(36).substr(2, 9),
+            x: Math.random() * c.worldWidth,
+            y: Math.random() * c.worldHeight,
+            color: `hsl(${Math.random() * 360}, 100%, 50%)`,
+            mass: 1
+        });
+    }
 }
 
-io.on('connection', (socket) => {
-    console.log(`📡 Nytt anslutningsförsök (Socket ID: ${socket.id})`);
-    
-    // Kolla om vi fick med auth-token direkt i handskakningen
-    if (socket.handshake.auth && socket.handshake.auth.token) {
-        console.log(`🔑 Token mottagen vid anslutning för: ${socket.id}`);
-    } else {
-        console.log(`⚠️ Ingen token hittades i handskakningen för: ${socket.id}`);
+function addViruses(n) {
+    for (let i = 0; i < n; i++) {
+        gameViruses.push({
+            id: Math.random().toString(36).substr(2, 9),
+            x: Math.random() * c.worldWidth,
+            y: Math.random() * c.worldHeight,
+            mass: 100,
+            color: '#33ff33'
+        });
     }
+}
 
+addFood(c.foodCount);
+addViruses(c.virusCount);
+
+io.on('connection', (socket) => {
     socket.on('joinGame', async ({ username, token }) => {
         try {
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             const user = await User.findById(decoded.id);
             
             if (!user || user.balance < 10) {
-                socket.emit('error', 'Minimum $10 balance required.');
+                socket.emit('error', 'Minimum $10 balance required to enter.');
                 return;
             }
 
-            // DRAG PENGAR: $10 entry ($3 house fee, $7 active balance)
-            user.balance -= 10;
+            user.balance -= 10; // Drar $10 vid start
             await user.save();
 
-            players[socket.id] = {
+            const newPlayer = {
                 id: socket.id,
                 username: user.username,
-                balance: 7, // Startkapital i spelet
-                color: '#007AFF',
+                balance: 7, // Börjar med $7 i arenan efter fee
+                color: util.randomColor(),
                 mouseX: 0,
                 mouseY: 0,
-                cells: [{ x: WORLD_SIZE / 2, y: WORLD_SIZE / 2, mass: PLAYER_START_MASS, vx: 0, vy: 0, lastSplit: Date.now() }]
+                screenWidth: 1920,
+                screenHeight: 1080,
+                cells: [{
+                    id: Math.random().toString(36).substr(2, 9),
+                    x: util.randomInRange(100, c.worldWidth - 100),
+                    y: util.randomInRange(100, c.worldHeight - 100),
+                    mass: c.playerStartMass,
+                    radius: util.massToRadius(c.playerStartMass),
+                    speed: 0,
+                    lastSplit: Date.now()
+                }]
             };
-
-            socket.emit('init', { id: socket.id, food, viruses });
+            gamePlayers.push(newPlayer);
+            // Skicka 'welcome' som i original-repot
+            socket.emit('welcome', newPlayer, { width: c.worldWidth, height: c.worldHeight });
         } catch (err) {
-            socket.emit('error', 'Auth failed');
+            socket.emit('error', 'Authentication failed');
         }
     });
 
-    socket.on('mouseMove', (data) => {
-        if (players[socket.id]) {
-            players[socket.id].mouseX = data.x;
-            players[socket.id].mouseY = data.y;
-        }
+    // Protokoll-matchning: 0 = rörelse
+    socket.on('0', (data) => {
+        const p = gamePlayers.find(pl => pl.id === socket.id);
+        if (p) { p.mouseX = data.x; p.mouseY = data.y; }
     });
 
-    socket.on('split', () => {
-        const player = players[socket.id];
-        if (!player || player.cells.length >= 16) return; // Max 16 celler
-
+    // Protokoll-matchning: 2 = split
+    socket.on('2', () => {
+        const p = gamePlayers.find(pl => pl.id === socket.id);
+        if (!p || p.cells.length >= c.maxCells) return;
+        
         let newCells = [];
-        player.cells.forEach(cell => {
-            if (cell.mass >= MIN_MASS_TO_SPLIT) {
+        p.cells.forEach(cell => {
+            if (cell.mass >= c.minMassSplit) {
                 cell.mass /= 2;
-                // Skjut iväg den nya cellen i musens riktning
-                const angle = Math.atan2(player.mouseY, player.mouseX);
+                cell.radius = util.massToRadius(cell.mass);
+                const angle = Math.atan2(p.mouseY, p.mouseX); 
                 newCells.push({
-                    x: cell.x,
-                    y: cell.y,
+                    id: Math.random().toString(36).substr(2, 9),
+                    x: cell.x, y: cell.y,
                     mass: cell.mass,
-                    vx: Math.cos(angle) * 25, // Explosiv fart
+                    radius: cell.radius,
+                    vx: Math.cos(angle) * 25,
                     vy: Math.sin(angle) * 25,
                     lastSplit: Date.now()
-                }); // Den ursprungliga cellen behåller sin position och massa
+                });
             }
         });
-        player.cells.push(...newCells);
+        p.cells.push(...newCells);
     });
 
-    socket.on('eject', () => {
-        const player = players[socket.id];
-        if (!player) return;
-
-        player.cells.forEach(cell => {
-            if (cell.mass >= 30) {
-                cell.mass -= 10;
-                const angle = Math.atan2(player.mouseY, player.mouseX);
-                ejectedMass.push({
-                    x: cell.x + Math.cos(angle) * (Math.sqrt(cell.mass * 100) + 20),
-                    y: cell.y + Math.sin(angle) * (Math.sqrt(cell.mass * 100) + 20),
+    // Protokoll-matchning: 1 = eject mass
+    socket.on('1', () => {
+        const p = gamePlayers.find(pl => pl.id === socket.id);
+        if (!p) return;
+        p.cells.forEach(cell => {
+            if (cell.mass >= c.minMassEject) {
+                cell.mass -= c.ejectMass;
+                const angle = Math.atan2(p.mouseY, p.mouseX);
+                gameEjected.push({
+                    id: Math.random().toString(36).substr(2, 9),
+                    x: cell.x + Math.cos(angle) * (cell.radius + 20),
+                    y: cell.y + Math.sin(angle) * (cell.radius + 20),
+                    radius: 10,
                     vx: Math.cos(angle) * 15,
                     vy: Math.sin(angle) * 15,
-                    color: player.color
+                    color: p.color,
+                    mass: c.ejectMassGain
                 });
             }
         });
     });
 
     socket.on('disconnect', () => {
-        console.log(`Spelare frånkopplad: ${socket.id}`);
-        delete players[socket.id];
+        gamePlayers = gamePlayers.filter(p => p.id !== socket.id);
     });
 });
 
-// Initiera virus
-for (let i = 0; i < VIRUS_COUNT; i++) {
-    viruses.push({
-        id: i,
-        x: Math.random() * WORLD_SIZE,
-        y: Math.random() * WORLD_SIZE,
-        mass: 100,
-        color: 'hsl(120, 70%, 50%)' // Grön färg
-    });
-}
-
-// Game Loop (60 FPS)
 setInterval(() => {
-    Object.values(players).forEach(player => {
+    qt.clear();
+    gamePlayers.forEach(p => p.cells.forEach(cell => qt.insert(new Point(cell.x, cell.y, { type: 'player', socketId: p.id, cell }))));
+    gameFood.forEach(f => qt.insert(new Point(f.x, f.y, { type: 'food', data: f })));
+    gameViruses.forEach(v => qt.insert(new Point(v.x, v.y, { type: 'virus', data: v })));
+    gameEjected.forEach(e => qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
+
+    gamePlayers.forEach(player => {
         player.cells.forEach((cell, index) => {
-            // 1. Grundrörelse (följ musen)
-            const speed = 4 / Math.pow(cell.mass, 0.35);
+            // PHYSICS: Movement & Friction
+            const speed = (60 / Math.pow(cell.mass, 0.44)) * c.speedMult;
             const angle = Math.atan2(player.mouseY, player.mouseX);
+            const distToMouse = Math.hypot(player.mouseX, player.mouseY);
             
-            // Applicera fart + fart från split (vx/vy)
-            cell.x += (Math.cos(angle) * speed) + cell.vx;
-            cell.y += (Math.sin(angle) * speed) + cell.vy;
+            const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
+            cell.x += (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
+            cell.y += (Math.sin(angle) * moveSpeed) + cell.vy;
+            cell.vx *= 0.85; cell.vy *= 0.85;
 
-            // Friktion (saktar ner vx/vy)
-            cell.vx *= 0.9;
-            cell.vy *= 0.9;
+            // DECAY
+            if (cell.mass > c.playerStartMass) cell.mass /= c.massLossRate;
 
-            // 2. Gränser
-            cell.x = Math.max(0, Math.min(WORLD_SIZE, cell.x));
-            cell.y = Math.max(0, Math.min(WORLD_SIZE, cell.y));
+            // BOUNDS
+            const r = cell.radius;
+            cell.x = Math.max(r, Math.min(c.worldWidth - r, cell.x));
+            cell.y = Math.max(r, Math.min(c.worldHeight - r, cell.y));
 
-            // 3. Mat-kollision
-            food = food.filter(f => {
-                const dist = Math.hypot(cell.x - f.x, cell.y - f.y);
-                if (dist < Math.sqrt(cell.mass * 100)) {
-                    cell.mass += 1;
-                    player.balance += 0.01;
-                    return false;
-                }
-                return true;
-            });
+            // SPATIAL COLLISIONS
+            const range = new Rectangle(cell.x, cell.y, r * 2, r * 2);
+            const items = qt.query(range);
 
-            // 4. Kollision med virus
-            viruses.forEach(virus => {
-                const dist = Math.hypot(cell.x - virus.x, cell.y - virus.y);
-                if (dist < Math.sqrt(cell.mass * 100) && cell.mass > virus.mass * 1.1) {
-                    // Spelaren äter viruset och splittas
-                    cell.mass /= 2;
-                    player.cells.push({
-                        x: cell.x,
-                        y: cell.y,
-                        mass: cell.mass,
-                        vx: Math.random() * 50 - 25, // Slumpmässig impuls
-                        vy: Math.random() * 50 - 25,
-                        lastSplit: Date.now()
-                    });
-                    // Flytta viruset eller återskapa det
-                    virus.x = Math.random() * WORLD_SIZE;
-                    virus.y = Math.random() * WORLD_SIZE;
-                }
-            });
-
-            // 5. Kollision med andra spelare (cell mot cell)
-            Object.values(players).forEach(other => {
-                if (player.id === other.id) {
-                    // Re-merge logik för egna celler
-                    player.cells.forEach((otherOwnCell, otherOwnIndex) => {
-                        if (index === otherOwnIndex) return; // Inte kollidera med sig själv
-                        
-                        const dist = Math.hypot(cell.x - otherOwnCell.x, cell.y - otherOwnCell.y);
-                        const r1 = Math.sqrt(cell.mass * 100);
-                        const r2 = Math.sqrt(otherOwnCell.mass * 100);
-
-                        // Om cellerna överlappar och merge-cooldown är över
-                        if (dist < (r1 + r2) * 0.8 && (Date.now() - cell.lastSplit > MERGE_COOLDOWN) && (Date.now() - otherOwnCell.lastSplit > MERGE_COOLDOWN)) {
-                            cell.mass += otherOwnCell.mass;
-                            player.cells.splice(otherOwnIndex, 1); // Ta bort den sammanslagna cellen
-                        }
-                    });
-                    return;
-                }
-                
-                // Kollision med andra spelares celler
-                other.cells.forEach((enemyCell, enemyIndex) => {
-                    const dist = Math.hypot(cell.x - enemyCell.x, cell.y - enemyCell.y);
-                    const r1 = Math.sqrt(cell.mass * 100);
-                    const r2 = Math.sqrt(enemyCell.mass * 100);
-
-                    if (dist < r1 && cell.mass > enemyCell.mass * 1.15) { // Om vår cell är 15% större
-                        cell.mass += enemyCell.mass * 0.5; // Ät upp halva massan
-                        
-                        // Beräkna pengar baserat på hur stor del av fiendens totala massa den ätna cellen var
-                        const enemyTotalMass = other.cells.reduce((sum, c) => sum + c.mass, 0);
-                        if (enemyTotalMass > 0) {
-                            player.balance += (other.balance * (enemyCell.mass / enemyTotalMass) * 0.85); // Killer tar 85%
-                        }
-                        
-                        other.cells.splice(enemyIndex, 1); // Ta bort den ätna cellen
-                        
-                        if (other.cells.length === 0) { // Om fienden inte har några celler kvar
-                            delete players[other.id]; // Ta bort fienden helt
-                            io.to(other.id).emit('died'); // Meddela fienden att den dog
+            items.forEach(item => {
+                if (item.type === 'food') {
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                        cell.mass += 1; 
+                        cell.radius = util.massToRadius(cell.mass);
+                        player.balance += 0.01;
+                        gameFood = gameFood.filter(f => f.id !== item.data.id);
+                    }
+                } else if (item.type === 'ejected') {
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                        cell.mass += item.data.mass; 
+                        cell.radius = util.massToRadius(cell.mass);
+                        gameEjected = gameEjected.filter(e => e.id !== item.data.id);
+                    }
+                } else if (item.type === 'virus') {
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.mass > item.data.mass * 1.1) {
+                        if (player.cells.length < c.maxCells) {
+                            cell.mass /= 2;
+                            cell.radius = util.massToRadius(cell.mass);
+                            player.cells.push({ 
+                                id: Math.random().toString(36).substr(2, 9), 
+                                x: cell.x, y: cell.y, mass: cell.mass, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now() 
+                            });
+                            gameViruses = gameViruses.filter(v => v.id !== item.data.id);
                         }
                     }
-                });
+                } else if (item.type === 'player') {
+                    const otherCell = item.cell;
+                    if (otherCell.id === cell.id) return;
+                    const d = Math.hypot(cell.x - otherCell.x, cell.y - otherCell.y);
+                    const r2 = otherCell.radius;
+
+                    if (item.socketId === player.id) {
+                        // INTERNAL: Merge or Push
+                        const canMerge = (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
+                        if (canMerge && d < (r + r2) * 0.5) {
+                            cell.mass += otherCell.mass;
+                            cell.radius = util.massToRadius(cell.mass);
+                            player.cells = player.cells.filter(c => c.id !== otherCell.id);
+                        } else if (d < r + r2) {
+                            const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
+                            const force = (r + r2 - d) / 15;
+                            cell.vx += Math.cos(pushAngle) * force; cell.vy += Math.sin(pushAngle) * force;
+                        }
+                    } else {
+                        // EXTERNAL: Eat
+                        if (cell.mass > otherCell.mass * 1.15 && d < r - r2 * 0.3) {
+                            cell.mass += otherCell.mass;
+                            cell.radius = util.massToRadius(cell.mass);
+                            const victim = gamePlayers.find(p => p.id === item.socketId);
+                            if (victim) {
+                                const weight = otherCell.mass / victim.cells.reduce((a, b) => a + b.mass, 0);
+                                // Överför balans: Killer tar 85%, 15% försvinner (fee)
+                                const prize = victim.balance * weight * (1 - c.houseFee);
+                                player.balance += prize;
+                                victim.balance -= (victim.balance * weight);
+                                victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
+                                if (victim.cells.length === 0) {
+                                    // Spara slutbalans till DB här om man vill
+                                    io.to(victim.id).emit('died');
+                                }
+                            }
+                        }
+                    }
+                }
             });
         });
     });
 
-    // Uppdatera utskjuten massa och kollisioner
-    ejectedMass = ejectedMass.filter(m => {
-        m.x += m.vx; m.y += m.vy;
-        m.vx *= 0.9; m.vy *= 0.9; // Friktion
-        // Om någon äter den, ta bort den
-        for (const p of Object.values(players)) {
-            for (const c of p.cells) {
-                if (Math.hypot(c.x - m.x, c.y - m.y) < Math.sqrt(c.mass * 100) * 0.8) { // Ät upp om tillräckligt nära
-                    c.mass += 8; // Lägg till massa
-                    return false; // Ta bort från ejectedMass
-                }
-            }
-        }
-        return true; // Behåll om ingen åt den
-    });
+    gameEjected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
+    if (gameFood.length < c.foodCount) addFood(c.foodCount - gameFood.length);
+    if (gameViruses.length < c.virusCount) addViruses(c.virusCount - gameViruses.length);
 
-    // Fyll på mat och virus om det behövs
-    while (food.length < 300) {
-        food.push({ id: Date.now() + Math.random(), x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE, color: `hsl(${Math.random() * 360}, 70%, 50%)` });
-    }
-    while (viruses.length < VIRUS_COUNT) {
-        viruses.push({ id: Date.now() + Math.random(), x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE, mass: 100, color: 'hsl(120, 70%, 50%)' });
-    }
+    // Skicka leaderboard separat för prestanda
+    const leaderboard = gamePlayers
+        .map(p => ({ id: p.id, name: p.username, massTotal: p.cells.reduce((s, c) => s + c.mass, 0) }))
+        .sort((a, b) => b.massTotal - a.massTotal)
+        .slice(0, 10);
+    io.emit('leaderboard', { leaderboard });
 
-    io.emit('tick', { players: Object.values(players), food, ejectedMass, viruses });
+    // Skicka uppdatering med original-repot's eventnamn
+    io.emit('serverTellPlayerMove', gamePlayers, gamePlayers, gameFood, gameEjected, gameViruses);
 }, 1000 / 60);
 
 const PORT = process.env.PORT || 5000;
