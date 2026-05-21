@@ -153,8 +153,11 @@ const c = {
     massLossRate: 1.002, 
     mergeTimer: 15, // sekunder
     speedMult: 2.1,
-    houseFee: 0.15 // 15% går till plattformen vid kills
+    houseFee: 0.15 
 };
+
+// Säkerställ att vi har världsstorleken tillgänglig för utils om det behövs
+const WORLD_SIZE = c.worldWidth;
 
 let gamePlayers = [];
 let gameFood = [];
@@ -200,7 +203,7 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            user.balance -= 10; // Drar $10 vid start
+            user.balance -= 10; // Drar $10 vid start (entry fee)
             await user.save();
 
             const newPlayer = {
@@ -223,7 +226,7 @@ io.on('connection', (socket) => {
                 }]
             };
             gamePlayers.push(newPlayer);
-            // Skicka 'welcome' som i original-repot
+            // Skicka 'welcome' som i original-repot, med spelarens initiala data och världsstorlek
             socket.emit('welcome', newPlayer, { width: c.worldWidth, height: c.worldHeight });
         } catch (err) {
             socket.emit('error', 'Authentication failed');
@@ -246,7 +249,7 @@ io.on('connection', (socket) => {
             if (cell.mass >= c.minMassSplit) {
                 cell.mass /= 2;
                 cell.radius = util.massToRadius(cell.mass);
-                const angle = Math.atan2(p.mouseY, p.mouseX); 
+                const angle = Math.atan2(p.mouseY, p.mouseX);
                 newCells.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x, y: cell.y,
@@ -303,7 +306,7 @@ setInterval(() => {
             const distToMouse = Math.hypot(player.mouseX, player.mouseY);
             
             const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
-            cell.x += (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
+            cell.x += (Math.cos(angle) * moveSpeed) + (cell.vx || 0); // Lägg till vx/vy för impuls
             cell.y += (Math.sin(angle) * moveSpeed) + cell.vy;
             cell.vx *= 0.85; cell.vy *= 0.85;
 
@@ -323,7 +326,7 @@ setInterval(() => {
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.mass += 1; 
-                        cell.radius = util.massToRadius(cell.mass);
+                        cell.radius = util.massToRadius(cell.mass); // Uppdatera radien
                         player.balance += 0.01;
                         gameFood = gameFood.filter(f => f.id !== item.data.id);
                     }
@@ -338,7 +341,7 @@ setInterval(() => {
                         if (player.cells.length < c.maxCells) {
                             cell.mass /= 2;
                             cell.radius = util.massToRadius(cell.mass);
-                            player.cells.push({ 
+                            player.cells.push({
                                 id: Math.random().toString(36).substr(2, 9), 
                                 x: cell.x, y: cell.y, mass: cell.mass, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now() 
                             });
@@ -356,7 +359,7 @@ setInterval(() => {
                         const canMerge = (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
                         if (canMerge && d < (r + r2) * 0.5) {
                             cell.mass += otherCell.mass;
-                            cell.radius = util.massToRadius(cell.mass);
+                            cell.radius = util.massToRadius(cell.mass); // Uppdatera radien
                             player.cells = player.cells.filter(c => c.id !== otherCell.id);
                         } else if (d < r + r2) {
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
@@ -367,7 +370,7 @@ setInterval(() => {
                         // EXTERNAL: Eat
                         if (cell.mass > otherCell.mass * 1.15 && d < r - r2 * 0.3) {
                             cell.mass += otherCell.mass;
-                            cell.radius = util.massToRadius(cell.mass);
+                            cell.radius = util.massToRadius(cell.mass); // Uppdatera radien
                             const victim = gamePlayers.find(p => p.id === item.socketId);
                             if (victim) {
                                 const weight = otherCell.mass / victim.cells.reduce((a, b) => a + b.mass, 0);
@@ -399,8 +402,10 @@ setInterval(() => {
         .slice(0, 10);
     io.emit('leaderboard', { leaderboard });
 
-    // Skicka uppdatering med original-repot's eventnamn
-    io.emit('serverTellPlayerMove', gamePlayers, gamePlayers, gameFood, gameEjected, gameViruses);
+    // Agario-logik: Skicka individuell data till varje spelare så kameran hamnar rätt (player-centric view)
+    gamePlayers.forEach(p => {
+        io.to(p.id).emit('serverTellPlayerMove', p, gamePlayers, gameFood, gameEjected, gameViruses);
+    });
 }, 1000 / 60);
 
 const PORT = process.env.PORT || 5000;
