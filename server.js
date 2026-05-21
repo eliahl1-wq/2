@@ -322,7 +322,7 @@ setInterval(() => {
     // Fyll på mat om det behövs
     if (food.length < 300) {
         food.push({ id: Date.now(), x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE, color: `hsl(${Math.random() * 360}, 70%, 50%)` });
-    });
+    }
 
     io.emit('tick', { players: Object.values(players), food, ejectedMass });
 }, 1000 / 60);
