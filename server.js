@@ -171,7 +171,9 @@ function addFood(n) {
             id: Math.random().toString(36).substr(2, 9),
             x: Math.random() * c.worldWidth,
             y: Math.random() * c.worldHeight,
-            color: `hsl(${Math.random() * 360}, 100%, 50%)`,
+            hue: Math.floor(Math.random() * 360),
+            radius: 7,
+            color: `hsl(${Math.random() * 360}, 100%, 50%)`, // Behåll för bakåtkompatibilitet
             mass: 1
         });
     }
@@ -183,6 +185,10 @@ function addViruses(n) {
             id: Math.random().toString(36).substr(2, 9),
             x: Math.random() * c.worldWidth,
             y: Math.random() * c.worldHeight,
+            radius: util.massToRadius(100),
+            fill: '#33ff33',
+            stroke: '#22cc22',
+            strokeWidth: 4,
             mass: 100,
             color: '#33ff33'
         });
@@ -211,6 +217,8 @@ io.on('connection', (socket) => {
                 username: user.username,
                 balance: 7, // Börjar med $7 i arenan efter fee
                 color: util.randomColor(),
+                x: c.worldWidth / 2, // Startposition för kameran
+                y: c.worldHeight / 2,
                 mouseX: 0,
                 mouseY: 0,
                 screenWidth: 1920,
@@ -299,6 +307,9 @@ setInterval(() => {
     gameEjected.forEach(e => qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
 
     gamePlayers.forEach(player => {
+        let totalX = 0;
+        let totalY = 0;
+        
         player.cells.forEach((cell, index) => {
             // PHYSICS: Movement & Friction
             const speed = (60 / Math.pow(cell.mass, 0.44)) * c.speedMult;
@@ -309,6 +320,9 @@ setInterval(() => {
             cell.x += (Math.cos(angle) * moveSpeed) + (cell.vx || 0); // Lägg till vx/vy för impuls
             cell.y += (Math.sin(angle) * moveSpeed) + cell.vy;
             cell.vx *= 0.85; cell.vy *= 0.85;
+            
+            totalX += cell.x;
+            totalY += cell.y;
 
             // DECAY
             if (cell.mass > c.playerStartMass) cell.mass /= c.massLossRate;
@@ -389,6 +403,11 @@ setInterval(() => {
                 }
             });
         });
+
+        if (player.cells.length > 0) {
+            player.x = totalX / player.cells.length;
+            player.y = totalY / player.cells.length;
+        }
     });
 
     gameEjected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
