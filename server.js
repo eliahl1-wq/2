@@ -3,13 +3,27 @@ import mongoose from 'mongoose';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { Server } from 'socket.io';
+import { createServer } from 'http';
 import 'dotenv/config';
 
 const app = express();
+const httpServer = createServer(app);
+const io = new Server(httpServer, { 
+    cors: { origin: "*" },
+    pingTimeout: 60000, // Öka timeout för att undvika att Render bryter anslutningen
+    pingInterval: 25000
+});
+
 app.use(express.json());
 app.use(cors());
 
-// 1. Anslut till Databasen (Du kan använda MongoDB Atlas för en gratis databas online)
+// Hälso-check för att se om servern är vaken
+app.get('/', (req, res) => {
+    console.log("Health check requested at " + new Date().toISOString());
+    res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>AgarStake Backend is Running! 🚀</h1><p style="color:#007AFF;font-size:1.5rem;">Status: Online (v8 - SERVER PUSH VERIFIED)</p><p>Success! You are now pushing from the correct server directory.</p></body></html>');
+});
+
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -119,5 +133,116 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     }
 });
 
-const PORT = 5000;
-app.listen(PORT, () => console.log(`Servern körs på http://localhost:${PORT}`));
+// --- AGARSTAKE SPELMOTOR (MULTIPLAYER) ---
+let players = {};
+let food = [];
+const WORLD_SIZE = 5000;
+
+// Initiera mat
+for (let i = 0; i < 300; i++) {
+    food.push({ id: i, x: Math.random() * WORLD_SIZE, y: Math.random() * WORLD_SIZE, color: `hsl(${Math.random() * 360}, 70%, 50%)` });
+}
+
+io.on('connection', (socket) => {
+    console.log(`📡 Nytt anslutningsförsök (Socket ID: ${socket.id})`);
+    
+    // Kolla om vi fick med auth-token direkt i handskakningen
+    if (socket.handshake.auth && socket.handshake.auth.token) {
+        console.log(`🔑 Token mottagen vid anslutning för: ${socket.id}`);
+    } else {
+        console.log(`⚠️ Ingen token hittades i handskakningen för: ${socket.id}`);
+    }
+
+    socket.on('joinGame', async ({ username, token }) => {
+        try {
+            const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
+            const user = await User.findById(decoded.id);
+            
+            if (!user || user.balance < 10) {
+                socket.emit('error', 'Minimum $10 balance required.');
+                return;
+            }
+
+            // DRAG PENGAR: $10 entry ($3 house fee, $7 active balance)
+            user.balance -= 10;
+            await user.save();
+
+            players[socket.id] = {
+                id: socket.id,
+                username: user.username,
+                x: WORLD_SIZE / 2,
+                y: WORLD_SIZE / 2,
+                mass: 20,
+                balance: 7, // Startkapital i spelet
+                color: '#007AFF',
+                mouseX: 0,
+                mouseY: 0
+            };
+
+            socket.emit('init', { id: socket.id, food });
+        } catch (err) {
+            socket.emit('error', 'Auth failed');
+        }
+    });
+
+    socket.on('mouseMove', (data) => {
+        if (players[socket.id]) {
+            players[socket.id].mouseX = data.x;
+            players[socket.id].mouseY = data.y;
+        }
+    });
+
+    socket.on('disconnect', () => {
+        delete players[socket.id];
+    });
+});
+
+// Game Loop (60 FPS)
+setInterval(() => {
+    Object.values(players).forEach(player => {
+        // Beräkna hastighet baserat på massa (Agar.io fysik)
+        const speed = 4 / Math.pow(player.mass, 0.4);
+        const angle = Math.atan2(player.mouseY, player.mouseX);
+        
+        player.x += Math.cos(angle) * speed;
+        player.y += Math.sin(angle) * speed;
+
+        // Världsgränser
+        player.x = Math.max(0, Math.min(WORLD_SIZE, player.x));
+        player.y = Math.max(0, Math.min(WORLD_SIZE, player.y));
+
+        // Kolla mat-kollision
+        food = food.filter(f => {
+            const dist = Math.hypot(player.x - f.x, player.y - f.y);
+            if (dist < Math.sqrt(player.mass * 100)) {
+                player.mass += 0.5;
+                player.balance += 0.01; // Varje matbit ger lite pengar
+                return false;
+            }
+            return true;
+        });
+
+        // Kolla spelar-kollision (85/15 split regler)
+        Object.values(players).forEach(other => {
+            if (player.id === other.id) return;
+            const dist = Math.hypot(player.x - other.x, player.y - other.y);
+            const r1 = Math.sqrt(player.mass * 100);
+            const r2 = Math.sqrt(other.mass * 100);
+
+            if (dist < r1 && player.mass > other.mass * 1.1) {
+                // Player äter Other
+                player.mass += other.mass * 0.5;
+                player.balance += (other.balance * 0.85); // Killer tar 85%
+                // 15% försvinner till plattformen (house fee)
+                delete players[other.id];
+                io.to(other.id).emit('died');
+            }
+        });
+    });
+
+    // Skicka uppdatering till alla
+    io.emit('tick', { players: Object.values(players), food });
+}, 1000 / 60);
+
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
