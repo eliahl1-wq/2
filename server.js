@@ -225,11 +225,12 @@ io.on('connection', (socket) => {
                 screenHeight: 1080,
                 cells: [{
                     id: Math.random().toString(36).substr(2, 9),
-                    x: util.randomInRange(100, c.worldWidth - 100),
-                    y: util.randomInRange(100, c.worldHeight - 100),
+                    x: util.randomInRange(c.worldWidth * 0.2, c.worldWidth * 0.8),
+                    y: util.randomInRange(c.worldHeight * 0.2, c.worldHeight * 0.8),
                     mass: c.playerStartMass,
                     radius: util.massToRadius(c.playerStartMass),
-                    speed: 0,
+                    vx: 0,
+                    vy: 0,
                     lastSplit: Date.now()
                 }]
             };
@@ -318,7 +319,7 @@ setInterval(() => {
             
             const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
             cell.x += (Math.cos(angle) * moveSpeed) + (cell.vx || 0); // Lägg till vx/vy för impuls
-            cell.y += (Math.sin(angle) * moveSpeed) + cell.vy;
+            cell.y += (Math.sin(angle) * moveSpeed) + (cell.vy || 0);
             cell.vx *= 0.85; cell.vy *= 0.85;
             
             totalX += cell.x;
