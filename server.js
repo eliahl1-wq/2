@@ -21,7 +21,7 @@ app.use(cors());
 // Hälso-check för att se om servern är vaken
 app.get('/', (req, res) => {
     console.log("Health check requested at " + new Date().toISOString());
-    res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>AgarStake Backend is Running! 🚀</h1><p style="color:#007AFF;font-size:1.5rem;">Status: Online (v8 - SERVER PUSH VERIFIED)</p><p>Success! You are now pushing from the correct server directory.</p></body></html>');
+    res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>AgarStake Engine v2.0 🎮</h1><p style="color:#007AFF;font-size:1.5rem;">Status: Pro Physics Enabled</p></body></html>');
 });
 
 const authenticateToken = (req, res, next) => {
@@ -189,6 +189,24 @@ io.on('connection', (socket) => {
         if (players[socket.id]) {
             players[socket.id].mouseX = data.x;
             players[socket.id].mouseY = data.y;
+        }
+    });
+
+    socket.on('split', () => {
+        const player = players[socket.id];
+        if (player && player.mass >= 35) {
+            player.mass /= 2;
+            // Logik för att skjuta iväg en ny cell läggs till i nästa steg
+            console.log(`${player.username} split!`);
+        }
+    });
+
+    socket.on('eject', () => {
+        const player = players[socket.id];
+        if (player && player.mass >= 25) {
+            player.mass -= 5;
+            // Skapa en liten matbit som flyger iväg
+            console.log(`${player.username} ejected mass`);
         }
     });
 
