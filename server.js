@@ -150,9 +150,9 @@ const c = {
     minMassEject: 30,
     ejectMass: 12,
     ejectMassGain: 10,
-    massLossRate: 1.002, 
+    massLossRate: 1.0001, 
     mergeTimer: 15, // sekunder
-    speedMult: 2.1,
+    speedMult: 0.4,
     houseFee: 0.15 
 };
 
@@ -212,28 +212,24 @@ io.on('connection', (socket) => {
             user.balance -= 10; // Drar $10 vid start (entry fee)
             await user.save();
 
-            const spawnX = util.randomInRange(100, c.worldWidth - 100);
-            const spawnY = util.randomInRange(100, c.worldHeight - 100);
-
             const newPlayer = {
                 id: socket.id,
                 username: user.username,
                 balance: 7, // Börjar med $7 i arenan efter fee
                 color: util.randomColor(),
-                x: spawnX, // Startposition för kameran matchar cellen
-                y: spawnY,
+                x: c.worldWidth / 2, // Startposition för kameran
+                y: c.worldHeight / 2,
                 mouseX: 0,
                 mouseY: 0,
                 screenWidth: 1920,
                 screenHeight: 1080,
                 cells: [{
                     id: Math.random().toString(36).substr(2, 9),
-                    x: spawnX,
-                    y: spawnY,
+                    x: util.randomInRange(100, c.worldWidth - 100),
+                    y: util.randomInRange(100, c.worldHeight - 100),
                     mass: c.playerStartMass,
                     radius: util.massToRadius(c.playerStartMass),
-                    vx: 0,
-                    vy: 0,
+                    speed: 0,
                     lastSplit: Date.now()
                 }]
             };
@@ -322,7 +318,7 @@ setInterval(() => {
             
             const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
             cell.x += (Math.cos(angle) * moveSpeed) + (cell.vx || 0); // Lägg till vx/vy för impuls
-            cell.y += (Math.sin(angle) * moveSpeed) + (cell.vy || 0);
+            cell.y += (Math.sin(angle) * moveSpeed) + cell.vy;
             cell.vx *= 0.85; cell.vy *= 0.85;
             
             totalX += cell.x;
