@@ -150,9 +150,9 @@ const c = {
     minMassEject: 30,
     ejectMass: 12,
     ejectMassGain: 10,
-    massLossRate: 1.0001, 
+    massLossRate: 1.00006, // Mycket långsammare decay
     mergeTimer: 15, // sekunder
-    speedMult: 0.4,
+    speedMult: 0.8, // Högre bas-multiplikator för att känna accelerationen
     houseFee: 0.15 
 };
 
@@ -225,8 +225,8 @@ io.on('connection', (socket) => {
                 screenHeight: 1080,
                 cells: [{
                     id: Math.random().toString(36).substr(2, 9),
-                    x: util.randomInRange(c.worldWidth * 0.2, c.worldWidth * 0.8),
-                    y: util.randomInRange(c.worldHeight * 0.2, c.worldHeight * 0.8),
+                    x: util.randomInRange(c.worldWidth * 0.3, c.worldWidth * 0.7), // Säkrare spawn mer mot mitten
+                    y: util.randomInRange(c.worldHeight * 0.3, c.worldHeight * 0.7),
                     mass: c.playerStartMass,
                     radius: util.massToRadius(c.playerStartMass),
                     vx: 0,
@@ -313,7 +313,8 @@ setInterval(() => {
         
         player.cells.forEach((cell, index) => {
             // PHYSICS: Movement & Friction
-            const speed = (60 / Math.pow(cell.mass, 0.44)) * c.speedMult;
+            // Ny formel: Baseras på 2.2 * mass^-0.44 för äkta Agar.io känsla
+            const speed = (40 / Math.pow(cell.mass, 0.44)) * c.speedMult;
             const angle = Math.atan2(player.mouseY, player.mouseX);
             const distToMouse = Math.hypot(player.mouseX, player.mouseY);
             
@@ -325,8 +326,8 @@ setInterval(() => {
             totalX += cell.x;
             totalY += cell.y;
 
-            // DECAY
-            if (cell.mass > c.playerStartMass) cell.mass /= c.massLossRate;
+            // DECAY: Bara om man är större än 50
+            if (cell.mass > 50) cell.mass /= c.massLossRate;
 
             // BOUNDS
             const r = cell.radius;
