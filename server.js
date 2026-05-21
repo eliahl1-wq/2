@@ -397,7 +397,7 @@ setInterval(() => {
 
     // Skicka leaderboard separat för prestanda
     const leaderboard = gamePlayers
-        .map(p => ({ id: p.id, name: p.username, massTotal: p.cells.reduce((s, c) => s + c.mass, 0) }))
+        .map(p => ({ id: p.id, name: p.username, massTotal: p.cells.reduce((s, c) => s + c.mass, 0), balance: p.balance }))
         .sort((a, b) => b.massTotal - a.massTotal)
         .slice(0, 10);
     io.emit('leaderboard', { leaderboard });
