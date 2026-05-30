@@ -226,7 +226,7 @@ const c = {
     ejectMass: 0.05,
     ejectMassGain: 0.04,
     massLossRate: 1.0, // Ingen decay i penga-läge
-    mergeTimer: 15, // sekunder
+    mergeTimer: 30, // sekunder (justerat för Agar.io-liknande beteende)
     speedMult: 0.8, 
     houseFee: 0.0, // 100% absorption vid ätande
     targetPopulation: 30, // Vi siktar på totalt 30 varelser i arenan
@@ -254,8 +254,7 @@ const rooms = [0, 1, 2].map(id => ({
     qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4)
 }));
 
-// Hjälpfunktion för den nya radie-formeln
-const balanceToRadius = (balance) => 20 + (balance * 8);
+// Radius beräknas via `util.massToRadius` (sqrt-baserad) för konsistens med klient och Agar.io
 
 function addFood(room, n) {
     for (let i = 0; i < n; i++) {
@@ -293,7 +292,7 @@ function addBots(room, n) {
             cells: [{
                 id: Math.random().toString(36).substr(2, 9),
                 x: Math.random() * c.worldWidth, y: Math.random() * c.worldHeight,
-                balance: c.botStartBalance, radius: balanceToRadius(c.botStartBalance), vx: 0, vy: 0, lastSplit: Date.now()
+                balance: c.botStartBalance, radius: util.massToRadius(c.botStartBalance), vx: 0, vy: 0, lastSplit: Date.now()
             }]
         });
     }
@@ -365,7 +364,7 @@ io.on('connection', (socket) => {
                     x: spawnX,
                     y: spawnY,
                     balance: c.playerStartBalance,
-                    radius: balanceToRadius(c.playerStartBalance),
+                    radius: util.massToRadius(c.playerStartBalance),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
@@ -400,14 +399,14 @@ io.on('connection', (socket) => {
         p.cells.forEach(cell => {
             if (cell.balance >= c.minMassSplit) {
                 cell.balance /= 2;
-                cell.radius = balanceToRadius(cell.balance);
+                cell.radius = util.massToRadius(cell.balance);
                 cell.lastSplit = Date.now(); // Starta timern även för ursprungscellen
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 newCells.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x, y: cell.y,
                     balance: cell.balance,
-                    radius: cell.radius,
+                    radius: util.massToRadius(cell.balance),
                     vx: Math.cos(angle) * 25,
                     vy: Math.sin(angle) * 25,
                     lastSplit: Date.now()
@@ -648,7 +647,7 @@ function processRoom(room) {
             const cell = player.cells[i];
             // PHYSICS: Movement & Friction
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
-            const speed = (40 / Math.pow(cell.balance * 50, 0.44)) * c.speedMult;
+            const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult;
             const angle = Math.atan2(player.mouseY, player.mouseX);
             const distToMouse = Math.hypot(player.mouseX, player.mouseY);
             
@@ -684,14 +683,14 @@ function processRoom(room) {
 
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
-                        cell.balance += 0.01; 
-                        cell.radius = balanceToRadius(cell.balance);
+                        cell.balance += item.data.balance || 0.01; 
+                        cell.radius = util.massToRadius(cell.balance);
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance; 
-                        cell.radius = balanceToRadius(cell.balance);
+                        cell.radius = util.massToRadius(cell.balance);
                         room.ejected = room.ejected.filter(e => e.id !== item.data.id);
                     }
                 } else if (item.type === 'virus') {
@@ -699,7 +698,7 @@ function processRoom(room) {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > 2.0) {
                         if (player.cells.length < c.maxCells) {
                             cell.balance /= 2;
-                            cell.radius = balanceToRadius(cell.balance);
+                            cell.radius = util.massToRadius(cell.balance);
                             player.cells.push({
                                 id: Math.random().toString(36).substr(2, 9), 
                                 x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now() 
@@ -721,7 +720,7 @@ function processRoom(room) {
                             // Merga när de överlappar ordentligt (t.ex. center nuddar den andra) för en mjuk "snap"
                             if (d < Math.max(r, r2)) {
                                 cell.balance += otherCell.balance;
-                                cell.radius = balanceToRadius(cell.balance);
+                                cell.radius = util.massToRadius(cell.balance);
                                 cellsToDelete.add(otherCell.id);
                             }
                             // Ingen repulsion när vi kan merga, så de kan "pressas ihop" mjukt
@@ -737,7 +736,7 @@ function processRoom(room) {
                         if (cell.balance > otherCell.balance * 1.10 && d < r - r2 * 0.3) {
                             // EKONOMI: Absorberar 100% av balansen
                             cell.balance += otherCell.balance;
-                            cell.radius = balanceToRadius(cell.balance);
+                            cell.radius = util.massToRadius(cell.balance);
                             const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
                             if (victim) {
                                 victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
