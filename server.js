@@ -16,14 +16,17 @@ const allowedOrigins = [
     "https://www.agararena.space", 
     "https://agararena.space", 
     "http://localhost:5173", 
-    "https://api.agararena.space"
+    "https://api.agararena.space",
+    "https://DITT-PROJEKT-NAMN.pages.dev",
+    "https://din-frontend-service-namn.up.railway.app" // Din nya Railway frontend-URL
 ];
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Tillåt förfrågningar utan origin (t.ex. server-till-server eller mobil) 
-        // eller om ursprunget finns i vår lista
-        if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+        if (!origin || 
+            allowedOrigins.indexOf(origin) !== -1 || 
+            origin.endsWith('.up.railway.app')
+        ) {
             callback(null, true);
         } else {
             callback(new Error('Not allowed by CORS'));
