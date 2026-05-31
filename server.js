@@ -30,7 +30,7 @@ app.use(cors({
         }
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "bypass-tunnel-reminders"],
+    allowedHeaders: ["Content-Type", "Authorization", "bypass-tunnel-reminders", "Cache-Control", "Pragma"],
     credentials: true,
     optionsSuccessStatus: 200 // Viktigt för preflight-svar
 }));
@@ -68,6 +68,29 @@ const authenticateToken = (req, res, next) => {
         next();
     });
 };
+
+// --- NYTT: Endpoint för att kolla om användaren är i ett game ---
+app.get('/api/game-status', authenticateToken, (req, res) => {
+    const inGame = rooms[0].players.some(p => p.mongoId.toString() === req.user.id);
+    res.json({ inGame });
+});
+
+// --- NYTT: Endpoint för att verifiera insättning och spara i historik ---
+app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
+    const { signature, amountUSD, solAmount } = req.body;
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: "Användare hittades ej" });
+        
+        user.balance += amountUSD;
+        await user.save();
+        
+        const tx = new Transaction({ userId: user._id, type: 'deposit', amount: amountUSD, meta: { signature, solAmount } });
+        await tx.save();
+        
+        res.json({ success: true, balance: user.balance });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db";
 
@@ -215,8 +238,8 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 
 // --- AGARSTAKE SPELMOTOR (MULTIPLAYER) ---
 const c = {
-    worldWidth: 15000, // Ännu lite större för öppen värld
-    worldHeight: 15000,
+    worldWidth: 18000, // Ökad storlek för en mer öppen arena
+    worldHeight: 18000,
     foodCount: 0, // Ingen mat vid start, spawnas vid join
     virusCount: 40,
     playerStartBalance: 1.0, // Startar på $1.00
@@ -227,30 +250,31 @@ const c = {
     ejectMassGain: 0.04,
     massLossRate: 1.0, // Ingen decay i penga-läge
     mergeTimer: 30, // sekunder (justerat för Agar.io-liknande beteende)
-    speedMult: 0.8, 
+    speedMult: 1.1, 
     houseFee: 0.0, // 100% absorption vid ätande
     targetPopulation: 30, // Vi siktar på totalt 30 varelser i arenan
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
+    sizeMult: 18,          // Något mindre bas-storlek för att ge plats för snabb tillväxt
+    growthBoost: 2,        // Justerad: Eftersom food nu är värd $0.02, sänker vi boosten till 2x för att behålla samma storleksökning per matbit
     foodValuePerPlayer: 7.0, // Ny konstant: $7 värde av mat per spelare
-    foodBlobValue: 0.01,     // Ny konstant: Varje matbit är värd $0.01
-    rewardUnlockDelay: 2 * 60 * 1000, // Rewards låses upp efter 2 minuter
-    roomDuration: 40 * 60 * 1000,     // Rummet stängs efter 40 minuter
-    joinCutoff: 30 * 60 * 1000        // Inga nya spelare efter 30 minuter
+    foodBlobValue: 0.02,     // Varje matbit är nu värd $0.02
+    rewardUnlockDelay: 10 * 60 * 1000, // Rewards låses upp efter 10 minuter
+    roomDuration: 2 * 60 * 60 * 1000, // Rummet resettas var 2:a timme
 };
 
 // Säkerställ att vi har världsstorleken tillgänglig för utils om det behövs
 const WORLD_SIZE = c.worldWidth;
 
-// RUMSSYSTEM: Vi skapar 3 separata instanser av spelet
-const rooms = [0, 1, 2].map(id => ({
+// RUMSSYSTEM: Nu bara ett enda globalt rum för alla spelare
+const rooms = [0].map(id => ({
     id,
     players: [],
     bots: [],
     food: [],
     viruses: [],
     ejected: [],
-    startTime: Date.now() - (id * (c.roomDuration / 3)), // Tidsförskjut rummen så de inte startar om samtidigt
+    startTime: Date.now(), 
     qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4)
 }));
 
@@ -263,8 +287,8 @@ function addFood(room, n) {
             x: Math.random() * c.worldWidth,
             y: Math.random() * c.worldHeight,
             hue: Math.floor(Math.random() * 360),
-            radius: 7,
-            balance: 0.01 // Varje matbit är värd $0.01
+            radius: 7, // Originalstorlek för mat
+            balance: c.foodBlobValue // Använder konstanter för konsekvens
         });
     }
 }
@@ -275,7 +299,7 @@ function addViruses(room, n) {
             id: Math.random().toString(36).substr(2, 9),
             x: Math.random() * c.worldWidth,
             y: Math.random() * c.worldHeight,
-            radius: util.massToRadius(100),
+            radius: util.massToRadius(100), // Originalstorlek för virus
             fill: '#33ff33', stroke: '#22cc22', strokeWidth: 4, mass: 100
         });
     }
@@ -292,8 +316,8 @@ function addBots(room, n) {
             cells: [{
                 id: Math.random().toString(36).substr(2, 9),
                 x: Math.random() * c.worldWidth, y: Math.random() * c.worldHeight,
-                balance: c.botStartBalance, radius: util.massToRadius(c.botStartBalance), vx: 0, vy: 0, lastSplit: Date.now()
-            }]
+                balance: c.botStartBalance, radius: util.massToRadius(c.botStartBalance * c.sizeMult), vx: 0, vy: 0, lastSplit: Date.now()
+            }] // Bottar använder standard-radie för enkelhetens skull eller kan också uppdateras
         });
     }
 }
@@ -305,24 +329,19 @@ rooms.forEach(room => {
 });
 
 function getBestRoom() {
-    const now = Date.now();
-    // 1. Hitta rum som är öppna för anslutning (under 30 minuter gamla)
-    let joinable = rooms.filter(r => (now - r.startTime) < c.joinCutoff);
-    
-    if (joinable.length === 0) {
-        return rooms.sort((a, b) => b.startTime - a.startTime)[0];
-    }
+    // Eftersom det bara finns en global arena nu tillåter vi anslutning när som helst
+    // tills rummet resettas automatiskt varannan timme.
+    return rooms[0];
+}
 
-    // Matchmaking-prioritet: "prioriterar de rum med minst ai bottar om man bara behöver vänta i typ en minut annars tar den de senaste"
-    // Vi tolkar detta som: om ett rum har mer än 1 min kvar till join-cutoff, prioritera rummet med flest spelare (minst bottar).
-    const stableRooms = joinable.filter(r => (c.joinCutoff - (now - r.startTime)) > 60 * 1000);
-    
-    if (stableRooms.length > 0) {
-        return stableRooms.sort((a, b) => a.bots.length - b.bots.length)[0];
-    }
-
-    // Annars ta det nyaste tillgängliga rummet
-    return joinable.sort((a, b) => b.startTime - a.startTime)[0];
+// Helper för att beräkna radie med extra tillväxt-effekt
+function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
+    // Vi utgår från att $1.00 (eller $1/antal celler) är baslinjen.
+    // Allt över det multipliceras med growthBoost för att man ska se större ut snabbare.
+    const startBalancePerCell = c.playerStartBalance / cellCount;
+    const extraBalance = Math.max(0, cellBalance - startBalancePerCell);
+    const visualMass = cellBalance + (extraBalance * (c.growthBoost - 1));
+    return util.massToRadius(visualMass * c.sizeMult);
 }
 
 io.on('connection', (socket) => {
@@ -330,8 +349,28 @@ io.on('connection', (socket) => {
         try {
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             const user = await User.findById(decoded.id);
+            if (!user) return;
+
+            const room = getBestRoom();
             
-            if (!user || user.balance < 10.0) {
+            // --- REJOIN LOGIK ---
+            const existingPlayer = room.players.find(p => p.mongoId.toString() === user._id.toString());
+            if (existingPlayer) {
+                console.log(`♻️ User ${user.username} rejoining. Kicking old socket ${existingPlayer.id}`);
+                // Meddela det gamla fönstret att det blivit ersatt
+                io.to(existingPlayer.id).emit('forcedDisconnect');
+                
+                existingPlayer.id = socket.id; // Uppdatera till nya socket id
+                socket.roomId = room.id;
+                let remaining = 0;
+                if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
+                    remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
+                }
+                socket.emit('welcome', existingPlayer, { width: c.worldWidth, height: c.worldHeight, cashOutRemaining: remaining });
+                return;
+            }
+
+            if (user.balance < 10.0) {
                 socket.emit('error', 'Minimum $10 balance required to enter.');
                 return;
             }
@@ -340,7 +379,6 @@ io.on('connection', (socket) => {
             user.balance -= 10.0;
             await user.save();
             
-            const room = getBestRoom();
             socket.roomId = room.id;
 
             const spawnX = Math.random() * c.worldWidth;
@@ -352,6 +390,7 @@ io.on('connection', (socket) => {
                 username: username || user.username,
                 kills: 0, // Behåll variabeln men används ej för rewards längre
                 balance: c.playerStartBalance, 
+                startTime: Date.now(),
                 color: util.randomColor(),
                 x: c.worldWidth / 2, // Startposition för kameran
                 y: c.worldHeight / 2,
@@ -364,7 +403,7 @@ io.on('connection', (socket) => {
                     x: spawnX,
                     y: spawnY,
                     balance: c.playerStartBalance,
-                    radius: util.massToRadius(c.playerStartBalance),
+                    radius: calculateCellRadius(c.playerStartBalance, c.playerStartBalance, 1),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
@@ -399,14 +438,14 @@ io.on('connection', (socket) => {
         p.cells.forEach(cell => {
             if (cell.balance >= c.minMassSplit) {
                 cell.balance /= 2;
-                cell.radius = util.massToRadius(cell.balance);
+                cell.radius = calculateCellRadius(cell.balance, p.balance, p.cells.length + 1);
                 cell.lastSplit = Date.now(); // Starta timern även för ursprungscellen
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 newCells.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x, y: cell.y,
                     balance: cell.balance,
-                    radius: util.massToRadius(cell.balance),
+                    radius: calculateCellRadius(cell.balance, p.balance, p.cells.length + 1),
                     vx: Math.cos(angle) * 25,
                     vy: Math.sin(angle) * 25,
                     lastSplit: Date.now()
@@ -445,29 +484,34 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
 
-        console.log(`⏱️ User ${p.username} started cashout timer (30s)`);
+        console.log(`⏱️ User ${p.username} started cashout timer (20s)`);
         p.isCashingOut = true;
+        const duration = 20000;
+        p.cashOutEndTime = Date.now() + duration;
+        const playerMongoId = p.mongoId.toString();
+        const roomId = socket.roomId;
         
         // Meddela klienten att timern har börjat
-        socket.emit('cashOutStarting', { seconds: 30 });
+        socket.emit('cashOutStarting', { seconds: 20 });
 
         setTimeout(async () => {
             // Hämta färsk referens till rummet och spelaren för att se om de fortfarande lever
-            const activeRoom = rooms.find(r => r.id === socket.roomId);
-            const activePlayer = activeRoom?.players.find(pl => pl.id === socket.id);
+            const activeRoom = rooms.find(r => r.id === roomId);
+            // Hitta spelaren via mongoId för att hantera reconnects korrekt
+            const activePlayer = activeRoom?.players.find(pl => pl.mongoId.toString() === playerMongoId);
 
             // Om spelaren inte finns kvar i rummet (uppäten) eller flaggan nollställts, avbryt
             if (!activePlayer || !activePlayer.isCashingOut) {
-                console.log(`❌ Cashout cancelled for ${p?.username || 'unknown'} (died or disconnected)`);
+                console.log(`❌ Cashout cancelled (died or invalid state)`);
                 return;
             }
 
             const age = Date.now() - activeRoom.startTime;
-            const rewardsUnlocked = age > c.rewardUnlockDelay;
+            const rewardsUnlocked = (age > c.rewardUnlockDelay) && (activeRoom.players.length >= 4);
 
             // Beräkna leaderboard-bonus vid cashout ($20 för #1, $10 för #2-3)
             const all = [...activeRoom.players, ...activeRoom.bots].sort((a, b) => b.balance - a.balance);
-            const rank = all.findIndex(u => u.id === socket.id) + 1;
+            const rank = all.findIndex(u => u.mongoId?.toString() === playerMongoId) + 1;
             
             let rankBonus = 0;
             if (rewardsUnlocked) {
@@ -477,29 +521,37 @@ io.on('connection', (socket) => {
 
             const totalCashout = activePlayer.balance + rankBonus;
             const mongoId = activePlayer.mongoId;
-            const username = activePlayer.username;
 
             // Ta bort spelaren från arenan nu när utbetalningen är säkrad
-            activeRoom.players = activeRoom.players.filter(pl => pl.id !== socket.id);
+            activeRoom.players = activeRoom.players.filter(pl => pl.mongoId.toString() !== playerMongoId);
 
             try {
                 const user = await User.findById(mongoId);
                 if (user) {
+                    const sessionPlaytime = Date.now() - activePlayer.startTime;
                     user.balance += totalCashout; 
+                    user.playtime += sessionPlaytime;
                     await user.save();
-                    console.log(`💰 User ${username} cashed out $${totalCashout.toFixed(2)} (Rank: ${rank}, Bonus: $${rankBonus})`);
-                    socket.emit('cashOutSuccess', { amount: totalCashout });
+                    
+                    // Spara i transaktionshistorik
+                    const tx = new Transaction({ userId: user._id, type: 'withdraw', amount: totalCashout, meta: { reason: 'Arena Cashout', rank } });
+                    await tx.save();
+
+                    console.log(`💰 User ${activePlayer.username} cashed out $${totalCashout.toFixed(2)} (Rank: ${rank}, Bonus: $${rankBonus})`);
+                    // Skicka till spelarens aktuella socket (som kan ha ändrats vid refresh)
+                    io.to(activePlayer.id).emit('cashOutSuccess', { amount: totalCashout });
                 }
             } catch (err) {
                 console.error("Cashout error:", err);
             }
-        }, 30000); // 30 sekunders fördröjning
+        }, 20000); // 20 sekunders fördröjning
     });
 
     socket.on('disconnect', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         if (!room) return;
-        room.players = room.players.filter(p => p.id !== socket.id);
+        // Vi tar INTE bort spelaren här längre för att tillåta rejoin. 
+        // De tas bara bort om de blir uppätna eller cashar ut.
         
         // Om en spelare lämnar och vi hamnar under 30 totalt, lägg till en bot
         if (room.players.length + room.bots.length < c.targetPopulation) {
@@ -526,9 +578,9 @@ function processRoom(room) {
     const now = Date.now();
     const age = now - room.startTime;
 
-    // Kontrollera om rummet har kört i 40 minuter och behöver starta om
+    // Kontrollera om rummet behöver resettas (var 2:a timme)
     if (age > c.roomDuration) {
-        console.log(`♻️ Room ${room.id} expired. Restarting...`);
+        console.log(`♻️ Global Arena reset period reached. Restarting room ${room.id}...`);
         room.players.forEach(p => io.to(p.id).emit('died'));
         room.players = [];
         room.bots = [];
@@ -683,14 +735,14 @@ function processRoom(room) {
 
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
-                        cell.balance += item.data.balance || 0.01; 
-                        cell.radius = util.massToRadius(cell.balance);
+                        cell.balance += item.data.balance || c.foodBlobValue; 
+                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance; 
-                        cell.radius = util.massToRadius(cell.balance);
+                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                         room.ejected = room.ejected.filter(e => e.id !== item.data.id);
                     }
                 } else if (item.type === 'virus') {
@@ -698,7 +750,7 @@ function processRoom(room) {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > 2.0) {
                         if (player.cells.length < c.maxCells) {
                             cell.balance /= 2;
-                            cell.radius = util.massToRadius(cell.balance);
+                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                             player.cells.push({
                                 id: Math.random().toString(36).substr(2, 9), 
                                 x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now() 
@@ -717,10 +769,11 @@ function processRoom(room) {
                         const canMerge = (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
 
                         if (canMerge) {
-                            // Merga när de överlappar ordentligt (t.ex. center nuddar den andra) för en mjuk "snap"
-                            if (d < Math.max(r, r2)) {
+                            // INTERNAL sammanslagning: Ingen 5% regel.
+                            // Om din mittpunkt är inne i den andra cellen
+                            if (d < Math.max(r, r2) * 0.9) {
                                 cell.balance += otherCell.balance;
-                                cell.radius = util.massToRadius(cell.balance);
+                                cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                                 cellsToDelete.add(otherCell.id);
                             }
                             // Ingen repulsion när vi kan merga, så de kan "pressas ihop" mjukt
@@ -733,17 +786,33 @@ function processRoom(room) {
                         }
                     } else if (item.type === 'player' || item.type === 'bot') {
                         // EXTERNAL: Eat
-                        if (cell.balance > otherCell.balance * 1.10 && d < r - r2 * 0.3) {
+                        // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r + r2 * 0.2)
+                        if (cell.balance > otherCell.balance * 1.05 && d < (r + r2 * 0.1)) {
                             // EKONOMI: Absorberar 100% av balansen
                             cell.balance += otherCell.balance;
-                            cell.radius = util.massToRadius(cell.balance);
+                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                             const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
                             if (victim) {
                                 victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
                                 if (victim.cells.length === 0) {
                                     if (!victim.isBot) {
                                         io.to(victim.id).emit('RIP');
+                                        const victimMongoId = victim.mongoId;
+                                        const sessionPlaytime = Date.now() - victim.startTime;
+                                        
+                                        // Uppdatera playtime i DB vid död
+                                        User.findByIdAndUpdate(victimMongoId, { $inc: { playtime: sessionPlaytime } })
+                                            .catch(err => console.error("Error updating playtime on death:", err));
+
                                         room.players = room.players.filter(p => p.id !== victim.id);
+                                        // Logga förlusten av entry fee
+                                        Transaction.create({ 
+                                            userId: victimMongoId, 
+                                            type: 'game', 
+                                            amount: -10.00, 
+                                            meta: { reason: 'Arena Death' },
+                                            status: 'confirmed'
+                                        }).catch(err => console.error("Error logging arena death:", err));
                                     } else {
                                         // Ta bort botten och spawna en ny direkt
                                         // Kill rewards är borttagna, så ingen ökning av kills
@@ -792,7 +861,7 @@ function processRoom(room) {
         .sort((a, b) => b.balance - a.balance)
         .slice(0, 10);
 
-    const rewardsUnlocked = age > c.rewardUnlockDelay;
+    const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
     
     room.players.forEach(p => {
         io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
@@ -818,7 +887,12 @@ function processRoom(room) {
                 if (found) visibleUsersSet.add(found);
             }
         });
-        io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, rewardsUnlocked);
+        io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
+            unlocked: rewardsUnlocked,
+            unlockTime: room.startTime + c.rewardUnlockDelay,
+            playerCount: room.players.length,
+            resetTime: room.startTime + c.roomDuration
+        });
     });
 }
 
