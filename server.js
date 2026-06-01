@@ -48,6 +48,7 @@ const SOLANA_RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solan
 const connection = new solanaWeb3.Connection(SOLANA_RPC, 'confirmed');
 // En fast kurs för enkelhetens skull, eller hämta live nedan
 let SOL_PRICE_USD = 150; 
+const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
 
 const c = {
     worldWidth: 18000,
@@ -156,6 +157,34 @@ async function scanDeposits() {
                     // Uppdatera användarens balans
                     user.balance += amountUSD;
                     await user.save();
+
+                    // --- SWEEPER: Skicka SOL vidare till din huvudplånbok ---
+                    if (HOUSE_WALLET_ADDRESS) {
+                        try {
+                            const fromKeypair = solanaWeb3.Keypair.fromSecretKey(
+                                Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
+                            );
+                            
+                            // Vi lämnar en liten mängd (t.ex. 0.001 SOL) för att täcka framtida transaktionsavgifter 
+                            // eller så skickar vi allt minus avgiften för denna transaktion.
+                            const balance = await connection.getBalance(pubKey);
+                            const fee = 5000; // Standardavgift på Solana (lamports)
+                            
+                            if (balance > fee) {
+                                const sweepTx = new solanaWeb3.Transaction().add(
+                                    solanaWeb3.SystemProgram.transfer({
+                                        fromPubkey: pubKey,
+                                        toPubkey: new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS),
+                                        lamports: balance - fee,
+                                    })
+                                );
+                                await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [fromKeypair]);
+                                console.log(`💸 SWEEP: Skickade ${solAmount} SOL till hus-plånboken.`);
+                            }
+                        } catch (sweepErr) {
+                            console.error("Sweep Error:", sweepErr.message);
+                        }
+                    }
 
                     // Spara transaktionen så vi inte dubbel-krediterar
                     await Transaction.create({
