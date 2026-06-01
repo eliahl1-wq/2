@@ -8,6 +8,9 @@ import { createServer } from 'http';
 import 'dotenv/config';
 import * as util from './utils.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
+import * as solanaWeb3 from '@solana/web3.js';
+import passport from 'passport';
+import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 
 const app = express();
 
@@ -50,6 +53,51 @@ const io = new Server(httpServer, {
 });
 
 app.use(express.json());
+app.use(passport.initialize());
+
+// --- GOOGLE OAUTH KONFIGURATION ---
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID || "DIN_GOOGLE_CLIENT_ID",
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || "DIN_GOOGLE_CLIENT_SECRET",
+    callbackURL: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`
+  },
+  async (accessToken, refreshToken, profile, done) => {
+    try {
+        let user = await User.findOne({ $or: [{ googleId: profile.id }, { email: profile.emails[0].value }] });
+        
+        if (!user) {
+            // Skapa ny användare om den inte finns
+            const keypair = solanaWeb3.Keypair.generate();
+            user = new User({
+                googleId: profile.id,
+                username: profile.displayName.replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
+                email: profile.emails[0].value,
+                password: await bcrypt.hash(Math.random().toString(36), 10), // Random lösenord för Google-användare
+                depositAddress: keypair.publicKey.toBase58(),
+                depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
+            });
+            await user.save();
+        }
+        return done(null, user);
+    } catch (err) {
+        return done(err, null);
+    }
+  }
+));
+
+// Google Auth Routes
+app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+
+app.get('/api/auth/google/callback', 
+    passport.authenticate('google', { session: false, failureRedirect: '/login' }),
+    (req, res) => {
+        const secret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
+        const token = jwt.sign({ id: req.user._id }, secret, { expiresIn: '24h' });
+        // Skicka tillbaka användaren till frontenden med token i URL:en
+        const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+        res.redirect(`${frontendUrl}/?token=${token}`);
+    }
+);
 
 // Hälso-check för att se om servern är vaken
 app.get('/', (req, res) => {
@@ -104,9 +152,14 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
 // 2. Skapa en "User" modell (hur en användare ser ut i databasen)
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
+    email: { type: String, unique: true, sparse: true },
+    googleId: { type: String, unique: true, sparse: true },
     password: { type: String, required: true },
     balance: { type: Number, default: 0 },
-    walletAddress: { type: String } // Koppla till användarens Solana-plånbok
+    walletAddress: { type: String }, // Extern plånbok (från Connect Wallet)
+    depositAddress: { type: String }, // Unik insättningsplånbok för detta konto
+    depositSecret: { type: String },  // Privat nyckel för insättningsplånbok
+    playtime: { type: Number, default: 0 }
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -126,22 +179,26 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 // 3. REGISTRERING (Spara ny användare)
 app.post('/api/register', async (req, res) => {
-    console.log("Mottog registreringsförfrågan:", req.body.username);
     try {
-        const { username, password } = req.body;
+        const { email, username, password } = req.body;
 
         // Kolla om användaren redan finns
-        console.log("Söker efter befintlig användare:", username);
-        const existingUser = await User.findOne({ username });
-        if (existingUser) return res.status(400).json({ message: "Användarnamnet upptaget" });
+        const existingUser = await User.findOne({ $or: [{ username }, { email }] });
+        if (existingUser) return res.status(400).json({ message: "Username or Email already taken" });
 
         // Hasha lösenordet (gör det oläsbart)
         const hashedPassword = await bcrypt.hash(password, 10);
 
+        // Generera unik Solana-plånbok för insättningar
+        const keypair = solanaWeb3.Keypair.generate();
+
         const newUser = new User({
+            email,
             username,
             password: hashedPassword,
-            balance: 0 
+            balance: 0,
+            depositAddress: keypair.publicKey.toBase58(),
+            depositSecret: Buffer.from(keypair.secretKey).toString('hex')
         });
 
         await newUser.save();
