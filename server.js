@@ -10,6 +10,7 @@ import * as util from './utils.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import passport from 'passport';
+import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 
 const app = express();
@@ -41,6 +42,12 @@ const TransactionSchema = new mongoose.Schema({
 });
 
 const Transaction = mongoose.model('Transaction', TransactionSchema);
+
+// --- SOLANA CONNECTION ---
+const SOLANA_RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+const connection = new solanaWeb3.Connection(SOLANA_RPC, 'confirmed');
+// En fast kurs för enkelhetens skull, eller hämta live nedan
+let SOL_PRICE_USD = 150; 
 
 const c = {
     worldWidth: 18000,
@@ -85,8 +92,7 @@ const allowedOrigins = [
     "https://agararena.space", 
     "http://localhost:5173", 
     "https://api.agararena.space",
-    "https://DITT-PROJEKT-NAMN.pages.dev",
-    "https://din-frontend-service-namn.up.railway.app" // Din nya Railway frontend-URL
+    "https://2-production-9e74.up.railway.app"
 ];
 
 app.use(cors({
@@ -103,6 +109,79 @@ app.use(cors({
     credentials: true,
     optionsSuccessStatus: 200 // Viktigt för preflight-svar
 }));
+
+// --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
+async function scanDeposits() {
+    try {
+        // 1. Uppdatera SOL-kursen (valfritt men bra)
+        const priceRes = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT').catch(() => null);
+        if (priceRes && priceRes.ok) {
+            const priceData = await priceRes.json();
+            SOL_PRICE_USD = parseFloat(priceData.price);
+        }
+
+        // 2. Hitta alla användare som har en insättningsadress
+        const users = await User.find({ depositAddress: { $exists: true } });
+        
+        for (const user of users) {
+            const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
+            // Hämta de senaste 5 transaktionerna för denna adress
+            const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 5 });
+
+            for (const sigInfo of signatures) {
+                // Kolla om vi redan har hanterat denna transaktion
+                const existingTx = await Transaction.findOne({ "meta.signature": sigInfo.signature });
+                if (existingTx) continue;
+
+                // Hämta detaljer om transaktionen
+                const txDetails = await connection.getTransaction(sigInfo.signature, {
+                    maxSupportedTransactionVersion: 0
+                });
+
+                if (!txDetails || txDetails.meta?.err) continue;
+
+                // Beräkna hur mycket SOL som kom in till just denna adress
+                // Vi kollar skillnaden i balans för kontot i transaktionen
+                const accountIndex = txDetails.transaction.message.staticAccountKeys.findIndex(k => k.equals(pubKey));
+                if (accountIndex === -1) continue;
+
+                const preBalance = txDetails.meta.preBalances[accountIndex];
+                const postBalance = txDetails.meta.postBalances[accountIndex];
+                const changeLamports = postBalance - preBalance;
+
+                if (changeLamports > 0) {
+                    const solAmount = changeLamports / solanaWeb3.LAMPORTS_PER_SOL;
+                    const amountUSD = solAmount * SOL_PRICE_USD;
+
+                    // Uppdatera användarens balans
+                    user.balance += amountUSD;
+                    await user.save();
+
+                    // Spara transaktionen så vi inte dubbel-krediterar
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'deposit',
+                        amount: amountUSD,
+                        meta: {
+                            signature: sigInfo.signature,
+                            solAmount: solAmount,
+                            automated: true,
+                            solPrice: SOL_PRICE_USD
+                        },
+                        status: 'confirmed'
+                    });
+
+                    console.log(`✅ AUTO-DEPOSIT: ${user.username} fick $${amountUSD.toFixed(2)} (${solAmount} SOL)`);
+                }
+            }
+        }
+    } catch (err) {
+        console.error("Scanner Error:", err.message);
+    }
+}
+
+// Starta scannern var 15:e sekund
+setInterval(scanDeposits, 15000);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, { 
