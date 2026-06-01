@@ -8,7 +8,6 @@
     "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "packageManager": "npm@10.8.2",
   "engines": {
     "node": ">=20.18.0"
   },
