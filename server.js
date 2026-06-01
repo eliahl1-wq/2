@@ -14,6 +14,71 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 
 const app = express();
 
+// --- 1. MODELLER & KONFIGURATION (Flyttade till toppen för att undvika krascher) ---
+
+const UserSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    email: { type: String, unique: true, sparse: true },
+    googleId: { type: String, unique: true, sparse: true },
+    password: { type: String, required: true },
+    balance: { type: Number, default: 0 },
+    walletAddress: { type: String }, 
+    depositAddress: { type: String }, 
+    depositSecret: { type: String },  
+    playtime: { type: Number, default: 0 }
+});
+
+const User = mongoose.model('User', UserSchema);
+
+const TransactionSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    type: { type: String, enum: ['deposit', 'withdraw', 'game'], required: true },
+    amount: { type: Number, required: true },
+    currency: { type: String, default: 'USD' },
+    meta: { type: Object, default: {} },
+    status: { type: String, enum: ['pending','confirmed','failed'], default: 'confirmed' },
+    createdAt: { type: Date, default: Date.now }
+});
+
+const Transaction = mongoose.model('Transaction', TransactionSchema);
+
+const c = {
+    worldWidth: 18000,
+    worldHeight: 18000,
+    foodCount: 0,
+    virusCount: 40,
+    playerStartBalance: 1.0,
+    maxCells: 16,
+    minMassSplit: 2.0,
+    minMassEject: 1.5,
+    ejectMass: 0.05,
+    ejectMassGain: 0.04,
+    massLossRate: 1.0,
+    mergeTimer: 30,
+    speedMult: 1.1, 
+    houseFee: 0.0,
+    targetPopulation: 30,
+    botStartBalance: 1.0,
+    botMaxBalance: 500.0,
+    sizeMult: 18,
+    growthBoost: 2,
+    foodValuePerPlayer: 7.0,
+    foodBlobValue: 0.02,
+    rewardUnlockDelay: 10 * 60 * 1000,
+    roomDuration: 2 * 60 * 60 * 1000,
+};
+
+const rooms = [0].map(id => ({
+    id,
+    players: [],
+    bots: [],
+    food: [],
+    viruses: [],
+    ejected: [],
+    startTime: Date.now(), 
+    qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4)
+}));
+
 // 1. Flytta CORS till toppen och definiera origins centralt
 const allowedOrigins = [
     "https://www.agararena.space", 
@@ -61,15 +126,16 @@ passport.use(new GoogleStrategy({
   },
   async (accessToken, refreshToken, profile, done) => {
     try {
-        let user = await User.findOne({ $or: [{ googleId: profile.id }, { email: profile.emails[0].value }] });
+        const profileEmail = profile.emails && profile.emails.length > 0 ? profile.emails[0].value : null;
+        let user = await User.findOne({ $or: [{ googleId: profile.id }, { email: profileEmail }].filter(q => q.email || q.googleId) });
         
         if (!user) {
             // Skapa ny användare om den inte finns
             const keypair = solanaWeb3.Keypair.generate();
             user = new User({
                 googleId: profile.id,
-                username: profile.displayName.replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
-                email: profile.emails[0].value,
+                username: (profile.displayName || 'Gladiator').replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
+                email: profileEmail,
                 password: await bcrypt.hash(Math.random().toString(36), 10), // Random lösenord för Google-användare
                 depositAddress: keypair.publicKey.toBase58(),
                 depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
@@ -120,8 +186,12 @@ const authenticateToken = (req, res, next) => {
 
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
 app.get('/api/game-status', authenticateToken, (req, res) => {
-    const inGame = rooms[0].players.some(p => p.mongoId.toString() === req.user.id);
-    res.json({ inGame });
+    try {
+        const inGame = rooms[0].players.some(p => p.mongoId && p.mongoId.toString() === req.user.id);
+        res.json({ inGame });
+    } catch (err) {
+        res.status(500).json({ inGame: false });
+    }
 });
 
 // --- NYTT: Endpoint för att verifiera insättning och spara i historik ---
@@ -146,34 +216,6 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db"
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .then(() => console.log("Ansluten till databasen!"))
     .catch(err => console.error("Kunde inte ansluta:", err));
-
-// 2. Skapa en "User" modell (hur en användare ser ut i databasen)
-const UserSchema = new mongoose.Schema({
-    username: { type: String, required: true, unique: true },
-    email: { type: String, unique: true, sparse: true },
-    googleId: { type: String, unique: true, sparse: true },
-    password: { type: String, required: true },
-    balance: { type: Number, default: 0 },
-    walletAddress: { type: String }, // Extern plånbok (från Connect Wallet)
-    depositAddress: { type: String }, // Unik insättningsplånbok för detta konto
-    depositSecret: { type: String },  // Privat nyckel för insättningsplånbok
-    playtime: { type: Number, default: 0 }
-});
-
-const User = mongoose.model('User', UserSchema);
-
-// Transaction schema för deposits, withdrawals och game-transactions
-const TransactionSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    type: { type: String, enum: ['deposit', 'withdraw', 'game'], required: true },
-    amount: { type: Number, required: true },
-    currency: { type: String, default: 'USD' },
-    meta: { type: Object, default: {} },
-    status: { type: String, enum: ['pending','confirmed','failed'], default: 'confirmed' },
-    createdAt: { type: Date, default: Date.now }
-});
-
-const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 // 3. REGISTRERING (Spara ny användare)
 app.post('/api/register', async (req, res) => {
@@ -214,11 +256,11 @@ app.post('/api/login', async (req, res) => {
     try {
         const { username, password } = req.body;
 
-        // Hitta användaren
+        // Hitta användaren via username ELLER email
         console.log("Söker efter användare för inloggning:", username);
-        const user = await User.findOne({ username });
+        const user = await User.findOne({ $or: [{ username: username }, { email: username }] });
         console.log("Användare hittad i DB:", user ? "JA" : "NEJ");
-        
+
         if (!user) {
             console.log("❌ FAIL: Användaren hittades inte:", username);
             return res.status(400).json({ message: "Användaren finns inte" });
@@ -293,48 +335,6 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Unable to fetch transactions' });
     }
 });
-
-// --- AGARSTAKE SPELMOTOR (MULTIPLAYER) ---
-const c = {
-    worldWidth: 18000, // Ökad storlek för en mer öppen arena
-    worldHeight: 18000,
-    foodCount: 0, // Ingen mat vid start, spawnas vid join
-    virusCount: 40,
-    playerStartBalance: 1.0, // Startar på $1.00
-    maxCells: 16,
-    minMassSplit: 2.0, // Kräver $2.0 i balans för att splitta
-    minMassEject: 1.5,
-    ejectMass: 0.05,
-    ejectMassGain: 0.04,
-    massLossRate: 1.0, // Ingen decay i penga-läge
-    mergeTimer: 30, // sekunder (justerat för Agar.io-liknande beteende)
-    speedMult: 1.1, 
-    houseFee: 0.0, // 100% absorption vid ätande
-    targetPopulation: 30, // Vi siktar på totalt 30 varelser i arenan
-    botStartBalance: 1.0,
-    botMaxBalance: 500.0,
-    sizeMult: 18,          // Något mindre bas-storlek för att ge plats för snabb tillväxt
-    growthBoost: 2,        // Justerad: Eftersom food nu är värd $0.02, sänker vi boosten till 2x för att behålla samma storleksökning per matbit
-    foodValuePerPlayer: 7.0, // Ny konstant: $7 värde av mat per spelare
-    foodBlobValue: 0.02,     // Varje matbit är nu värd $0.02
-    rewardUnlockDelay: 10 * 60 * 1000, // Rewards låses upp efter 10 minuter
-    roomDuration: 2 * 60 * 60 * 1000, // Rummet resettas var 2:a timme
-};
-
-// Säkerställ att vi har världsstorleken tillgänglig för utils om det behövs
-const WORLD_SIZE = c.worldWidth;
-
-// RUMSSYSTEM: Nu bara ett enda globalt rum för alla spelare
-const rooms = [0].map(id => ({
-    id,
-    players: [],
-    bots: [],
-    food: [],
-    viruses: [],
-    ejected: [],
-    startTime: Date.now(), 
-    qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4)
-}));
 
 // Radius beräknas via `util.massToRadius` (sqrt-baserad) för konsistens med klient och Agar.io
 
