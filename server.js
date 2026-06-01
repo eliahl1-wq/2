@@ -26,13 +26,11 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: function (origin, callback) {
-        if (!origin || 
-            allowedOrigins.indexOf(origin) !== -1 || 
-            origin.endsWith('.up.railway.app')
-        ) {
+        // Använd includes() istället för indexOf() för bättre läsbarhet
+        if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.up.railway.app')) {
             callback(null, true);
         } else {
-            callback(new Error('Not allowed by CORS'));
+            callback(null, false); // Returnera false istället för ett Error-objekt
         }
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
