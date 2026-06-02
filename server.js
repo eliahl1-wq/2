@@ -49,6 +49,7 @@ const connection = new solanaWeb3.Connection(SOLANA_RPC, 'confirmed');
 // En fast kurs för enkelhetens skull, eller hämta live nedan
 let SOL_PRICE_USD = 150; 
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
+const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET; // Måste läggas till i Railway!
 
 const c = {
     worldWidth: 18000,
@@ -299,6 +300,59 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
         res.json({ inGame });
     } catch (err) {
         res.status(500).json({ inGame: false });
+    }
+});
+
+// --- NYTT: UTTAG (WITHDRAW) ---
+app.post('/api/withdraw', authenticateToken, async (req, res) => {
+    const { amountUSD, destinationAddress } = req.body;
+    
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user || user.balance < amountUSD || amountUSD < 1) {
+            return res.status(400).json({ message: "Insufficient balance or invalid amount" });
+        }
+
+        if (!HOUSE_WALLET_SECRET) {
+            return res.status(500).json({ message: "Withdrawals currently disabled (missing secret)" });
+        }
+
+        // 1. Beräkna SOL-mängd
+        const solToWithdraw = amountUSD / SOL_PRICE_USD;
+        const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
+
+        // 2. Förbered transaktion från hus-plånboken
+        const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+        );
+
+        const transaction = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(destinationAddress),
+                lamports: lamports,
+            })
+        );
+
+        // 3. Skicka transaktionen
+        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
+        // 4. Uppdatera databasen efter lyckat uttag
+        user.balance -= amountUSD;
+        await user.save();
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: amountUSD,
+            meta: { signature, destination: destinationAddress, solAmount: solToWithdraw },
+            status: 'confirmed'
+        });
+
+        res.json({ success: true, newBalance: user.balance, signature });
+    } catch (err) {
+        console.error("Withdraw Error:", err.message);
+        res.status(500).json({ error: "Blockchain transaction failed" });
     }
 });
 
