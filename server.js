@@ -472,18 +472,65 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 app.get('/api/stats', (req, res) => {
     try {
         const playersOnline = rooms.reduce((sum, room) => sum + room.players.length, 0);
-        const biggestPayout = rooms.reduce((max, room) => {
-            const roomMax = room.players.reduce((roomMaxValue, player) => Math.max(roomMaxValue, player.balance || 0), 0);
-            return Math.max(max, roomMax);
-        }, 0);
+        let biggestPayout = 0;
+        let topPlayer = null;
+
+        rooms.forEach(room => {
+            room.players.forEach(player => {
+                if ((player.balance || 0) > biggestPayout) {
+                    biggestPayout = player.balance;
+                    topPlayer = player.username;
+                }
+            });
+        });
 
         res.json({
             playersOnline,
-            biggestPayout: Number(biggestPayout.toFixed(2))
+            biggestPayout: Number(biggestPayout.toFixed(2)),
+            topPlayer
         });
     } catch (err) {
         console.error('Error fetching stats:', err);
         res.status(500).json({ error: 'Unable to fetch stats' });
+    }
+});
+
+// 7. Leaderboard - all time and this week
+app.get('/api/leaderboard', async (req, res) => {
+    try {
+        // All time: sum cashout transactions per user
+        const alltimePipeline = [
+            { $match: { type: { $in: ['withdraw'] }, 'meta.reason': 'Arena Cashout' } },
+            { $group: { _id: '$userId', total: { $sum: '$amount' } } },
+            { $sort: { total: -1 } },
+            { $limit: 10 },
+            { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+            { $unwind: '$user' },
+            { $project: { username: '$user.username', amount: '$total' } }
+        ];
+
+        // This week
+        const weekStart = new Date();
+        weekStart.setDate(weekStart.getDate() - 7);
+        const weekPipeline = [
+            { $match: { type: { $in: ['withdraw'] }, 'meta.reason': 'Arena Cashout', createdAt: { $gte: weekStart } } },
+            { $group: { _id: '$userId', total: { $sum: '$amount' } } },
+            { $sort: { total: -1 } },
+            { $limit: 10 },
+            { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+            { $unwind: '$user' },
+            { $project: { username: '$user.username', amount: '$total' } }
+        ];
+
+        const [alltime, week] = await Promise.all([
+            Transaction.aggregate(alltimePipeline),
+            Transaction.aggregate(weekPipeline)
+        ]);
+
+        res.json({ alltime, week });
+    } catch (err) {
+        console.error('Error fetching leaderboard:', err);
+        res.status(500).json({ error: 'Unable to fetch leaderboard' });
     }
 });
 
