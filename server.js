@@ -10,6 +10,7 @@ import * as util from './utils.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import passport from 'passport';
+import { randomUUID } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 
@@ -43,14 +44,6 @@ const TransactionSchema = new mongoose.Schema({
 
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
-// --- SOLANA CONNECTION ---
-const SOLANA_RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
-const connection = new solanaWeb3.Connection(SOLANA_RPC, 'confirmed');
-// En fast kurs för enkelhetens skull, eller hämta live nedan
-let SOL_PRICE_USD = 150; 
-const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
-const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET; // Måste läggas till i Railway!
-
 const c = {
     worldWidth: 18000,
     worldHeight: 18000,
@@ -64,7 +57,7 @@ const c = {
     ejectMassGain: 0.04,
     massLossRate: 1.0,
     mergeTimer: 30,
-    speedMult: 1.1, 
+    speedMult: 1.1,
     houseFee: 0.0,
     targetPopulation: 30,
     botStartBalance: 1.0,
@@ -74,7 +67,7 @@ const c = {
     foodValuePerPlayer: 7.0,
     foodBlobValue: 0.02,
     rewardUnlockDelay: 10 * 60 * 1000,
-    roomDuration: 2 * 60 * 60 * 1000,
+    roomDuration: 3 * 60 * 60 * 1000,
 };
 
 const rooms = [0].map(id => ({
@@ -84,33 +77,108 @@ const rooms = [0].map(id => ({
     food: [],
     viruses: [],
     ejected: [],
-    startTime: Date.now(), 
+    foodPoolBalance: 0,
+    aiBudgetBalance: 0,
+    ownerBalance: 0,
+    startTime: Date.now(),
+    isResetting: false,
     qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4)
 }));
 
-// 1. Flytta CORS till toppen och definiera origins centralt
-const allowedOrigins = [
-    "https://www.agararena.space", 
-    "https://agararena.space", 
-    "http://localhost:5173", 
-    "https://api.agararena.space",
-    "https://2-production-9e74.up.railway.app"
-];
+// In-memory locks and maps for idempotency / processing
+const processingCashouts = new Set(); // mongoId strings
 
-app.use(cors({
-    origin: function (origin, callback) {
-        // Använd includes() istället för indexOf() för bättre läsbarhet
-        if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.up.railway.app')) {
-            callback(null, true);
-        } else {
-            callback(null, false); // Returnera false istället för ett Error-objekt
+// --- RESET FLOW LOGIC ---
+async function performRoomReset(room) {
+    if (room.isResetting) return;
+    room.isResetting = true;
+
+    console.log(`🚨 RESET STARTED: Room ${room.id}`);
+    await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_start', roomId: room.id }, status: 'confirmed' });
+
+    try {
+        // Step 1 & 2: Gameplay is locked via isResetting check in processRoom. Joins are disabled in joinGame.
+
+        // Step 3: Automatically cash out all real players
+        const playersToProcess = [...room.players];
+        for (const p of playersToProcess) {
+            try {
+                const cashoutAmount = p.balance;
+                const user = await User.findById(p.mongoId);
+                if (user) {
+                    user.balance += cashoutAmount;
+                    user.playtime += (Date.now() - p.startTime);
+                    await user.save();
+                    
+                    await Transaction.create({ 
+                        userId: user._id, 
+                        type: 'withdraw', 
+                        amount: cashoutAmount, 
+                        meta: { reason: 'Auto Room Reset', roomId: room.id } 
+                    });
+                    
+                    io.to(p.id).emit('cashOutSuccess', { amount: cashoutAmount, reason: 'Room Reset' });
+                }
+            } catch (err) {
+                await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'auto_cashout_failed', userId: p.mongoId, error: err.message } });
+            }
         }
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "bypass-tunnel-reminders", "Cache-Control", "Pragma"],
-    credentials: true,
-    optionsSuccessStatus: 200 // Viktigt för preflight-svar
-}));
+        room.players = [];
+
+        // Step 4: Wait for confirmations (Step 3 and DB saves are awaited)
+
+        // Step 5: Transfer remaining foodPoolBalance to owner wallet
+        if (room.foodPoolBalance > 0 && HOUSE_WALLET_SECRET && HOUSE_WALLET_ADDRESS) {
+            try {
+                const solToTransfer = room.foodPoolBalance / (typeof SOL_PRICE_USD !== 'undefined' ? SOL_PRICE_USD : 150);
+                const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
+                
+                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                );
+
+                const sweepTx = new solanaWeb3.Transaction().add(
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: houseKeypair.publicKey,
+                        toPubkey: new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS),
+                        lamports: lamports,
+                    })
+                );
+                
+                const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
+                await Transaction.create({ 
+                    type: 'withdraw', 
+                    amount: room.foodPoolBalance, 
+                    meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Sweep' } 
+                });
+                console.log(`💸 Pool Sweep: ${room.foodPoolBalance} USD sent to owner.`);
+            } catch (sweepErr) {
+                await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'pool_sweep_failed', error: sweepErr.message } });
+            }
+        }
+
+        // Step 6-8: Reset temporary game state and entities
+        room.bots = [];
+        room.food = [];
+        room.viruses = [];
+        room.ejected = [];
+        room.foodPoolBalance = 0;
+        room.aiBudgetBalance = 0;
+        room.ownerBalance = 0;
+        room.startTime = Date.now();
+        room.qt.clear();
+
+        // Step 9: Start fresh
+        addViruses(room, c.virusCount);
+        room.aiBudgetBalance += c.targetPopulation * c.botStartBalance;
+        addBots(room, c.targetPopulation);
+
+        console.log(`✅ RESET COMPLETE: Room ${room.id}`);
+        await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_complete', roomId: room.id }, status: 'confirmed' });
+    } finally {
+        room.isResetting = false;
+    }
+}
 
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
@@ -293,11 +361,26 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+// --- ADMIN MIDDLEWARE ---
+const authenticateAdmin = (req, res, next) => {
+    authenticateToken(req, res, async () => {
+        try {
+            const user = await User.findById(req.user.id);
+            // Replace with your actual owner/admin identification logic
+            if (user && user.username === process.env.ADMIN_USERNAME) {
+                next();
+            } else {
+                res.status(403).json({ message: "Admin access required" });
+            }
+        } catch (err) { res.sendStatus(500); }
+    });
+};
+
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
 app.get('/api/game-status', authenticateToken, (req, res) => {
     try {
         const inGame = rooms[0].players.some(p => p.mongoId && p.mongoId.toString() === req.user.id);
-        res.json({ inGame });
+        res.json({ inGame, isResetting: rooms[0].isResetting });
     } catch (err) {
         res.status(500).json({ inGame: false });
     }
@@ -371,6 +454,122 @@ app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
         
         res.json({ success: true, balance: user.balance });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Entry fee info (client can request how much SOL to send and where)
+app.get('/api/entry-info', authenticateToken, async (req, res) => {
+    try {
+        const entryUSD = 10.0;
+        const solAmount = entryUSD / SOL_PRICE_USD;
+        res.json({ entryUSD, solAmount, houseAddress: HOUSE_WALLET_ADDRESS, solPrice: SOL_PRICE_USD });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Verify an on-chain entry payment (client should send the transaction signature)
+app.post('/api/entry-pay', authenticateToken, async (req, res) => {
+    const { signature, solAmount } = req.body;
+    const entryUSD = 10.0;
+    try {
+        if (!signature) return res.status(400).json({ message: 'Missing signature' });
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        // Check if we've already processed this signature
+        const existing = await Transaction.findOne({ 'meta.signature': signature });
+        if (existing) return res.json({ success: true, message: 'Already processed' });
+
+        const txDetails = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        if (!txDetails || txDetails.meta?.err) return res.status(400).json({ message: 'Invalid on-chain transaction' });
+
+        // Ensure the transfer went to our house wallet and amount matches
+        const toPubkey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+        // Find any transfer instructions that credited the house address
+        const accountKeys = txDetails.transaction.message.staticAccountKeys;
+        let credited = false;
+        let creditedLamports = 0;
+        for (let i = 0; i < accountKeys.length; i++) {
+            if (accountKeys[i].equals(toPubkey)) {
+                const pre = txDetails.meta.preBalances[i];
+                const post = txDetails.meta.postBalances[i];
+                if (post > pre) { credited = true; creditedLamports = post - pre; break; }
+            }
+        }
+
+        if (!credited) return res.status(400).json({ message: 'House wallet not credited in this transaction' });
+
+        const solReceived = creditedLamports / solanaWeb3.LAMPORTS_PER_SOL;
+        const amountUSD = solReceived * SOL_PRICE_USD;
+        // Allow small rounding differences
+        if (Math.abs(amountUSD - entryUSD) > 0.5) {
+            return res.status(400).json({ message: 'Incorrect amount sent' });
+        }
+
+        // Log transaction and mark as entry (not yet consumed by join)
+        await Transaction.create({ userId: user._id, type: 'game', amount: -entryUSD, meta: { signature, solAmount: solReceived, solPrice: SOL_PRICE_USD, entryConsumed: false, entryFor: 'arena-entry' }, status: 'confirmed' });
+
+        res.json({ success: true, amountUSD, solReceived });
+    } catch (err) { console.error('Entry pay error', err); res.status(500).json({ error: err.message }); }
+});
+
+// --- ADMIN TOOLS ---
+app.get('/api/admin/room-balances', authenticateAdmin, (req, res) => {
+    const r = rooms[0];
+    res.json({ foodPoolBalance: r.foodPoolBalance, aiBudgetBalance: r.aiBudgetBalance, ownerBalance: r.ownerBalance });
+});
+
+app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) => {
+    const { userId, balance } = req.body;
+    try {
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).send("User not found");
+        user.balance = balance;
+        await user.save();
+        
+        // Also update if they are active in-game
+        const p = rooms[0].players.find(pl => pl.mongoId.toString() === userId);
+        if (p) {
+            p.balance = balance;
+            p.cells.forEach(c => { c.balance = balance / p.cells.length; });
+        }
+
+        await Transaction.create({ type: 'game', amount: 0, meta: { event: 'admin_action', action: 'set_balance', target: userId, newValue: balance } });
+        res.json({ success: true });
+    } catch (err) { res.status(500).send(err.message); }
+});
+
+app.post('/api/admin/set-bot-balance', authenticateAdmin, (req, res) => {
+    const { botId, balance } = req.body;
+    const bot = rooms[0].bots.find(b => b.id === botId);
+    if (bot) {
+        bot.balance = balance;
+        bot.cells.forEach(c => { c.balance = balance / bot.cells.length; });
+        res.json({ success: true });
+    } else res.status(404).send("Bot not found");
+});
+
+app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
+    performRoomReset(rooms[0]);
+    res.json({ success: true, message: "Reset sequence initiated" });
+});
+
+app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
+    const { userId } = req.body;
+    try {
+        const p = rooms[0].players.find(pl => pl.mongoId.toString() === userId);
+        if (!p) return res.status(404).send("Player not in arena");
+        
+        const amount = p.balance;
+        const user = await User.findById(userId);
+        user.balance += amount;
+        await user.save();
+        
+        rooms[0].players = rooms[0].players.filter(pl => pl.mongoId.toString() !== userId);
+        
+        await Transaction.create({ userId: user._id, type: 'withdraw', amount: amount, meta: { reason: 'Admin Forced Cashout' } });
+        io.to(p.id).emit('cashOutSuccess', { amount });
+        
+        res.json({ success: true });
+    } catch (err) { res.status(500).send(err.message); }
 });
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db";
@@ -549,6 +748,8 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 
 function addFood(room, n) {
     for (let i = 0; i < n; i++) {
+        if (room.foodPoolBalance < c.foodBlobValue) break;
+        room.foodPoolBalance -= c.foodBlobValue;
         room.food.push({
             id: Math.random().toString(36).substr(2, 9),
             x: Math.random() * c.worldWidth,
@@ -574,9 +775,12 @@ function addViruses(room, n) {
 
 function addBots(room, n) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
-    for (let i = 0; i < n; i++) {
+    const botCost = c.botStartBalance;
+    const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCost));
+    for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
         const randomName = botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]";
+        room.aiBudgetBalance -= botCost;
         room.bots.push({
             id: id, username: randomName, balance: 0, kills: 0, color: util.randomColor(), isBot: true,
             targetX: Math.random() * c.worldWidth, targetY: Math.random() * c.worldHeight, lastTargetUpdate: 0,
@@ -592,6 +796,8 @@ function addBots(room, n) {
 // Initiera alla rum
 rooms.forEach(room => {
     addViruses(room, c.virusCount);
+    // Seed initial bot population with reserved AI budget so the arena starts populated.
+    room.aiBudgetBalance += c.targetPopulation * c.botStartBalance;
     addBots(room, c.targetPopulation);
 });
 
@@ -619,6 +825,11 @@ io.on('connection', (socket) => {
             if (!user) return;
 
             const room = getBestRoom();
+
+            if (room.isResetting) {
+                socket.emit('error', 'The arena is currently resetting. Please wait a moment.');
+                return;
+            }
             
             // --- REJOIN LOGIK ---
             const existingPlayer = room.players.find(p => p.mongoId.toString() === user._id.toString());
@@ -626,8 +837,15 @@ io.on('connection', (socket) => {
                 console.log(`♻️ User ${user.username} rejoining. Kicking old socket ${existingPlayer.id}`);
                 // Meddela det gamla fönstret att det blivit ersatt
                 io.to(existingPlayer.id).emit('forcedDisconnect');
-                
+
+                // Cancel scheduled removal if they were disconnected
+                if (existingPlayer.removeTimeout) {
+                    clearTimeout(existingPlayer.removeTimeout);
+                    delete existingPlayer.removeTimeout;
+                }
+
                 existingPlayer.id = socket.id; // Uppdatera till nya socket id
+                existingPlayer.disconnected = false;
                 socket.roomId = room.id;
                 let remaining = 0;
                 if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
@@ -637,14 +855,25 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            if (user.balance < 10.0) {
-                socket.emit('error', 'Minimum $10 balance required to enter.');
+            // Require on-chain entry payment: find a pending entry transaction created by /api/entry-pay
+            const entryTx = await Transaction.findOne({ userId: user._id, type: 'game', 'meta.entryFor': 'arena-entry', 'meta.entryConsumed': false });
+            if (!entryTx) {
+                socket.emit('error', 'Entry fee required. Please pay $10 in SOL before joining.');
                 return;
             }
 
-            // EKONOMI: $10 inträde. $4 till plattform, $1 startbalans, $5 till mat-poolen.
-            user.balance -= 10.0;
-            await user.save();
+            // Consume the entry transaction (idempotent)
+            entryTx.meta.entryConsumed = true;
+            entryTx.meta.consumedAt = Date.now();
+            await entryTx.save();
+
+            // Log Join
+            await Transaction.create({ userId: user._id, type: 'game', amount: 0, meta: { event: 'join', roomId: room.id }, status: 'confirmed' });
+
+            // EKONOMI: Distribute the $10: $1 owner, $6 food pool, $2 AI budget, $1 player starting balance
+            room.ownerBalance += 1.0;
+            room.foodPoolBalance += 6.0;
+            room.aiBudgetBalance += 2.0;
             
             socket.roomId = room.id;
 
@@ -817,10 +1046,23 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         if (!room) return;
-        // Vi tar INTE bort spelaren här längre för att tillåta rejoin. 
-        // De tas bara bort om de blir uppätna eller cashar ut.
-        
-        // Om en spelare lämnar och vi hamnar under 30 totalt, lägg till en bot
+        // Mark player as disconnected but preserve their entity/state for 5 minutes
+        const p = room.players.find(pl => pl.id === socket.id);
+        if (p) {
+            p.disconnected = true;
+            p.disconnectedAt = Date.now();
+            // Schedule removal after 5 minutes (300000 ms)
+            p.removeTimeout = setTimeout(() => {
+                // If they didn't reconnect, treat as eliminated: remove and zero their balance
+                room.players = room.players.filter(x => x.id !== p.id);
+                p.balance = 0;
+                console.log(`🗑️ Removed disconnected player ${p.username} after timeout`);
+                // Ensure population
+                if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
+            }, 5 * 60 * 1000);
+        }
+
+        // If population is low, ensure bots fill the arena
         if (room.players.length + room.bots.length < c.targetPopulation) {
             addBots(room, 1);
         }
@@ -845,26 +1087,14 @@ function processRoom(room) {
     const now = Date.now();
     const age = now - room.startTime;
 
-    // Kontrollera om rummet behöver resettas (var 2:a timme)
-    if (age > c.roomDuration) {
-        console.log(`♻️ Global Arena reset period reached. Restarting room ${room.id}...`);
-        room.players.forEach(p => io.to(p.id).emit('died'));
-        room.players = [];
-        room.bots = [];
-        room.food = [];
-        room.viruses = [];
-        room.ejected = [];
-        room.startTime = now;
-        addViruses(room, c.virusCount);
-        addBots(room, c.targetPopulation);
-        room.qt.clear();
+    // Automated Reset Check
+    if (age > c.roomDuration && !room.isResetting) {
+        performRoomReset(room);
+        return; // Pause processing during reset
     }
+    
+    if (room.isResetting) return; // Step 1: Lock gameplay
 
-    room.qt.clear();
-    room.players.forEach(p => p.cells.forEach(cell => room.qt.insert(new Point(cell.x, cell.y, { type: 'player', socketId: p.id, cell }))));
-    room.bots.forEach(b => b.cells.forEach(cell => room.qt.insert(new Point(cell.x, cell.y, { type: 'bot', botId: b.id, cell }))));
-    room.food.forEach(f => room.qt.insert(new Point(f.x, f.y, { type: 'food', data: f })));
-    room.viruses.forEach(v => room.qt.insert(new Point(v.x, v.y, { type: 'virus', data: v })));
     room.ejected.forEach(e => room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
 
     const allUsers = [...room.players, ...room.bots];
@@ -1072,14 +1302,6 @@ function processRoom(room) {
                                             .catch(err => console.error("Error updating playtime on death:", err));
 
                                         room.players = room.players.filter(p => p.id !== victim.id);
-                                        // Logga förlusten av entry fee
-                                        Transaction.create({ 
-                                            userId: victimMongoId, 
-                                            type: 'game', 
-                                            amount: -10.00, 
-                                            meta: { reason: 'Arena Death' },
-                                            status: 'confirmed'
-                                        }).catch(err => console.error("Error logging arena death:", err));
                                     } else {
                                         // Ta bort botten och spawna en ny direkt
                                         // Kill rewards är borttagna, så ingen ökning av kills
@@ -1114,11 +1336,11 @@ function processRoom(room) {
     });
 
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
-    // Kontinuerlig mat-spawn: Sträva efter $7 värde av mat per spelare
-    const targetFoodCount = room.players.length * (c.foodValuePerPlayer / c.foodBlobValue);
+    // Kontinuerlig mat-spawn: Food must come from the food pool and never be generated from nothing.
+    const foodValueTarget = Math.min(room.players.length * c.foodValuePerPlayer, room.foodPoolBalance);
+    const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
     if (room.food.length < targetFoodCount) {
-        // Spawna i små omgångar för att undvika en plötslig flod
-        addFood(room, Math.min(5, targetFoodCount - room.food.length)); 
+        addFood(room, Math.min(5, targetFoodCount - room.food.length));
     }
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
