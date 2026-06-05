@@ -168,32 +168,35 @@ async function performRoomReset(room) {
 
         // Step 4: Wait for confirmations (Step 3 and DB saves are awaited)
 
-        // Step 5: Transfer remaining foodPoolBalance to owner wallet
-        if (room.foodPoolBalance > 0 && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
+        // Step 5: Blockchain Wallet Sweep (Transfer real SOL to owner)
+        if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
             try {
-                const solToTransfer = room.foodPoolBalance / (typeof SOL_PRICE_USD !== 'undefined' ? SOL_PRICE_USD : 150);
-                const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
-                
+                const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                const totalLamports = await connection.getBalance(housePubKey);
+                const bufferLamports = 0.005 * solanaWeb3.LAMPORTS_PER_SOL;
+                const sweepLamports = totalLamports - bufferLamports;
+
+                if (sweepLamports > 0) {
                 const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
                     Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
                 );
-
                 const sweepTx = new solanaWeb3.Transaction().add(
                     solanaWeb3.SystemProgram.transfer({
                         fromPubkey: houseKeypair.publicKey,
                         toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
-                        lamports: lamports,
+                        lamports: sweepLamports,
                     })
                 );
-                
                 const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
                 await Transaction.create({ 
                     type: 'withdraw', 
-                    amount: room.foodPoolBalance, 
-                    meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Sweep' } 
+                    amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, 
+                    meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' } 
                 });
-                console.log(`💸 Pool Sweep: ${room.foodPoolBalance} USD sent to owner.`);
+                console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
+                }
             } catch (sweepErr) {
+                console.error("Sweep Error:", sweepErr.message);
                 await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'pool_sweep_failed', error: sweepErr.message } });
             }
         }
@@ -203,6 +206,7 @@ async function performRoomReset(room) {
         room.food = [];
         room.viruses = [];
         room.ejected = [];
+        // Reset balances only after sweep logic is handled
         room.foodPoolBalance = 0;
         room.aiBudgetBalance = 0;
         room.ownerBalance = 0;
@@ -911,10 +915,22 @@ io.on('connection', (socket) => {
             // Log Join
             await Transaction.create({ userId: user._id, type: 'game', amount: 0, meta: { event: 'join', roomId: room.id }, status: 'confirmed' });
 
-            // EKONOMI: Distribute the $10: $1 owner, $6 food pool, $2 AI budget, $1 player starting balance
+            // EKONOMI: Dynamic Bot Budgeting based on Human Population
+            const realPlayerCount = room.players.length;
             room.ownerBalance += 1.0;
             room.foodPoolBalance += 6.0;
-            room.aiBudgetBalance += 2.0;
+
+            if (realPlayerCount <= 4) {
+                // RULE A: Low population
+                room.aiBudgetBalance += 2.0;
+            } else if (realPlayerCount <= 10) {
+                // RULE B: Medium population ($1.0 to bots, $1.0 extra to house profit)
+                room.aiBudgetBalance += 1.0;
+                room.ownerBalance += 1.0;
+            } else {
+                // RULE C: High population ($0 to bots, $2.0 extra to house profit)
+                room.ownerBalance += 2.0;
+            }
             
             socket.roomId = room.id;
 
@@ -1043,20 +1059,8 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const age = Date.now() - activeRoom.startTime;
-            const rewardsUnlocked = (age > c.rewardUnlockDelay) && (activeRoom.players.length >= 4);
-
-            // Beräkna leaderboard-bonus vid cashout ($20 för #1, $10 för #2-3)
-            const all = [...activeRoom.players, ...activeRoom.bots].sort((a, b) => b.balance - a.balance);
-            const rank = all.findIndex(u => u.mongoId?.toString() === playerMongoId) + 1;
-            
-            let rankBonus = 0;
-            if (rewardsUnlocked) {
-                if (rank === 1) rankBonus = 20.0;
-                else if (rank <= 3) rankBonus = 10.0;
-            }
-
-            const totalCashout = activePlayer.balance + rankBonus;
+            // REMOVE RANK BONUS: Pay out only the server-side balance
+            const totalCashout = activePlayer.balance;
             const mongoId = activePlayer.mongoId;
 
             try {
@@ -1100,8 +1104,8 @@ io.on('connection', (socket) => {
                 await Transaction.create({
                     userId: user._id,
                     type: 'withdraw',
-                    amount: totalCashout, 
-                    meta: { signature, reason: 'Arena Cashout to Account', rank, solAmount: solToWithdraw },
+                    amount: totalCashout,
+                    meta: { signature, reason: 'Arena Cashout to Account', solAmount: solToWithdraw },
                     status: 'confirmed'
                 });
 
