@@ -749,7 +749,8 @@ app.post('/api/login', async (req, res) => {
             user: {
                 id: user._id,
                 username: user.username,
-                balance: user.balance
+                balanceSol: user.balance,
+                balanceUsd: user.balance * SOL_PRICE_USD
             }
         });
     } catch (err) {
@@ -901,7 +902,7 @@ function addBots(room, n) {
             cells: [{
                 id: Math.random().toString(36).substr(2, 9),
                 x: Math.random() * c.worldWidth, y: Math.random() * c.worldHeight,
-                balance: botCostSol, radius
+                balance: botCostSol, radius: calculateCellRadius(botCostSol, botCostSol, 1)
             }] // Bottar använder standard-radie för enkelhetens skull eller kan också uppdateras
         });
     }
@@ -1032,8 +1033,8 @@ io.on('connection', (socket) => {
                     id: Math.random().toString(36).substr(2, 9),
                     x: spawnX,
                     y: spawnY,
-                    balance: c.playerStartBalance,
-                    radius: calculateCellRadius(c.playerStartBalance, c.playerStartBalance, 1),
+                    balance: playerStartBalanceSol,
+                    radius: calculateCellRadius(playerStartBalanceSol, playerStartBalanceSol, 1),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
