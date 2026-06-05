@@ -22,7 +22,34 @@ const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET;
 const OWNER_VAULT_ADDRESS = process.env.OWNER_VAULT_ADDRESS; // Din personliga plånbok för vinst
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
-let SOL_PRICE_USD = 150; // Startvärde, uppdateras av scannern
+let SOL_PRICE_USD = 57; // Default fallback price, updated by market scanner
+
+async function updateSolPrice() {
+    try {
+        const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+        if (!response.ok) throw new Error('CoinGecko network error');
+        const data = await response.json();
+        if (data && data.solana && data.solana.usd) {
+            SOL_PRICE_USD = parseFloat(data.solana.usd);
+            console.log(`[PRICE SCANNER] Live SOL price updated to: $${SOL_PRICE_USD} USD`);
+        }
+    } catch (error) {
+        console.error('[PRICE SCANNER ERROR] CoinGecko failed, trying Binance...', error.message);
+        try {
+            const binanceResponse = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+            const binanceData = await binanceResponse.json();
+            if (binanceData && binanceData.price) {
+                SOL_PRICE_USD = parseFloat(binanceData.price);
+                console.log(`[PRICE SCANNER FALLBACK] Live SOL price updated from Binance: $${SOL_PRICE_USD} USD`);
+            }
+        } catch (binanceError) {
+            console.error('[PRICE SCANNER ERROR] Fallback Binance API also failed:', binanceError.message);
+        }
+    }
+}
+// Start scanner immediately and refresh every 5 minutes
+updateSolPrice();
+setInterval(updateSolPrice, 300000);
 
 // Kontrollera att kritiska miljövariabler finns
 if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
@@ -255,6 +282,7 @@ async function scanDeposits() {
             const priceData = await priceRes.json();
             SOL_PRICE_USD = parseFloat(priceData.price);
         }
+        // SOL_PRICE_USD is now handled by the central updateSolPrice scanner.
 
         // 2. Hitta alla användare som har en insättningsadress
         const users = await User.find({ depositAddress: { $exists: true } });
@@ -1480,7 +1508,8 @@ function processRoom(room) {
             unlocked: rewardsUnlocked,
             unlockTime: room.startTime + c.rewardUnlockDelay,
             playerCount: room.players.length,
-            resetTime: room.startTime + c.roomDuration
+            resetTime: room.startTime + c.roomDuration,
+            solPrice: SOL_PRICE_USD
         });
     });
 }
