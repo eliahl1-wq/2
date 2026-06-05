@@ -124,6 +124,9 @@ async function performRoomReset(room) {
     console.log(`🚨 RESET STARTED: Room ${room.id}`);
     await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_start', roomId: room.id }, status: 'confirmed' });
 
+    // Capture human player count BEFORE clearing the players array for the sweep
+    const realPlayerCount = room.players.filter(p => !p.isBot).length;
+
     try {
         // Step 1 & 2: Gameplay is locked via isResetting check in processRoom. Joins are disabled in joinGame.
 
@@ -164,59 +167,77 @@ async function performRoomReset(room) {
                 await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'auto_cashout_failed', userId: p.mongoId, error: err.message } });
             }
         }
-        room.players = [];
+        room.players = []; // Step 4: Players are now cleared from memory
 
-        // Step 4: Wait for confirmations (Step 3 and DB saves are awaited)
-
-        // Step 5: Blockchain Wallet Sweep (Transfer real SOL to owner)
+        // Step 5: Direct Blockchain Wallet Sweep (Transfer real SOL to owner)
         if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
             try {
                 const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                // Step 1: Fetch exact, real-time Lamports balance from the blockchain
                 const totalLamports = await connection.getBalance(housePubKey);
-                const bufferLamports = 0.005 * solanaWeb3.LAMPORTS_PER_SOL;
+                
+                // Step 2 & 3: Reserve exactly 0.005 SOL buffer for gas fees
+                const bufferLamports = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
                 const sweepLamports = totalLamports - bufferLamports;
 
                 if (sweepLamports > 0) {
-                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
-                );
-                const sweepTx = new solanaWeb3.Transaction().add(
-                    solanaWeb3.SystemProgram.transfer({
-                        fromPubkey: houseKeypair.publicKey,
-                        toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
-                        lamports: sweepLamports,
-                    })
-                );
-                const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
-                await Transaction.create({ 
-                    type: 'withdraw', 
-                    amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, 
-                    meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' } 
-                });
-                console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
+                    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                    );
+                    const sweepTx = new solanaWeb3.Transaction().add(
+                        solanaWeb3.SystemProgram.transfer({
+                            fromPubkey: houseKeypair.publicKey,
+                            toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                            lamports: sweepLamports,
+                        })
+                    );
+                    // Step 4: Transfer 100% of remaining SOL directly to OWNER_VAULT_ADDRESS
+                    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
+                    
+                    await Transaction.create({ 
+                        type: 'withdraw', 
+                        amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, 
+                        meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' } 
+                    });
+                    console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
+                    
+                    // Step 6: Reset allocation balances only after successful initiation
+                    room.foodPoolBalance = 0;
+                    room.aiBudgetBalance = 0;
+                    room.ownerBalance = 0;
                 }
             } catch (sweepErr) {
+                // Step 5: Handle RPC network or timeout errors safely
                 console.error("Sweep Error:", sweepErr.message);
                 await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'pool_sweep_failed', error: sweepErr.message } });
             }
         }
 
-        // Step 6-8: Reset temporary game state and entities
+        // Step 6-8: Reset entities and game metadata
         room.bots = [];
         room.food = [];
         room.viruses = [];
         room.ejected = [];
-        // Reset balances only after sweep logic is handled
-        room.foodPoolBalance = 0;
-        room.aiBudgetBalance = 0;
-        room.ownerBalance = 0;
         room.startTime = Date.now();
         room.qt.clear();
 
-        // Step 9: Start fresh
+        // Step 9: Start fresh with Dynamic Bot Spawning Logic
         addViruses(room, c.virusCount);
-        room.aiBudgetBalance += c.targetPopulation * c.botStartBalance;
-        addBots(room, c.targetPopulation);
+
+        // Exact dynamic check based on human population (captured at line 98)
+        if (realPlayerCount <= 4) {
+            // Rule A: Full default starting bot pack if room is empty or low population
+            room.aiBudgetBalance = 30.0; 
+            addBots(room, c.targetPopulation);
+        } else if (realPlayerCount >= 5 && realPlayerCount <= 10) {
+            // Rule B: Only allocate $1 per player to bot budget
+            room.aiBudgetBalance = realPlayerCount * 1.0;
+            addBots(room, Math.floor(room.aiBudgetBalance));
+        } else {
+            // Rule C: More than 10 players -> 0 bots spawned. All remaining SOL stays in wallet for sweep.
+            room.aiBudgetBalance = 0;
+            room.bots = [];
+        }
 
         console.log(`✅ RESET COMPLETE: Room ${room.id}`);
         await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_complete', roomId: room.id }, status: 'confirmed' });
@@ -841,8 +862,10 @@ function addBots(room, n) {
 // Initiera alla rum
 rooms.forEach(room => {
     addViruses(room, c.virusCount);
-    // Seed initial bot population with reserved AI budget so the arena starts populated.
-    room.aiBudgetBalance += c.targetPopulation * c.botStartBalance;
+    // Rule A applies for empty room initialization: Full starting pack
+    room.aiBudgetBalance = 30.0;
+    // Rule A: Full default starting bot pack if room is empty or low population
+    room.aiBudgetBalance = 30.0; 
     addBots(room, c.targetPopulation);
 });
 
@@ -916,17 +939,18 @@ io.on('connection', (socket) => {
             await Transaction.create({ userId: user._id, type: 'game', amount: 0, meta: { event: 'join', roomId: room.id }, status: 'confirmed' });
 
             // EKONOMI: Dynamic Bot Budgeting based on Human Population
-            const realPlayerCount = room.players.length;
-            room.ownerBalance += 1.0;
-            room.foodPoolBalance += 6.0;
+            const realPlayerCount = room.players.filter(p => !p.isBot).length;
+            room.foodPoolBalance += c.foodValuePerPlayer; // Full $7.0 goes to food pool/map at start
 
             if (realPlayerCount <= 4) {
                 // RULE A: Low population
                 room.aiBudgetBalance += 2.0;
+                addBots(room, 2); // Spawns 2 bots using the $2.0 budget
             } else if (realPlayerCount <= 10) {
                 // RULE B: Medium population ($1.0 to bots, $1.0 extra to house profit)
                 room.aiBudgetBalance += 1.0;
                 room.ownerBalance += 1.0;
+                addBots(room, 1); // Spawns 1 bot using the $1.0 budget
             } else {
                 // RULE C: High population ($0 to bots, $2.0 extra to house profit)
                 room.ownerBalance += 2.0;
