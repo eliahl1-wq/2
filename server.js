@@ -16,6 +16,22 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 
 const app = express();
 
+// --- SOLANA KONFIGURATION ---
+const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
+const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET;
+const OWNER_VAULT_ADDRESS = process.env.OWNER_VAULT_ADDRESS; // Din personliga plånbok för vinst
+const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
+const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
+let SOL_PRICE_USD = 150; // Startvärde, uppdateras av scannern
+
+// Kontrollera att kritiska miljövariabler finns
+if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
+    console.warn("⚠️ VARNING: HOUSE_WALLET_ADDRESS eller HOUSE_WALLET_SECRET saknas i miljövariablerna!");
+    console.warn("Transaktioner och cashouts kommer inte att fungera.");
+} else {
+    console.log("✅ Solana House Wallet konfigurerad: " + HOUSE_WALLET_ADDRESS);
+}
+
 const allowedOrigins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -115,21 +131,34 @@ async function performRoomReset(room) {
         const playersToProcess = [...room.players];
         for (const p of playersToProcess) {
             try {
-                const cashoutAmount = p.balance;
                 const user = await User.findById(p.mongoId);
-                if (user) {
-                    user.balance += cashoutAmount;
+                if (user && user.depositAddress && HOUSE_WALLET_SECRET) {
+                    const solToTransfer = p.balance / SOL_PRICE_USD;
+                    const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
+                    
+                    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                    );
+                    const transaction = new solanaWeb3.Transaction().add(
+                        solanaWeb3.SystemProgram.transfer({
+                            fromPubkey: houseKeypair.publicKey,
+                            toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
+                            lamports: lamports,
+                        })
+                    );
+                    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
                     user.playtime += (Date.now() - p.startTime);
                     await user.save();
                     
                     await Transaction.create({ 
                         userId: user._id, 
                         type: 'withdraw', 
-                        amount: cashoutAmount, 
-                        meta: { reason: 'Auto Room Reset', roomId: room.id } 
+                        amount: p.balance, 
+                        meta: { signature: sig, reason: 'Auto Room Reset to Account Address', roomId: room.id } 
                     });
                     
-                    io.to(p.id).emit('cashOutSuccess', { amount: cashoutAmount, reason: 'Room Reset' });
+                    io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: sig });
                 }
             } catch (err) {
                 await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'auto_cashout_failed', userId: p.mongoId, error: err.message } });
@@ -140,7 +169,7 @@ async function performRoomReset(room) {
         // Step 4: Wait for confirmations (Step 3 and DB saves are awaited)
 
         // Step 5: Transfer remaining foodPoolBalance to owner wallet
-        if (room.foodPoolBalance > 0 && HOUSE_WALLET_SECRET && HOUSE_WALLET_ADDRESS) {
+        if (room.foodPoolBalance > 0 && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
             try {
                 const solToTransfer = room.foodPoolBalance / (typeof SOL_PRICE_USD !== 'undefined' ? SOL_PRICE_USD : 150);
                 const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
@@ -152,7 +181,7 @@ async function performRoomReset(room) {
                 const sweepTx = new solanaWeb3.Transaction().add(
                     solanaWeb3.SystemProgram.transfer({
                         fromPubkey: houseKeypair.publicKey,
-                        toPubkey: new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS),
+                        toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
                         lamports: lamports,
                     })
                 );
@@ -1030,27 +1059,58 @@ io.on('connection', (socket) => {
             const totalCashout = activePlayer.balance + rankBonus;
             const mongoId = activePlayer.mongoId;
 
-            // Ta bort spelaren från arenan nu när utbetalningen är säkrad
-            activeRoom.players = activeRoom.players.filter(pl => pl.mongoId.toString() !== playerMongoId);
-
             try {
                 const user = await User.findById(mongoId);
-                if (user) {
-                    const sessionPlaytime = Date.now() - activePlayer.startTime;
-                    user.balance += totalCashout; 
-                    user.playtime += sessionPlaytime;
-                    await user.save();
-                    
-                    // Spara i transaktionshistorik
-                    const tx = new Transaction({ userId: user._id, type: 'withdraw', amount: totalCashout, meta: { reason: 'Arena Cashout', rank } });
-                    await tx.save();
-
-                    console.log(`💰 User ${activePlayer.username} cashed out $${totalCashout.toFixed(2)} (Rank: ${rank}, Bonus: $${rankBonus})`);
-                    // Skicka till spelarens aktuella socket (som kan ha ändrats vid refresh)
-                    io.to(activePlayer.id).emit('cashOutSuccess', { amount: totalCashout });
+                if (!user || !user.depositAddress) {
+                    console.log(`❌ Cashout failed: User ${activePlayer.username} has no internal deposit address.`);
+                    io.to(activePlayer.id).emit('error', 'Account internal error.');
+                    activePlayer.isCashingOut = false;
+                    return;
                 }
+
+                // Ta bort spelaren från arenan
+                activeRoom.players = activeRoom.players.filter(pl => pl.mongoId.toString() !== playerMongoId);
+
+                // 1. Beräkna SOL-mängd
+                const solToWithdraw = totalCashout / SOL_PRICE_USD;
+                const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
+
+                // 2. Skapa transaktionen on-chain till användarens insättningsadress
+                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                );
+
+                const transaction = new solanaWeb3.Transaction().add(
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: houseKeypair.publicKey,
+                        toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
+                        lamports: lamports,
+                    })
+                );
+
+                // 3. Skicka och vänta på bekräftelse
+                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
+                // 4. Uppdatera playtime och logga i DB
+                // OBS: Vi uppdaterar INTE user.balance här manuellt, 
+                // eftersom scanDeposits() kommer upptäcka detta och göra det automatiskt.
+                user.playtime += (Date.now() - activePlayer.startTime);
+                await user.save();
+
+                await Transaction.create({
+                    userId: user._id,
+                    type: 'withdraw',
+                    amount: totalCashout, 
+                    meta: { signature, reason: 'Arena Cashout to Account', rank, solAmount: solToWithdraw },
+                    status: 'confirmed'
+                });
+
+                console.log(`💰 CASHOUT TO ACCOUNT: $${totalCashout.toFixed(2)} moved to ${user.depositAddress}`);
+                io.to(activePlayer.id).emit('cashOutSuccess', { amount: totalCashout, signature });
+
             } catch (err) {
-                console.error("Cashout error:", err);
+                console.error("❌ Cashout error:", err.message);
+                io.to(activePlayer.id).emit('error', 'Transfer failed.');
             }
         }, 20000); // 20 sekunders fördröjning
     });
