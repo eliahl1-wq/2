@@ -63,7 +63,8 @@ const allowedOrigins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://www.agararena.space",
-    "https://agararena.space"
+    "https://agararena.space",
+    "https://2-production-9e74.up.railway.app"
 ];
 
 app.use(cors({
@@ -764,12 +765,24 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     console.log("Mottog förfrågan om aktuell användare (api/me)");
     try {
         const user = await User.findById(req.user.id).select('-password');
+        
+        let balanceSol = user.balance;
+        if (user.depositAddress) {
+            try {
+                const lamports = await connection.getBalance(new solanaWeb3.PublicKey(user.depositAddress));
+                balanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+            } catch (blockchainError) {
+                console.warn(`[RPC TIMEOUT] Falling back to database balance for ${user.username}:`, blockchainError.message);
+                balanceSol = user.balance;
+            }
+        }
+
         // API Exposure: Return both SOL and calculated USD value
         res.json({
             _id: user._id,
             username: user.username,
-            balanceSol: user.balance,
-            balanceUsd: user.balance * SOL_PRICE_USD,
+            balanceSol: balanceSol,
+            balanceUsd: balanceSol * SOL_PRICE_USD,
             solPrice: SOL_PRICE_USD,
             email: user.email,
             depositAddress: user.depositAddress,
@@ -1013,11 +1026,11 @@ io.on('connection', (socket) => {
                 id: socket.id,
                 mongoId: user._id,
                 username: username || user.username,
-                kills: 0, // Behåll variabeln men används ej för rewards längre
-                balance: entryFeeInSol, 
+                kills: 0,
+                balance: c.playerStartBalance,
                 startTime: Date.now(),
                 color: util.randomColor(),
-                x: c.worldWidth / 2, // Startposition för kameran
+                x: c.worldWidth / 2,
                 y: c.worldHeight / 2,
                 mouseX: 0,
                 mouseY: 0,
@@ -1027,8 +1040,8 @@ io.on('connection', (socket) => {
                     id: Math.random().toString(36).substr(2, 9),
                     x: spawnX,
                     y: spawnY,
-                    balance: entryFeeInSol,
-                    radius: calculateCellRadius(entryFeeInSol, entryFeeInSol, 1),
+                    balance: c.playerStartBalance,
+                    radius: calculateCellRadius(c.playerStartBalance, c.playerStartBalance, 1),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
