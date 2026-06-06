@@ -252,21 +252,12 @@ async function performRoomReset(room) {
         // Step 9: Start fresh with Dynamic Bot Spawning Logic
         addViruses(room, c.virusCount);
 
-        // Exact dynamic check based on human population (captured at line 98)
-        const startPackUSD = 30.0;
-        if (realPlayerCount <= 4) {
-            // Rule A: Full default starting bot pack if room is empty or low population
-            room.aiBudgetBalance = startPackUSD / SOL_PRICE_USD; 
-            addBots(room, c.targetPopulation);
-        } else if (realPlayerCount >= 5 && realPlayerCount <= 10) {
-            // Rule B: Only allocate $1 per player to bot budget
-            room.aiBudgetBalance = (realPlayerCount * 1.0) / SOL_PRICE_USD;
-            addBots(room, Math.floor(room.aiBudgetBalance));
-        } else {
-            // Rule C: More than 10 players -> 0 bots spawned. All remaining SOL stays in wallet for sweep.
-            room.aiBudgetBalance = 0;
-            room.bots = [];
-        }
+        // ENFORCE STRICT 1:1 RATIO: Humans are removed during reset, so bots must be 0.
+        // Bots will be populated dynamically as players rejoin via joinGame logic.
+        room.bots = [];
+        room.aiBudgetBalance = 0;
+        room.foodPoolBalance = 0;
+        room.ownerBalance = 0;
 
         console.log(`✅ RESET COMPLETE: Room ${room.id}`);
         await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_complete', roomId: room.id }, status: 'confirmed' });
@@ -487,19 +478,28 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
     
     try {
         const user = await User.findById(req.user.id);
-        if (!user || user.balance < amountUSD || amountUSD < 1) {
+        // Calculate SOL amount to deduct (balance is already in SOL)
+        const solToWithdraw = amountUSD / SOL_PRICE_USD; 
+
+        if (!user || user.balance < solToWithdraw || amountUSD < 1) {
             return res.status(400).json({ message: "Insufficient balance or invalid amount" });
         }
 
-        if (!HOUSE_WALLET_SECRET) {
-            return res.status(500).json({ message: "Withdrawals currently disabled (missing secret)" });
+        if (!HOUSE_WALLET_SECRET || !HOUSE_WALLET_ADDRESS) {
+            return res.status(500).json({ message: "Withdrawals currently disabled (missing configuration)" });
         }
 
-        // Calculate SOL amount to deduct (balance is already in SOL)
-        const solToWithdraw = amountUSD / SOL_PRICE_USD; 
-        if (user.balance < solToWithdraw) return res.status(400).json({ message: "Insufficient balance" });
-
         const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
+
+        // Pre-flight liquidity check
+        const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+        const totalLamports = await connection.getBalance(housePubKey);
+        const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+
+        if (totalLamports < (lamports + feeBuffer)) {
+            console.error('[CASHOUT ERROR] House wallet lacks liquidity');
+            return res.status(500).json({ message: "Withdrawals temporarily unavailable due to liquidity. Contact support." });
+        }
 
         // 2. Förbered transaktion från hus-plånboken
         const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -861,17 +861,17 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 // Radius beräknas via `util.massToRadius` (sqrt-baserad) för konsistens med klient och Agar.io
 
 function addFood(room, n) {
-    const foodBlobSol = c.foodBlobValue / SOL_PRICE_USD;
+    const foodBlobValue = c.foodBlobValue;
     for (let i = 0; i < n; i++) {
-        if (room.foodPoolBalance < foodBlobSol) break;
-        room.foodPoolBalance -= foodBlobSol;
+        if (room.foodPoolBalance < foodBlobValue) break;
+        room.foodPoolBalance -= foodBlobValue;
         room.food.push({
             id: Math.random().toString(36).substr(2, 9),
             x: Math.random() * c.worldWidth,
             y: Math.random() * c.worldHeight,
             hue: Math.floor(Math.random() * 360),
             radius: 7, // Originalstorlek för mat
-            balance: foodBlobSol
+            balance: foodBlobValue
         });
     }
 }
@@ -890,14 +890,14 @@ function addViruses(room, n) {
 
 function addBots(room, n) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
-    const botCostSol = c.botStartBalance / SOL_PRICE_USD;
+    const botCostSol = c.botStartBalance;
     const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCostSol));
     for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
         const randomName = botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]";
         room.aiBudgetBalance -= botCostSol;
         room.bots.push({
-            id: id, username: randomName, balance: 0, kills: 0, color: util.randomColor(), isBot: true,
+            id: id, username: randomName, balance: botCostSol, kills: 0, color: util.randomColor(), isBot: true,
             targetX: Math.random() * c.worldWidth, targetY: Math.random() * c.worldHeight, lastTargetUpdate: 0,
             cells: [{
                 id: Math.random().toString(36).substr(2, 9),
@@ -911,9 +911,7 @@ function addBots(room, n) {
 // Initiera alla rum
 rooms.forEach(room => {
     addViruses(room, c.virusCount);
-    // Rule A: Full default starting bot pack ($30 worth of SOL)
-    room.aiBudgetBalance = 30.0 / SOL_PRICE_USD; 
-    addBots(room, c.targetPopulation);
+    room.aiBudgetBalance = 0; 
 });
 
 function getBestRoom() {
@@ -972,7 +970,6 @@ io.on('connection', (socket) => {
 
             // FINANCIAL REWRITE: Check SOL balance for $10 entry fee
             const entryFeeInSol = 10.0 / SOL_PRICE_USD;
-            const playerStartBalanceSol = 1.0 / SOL_PRICE_USD;
 
             if (user.balance < entryFeeInSol) {
                 socket.emit('error', `Insufficient SOL balance for $10 entry fee (Need: ${entryFeeInSol.toFixed(4)} SOL).`);
@@ -992,24 +989,20 @@ io.on('connection', (socket) => {
                 status: 'confirmed' 
             });
 
-            // EKONOMI: Distribute splits in raw SOL mass
-            const realPlayerCount = room.players.filter(p => !p.isBot).length;
-            room.foodPoolBalance += 7.0 / SOL_PRICE_USD; // Full $7.0 worth of SOL to food
-
-            if (realPlayerCount <= 4) {
-                // RULE A: Low population
-                room.aiBudgetBalance += 2.0 / SOL_PRICE_USD;
-                addBots(room, 2); // Spawns 2 bots using the $2.0 budget
-            } else if (realPlayerCount <= 10) {
-                // RULE B: Medium population ($1.0 to bots, $1.0 extra to house profit)
-                room.aiBudgetBalance += 1.0 / SOL_PRICE_USD;
-                room.ownerBalance += 1.0 / SOL_PRICE_USD;
-                addBots(room, 1); // Spawns 1 bot using the $1.0 budget
-            } else {
-                // RULE C: High population ($0 to bots, $2.0 extra to house profit)
-                room.ownerBalance += 2.0 / SOL_PRICE_USD;
-            }
+            // EKONOMI: Distribute splits in mass units ($)
+            room.foodPoolBalance += 7.0; 
+            room.aiBudgetBalance += 1.0; 
+            room.ownerBalance += 2.0; 
             
+            // ENFORCE STRICT 1:1 HUMAN-BOT RATIO
+            const activeHumans = room.players.filter(p => !p.disconnected).length + 1;
+            const targetBots = Math.min(30, activeHumans);
+            if (room.bots.length < targetBots) {
+                addBots(room, targetBots - room.bots.length);
+            } else if (room.bots.length > targetBots) {
+                room.bots.splice(0, room.bots.length - targetBots);
+            }
+
             socket.roomId = room.id;
 
             const spawnX = Math.random() * c.worldWidth;
@@ -1020,7 +1013,7 @@ io.on('connection', (socket) => {
                 mongoId: user._id,
                 username: username || user.username,
                 kills: 0, // Behåll variabeln men används ej för rewards längre
-                balance: playerStartBalanceSol, 
+                balance: entryFeeInSol, 
                 startTime: Date.now(),
                 color: util.randomColor(),
                 x: c.worldWidth / 2, // Startposition för kameran
@@ -1033,8 +1026,8 @@ io.on('connection', (socket) => {
                     id: Math.random().toString(36).substr(2, 9),
                     x: spawnX,
                     y: spawnY,
-                    balance: playerStartBalanceSol,
-                    radius: calculateCellRadius(playerStartBalanceSol, playerStartBalanceSol, 1),
+                    balance: entryFeeInSol,
+                    radius: calculateCellRadius(entryFeeInSol, entryFeeInSol, 1),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
@@ -1150,12 +1143,21 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                // Ta bort spelaren från arenan
-                activeRoom.players = activeRoom.players.filter(pl => pl.mongoId.toString() !== playerMongoId);
-
-                // 1. SKIP CONVERSION: Balance is already in SOL units
+                // 1. RAW SOL: Game balance is already in SOL units (cryptomass)
                 const solToWithdraw = totalCashout;
                 const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
+
+                // Pre-flight liquidity check
+                if (!HOUSE_WALLET_ADDRESS) throw new Error("House wallet not configured");
+                const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                const totalLamports = await connection.getBalance(housePubKey);
+                const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+                if (totalLamports < (lamports + feeBuffer)) {
+                    console.error('[CASHOUT ERROR] House wallet lacks liquidity');
+                    io.to(activePlayer.id).emit('error', 'House wallet lacks liquidity. Try again later.');
+                    activePlayer.isCashingOut = false;
+                    return;
+                }
 
                 // 2. Skapa transaktionen on-chain till användarens insättningsadress
                 const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -1170,8 +1172,20 @@ io.on('connection', (socket) => {
                     })
                 );
 
-                // 3. Skicka och vänta på bekräftelse
-                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+                // 3. Robust Blockchain execution with error recovery
+                let signature;
+                try {
+                    signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+                } catch (err) {
+                    console.error("Cashout transaction failed on-chain:", err.message);
+                    io.to(activePlayer.id).emit('error', 'Blockchain transfer failed. Your game balance remains intact.');
+                    activePlayer.isCashingOut = false;
+                    // DO NOT remove player from room; allow them to continue playing or retry.
+                    return;
+                }
+
+                // Success: Remove player from arena only AFTER confirmed blockchain success
+                activeRoom.players = activeRoom.players.filter(pl => pl.mongoId.toString() !== playerMongoId);
 
                 // 4. Uppdatera playtime och logga i DB
                 // OBS: Vi uppdaterar INTE user.balance här manuellt, 
@@ -1248,6 +1262,15 @@ function processRoom(room) {
     }
     
     if (room.isResetting) return; // Step 1: Lock gameplay
+
+    // STRICT 1:1 BOT RATIO ENFORCEMENT
+    const activeHumans = room.players.filter(p => !p.disconnected).length;
+    const targetBots = Math.min(30, activeHumans);
+    if (room.bots.length < targetBots) {
+        addBots(room, targetBots - room.bots.length);
+    } else if (room.bots.length > targetBots) {
+        room.bots.splice(0, room.bots.length - targetBots);
+    }
 
     room.ejected.forEach(e => room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
 
