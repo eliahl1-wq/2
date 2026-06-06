@@ -995,8 +995,9 @@ io.on('connection', (socket) => {
             room.ownerBalance += 2.0; 
             
             // ENFORCE STRICT 1:1 HUMAN-BOT RATIO
+            // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
             const activeHumans = room.players.filter(p => !p.disconnected).length + 1;
-            const targetBots = Math.min(30, activeHumans);
+            const targetBots = activeHumans > 0 ? Math.min(30, activeHumans + 14) : 0;
             if (room.bots.length < targetBots) {
                 addBots(room, targetBots - room.bots.length);
             } else if (room.bots.length > targetBots) {
@@ -1264,8 +1265,9 @@ function processRoom(room) {
     if (room.isResetting) return; // Step 1: Lock gameplay
 
     // STRICT 1:1 BOT RATIO ENFORCEMENT
+    // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
     const activeHumans = room.players.filter(p => !p.disconnected).length;
-    const targetBots = Math.min(30, activeHumans);
+    const targetBots = activeHumans > 0 ? Math.min(30, activeHumans + 14) : 0;
     if (room.bots.length < targetBots) {
         addBots(room, targetBots - room.bots.length);
     } else if (room.bots.length > targetBots) {
