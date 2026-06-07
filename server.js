@@ -798,7 +798,8 @@ app.get('/api/stats', (req, res) => {
         res.json({
             playersOnline,
             biggestPayout: Number(biggestPayoutUSD.toFixed(2)),
-            topPlayer
+            topPlayer,
+            solPrice: SOL_PRICE_USD
         });
     } catch (err) {
         console.error('Error fetching stats:', err);
