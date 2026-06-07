@@ -448,6 +448,23 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+app.get('/api/me', authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id).select('-password -depositSecret');
+        if (!user) return res.status(404).json({ message: "Användare hittades ej" });
+
+        const userObj = user.toObject();
+        // Map the internal raw SOL balance to what the frontend expects
+        userObj.balanceSol = user.balance; 
+        userObj.balanceUsd = user.balance * SOL_PRICE_USD;
+        userObj.solPrice = SOL_PRICE_USD;
+
+        res.json(userObj);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- ADMIN MIDDLEWARE ---
 const authenticateAdmin = (req, res, next) => {
     authenticateToken(req, res, async () => {
@@ -751,45 +768,12 @@ app.post('/api/login', async (req, res) => {
                 id: user._id,
                 username: user.username,
                 balanceSol: user.balance,
-                balanceUsd: user.balance * SOL_PRICE_USD
+                balanceUsd: user.balance * SOL_PRICE_USD,
+                solPrice: SOL_PRICE_USD
             }
         });
     } catch (err) {
         console.error("Fel vid inloggning:", err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// 5. Hämta aktuell användare (används vid sidladdning)
-app.get('/api/me', authenticateToken, async (req, res) => {
-    console.log("Mottog förfrågan om aktuell användare (api/me)");
-    try {
-        const user = await User.findById(req.user.id).select('-password');
-        
-        let balanceSol = user.balance;
-        if (user.depositAddress) {
-            try {
-                const lamports = await connection.getBalance(new solanaWeb3.PublicKey(user.depositAddress));
-                balanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
-            } catch (blockchainError) {
-                console.warn(`[RPC TIMEOUT] Falling back to database balance for ${user.username}:`, blockchainError.message);
-                balanceSol = user.balance;
-            }
-        }
-
-        // API Exposure: Return both SOL and calculated USD value
-        res.json({
-            _id: user._id,
-            username: user.username,
-            balanceSol: balanceSol,
-            balanceUsd: balanceSol * SOL_PRICE_USD,
-            solPrice: SOL_PRICE_USD,
-            email: user.email,
-            depositAddress: user.depositAddress,
-            playtime: user.playtime
-        });
-    } catch (err) {
-        console.error("Fel vid hämtning av aktuell användare:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -810,9 +794,10 @@ app.get('/api/stats', (req, res) => {
             });
         });
 
+        const biggestPayoutUSD = biggestPayout * SOL_PRICE_USD;
         res.json({
             playersOnline,
-            biggestPayout: Number(biggestPayout.toFixed(2)),
+            biggestPayout: Number(biggestPayoutUSD.toFixed(2)),
             topPlayer
         });
     } catch (err) {
