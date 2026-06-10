@@ -856,27 +856,45 @@ app.post('/api/login', async (req, res) => {
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
-        const playersOnline = rooms.reduce(
-            (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
-            0
-        );
+        let playersOnline = 0;
+        let aiPlayersOnline = 0;
         let topPlayer = null;
         let topBalance = 0;
+        let topIsBot = false;
+
+        const considerTop = (name, balance, isBot = false) => {
+            const b = balance || 0;
+            if (b > topBalance) {
+                topBalance = b;
+                topPlayer = name;
+                topIsBot = isBot;
+            }
+        };
 
         rooms.forEach(room => {
             room.players.forEach(player => {
-                if (!player.disconnected && (player.balance || 0) > topBalance) {
-                    topBalance = player.balance;
-                    topPlayer = player.username;
-                }
+                if (!player.disconnected) playersOnline += 1;
+                if (!player.disconnected) considerTop(player.username, player.balance, false);
+            });
+            room.bots.forEach(bot => {
+                aiPlayersOnline += 1;
+                const botBalance = bot.cells?.reduce((s, c) => s + c.balance, 0) ?? bot.balance ?? 0;
+                considerTop(bot.username, botBalance, true);
+            });
+            room.slitherBots.forEach(bot => {
+                aiPlayersOnline += 1;
+                considerTop(bot.username, bot.balance, true);
             });
         });
 
         res.json({
             playersOnline,
+            aiPlayersOnline,
+            playersInArena: playersOnline + aiPlayersOnline,
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
+            topIsBot,
             solPrice: SOL_PRICE_USD,
         });
     } catch (err) {
@@ -1000,8 +1018,12 @@ function getTargetBots(humanCount) {
     return Math.min(humanCount * 2, 12);
 }
 
-function countHumansByMode(room, mode) {
-    return room.players.filter(p => !p.disconnected && p.mode === mode).length;
+function countHumansInMode(room, mode) {
+    return room.players.filter(p => p.mode === mode || (mode === 'agar' && !p.mode)).length;
+}
+
+function countActiveHumansByMode(room, mode) {
+    return room.players.filter(p => !p.disconnected && (p.mode === mode || (mode === 'agar' && !p.mode))).length;
 }
 
 function getBestRoom() {
@@ -1037,28 +1059,33 @@ io.on('connection', (socket) => {
             // --- REJOIN LOGIK ---
             const existingPlayer = room.players.find(p => p.mongoId.toString() === user._id.toString());
             if (existingPlayer) {
-                console.log(`♻️ User ${user.username} rejoining. Kicking old socket ${existingPlayer.id}`);
-                // Meddela det gamla fönstret att det blivit ersatt
-                io.to(existingPlayer.id).emit('forcedDisconnect');
+                const oldSocketId = existingPlayer.id;
+                const oldSocket = io.sockets.sockets.get(oldSocketId);
+                if (oldSocket?.connected && oldSocket.id !== socket.id) {
+                    console.log(`♻️ User ${user.username} rejoining — replacing live socket ${oldSocketId}`);
+                    oldSocket.emit('forcedDisconnect');
+                } else {
+                    console.log(`♻️ User ${user.username} rejoining session (${existingPlayer.disconnected ? 'was disconnected' : 'same tab'})`);
+                }
 
-                // Cancel scheduled removal if they were disconnected
                 if (existingPlayer.removeTimeout) {
                     clearTimeout(existingPlayer.removeTimeout);
                     delete existingPlayer.removeTimeout;
                 }
 
-                existingPlayer.id = socket.id; // Uppdatera till nya socket id
+                existingPlayer.id = socket.id;
                 existingPlayer.disconnected = false;
                 socket.roomId = room.id;
                 let remaining = 0;
                 if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
                     remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
                 }
+                const rejoinMode = existingPlayer.mode || 'agar';
                 socket.emit('welcome', existingPlayer, {
-                    width: c.worldWidth,
-                    height: c.worldHeight,
+                    width: rejoinMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
+                    height: rejoinMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
                     cashOutRemaining: remaining,
-                    mode: existingPlayer.mode || 'agar',
+                    mode: rejoinMode,
                     solPrice: SOL_PRICE_USD,
                 });
                 return;
@@ -1133,7 +1160,7 @@ io.on('connection', (socket) => {
 
             // DYNAMIC BOT SCALING (mode-specific)
             const gameMode = mode === 'slither' ? 'slither' : 'agar';
-            const modeHumansAfterJoin = room.players.filter(p => !p.disconnected && p.mode === gameMode).length + 1;
+            const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
             const targetBots = gameMode === 'slither'
                 ? getSlitherTargetBots(modeHumansAfterJoin)
                 : getTargetBots(modeHumansAfterJoin);
@@ -1402,18 +1429,10 @@ io.on('connection', (socket) => {
             p.disconnectedAt = Date.now();
             // Schedule removal after 5 minutes (300000 ms)
             p.removeTimeout = setTimeout(() => {
-                // If they didn't reconnect, treat as eliminated: remove and zero their balance
                 room.players = room.players.filter(x => x.id !== p.id);
                 p.balance = 0;
                 console.log(`🗑️ Removed disconnected player ${p.username} after timeout`);
-                // Ensure population
-                if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
             }, 5 * 60 * 1000);
-        }
-
-        // If population is low, ensure bots fill the arena
-        if (room.players.length + room.bots.length < c.targetPopulation) {
-            addBots(room, 1);
         }
     });
 
@@ -1446,17 +1465,19 @@ function processRoom(room) {
     if (room.isResetting) return; // Step 1: Lock gameplay
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
-    const agarHumans = countHumansByMode(room, 'agar');
-    const slitherHumans = countHumansByMode(room, 'slither');
+    const agarHumans = countActiveHumansByMode(room, 'agar');
+    const slitherHumans = countActiveHumansByMode(room, 'slither');
+    const agarHumansInArena = countHumansInMode(room, 'agar');
+    const slitherHumansInArena = countHumansInMode(room, 'slither');
 
-    const agarTargetBots = getTargetBots(agarHumans);
+    const agarTargetBots = getTargetBots(agarHumansInArena);
     if (room.bots.length < agarTargetBots) {
         addBots(room, agarTargetBots - room.bots.length);
     } else if (room.bots.length > agarTargetBots) {
         room.bots.splice(0, room.bots.length - agarTargetBots);
     }
 
-    const slitherTargetBots = getSlitherTargetBots(slitherHumans);
+    const slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
     if (room.slitherBots.length < slitherTargetBots) {
         addSlitherBots(room, slitherTargetBots - room.slitherBots.length);
     } else if (room.slitherBots.length > slitherTargetBots) {
@@ -1789,4 +1810,17 @@ function processRoom(room) {
 }
 
 const PORT = process.env.PORT || 5000;
+
+// Keep CORS headers on unhandled errors (e.g. during Railway restarts)
+app.use((err, req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && isOriginAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
+    console.error('Unhandled error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+});
+
 httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
