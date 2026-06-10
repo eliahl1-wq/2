@@ -125,7 +125,9 @@ const c = {
     foodValuePerPlayer: 6.0,
     foodBlobValue: 0.01,
     rewardUnlockDelay: 10 * 60 * 1000,
-    roomDuration: 3 * 60 * 60 * 1000,
+    roomDuration: process.env.DEV_ROOM_DURATION_MS
+        ? parseInt(process.env.DEV_ROOM_DURATION_MS, 10)
+        : 3 * 60 * 60 * 1000,
 };
 
 const rooms = [0].map(id => ({
@@ -166,7 +168,7 @@ async function performRoomReset(room) {
             try {
                 const user = await User.findById(p.mongoId);
                 if (user && user.depositAddress && HOUSE_WALLET_SECRET) {
-                    const solToTransfer = p.balance; // Balance is already in SOL units
+                    const solToTransfer = p.balance / SOL_PRICE_USD;
                     const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
 
                     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -612,6 +614,43 @@ app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
     res.json({ success: true, message: "Reset sequence initiated" });
 });
 
+// Dev-only reset endpoint (no JWT — uses DEV_RESET_SECRET header)
+app.post('/api/dev/trigger-reset', async (req, res) => {
+    const secret = req.headers['x-dev-reset-secret'];
+    if (!process.env.DEV_RESET_SECRET || secret !== process.env.DEV_RESET_SECRET) {
+        return res.status(403).json({ message: 'Invalid or missing DEV_RESET_SECRET' });
+    }
+    if (rooms[0].isResetting) {
+        return res.status(409).json({ message: 'Reset already in progress' });
+    }
+    performRoomReset(rooms[0]);
+    res.json({ success: true, message: 'Reset sequence initiated' });
+});
+
+app.get('/api/dev/room-status', async (req, res) => {
+    const secret = req.headers['x-dev-reset-secret'];
+    if (!process.env.DEV_RESET_SECRET || secret !== process.env.DEV_RESET_SECRET) {
+        return res.status(403).json({ message: 'Invalid or missing DEV_RESET_SECRET' });
+    }
+    const room = rooms[0];
+    let houseBalanceSol = null;
+    if (HOUSE_WALLET_ADDRESS) {
+        const lamports = await connection.getBalance(new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS));
+        houseBalanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+    }
+    res.json({
+        isResetting: room.isResetting,
+        playerCount: room.players.filter(p => !p.isBot).length,
+        foodPoolBalance: room.foodPoolBalance,
+        aiBudgetBalance: room.aiBudgetBalance,
+        ownerBalance: room.ownerBalance,
+        roomAgeMs: Date.now() - room.startTime,
+        roomDurationMs: c.roomDuration,
+        houseWalletSol: houseBalanceSol,
+        ownerVaultConfigured: !!OWNER_VAULT_ADDRESS,
+    });
+});
+
 app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
     const { userId } = req.body;
     try {
@@ -874,7 +913,7 @@ function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
 }
 
 io.on('connection', (socket) => {
-    socket.on('joinGame', async ({ username, token }) => {
+    socket.on('joinGame', async ({ username, token, mode }) => {
         try {
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             const user = await User.findById(decoded.id);
@@ -907,7 +946,13 @@ io.on('connection', (socket) => {
                 if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
                     remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
                 }
-                socket.emit('welcome', existingPlayer, { width: c.worldWidth, height: c.worldHeight, cashOutRemaining: remaining });
+                socket.emit('welcome', existingPlayer, {
+                    width: c.worldWidth,
+                    height: c.worldHeight,
+                    cashOutRemaining: remaining,
+                    mode: existingPlayer.mode || 'agar',
+                    solPrice: SOL_PRICE_USD,
+                });
                 return;
             }
 
@@ -991,10 +1036,12 @@ io.on('connection', (socket) => {
             const spawnY = Math.random() * c.worldHeight;
 
             const startBalanceUsd = 1.0; // Starta med massa värd exakt $1.00 USD
+            const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const newPlayer = {
                 id: socket.id,
                 mongoId: user._id,
                 username: username || user.username,
+                mode: gameMode,
                 kills: 0,
                 balance: startBalanceUsd,
                 startTime: Date.now(),
@@ -1019,7 +1066,12 @@ io.on('connection', (socket) => {
             room.players.push(newPlayer);
 
             // Skicka 'welcome' som i original-repot, med spelarens initiala data och världsstorlek
-            socket.emit('welcome', newPlayer, { width: c.worldWidth, height: c.worldHeight });
+            socket.emit('welcome', newPlayer, {
+                width: c.worldWidth,
+                height: c.worldHeight,
+                mode: gameMode,
+                solPrice: SOL_PRICE_USD,
+            });
         } catch (err) {
             socket.emit('error', 'Authentication failed');
         }
@@ -1216,12 +1268,42 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('playerDied', (data) => {
+    socket.on('playerDied', async () => {
         const room = rooms.find(r => r.id === socket.roomId);
         if (!room) return;
-        // Markera spelaren som inte längre cashing out om de dör
         const p = room.players.find(pl => pl.id === socket.id);
-        if (p) p.isCashingOut = false;
+        if (!p) return;
+        p.isCashingOut = false;
+
+        if (p.mode === 'slither') {
+            room.players = room.players.filter(pl => pl.id !== socket.id);
+            try {
+                const user = await User.findById(p.mongoId);
+                if (user) {
+                    user.playtime += (Date.now() - p.startTime);
+                    await user.save();
+                }
+                await Transaction.create({
+                    userId: p.mongoId,
+                    type: 'game',
+                    amount: 0,
+                    meta: { event: 'slither_death', lostBalance: p.balance, roomId: room.id },
+                    status: 'confirmed',
+                });
+            } catch (err) {
+                console.error('Slither death cleanup error:', err.message);
+            }
+        }
+    });
+
+    socket.on('slitherUpdateBalance', ({ balance }) => {
+        const room = rooms.find(r => r.id === socket.roomId);
+        const p = room?.players.find(pl => pl.id === socket.id);
+        if (!p || p.mode !== 'slither' || p.isCashingOut) return;
+        const parsed = Number(balance);
+        if (!Number.isFinite(parsed) || parsed < 1.0) return;
+        p.balance = parsed;
+        if (p.cells[0]) p.cells[0].balance = parsed;
     });
 });
 
@@ -1267,6 +1349,9 @@ function processRoom(room) {
     allUsers.forEach(u => userMap.set(u.id, u));
 
     allUsers.forEach(player => {
+        // Slither-spelare körs client-side — hoppa över Agar-fysik
+        if (player.mode === 'slither') return;
+
         // 0. Avancerad AI-logik för bottar
         if (player.isBot) {
             const botCells = player.cells;
@@ -1527,6 +1612,16 @@ function processRoom(room) {
     room.players.forEach(p => {
         io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
 
+        if (p.mode === 'slither') {
+            io.to(p.id).emit('slitherState', {
+                balance: p.balance,
+                resetTime: room.startTime + c.roomDuration,
+                solPrice: SOL_PRICE_USD,
+                isResetting: room.isResetting,
+            });
+            return;
+        }
+
         // OPTIMERING: Spatial Filtering.
         const rangeX = (p.screenWidth || 1920) / 2 + 500;
         const rangeY = (p.screenHeight || 1080) / 2 + 500;
@@ -1559,12 +1654,4 @@ function processRoom(room) {
 }
 
 const PORT = process.env.PORT || 5000;
-
-// Fix för att stoppa de 25 "Redeclare" felen:
-// Om din fil har kopierats in i sig själv flera gånger, 
-// ser vi till att vi bara startar lyssnaren en gång.
-if (!httpServer.listening) {
-    httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
-}
-
-// VIKTIGT: Radera manuellt allt i din server.js fil som kommer EFTER denna rad!
+httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));

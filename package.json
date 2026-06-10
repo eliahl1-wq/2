@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "reset": "node scripts/dev-reset.mjs reset",
+    "reset:status": "node scripts/dev-reset.mjs status",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {
