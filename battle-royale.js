@@ -145,20 +145,35 @@ function clearQueueGrace(key) {
     queueGrace.delete(key);
 }
 
+function scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps) {
+    if (queueGrace.has(key)) return;
+    const readyAt = Date.now();
+    const timer = setTimeout(() => {
+        queueGrace.delete(key);
+        try {
+            launchMatch(variant, entryFeeUsd, io, deps);
+        } catch (err) {
+            console.error('BR launch failed after grace:', err);
+            emitQueueStatus(io, variant, entryFeeUsd, deps);
+        }
+    }, BR.gracePeriodMs);
+    queueGrace.set(key, { readyAt, timer });
+}
+
 function emitQueueStatus(io, variant, entryFeeUsd, deps) {
     const q = getQueue(variant, entryFeeUsd);
     const fee = normalizeBREntryFee(entryFeeUsd);
     const key = queueKey(variant, entryFeeUsd);
     const grace = queueGrace.get(key);
-    const graceRemainingMs = grace
-        ? Math.max(0, BR.gracePeriodMs - (Date.now() - grace.readyAt))
-        : null;
+    const graceEndsAt = grace ? grace.readyAt + BR.gracePeriodMs : null;
+    const graceRemainingMs = graceEndsAt ? Math.max(0, graceEndsAt - Date.now()) : null;
     const payload = {
         variant,
         entryFeeUsd: fee,
         playersInQueue: q.length,
         minPlayers: BR.minPlayers,
         maxPlayers: BR.maxPlayers,
+        graceEndsAt,
         graceRemainingMs,
         searching: q.length < BR.minPlayers
             || (graceRemainingMs != null && graceRemainingMs > 0 && q.length < BR.maxPlayers),
@@ -174,7 +189,14 @@ function launchMatch(variant, entryFeeUsd, io, deps) {
     clearQueueGrace(key);
     const take = Math.min(BR.maxPlayers, q.length);
     const batch = q.splice(0, take);
-    startMatch(batch, variant, entryFeeUsd, io, deps);
+    try {
+        startMatch(batch, variant, entryFeeUsd, io, deps);
+        console.log(`🎯 BR match started: ${variant} $${normalizeBREntryFee(entryFeeUsd)} · ${batch.length} players`);
+    } catch (err) {
+        console.error('BR startMatch failed:', err);
+        batch.forEach(entry => q.unshift(entry));
+        throw err;
+    }
 }
 
 function tryStartMatch(variant, entryFeeUsd, io, deps) {
@@ -191,19 +213,34 @@ function tryStartMatch(variant, entryFeeUsd, io, deps) {
         return;
     }
 
-    const grace = queueGrace.get(key);
-    if (!grace) {
-        const readyAt = Date.now();
-        const timer = setTimeout(() => {
-            tryStartMatch(variant, entryFeeUsd, io, deps);
-        }, BR.gracePeriodMs);
-        queueGrace.set(key, { readyAt, timer });
-        emitQueueStatus(io, variant, entryFeeUsd, deps);
-        return;
-    }
+    scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps);
+    emitQueueStatus(io, variant, entryFeeUsd, deps);
+}
 
-    if (Date.now() - grace.readyAt >= BR.gracePeriodMs) {
-        launchMatch(variant, entryFeeUsd, io, deps);
+/** Safety tick — ensures grace timers / stale queues still progress. */
+export function processBRQueues(io, deps) {
+    for (const [key, q] of queues.entries()) {
+        if (!q.length) continue;
+        const [variant, feeStr] = key.split(':');
+        const entryFeeUsd = Number(feeStr);
+        if (q.length >= BR.maxPlayers) {
+            tryStartMatch(variant, entryFeeUsd, io, deps);
+            continue;
+        }
+        if (q.length >= BR.minPlayers) {
+            const grace = queueGrace.get(key);
+            if (!grace) {
+                tryStartMatch(variant, entryFeeUsd, io, deps);
+            } else if (Date.now() - grace.readyAt >= BR.gracePeriodMs) {
+                try {
+                    launchMatch(variant, entryFeeUsd, io, deps);
+                } catch (err) {
+                    console.error('BR launch failed in queue tick:', err);
+                }
+            } else {
+                emitQueueStatus(io, variant, entryFeeUsd, deps);
+            }
+        }
     }
 }
 
@@ -320,9 +357,17 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
     socketToMatch.delete(player.id);
     if (player.mongoId) mongoToMatch.delete(player.mongoId.toString());
 
-    if (alive.length === 1 && room.status === 'active') {
-        finishMatch(room, alive[0], io, deps);
-    } else if (alive.length === 0 && room.status === 'active') {
+    tryDeclareBRWinner(room, io, deps);
+}
+
+function tryDeclareBRWinner(room, io, deps) {
+    if (room.status !== 'active') return;
+    if (room.players.length === 1) {
+        const winner = room.players[0];
+        if (!winner.disconnected && socketToMatch.has(winner.id)) {
+            finishMatch(room, winner, io, deps);
+        }
+    } else if (room.players.length === 0) {
         endMatchNoWinner(room, io);
     }
 }
@@ -689,10 +734,7 @@ export function processBattleRoyaleMatches(io, deps) {
             processBRAgarMatch(room, io, deps);
         }
 
-        const alive = room.players.filter(p => !p.disconnected);
-        if (room.status === 'active' && alive.length === 1) {
-            finishMatch(room, alive[0], io, deps);
-        }
+        tryDeclareBRWinner(room, io, deps);
     }
 }
 
@@ -774,9 +816,10 @@ export function setupBattleRoyale(io, deps) {
                 });
                 socket.brQueueVariant = variant;
                 socket.brQueueEntryFee = entryFeeUsd;
-                emitQueueStatus(io, variant, entryFeeUsd, deps);
                 tryStartMatch(variant, entryFeeUsd, io, deps);
+                emitQueueStatus(io, variant, entryFeeUsd, deps);
             } catch (err) {
+                console.error('brJoinQueue failed:', err.message);
                 socket.emit('error', 'Failed to join battle royale queue.');
             }
         });

@@ -33,6 +33,7 @@ import {
 import {
     setupBattleRoyale,
     processBattleRoyaleMatches,
+    processBRQueues,
     findBRPlayerBySocket,
     getBRMatchForMongo,
     isPlayerInBR,
@@ -1853,6 +1854,10 @@ function getBattleRoyaleDeps() {
 }
 
 setupBattleRoyale(io, getBattleRoyaleDeps());
+
+setInterval(() => {
+    processBRQueues(io, getBattleRoyaleDeps());
+}, 1000);
 
 setInterval(() => {
     const age = Date.now() - GLOBAL_ARENA_START;
