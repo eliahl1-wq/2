@@ -2,20 +2,32 @@ import * as util from './utils.js';
 
 export const SLITHER = {
     worldHalf: 1000,
-    baseSpeed: 2.0,
+    // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
+    slitherGameRadius: 21600,
+    spawnSegments: 10,
+    maxSegments: 400,
+    segmentsPerCent: 0.1, // $0.10 eaten ≈ +1 segment (slither-like growth pace)
+    maxScale: 6,
+    scaleDivisor: 106,
+    baseRadius: 5.5,
+    segmentSepFactor: 6,
+    nsp1: 5.39,
+    nsp2: 0.4,
+    nsp3: 14,
+    slitherTickRate: 125,
+    serverTickRate: 40,
     maxInput: 4,
-    boostMultiplier: 1.75,
-    boostCostPerTick: 0.00015,
-    headRadius: 10,
-    foodRadius: 7,
-    segmentSpacing: 7,
-    baseSegments: 40,
-    segmentsPerCent: 0.15,
+    boostMultiplier: 1.55,
+    boostCostPerTick: 0.00012,
+    foodRadius: 5,
+    segmentSpacing: 6,
+    baseSegments: 10,
+    segmentsPerCentLegacy: 0.1,
     foodBlobValue: 0.01,
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
     viewRange: 900,
-    selfCollisionSkip: 8,
+    selfCollisionSkip: 4,
 };
 
 const BOT_NAMES = [
@@ -72,18 +84,48 @@ function dist(x1, y1, x2, y2) {
     return Math.hypot(x1 - x2, y1 - y2);
 }
 
-export function balanceToSegmentCount(balance) {
+export function segmentCountForBalance(balance) {
     const cents = Math.max(0, (balance - 1.0) * 100);
-    return Math.min(500, Math.round(SLITHER.baseSegments + cents * SLITHER.segmentsPerCent));
+    const extra = Math.floor(cents * SLITHER.segmentsPerCent);
+    return Math.min(SLITHER.maxSegments, SLITHER.spawnSegments + extra);
+}
+
+export function scaleForSegmentCount(sct) {
+    return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
+}
+
+export function balanceToSegmentCount(balance) {
+    return segmentCountForBalance(balance);
+}
+
+export function headRadiusForBalance(balance) {
+    const sc = scaleForSegmentCount(segmentCountForBalance(balance));
+    return SLITHER.baseRadius * sc;
+}
+
+export function segmentSpacingForBalance(balance) {
+    const sc = scaleForSegmentCount(segmentCountForBalance(balance));
+    return SLITHER.segmentSepFactor * sc;
+}
+
+export function speedForBalance(balance, boosting = false) {
+    const sc = scaleForSegmentCount(segmentCountForBalance(balance));
+    const worldScale = (SLITHER.worldHalf * 2) / (SLITHER.slitherGameRadius * 2);
+    const slitherUnitsPerFrame = boosting
+        ? SLITHER.nsp3
+        : SLITHER.nsp1 + SLITHER.nsp2 * sc;
+    const ourUnitsPerSec = slitherUnitsPerFrame * SLITHER.slitherTickRate * worldScale;
+    return ourUnitsPerSec / SLITHER.serverTickRate;
 }
 
 export function createSegments(x, y, balance, angle = 0) {
     const count = balanceToSegmentCount(balance);
+    const spacing = segmentSpacingForBalance(balance);
     const segs = [];
     for (let i = 0; i < count; i++) {
         segs.push({
-            x: x - Math.cos(angle) * i * SLITHER.segmentSpacing,
-            y: y - Math.sin(angle) * i * SLITHER.segmentSpacing,
+            x: x - Math.cos(angle) * i * spacing,
+            y: y - Math.sin(angle) * i * spacing,
         });
     }
     return segs;
@@ -101,14 +143,9 @@ function pickSlitherSpawn(room) {
     for (let i = 0; i < 30; i++) {
         const x = randomSpawnCoord();
         const y = randomSpawnCoord();
-        if (isSpawnClear(room, x, y)) return { x, y };
+        if (isSpawnClear(room, x, y, 60)) return { x, y };
     }
     return { x: randomSpawnCoord(), y: randomSpawnCoord() };
-}
-
-export function headRadiusForBalance(balance) {
-    const cents = Math.max(0, (balance - 1.0) * 100);
-    return SLITHER.headRadius * (1 + Math.pow(cents / 200, 0.35));
 }
 
 function clampInput(dx, dy) {
@@ -138,7 +175,7 @@ export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity
             y: randomSpawnCoord(),
             balance: foodBlobValue,
             hue: Math.floor(Math.random() * 360),
-            radius: 7,
+            radius: SLITHER.foodRadius,
         });
     }
 }
@@ -214,8 +251,7 @@ function updateSnakeMovement(snake) {
     const { dx, dy } = normalizeSnakeInput(snake);
     snake.angle = Math.atan2(dy, dx);
 
-    const speedMult = snake.boost ? SLITHER.boostMultiplier : 1;
-    const step = SLITHER.baseSpeed * speedMult;
+    const step = speedForBalance(snake.balance, snake.boost);
     head.x += dx * step;
     head.y += dy * step;
 
@@ -223,14 +259,15 @@ function updateSnakeMovement(snake) {
         snake.balance = Math.max(1.0, snake.balance - SLITHER.boostCostPerTick);
     }
 
+    const spacing = segmentSpacingForBalance(snake.balance);
     for (let i = 1; i < snake.segments.length; i++) {
         const prev = snake.segments[i - 1];
         const cur = snake.segments[i];
         const segDx = cur.x - prev.x;
         const segDy = cur.y - prev.y;
         const d = Math.hypot(segDx, segDy);
-        if (d > SLITHER.segmentSpacing) {
-            const ratio = SLITHER.segmentSpacing / d;
+        if (d > spacing) {
+            const ratio = spacing / d;
             cur.x = prev.x + segDx * ratio;
             cur.y = prev.y + segDy * ratio;
         }
@@ -414,6 +451,8 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 }
 
 function serializeSnake(snake, isYou) {
+    const sct = snake.segments.length;
+    const sc = scaleForSegmentCount(sct);
     return {
         id: snake.id,
         name: snake.username,
@@ -423,6 +462,9 @@ function serializeSnake(snake, isYou) {
         isYou,
         segments: snake.segments.map(s => ({ x: s.x, y: s.y })),
         angle: snake.angle || 0,
+        sc,
+        radius: SLITHER.baseRadius * sc,
+        boost: !!snake.boost,
     };
 }
 
@@ -536,7 +578,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
             const visibleFood = room.slitherFood
                 .filter(f => isInView(head.x, head.y, f.x, f.y, range))
-                .map(f => ({ id: f.id, x: f.x, y: f.y, hue: f.hue, radius: f.radius || 7 }));
+                .map(f => ({ id: f.id, x: f.x, y: f.y, hue: f.hue, radius: f.radius || SLITHER.foodRadius }));
 
             io.to(p.id).emit('slitherTick', {
                 you: p.id,
@@ -577,7 +619,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room) {
             x,
             y,
             balance,
-            radius: 10,
+            radius: headRadiusForBalance(balance),
             vx: 0,
             vy: 0,
             lastSplit: Date.now(),
