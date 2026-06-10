@@ -453,8 +453,15 @@ const authenticateAdmin = (req, res, next) => {
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
 app.get('/api/game-status', authenticateToken, (req, res) => {
     try {
-        const inGame = rooms[0].players.some(p => p.mongoId && p.mongoId.toString() === req.user.id);
-        res.json({ inGame, isResetting: rooms[0].isResetting });
+        const player = rooms[0].players.find(
+            p => p.mongoId && p.mongoId.toString() === req.user.id
+        );
+        res.json({
+            inGame: !!player,
+            mode: player?.mode || null,
+            balance: player?.balance ?? null,
+            isResetting: rooms[0].isResetting,
+        });
     } catch (err) {
         res.status(500).json({ inGame: false });
     }
@@ -771,28 +778,28 @@ app.post('/api/login', async (req, res) => {
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
-        const playersOnline = rooms.reduce((sum, room) => sum + room.players.length, 0);
-        let biggestPayout = 0;
+        const playersOnline = rooms.reduce(
+            (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
+            0
+        );
         let topPlayer = null;
         let topBalance = 0;
 
         rooms.forEach(room => {
             room.players.forEach(player => {
-                if ((player.balance || 0) > biggestPayout) {
-                    biggestPayout = player.balance;
-                    topPlayer = player.username;
+                if (!player.disconnected && (player.balance || 0) > topBalance) {
                     topBalance = player.balance;
+                    topPlayer = player.username;
                 }
             });
         });
 
-        const biggestPayoutUSD = biggestPayout * SOL_PRICE_USD;
         res.json({
             playersOnline,
-            biggestPayout: Number(biggestPayoutUSD.toFixed(2)),
+            biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
-            topBalance: Number((topBalance * SOL_PRICE_USD).toFixed(2)),
-            solPrice: SOL_PRICE_USD
+            topBalance: Number(topBalance.toFixed(2)),
+            solPrice: SOL_PRICE_USD,
         });
     } catch (err) {
         console.error('Error fetching stats:', err);
