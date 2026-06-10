@@ -176,6 +176,8 @@ const c = {
         : 3 * 60 * 60 * 1000,
 };
 
+const joiningUsers = new Set();
+
 const rooms = [0].map(id => ({
     id,
     players: [],
@@ -438,6 +440,12 @@ app.get('/', (req, res) => {
 });
 
 const authenticateToken = (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && isOriginAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.sendStatus(401);
@@ -1044,6 +1052,7 @@ function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
 
 io.on('connection', (socket) => {
     socket.on('joinGame', async ({ username, token, mode }) => {
+        let userKey = null;
         try {
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             const user = await User.findById(decoded.id);
@@ -1056,8 +1065,12 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            userKey = user._id.toString();
+            if (joiningUsers.has(userKey)) return;
+            joiningUsers.add(userKey);
+
             // --- REJOIN LOGIK ---
-            const existingPlayer = room.players.find(p => p.mongoId.toString() === user._id.toString());
+            const existingPlayer = room.players.find(p => p.mongoId?.toString() === userKey);
             if (existingPlayer) {
                 const oldSocketId = existingPlayer.id;
                 const oldSocket = io.sockets.sockets.get(oldSocketId);
@@ -1086,6 +1099,7 @@ io.on('connection', (socket) => {
                     height: rejoinMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
                     cashOutRemaining: remaining,
                     mode: rejoinMode,
+                    rejoin: true,
                     solPrice: SOL_PRICE_USD,
                 });
                 return;
@@ -1216,16 +1230,41 @@ io.on('connection', (socket) => {
                     }]
                 };
             }
+
+            // Race guard: another join may have completed while we awaited payment
+            const raced = room.players.find(p => p.mongoId?.toString() === userKey);
+            if (raced) {
+                raced.id = socket.id;
+                raced.disconnected = false;
+                socket.roomId = room.id;
+                if (raced.removeTimeout) {
+                    clearTimeout(raced.removeTimeout);
+                    delete raced.removeTimeout;
+                }
+                const racedMode = raced.mode || 'agar';
+                socket.emit('welcome', raced, {
+                    width: racedMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
+                    height: racedMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
+                    mode: racedMode,
+                    rejoin: true,
+                    solPrice: SOL_PRICE_USD,
+                });
+                return;
+            }
+
             room.players.push(newPlayer);
 
             socket.emit('welcome', newPlayer, {
                 width: gameMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
                 height: gameMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
                 mode: gameMode,
+                rejoin: false,
                 solPrice: SOL_PRICE_USD,
             });
         } catch (err) {
             socket.emit('error', 'Authentication failed');
+        } finally {
+            if (userKey) joiningUsers.delete(userKey);
         }
     });
 
@@ -1427,10 +1466,9 @@ io.on('connection', (socket) => {
         if (p) {
             p.disconnected = true;
             p.disconnectedAt = Date.now();
-            // Schedule removal after 5 minutes (300000 ms)
+            const mongoId = p.mongoId?.toString();
             p.removeTimeout = setTimeout(() => {
-                room.players = room.players.filter(x => x.id !== p.id);
-                p.balance = 0;
+                room.players = room.players.filter(x => x.mongoId?.toString() !== mongoId);
                 console.log(`🗑️ Removed disconnected player ${p.username} after timeout`);
             }, 5 * 60 * 1000);
         }
@@ -1487,7 +1525,7 @@ function processRoom(room) {
     room.ejected.forEach(e => room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
 
     const allUsers = [
-        ...room.players.filter(p => p.mode !== 'slither'),
+        ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected),
         ...room.bots,
     ];
     const userMap = new Map();
@@ -1774,7 +1812,7 @@ function processRoom(room) {
     }));
 
     room.players.forEach(p => {
-        if (p.mode === 'slither') return;
+        if (p.mode === 'slither' || p.disconnected) return;
 
         io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
 
