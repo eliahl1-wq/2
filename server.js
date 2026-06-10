@@ -864,8 +864,8 @@ app.post('/api/login', async (req, res) => {
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
-        let playersOnline = 0;
-        let aiPlayersOnline = 0;
+        let humansOnline = 0;
+        let aiOnline = 0;
         let topPlayer = null;
         let topBalance = 0;
         let topIsBot = false;
@@ -881,24 +881,22 @@ app.get('/api/stats', (req, res) => {
 
         rooms.forEach(room => {
             room.players.forEach(player => {
-                if (!player.disconnected) playersOnline += 1;
+                if (!player.disconnected) humansOnline += 1;
                 if (!player.disconnected) considerTop(player.username, player.balance, false);
             });
             room.bots.forEach(bot => {
-                aiPlayersOnline += 1;
+                aiOnline += 1;
                 const botBalance = bot.cells?.reduce((s, c) => s + c.balance, 0) ?? bot.balance ?? 0;
                 considerTop(bot.username, botBalance, true);
             });
             room.slitherBots.forEach(bot => {
-                aiPlayersOnline += 1;
+                aiOnline += 1;
                 considerTop(bot.username, bot.balance, true);
             });
         });
 
         res.json({
-            playersOnline,
-            aiPlayersOnline,
-            playersInArena: playersOnline + aiPlayersOnline,
+            playersOnline: humansOnline + aiOnline,
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
@@ -991,6 +989,16 @@ function addViruses(room, n) {
     }
 }
 
+function getMaxAiBudgetForRoom(room) {
+    const agarHumans = countHumansInMode(room, 'agar');
+    const slitherHumans = countHumansInMode(room, 'slither');
+    return (getTargetBots(agarHumans) + getSlitherTargetBots(slitherHumans)) * c.botStartBalance;
+}
+
+function capAiBudget(room) {
+    room.aiBudgetBalance = Math.min(room.aiBudgetBalance, getMaxAiBudgetForRoom(room));
+}
+
 function addBots(room, n) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
     const botCostSol = c.botStartBalance;
@@ -1014,9 +1022,9 @@ function addBots(room, n) {
 // Initiera alla rum
 rooms.forEach(room => {
     addViruses(room, c.virusCount);
-    // Seed a small initial food + bot budget so the arena isn't empty on first join
-    room.aiBudgetBalance = 20.0;  // enough for 20 starter bots
-    room.foodPoolBalance = 250.0; // Mycket mer mat från start
+    // No free AI budget — bots are funded only from entry-fee splits
+    room.aiBudgetBalance = 0;
+    room.foodPoolBalance = 250.0;
 });
 
 function getTargetBots(humanCount) {
@@ -1156,24 +1164,32 @@ io.on('connection', (socket) => {
             });
 
             // DYNAMIC ECONOMY SPLIT ($10)
+            const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const activeHumansCount = room.players.filter(p => !p.disconnected).length + 1;
 
+            let aiAlloc = 0;
             if (activeHumansCount < 3) {
-                room.foodPoolBalance += 6.0;  // $6 to food
-                room.aiBudgetBalance += 2.0;  // $2 to AI budget
+                room.foodPoolBalance += 6.0;
+                aiAlloc = 2.0;
             } else if (activeHumansCount < 8) {
-                room.foodPoolBalance += 7.0;  // $7 to food
-                room.aiBudgetBalance += 1.0;  // $1 to AI budget
+                room.foodPoolBalance += 7.0;
+                aiAlloc = 1.0;
             } else {
-                room.foodPoolBalance += 8.0;  // $8 to food
-                room.aiBudgetBalance += 0.0;  // $0 to AI budget
+                room.foodPoolBalance += 8.0;
             }
 
-            room.ownerBalance += 1.0;  // Always $1 to Owner
-            // The remaining $1 is used for the player's starting balance ($1.0)
+            // Only fund bots up to the cap for current population; surplus → food pool
+            const agarAfter = countHumansInMode(room, 'agar') + (gameMode === 'agar' ? 1 : 0);
+            const slitherAfter = countHumansInMode(room, 'slither') + (gameMode === 'slither' ? 1 : 0);
+            const maxAi = (getTargetBots(agarAfter) + getSlitherTargetBots(slitherAfter)) * c.botStartBalance;
+            const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
+            const aiToAdd = Math.min(aiAlloc, aiDeficit);
+            room.aiBudgetBalance += aiToAdd;
+            room.foodPoolBalance += (aiAlloc - aiToAdd);
+
+            room.ownerBalance += 1.0;
 
             // DYNAMIC BOT SCALING (mode-specific)
-            const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
             const targetBots = gameMode === 'slither'
                 ? getSlitherTargetBots(modeHumansAfterJoin)
@@ -1521,6 +1537,8 @@ function processRoom(room) {
     } else if (room.slitherBots.length > slitherTargetBots) {
         room.slitherBots.splice(0, room.slitherBots.length - slitherTargetBots);
     }
+
+    capAiBudget(room);
 
     room.ejected.forEach(e => room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
 
