@@ -8,6 +8,7 @@
     "start": "node server.js",
     "reset": "node scripts/dev-reset.mjs reset",
     "reset:status": "node scripts/dev-reset.mjs status",
+    "br-wallets:generate": "node scripts/generate-br-wallets.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {

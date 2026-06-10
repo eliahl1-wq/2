@@ -23,6 +23,22 @@ import {
     broadcastSlitherState,
     syncSlitherFood,
 } from './slither-engine.js';
+import {
+    ALLOWED_ENTRY_FEES,
+    DEFAULT_ENTRY_FEE,
+    normalizeEntryFee,
+    getEconomy,
+    getJoinPoolSplit,
+} from './economy.js';
+import {
+    setupBattleRoyale,
+    processBattleRoyaleMatches,
+    findBRPlayerBySocket,
+    getBRMatchForMongo,
+    isPlayerInBR,
+    BR,
+} from './battle-royale.js';
+import { validateBRWalletsOnStartup, BR_WALLETS } from './br-wallets.js';
 
 const app = express();
 
@@ -73,6 +89,8 @@ if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
 } else {
     console.log("✅ Solana House Wallet konfigurerad: " + HOUSE_WALLET_ADDRESS);
 }
+
+validateBRWalletsOnStartup({ devFreePlay: DEV_FREE_PLAY });
 
 const allowedOrigins = [
     "http://localhost:5173",
@@ -180,162 +198,200 @@ const c = {
 
 const joiningUsers = new Set();
 
-const rooms = [0].map(id => ({
-    id,
-    players: [],
-    bots: [],
-    slitherBots: [],
-    food: [],
-    slitherFood: [],
-    viruses: [],
-    ejected: [],
-    foodPoolBalance: 0,
-    aiBudgetBalance: 0,
-    ownerBalance: 0,
-    startTime: Date.now(),
-    isResetting: false,
-    qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4)
-}));
+let GLOBAL_ARENA_START = Date.now();
+let globalArenaResetting = false;
+
+function createArenaRoom(entryFeeUsd) {
+    return {
+        id: `arena-${entryFeeUsd}`,
+        entryFeeUsd,
+        players: [],
+        bots: [],
+        slitherBots: [],
+        food: [],
+        slitherFood: [],
+        viruses: [],
+        ejected: [],
+        foodPoolBalance: 0,
+        aiBudgetBalance: 0,
+        ownerBalance: 0,
+        startTime: GLOBAL_ARENA_START,
+        isResetting: false,
+        qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4),
+    };
+}
+
+const rooms = ALLOWED_ENTRY_FEES.map(fee => createArenaRoom(fee));
 
 // In-memory locks and maps for idempotency / processing
 const processingCashouts = new Set(); // mongoId strings
 
 // --- RESET FLOW LOGIC ---
-async function performRoomReset(room) {
-    if (room.isResetting) return;
-    room.isResetting = true;
+async function cashOutRoomPlayers(room) {
+    const playersToProcess = [...room.players];
+    for (const p of playersToProcess) {
+        try {
+            const user = await User.findById(p.mongoId);
+            if (!user) continue;
 
-    console.log(`🚨 RESET STARTED: Room ${room.id}`);
-    await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_start', roomId: room.id }, status: 'confirmed' });
+            if (DEV_FREE_PLAY) {
+                user.playtime += (Date.now() - p.startTime);
+                await user.save();
+                await Transaction.create({
+                    userId: user._id,
+                    type: 'withdraw',
+                    amount: p.balance,
+                    meta: {
+                        simulated: true,
+                        reason: 'Auto Room Reset (Free Play)',
+                        roomId: room.id,
+                        entryFeeUsd: room.entryFeeUsd,
+                    },
+                });
+                io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: 'simulated' });
+            } else if (user.depositAddress && HOUSE_WALLET_SECRET) {
+                const solToTransfer = p.balance / SOL_PRICE_USD;
+                const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
 
-    // Capture human player count BEFORE clearing the players array for the sweep
-    const realPlayerCount = room.players.filter(p => !p.isBot).length;
+                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                );
+                const transaction = new solanaWeb3.Transaction().add(
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: houseKeypair.publicKey,
+                        toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
+                        lamports: lamports,
+                    })
+                );
+                const sig = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
+                user.playtime += (Date.now() - p.startTime);
+                await user.save();
+
+                await Transaction.create({
+                    userId: user._id,
+                    type: 'withdraw',
+                    amount: p.balance,
+                    currency: 'SOL',
+                    meta: {
+                        signature: sig,
+                        reason: 'Auto Room Reset to Account Address',
+                        roomId: room.id,
+                        entryFeeUsd: room.entryFeeUsd,
+                    },
+                });
+
+                io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: sig });
+            }
+        } catch (err) {
+            await Transaction.create({
+                type: 'game',
+                amount: 0,
+                meta: { event: 'failure', reason: 'auto_cashout_failed', userId: p.mongoId, error: err.message },
+            });
+        }
+    }
+    room.players = [];
+}
+
+function resetRoomEntities(room) {
+    room.bots = [];
+    room.slitherBots = [];
+    room.food = [];
+    room.slitherFood = [];
+    room.viruses = [];
+    room.ejected = [];
+    room.qt.clear();
+    addViruses(room, c.virusCount);
+    room.aiBudgetBalance = 0;
+    room.foodPoolBalance = 0;
+    room.ownerBalance = 0;
+}
+
+async function sweepHouseWalletOnReset() {
+    if (DEV_FREE_PLAY || !HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET || !OWNER_VAULT_ADDRESS) return;
+
+    const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+    const totalLamports = await connection.getBalance(housePubKey);
+    const solPrice = Number(SOL_PRICE_USD || 64);
+    const bufferLamports = Math.round((1.0 / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
+    const sweepLamports = totalLamports - bufferLamports;
+
+    if (sweepLamports <= 0) return;
+
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+    );
+    const sweepTx = new solanaWeb3.Transaction().add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: houseKeypair.publicKey,
+            toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+            lamports: sweepLamports,
+        })
+    );
+    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
+
+    await Transaction.create({
+        type: 'withdraw',
+        amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+        meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' },
+    });
+    console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
+}
+
+async function performGlobalArenaReset() {
+    if (globalArenaResetting) return;
+    globalArenaResetting = true;
+    for (const room of rooms) room.isResetting = true;
+
+    console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers)');
+    await Transaction.create({
+        type: 'game',
+        amount: 0,
+        meta: { event: 'reset_start', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
+        status: 'confirmed',
+    });
 
     try {
-        // Step 1 & 2: Gameplay is locked via isResetting check in processRoom. Joins are disabled in joinGame.
-
-        // Step 3: Automatically cash out all real players
-        const playersToProcess = [...room.players];
-        for (const p of playersToProcess) {
-            try {
-                const user = await User.findById(p.mongoId);
-                if (!user) continue;
-
-                if (DEV_FREE_PLAY) {
-                    user.playtime += (Date.now() - p.startTime);
-                    await user.save();
-                    await Transaction.create({
-                        userId: user._id,
-                        type: 'withdraw',
-                        amount: p.balance,
-                        meta: { simulated: true, reason: 'Auto Room Reset (Free Play)', roomId: room.id },
-                    });
-                    io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: 'simulated' });
-                } else if (user.depositAddress && HOUSE_WALLET_SECRET) {
-                    const solToTransfer = p.balance / SOL_PRICE_USD;
-                    const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
-
-                    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-                        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
-                    );
-                    const transaction = new solanaWeb3.Transaction().add(
-                        solanaWeb3.SystemProgram.transfer({
-                            fromPubkey: houseKeypair.publicKey,
-                            toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
-                            lamports: lamports,
-                        })
-                    );
-                    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-
-                    user.playtime += (Date.now() - p.startTime);
-                    await user.save();
-
-                    await Transaction.create({
-                        userId: user._id,
-                        type: 'withdraw',
-                        amount: p.balance,
-                        currency: 'SOL',
-                        meta: { signature: sig, reason: 'Auto Room Reset to Account Address', roomId: room.id }
-                    });
-
-                    io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: sig });
-                }
-            } catch (err) {
-                await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'auto_cashout_failed', userId: p.mongoId, error: err.message } });
-            }
-        }
-        room.players = []; // Step 4: Players are now cleared from memory
-
-        // Step 5: Direct Blockchain Wallet Sweep (Transfer real SOL to owner)
-        if (!DEV_FREE_PLAY && HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
-            try {
-                const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                // Step 1: Fetch exact, real-time Lamports balance from the blockchain
-                const totalLamports = await connection.getBalance(housePubKey);
-                const solPrice = Number(SOL_PRICE_USD || 64);
-
-                // Reserve exactly $1.00 USD worth of SOL as a permanent liquidity buffer for fees
-                const bufferLamports = Math.round((1.0 / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
-                const sweepLamports = totalLamports - bufferLamports;
-
-                if (sweepLamports > 0) {
-                    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-                        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
-                    );
-                    const sweepTx = new solanaWeb3.Transaction().add(
-                        solanaWeb3.SystemProgram.transfer({
-                            fromPubkey: houseKeypair.publicKey,
-                            toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
-                            lamports: sweepLamports,
-                        })
-                    );
-                    // Step 4: Transfer 100% of remaining SOL directly to OWNER_VAULT_ADDRESS
-                    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
-
-                    await Transaction.create({
-                        type: 'withdraw',
-                        amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
-                        meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' }
-                    });
-                    console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
-
-                    // Step 6: Reset allocation balances only after successful initiation
-                    room.foodPoolBalance = 0;
-                    room.aiBudgetBalance = 0;
-                    room.ownerBalance = 0;
-                }
-            } catch (sweepErr) {
-                // Step 5: Handle RPC network or timeout errors safely
-                console.error("Sweep Error:", sweepErr.message);
-                await Transaction.create({ type: 'game', amount: 0, meta: { event: 'failure', reason: 'pool_sweep_failed', error: sweepErr.message } });
-            }
+        for (const room of rooms) {
+            await cashOutRoomPlayers(room);
         }
 
-        // Step 6-8: Reset entities and game metadata
-        room.bots = [];
-        room.slitherBots = [];
-        room.food = [];
-        room.slitherFood = [];
-        room.viruses = [];
-        room.ejected = [];
-        room.startTime = Date.now();
-        room.qt.clear();
+        try {
+            await sweepHouseWalletOnReset();
+        } catch (sweepErr) {
+            console.error('Sweep Error:', sweepErr.message);
+            await Transaction.create({
+                type: 'game',
+                amount: 0,
+                meta: { event: 'failure', reason: 'pool_sweep_failed', error: sweepErr.message },
+            });
+        }
 
-        // Step 9: Start fresh with Dynamic Bot Spawning Logic
-        addViruses(room, c.virusCount);
+        for (const room of rooms) {
+            resetRoomEntities(room);
+        }
 
-        // ENFORCE STRICT 1:1 RATIO: Humans are removed during reset, so bots must be 0.
-        // Bots will be populated dynamically as players rejoin via joinGame logic.
-        room.bots = [];
-        room.aiBudgetBalance = 0;
-        room.foodPoolBalance = 0;
-        room.ownerBalance = 0;
+        GLOBAL_ARENA_START = Date.now();
+        for (const room of rooms) {
+            room.startTime = GLOBAL_ARENA_START;
+        }
 
-        console.log(`✅ RESET COMPLETE: Room ${room.id}`);
-        await Transaction.create({ type: 'game', amount: 0, meta: { event: 'reset_complete', roomId: room.id }, status: 'confirmed' });
+        console.log('✅ GLOBAL ARENA RESET COMPLETE');
+        await Transaction.create({
+            type: 'game',
+            amount: 0,
+            meta: { event: 'reset_complete', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
+            status: 'confirmed',
+        });
     } finally {
-        room.isResetting = false;
+        for (const room of rooms) room.isResetting = false;
+        globalArenaResetting = false;
     }
+}
+
+async function performRoomReset(_room) {
+    await performGlobalArenaReset();
 }
 
 // In-memory lock for scanDeposits to prevent concurrent runs
@@ -528,7 +584,12 @@ const authenticateAdmin = (req, res, next) => {
 app.get('/api/config', (req, res) => {
     res.json({
         freePlay: DEV_FREE_PLAY,
-        entryFeeUsd: DEV_FREE_PLAY ? 0 : 10,
+        entryFeeUsd: DEV_FREE_PLAY ? 0 : DEFAULT_ENTRY_FEE,
+        entryFees: DEV_FREE_PLAY ? [0] : ALLOWED_ENTRY_FEES,
+        defaultEntryFee: DEFAULT_ENTRY_FEE,
+        brEntryFeeUsd: DEV_FREE_PLAY ? 0 : BR.entryFeeUsd,
+        brMinPlayers: BR.minPlayers,
+        brMaxPlayers: BR.maxPlayers,
     });
 });
 
@@ -539,15 +600,44 @@ app.get('/api/health', (req, res) => {
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
 app.get('/api/game-status', authenticateToken, (req, res) => {
     try {
-        const player = rooms[0].players.find(
-            p => p.mongoId && p.mongoId.toString() === req.user.id
-        );
+        const arenaResetting = globalArenaResetting || rooms.some(r => r.isResetting);
+        for (const room of rooms) {
+            const player = room.players.find(
+                p => p.mongoId && p.mongoId.toString() === req.user.id
+            );
+            if (player) {
+                return res.json({
+                    inGame: true,
+                    mode: player.mode || 'agar',
+                    balance: player.balance ?? null,
+                    entryFeeUsd: player.entryFeeUsd ?? room.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                    disconnected: player.disconnected ?? false,
+                    isResetting: arenaResetting,
+                    battleRoyale: !!player.isBattleRoyale,
+                });
+            }
+        }
+        const brRoom = getBRMatchForMongo(req.user.id);
+        if (brRoom) {
+            const brPlayer = brRoom.players.find(p => p.mongoId?.toString() === req.user.id);
+            if (brPlayer) {
+                return res.json({
+                    inGame: true,
+                    mode: brRoom.variant === 'slither' ? 'br-slither' : 'br-agar',
+                    balance: brPlayer.balance ?? null,
+                    disconnected: brPlayer.disconnected ?? false,
+                    isResetting: false,
+                    battleRoyale: true,
+                    brStatus: brRoom.status,
+                });
+            }
+        }
         res.json({
-            inGame: !!player,
-            mode: player?.mode || null,
-            balance: player?.balance ?? null,
-            disconnected: player?.disconnected ?? false,
-            isResetting: rooms[0].isResetting,
+            inGame: false,
+            mode: null,
+            balance: null,
+            disconnected: false,
+            isResetting: arenaResetting,
         });
     } catch (err) {
         res.status(500).json({ inGame: false });
@@ -681,8 +771,15 @@ app.post('/api/entry-pay', authenticateToken, async (req, res) => {
 
 // --- ADMIN TOOLS ---
 app.get('/api/admin/room-balances', authenticateAdmin, (req, res) => {
-    const r = rooms[0];
-    res.json({ foodPoolBalance: r.foodPoolBalance, aiBudgetBalance: r.aiBudgetBalance, ownerBalance: r.ownerBalance });
+    res.json({
+        rooms: rooms.map(r => ({
+            entryFeeUsd: r.entryFeeUsd,
+            foodPoolBalance: r.foodPoolBalance,
+            aiBudgetBalance: r.aiBudgetBalance,
+            ownerBalance: r.ownerBalance,
+            players: r.players.filter(p => !p.isBot).length,
+        })),
+    });
 });
 
 app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) => {
@@ -694,10 +791,13 @@ app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) =>
         await user.save();
 
         // Also update if they are active in-game
-        const p = rooms[0].players.find(pl => pl.mongoId.toString() === userId);
-        if (p) {
-            p.balance = balance;
-            p.cells.forEach(c => { c.balance = balance / p.cells.length; });
+        for (const room of rooms) {
+            const p = room.players.find(pl => pl.mongoId.toString() === userId);
+            if (p) {
+                p.balance = balance;
+                p.cells.forEach(c => { c.balance = balance / p.cells.length; });
+                break;
+            }
         }
 
         await Transaction.create({ type: 'game', amount: 0, meta: { event: 'admin_action', action: 'set_balance', target: userId, newValue: balance } });
@@ -707,17 +807,20 @@ app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) =>
 
 app.post('/api/admin/set-bot-balance', authenticateAdmin, (req, res) => {
     const { botId, balance } = req.body;
-    const bot = rooms[0].bots.find(b => b.id === botId);
-    if (bot) {
-        bot.balance = balance;
-        bot.cells.forEach(c => { c.balance = balance / bot.cells.length; });
-        res.json({ success: true });
-    } else res.status(404).send("Bot not found");
+    for (const room of rooms) {
+        const bot = room.bots.find(b => b.id === botId);
+        if (bot) {
+            bot.balance = balance;
+            bot.cells.forEach(c => { c.balance = balance / bot.cells.length; });
+            return res.json({ success: true, entryFeeUsd: room.entryFeeUsd });
+        }
+    }
+    res.status(404).send("Bot not found");
 });
 
 app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
-    performRoomReset(rooms[0]);
-    res.json({ success: true, message: "Reset sequence initiated" });
+    performGlobalArenaReset();
+    res.json({ success: true, message: "Global reset sequence initiated" });
 });
 
 // Dev-only reset endpoint (no JWT — uses DEV_RESET_SECRET header)
@@ -726,11 +829,11 @@ app.post('/api/dev/trigger-reset', async (req, res) => {
     if (!process.env.DEV_RESET_SECRET || secret !== process.env.DEV_RESET_SECRET) {
         return res.status(403).json({ message: 'Invalid or missing DEV_RESET_SECRET' });
     }
-    if (rooms[0].isResetting) {
+    if (globalArenaResetting || rooms.some(r => r.isResetting)) {
         return res.status(409).json({ message: 'Reset already in progress' });
     }
-    performRoomReset(rooms[0]);
-    res.json({ success: true, message: 'Reset sequence initiated' });
+    performGlobalArenaReset();
+    res.json({ success: true, message: 'Global reset sequence initiated' });
 });
 
 app.get('/api/dev/room-status', async (req, res) => {
@@ -738,21 +841,37 @@ app.get('/api/dev/room-status', async (req, res) => {
     if (!process.env.DEV_RESET_SECRET || secret !== process.env.DEV_RESET_SECRET) {
         return res.status(403).json({ message: 'Invalid or missing DEV_RESET_SECRET' });
     }
-    const room = rooms[0];
+    const arenaResetting = globalArenaResetting || rooms.some(r => r.isResetting);
     let houseBalanceSol = null;
     if (HOUSE_WALLET_ADDRESS) {
         const lamports = await connection.getBalance(new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS));
         houseBalanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
     }
+    const brHouseWallets = {};
+    for (const variant of ['agar', 'slither']) {
+        const w = BR_WALLETS[variant];
+        if (w.address) {
+            const lamports = await connection.getBalance(new solanaWeb3.PublicKey(w.address));
+            brHouseWallets[variant] = {
+                address: w.address,
+                balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+            };
+        }
+    }
     res.json({
-        isResetting: room.isResetting,
-        playerCount: room.players.filter(p => !p.isBot).length,
-        foodPoolBalance: room.foodPoolBalance,
-        aiBudgetBalance: room.aiBudgetBalance,
-        ownerBalance: room.ownerBalance,
-        roomAgeMs: Date.now() - room.startTime,
+        isResetting: arenaResetting,
+        globalArenaStart: GLOBAL_ARENA_START,
         roomDurationMs: c.roomDuration,
+        rooms: rooms.map(room => ({
+            id: room.id,
+            entryFeeUsd: room.entryFeeUsd,
+            playerCount: room.players.filter(p => !p.isBot).length,
+            foodPoolBalance: room.foodPoolBalance,
+            aiBudgetBalance: room.aiBudgetBalance,
+            ownerBalance: room.ownerBalance,
+        })),
         houseWalletSol: houseBalanceSol,
+        brHouseWallets,
         ownerVaultConfigured: !!OWNER_VAULT_ADDRESS,
     });
 });
@@ -760,15 +879,20 @@ app.get('/api/dev/room-status', async (req, res) => {
 app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
     const { userId } = req.body;
     try {
-        const p = rooms[0].players.find(pl => pl.mongoId.toString() === userId);
-        if (!p) return res.status(404).send("Player not in arena");
+        let found = null;
+        for (const room of rooms) {
+            const p = room.players.find(pl => pl.mongoId.toString() === userId);
+            if (p) { found = { room, player: p }; break; }
+        }
+        if (!found) return res.status(404).send("Player not in arena");
 
+        const { room, player: p } = found;
         const amount = p.balance;
         const user = await User.findById(userId);
         user.balance += amount;
         await user.save();
 
-        rooms[0].players = rooms[0].players.filter(pl => pl.mongoId.toString() !== userId);
+        room.players = room.players.filter(pl => pl.mongoId.toString() !== userId);
 
         await Transaction.create({ userId: user._id, type: 'withdraw', amount: amount, meta: { reason: 'Admin Forced Cashout' } });
         io.to(p.id).emit('cashOutSuccess', { amount });
@@ -916,7 +1040,7 @@ app.get('/api/leaderboard', async (req, res) => {
     try {
         // All time: sum cashout transactions per user
         const alltimePipeline = [
-            { $match: { type: { $in: ['withdraw'] }, 'meta.reason': 'Arena Cashout' } },
+            { $match: { type: 'withdraw', 'meta.reason': { $regex: 'Arena Cashout' } } },
             { $group: { _id: '$userId', total: { $sum: '$amount' } } },
             { $sort: { total: -1 } },
             { $limit: 10 },
@@ -929,7 +1053,7 @@ app.get('/api/leaderboard', async (req, res) => {
         const weekStart = new Date();
         weekStart.setDate(weekStart.getDate() - 7);
         const weekPipeline = [
-            { $match: { type: { $in: ['withdraw'] }, 'meta.reason': 'Arena Cashout', createdAt: { $gte: weekStart } } },
+            { $match: { type: 'withdraw', 'meta.reason': { $regex: 'Arena Cashout' }, createdAt: { $gte: weekStart } } },
             { $group: { _id: '$userId', total: { $sum: '$amount' } } },
             { $sort: { total: -1 } },
             { $limit: 10 },
@@ -1003,9 +1127,36 @@ function getModeFoodBudgets(room, agarActive, slitherActive) {
 }
 
 function getMaxAiBudgetForRoom(room) {
+    const stake = botStakeForRoom(room);
     const agarHumans = countHumansInMode(room, 'agar');
     const slitherHumans = countHumansInMode(room, 'slither');
-    return (getTargetBots(agarHumans) + getSlitherTargetBots(slitherHumans)) * c.botStartBalance;
+    return getTargetBots(agarHumans) * stake + getSlitherTargetBots(slitherHumans) * stake;
+}
+
+function botStakeForRoom(room) {
+    return getEconomy(room.entryFeeUsd).botStartBalance;
+}
+
+function foodDensityForRoom(room) {
+    return getEconomy(room.entryFeeUsd).foodDensityPerHuman;
+}
+
+function findPlayerInArena(mongoId) {
+    const key = mongoId?.toString();
+    for (const room of rooms) {
+        const player = room.players.find(p => p.mongoId?.toString() === key);
+        if (player) return { room, player };
+    }
+    return null;
+}
+
+function getRoomForEntry(entryFeeUsd) {
+    const fee = normalizeEntryFee(entryFeeUsd);
+    return rooms.find(r => r.entryFeeUsd === fee) ?? rooms.find(r => r.entryFeeUsd === DEFAULT_ENTRY_FEE);
+}
+
+function isArenaResetting() {
+    return globalArenaResetting || rooms.some(r => r.isResetting);
 }
 
 function capAiBudget(room) {
@@ -1035,22 +1186,22 @@ function rebuildQuadTree(room, allUsers) {
     });
 }
 
-function addBots(room, n) {
+function addBots(room, n, botStake = null) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
-    const botCostSol = c.botStartBalance;
-    const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCostSol));
+    const botCost = botStake ?? botStakeForRoom(room);
+    const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCost));
     for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
         const randomName = botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]";
-        room.aiBudgetBalance -= botCostSol;
+        room.aiBudgetBalance -= botCost;
         room.bots.push({
-            id: id, username: randomName, balance: botCostSol, kills: 0, color: util.randomColor(), isBot: true,
+            id: id, username: randomName, balance: botCost, kills: 0, color: util.randomColor(), isBot: true,
             targetX: Math.random() * c.worldWidth, targetY: Math.random() * c.worldHeight, lastTargetUpdate: 0,
             cells: [{
                 id: Math.random().toString(36).substr(2, 9),
                 x: Math.random() * c.worldWidth, y: Math.random() * c.worldHeight,
-                balance: botCostSol, radius: calculateCellRadius(botCostSol, botCostSol, 1)
-            }] // Bottar använder standard-radie för enkelhetens skull eller kan också uppdateras
+                balance: botCost, radius: calculateCellRadius(botCost, botCost, 1, botCost)
+            }]
         });
     }
 }
@@ -1079,33 +1230,40 @@ function countActiveHumansByMode(room, mode) {
     return room.players.filter(p => !p.disconnected && (p.mode === mode || (mode === 'agar' && !p.mode))).length;
 }
 
-function getBestRoom() {
-    // Eftersom det bara finns en global arena nu tillåter vi anslutning när som helst
-    // tills rummet resettas automatiskt varannan timme.
-    return rooms[0];
+// Helper för att beräkna radie med extra tillväxt-effekt
+function playerStartBalance(player) {
+    return getEconomy(player?.entryFeeUsd).playerStartBalance;
 }
 
-// Helper för att beräkna radie med extra tillväxt-effekt
-function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
+function calculateCellRadius(cellBalance, playerTotalBalance, cellCount, startBalance = c.playerStartBalance) {
     // Spelet körs nu i USD-enheter internt
     const balanceInUsd = cellBalance;
-    const startUsdPerCell = c.playerStartBalance / cellCount;
+    const startUsdPerCell = startBalance / cellCount;
     const extraUsd = Math.max(0, balanceInUsd - startUsdPerCell);
     const visualMass = balanceInUsd + (extraUsd * (c.growthBoost - 1));
     return util.massToRadius(visualMass * c.sizeMult);
 }
 
 io.on('connection', (socket) => {
-    socket.on('joinGame', async ({ username, token, mode }) => {
+    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
         let userKey = null;
         try {
+            if (mode === 'br-agar' || mode === 'br-slither') {
+                socket.emit('error', 'Use the Battle Royale queue to join.');
+                return;
+            }
+            const entryFeeUsd = normalizeEntryFee(rawEntryFee);
+            const economy = getEconomy(entryFeeUsd);
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             const user = await User.findById(decoded.id);
             if (!user) return;
 
-            const room = getBestRoom();
+            if (getBRMatchForMongo(user._id.toString())) {
+                socket.emit('error', 'You are in an active Battle Royale match.');
+                return;
+            }
 
-            if (room.isResetting) {
+            if (isArenaResetting()) {
                 socket.emit('error', 'The arena is currently resetting. Please wait a moment.');
                 return;
             }
@@ -1114,8 +1272,16 @@ io.on('connection', (socket) => {
             if (joiningUsers.has(userKey)) return;
             joiningUsers.add(userKey);
 
+            const existing = findPlayerInArena(userKey);
+            if (existing && existing.room.entryFeeUsd !== entryFeeUsd) {
+                socket.emit('error', `You have an active $${existing.room.entryFeeUsd} game. Rejoin that stake tier first.`);
+                return;
+            }
+
+            const room = existing?.room ?? getRoomForEntry(entryFeeUsd);
+
             // --- REJOIN LOGIK ---
-            const existingPlayer = room.players.find(p => p.mongoId?.toString() === userKey);
+            const existingPlayer = existing?.player ?? null;
             if (existingPlayer) {
                 const oldSocketId = existingPlayer.id;
                 const oldSocket = io.sockets.sockets.get(oldSocketId);
@@ -1145,13 +1311,14 @@ io.on('connection', (socket) => {
                     cashOutRemaining: remaining,
                     mode: rejoinMode,
                     rejoin: true,
+                    entryFeeUsd: existingPlayer.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
                 return;
             }
 
-            // FINANCIAL REWRITE: Check SOL balance for $10 entry fee
-            const entryFeeInSol = 10.0 / SOL_PRICE_USD;
+            // FINANCIAL: Check SOL balance for entry fee
+            const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
             if (!DEV_FREE_PLAY) {
             // 1. Kontrollera on-chain balans direkt innan start
@@ -1160,7 +1327,7 @@ io.on('connection', (socket) => {
             const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
 
             if (currentLamports < (feeLamports + 5000)) { // +5000 för gas
-                socket.emit('error', `Insufficient SOL on your account address for $10 entry.`);
+                socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
                 return;
             }
 
@@ -1176,14 +1343,14 @@ io.on('connection', (socket) => {
                     })
                 );
                 const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
-                console.log(`🎟️ Arena Entry: ${user.username} paid $10. Sig: ${sig}`);
+                console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
             } catch (txErr) {
                 console.error("Join transaction failed:", txErr.message);
                 socket.emit('error', 'Blockchain transfer failed. Please try again.');
                 return;
             }
             } else {
-                console.log(`🎮 [FREE PLAY] ${user.username} joined (simulated $10 entry)`);
+                console.log(`🎮 [FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
             }
 
             // Log Join
@@ -1194,37 +1361,29 @@ io.on('connection', (socket) => {
                 meta: {
                     event: 'join',
                     roomId: room.id,
-                    entryFeeUsd: 10.0,
+                    entryFeeUsd,
+                    mode: mode === 'slither' ? 'slither' : 'agar',
                     ...(DEV_FREE_PLAY ? { simulated: true } : {}),
                 },
                 status: 'confirmed'
             });
 
-            // DYNAMIC ECONOMY SPLIT ($10)
+            // DYNAMIC ECONOMY SPLIT (scaled to entry tier)
             const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const activeHumansCount = room.players.filter(p => !p.disconnected).length + 1;
-
-            let aiAlloc = 0;
-            if (activeHumansCount < 3) {
-                room.foodPoolBalance += 6.0;
-                aiAlloc = 2.0;
-            } else if (activeHumansCount < 8) {
-                room.foodPoolBalance += 7.0;
-                aiAlloc = 1.0;
-            } else {
-                room.foodPoolBalance += 8.0;
-            }
+            const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, activeHumansCount);
 
             // Only fund bots up to the cap for current population; surplus → food pool
             const agarAfter = countHumansInMode(room, 'agar') + (gameMode === 'agar' ? 1 : 0);
             const slitherAfter = countHumansInMode(room, 'slither') + (gameMode === 'slither' ? 1 : 0);
-            const maxAi = (getTargetBots(agarAfter) + getSlitherTargetBots(slitherAfter)) * c.botStartBalance;
+            const joinBotStake = economy.botStartBalance;
+            const maxAi = getTargetBots(agarAfter) * joinBotStake + getSlitherTargetBots(slitherAfter) * joinBotStake;
             const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
             const aiToAdd = Math.min(aiAlloc, aiDeficit);
             room.aiBudgetBalance += aiToAdd;
-            room.foodPoolBalance += (aiAlloc - aiToAdd);
+            room.foodPoolBalance += foodAlloc + (aiAlloc - aiToAdd);
 
-            room.ownerBalance += 1.0;
+            room.ownerBalance += economy.ownerCut;
 
             // DYNAMIC BOT SCALING (mode-specific)
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
@@ -1234,13 +1393,13 @@ io.on('connection', (socket) => {
 
             if (gameMode === 'slither') {
                 if (room.slitherBots.length < targetBots) {
-                    addSlitherBots(room, targetBots - room.slitherBots.length);
+                    addSlitherBots(room, targetBots - room.slitherBots.length, joinBotStake);
                 } else if (room.slitherBots.length > targetBots) {
                     trimSlitherBots(room, targetBots);
                 }
             } else {
                 if (room.bots.length < targetBots) {
-                    addBots(room, targetBots - room.bots.length);
+                    addBots(room, targetBots - room.bots.length, joinBotStake);
                 } else if (room.bots.length > targetBots) {
                     room.bots.splice(0, room.bots.length - targetBots);
                 }
@@ -1248,11 +1407,12 @@ io.on('connection', (socket) => {
 
             socket.roomId = room.id;
 
-            const startBalanceUsd = 1.0;
+            const startBalanceUsd = economy.playerStartBalance;
             let newPlayer;
 
             if (gameMode === 'slither') {
-                newPlayer = createSlitherPlayer(socket.id, user._id, username || user.username, util.randomColor(), room);
+                newPlayer = createSlitherPlayer(socket.id, user._id, username || user.username, util.randomColor(), room, startBalanceUsd);
+                newPlayer.entryFeeUsd = room.entryFeeUsd;
             } else {
                 const spawnX = Math.random() * c.worldWidth;
                 const spawnY = Math.random() * c.worldHeight;
@@ -1261,6 +1421,7 @@ io.on('connection', (socket) => {
                     mongoId: user._id,
                     username: username || user.username,
                     mode: 'agar',
+                    entryFeeUsd: room.entryFeeUsd,
                     kills: 0,
                     balance: startBalanceUsd,
                     startTime: Date.now(),
@@ -1276,7 +1437,7 @@ io.on('connection', (socket) => {
                         x: spawnX,
                         y: spawnY,
                         balance: startBalanceUsd,
-                        radius: calculateCellRadius(startBalanceUsd, startBalanceUsd, 1),
+                        radius: calculateCellRadius(startBalanceUsd, startBalanceUsd, 1, startBalanceUsd),
                         vx: 0,
                         vy: 0,
                         lastSplit: Date.now()
@@ -1300,6 +1461,7 @@ io.on('connection', (socket) => {
                     height: racedMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
                     mode: racedMode,
                     rejoin: true,
+                    entryFeeUsd: raced.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
                 return;
@@ -1313,10 +1475,14 @@ io.on('connection', (socket) => {
                 const slitherActive = countActiveHumansByMode(room, 'slither');
                 const budgets = getModeFoodBudgets(room, agarActive, slitherActive);
                 if (gameMode === 'slither') {
-                    syncSlitherFood(room, c.foodBlobValue, budgets.slither, countHumansInMode(room, 'slither'));
+                    syncSlitherFood(
+                        room, c.foodBlobValue, budgets.slither,
+                        countHumansInMode(room, 'slither'),
+                        foodDensityForRoom(room),
+                    );
                 } else {
                     const agarInArena = countHumansInMode(room, 'agar');
-                    const agarFoodTarget = Math.min(agarInArena * 250.0, budgets.agar);
+                    const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), budgets.agar);
                     const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
                     if (room.food.length < agarTargetFoodCount) {
                         addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
@@ -1329,6 +1495,7 @@ io.on('connection', (socket) => {
                 height: gameMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
                 mode: gameMode,
                 rejoin: false,
+                entryFeeUsd,
                 solPrice: SOL_PRICE_USD,
             });
         } catch (err) {
@@ -1340,6 +1507,12 @@ io.on('connection', (socket) => {
 
     // Protokoll-matchning: 0 = rörelse
     socket.on('0', (data) => {
+        const br = findBRPlayerBySocket(socket.id);
+        if (br) {
+            br.player.mouseX = data.x;
+            br.player.mouseY = data.y;
+            return;
+        }
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (p) { p.mouseX = data.x; p.mouseY = data.y; }
@@ -1353,16 +1526,17 @@ io.on('connection', (socket) => {
 
         let newCells = [];
         p.cells.forEach(cell => {
-            if (cell.balance >= c.minMassSplit) {
+            const startBal = playerStartBalance(p);
+            if (cell.balance >= startBal * 2) {
                 cell.balance /= 2;
-                cell.radius = calculateCellRadius(cell.balance, p.balance, p.cells.length + 1);
+                cell.radius = calculateCellRadius(cell.balance, p.balance, p.cells.length + 1, startBal);
                 cell.lastSplit = Date.now(); // Starta timern även för ursprungscellen
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 newCells.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x, y: cell.y,
                     balance: cell.balance,
-                    radius: calculateCellRadius(cell.balance, p.balance, p.cells.length + 1),
+                    radius: calculateCellRadius(cell.balance, p.balance, p.cells.length + 1, startBal),
                     vx: Math.cos(angle) * 25,
                     vy: Math.sin(angle) * 25,
                     lastSplit: Date.now()
@@ -1378,7 +1552,8 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p) return;
         p.cells.forEach(cell => {
-            if (cell.balance >= c.minMassEject) {
+            const startBal = playerStartBalance(p);
+            if (cell.balance >= startBal * 1.5) {
                 cell.balance -= c.ejectMass;
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 room.ejected.push({
@@ -1397,6 +1572,11 @@ io.on('connection', (socket) => {
 
     // Cash Out Logik
     socket.on('cashOut', async () => {
+        const br = findBRPlayerBySocket(socket.id);
+        if (br?.player) {
+            socket.emit('error', 'Cash out is disabled in Battle Royale.');
+            return;
+        }
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
@@ -1444,7 +1624,12 @@ io.on('connection', (socket) => {
                         userId: user._id,
                         type: 'withdraw',
                         amount: totalCashout,
-                        meta: { simulated: true, reason: 'Arena Cashout (Free Play)' },
+                        meta: {
+                            simulated: true,
+                            reason: 'Arena Cashout',
+                            mode: activePlayer.mode || 'agar',
+                            entryFeeUsd: activePlayer.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                        },
                         status: 'confirmed',
                     });
                     console.log(`🎮 [FREE PLAY] Cashout: $${totalCashout.toFixed(2)} (simulated)`);
@@ -1514,7 +1699,13 @@ io.on('connection', (socket) => {
                     userId: user._id,
                     type: 'withdraw',
                     amount: totalCashout,
-                    meta: { signature, reason: 'Arena Cashout to Account', solAmount: solToWithdraw },
+                    meta: {
+                        signature,
+                        reason: 'Arena Cashout',
+                        solAmount: solToWithdraw,
+                        mode: activePlayer.mode || 'agar',
+                        entryFeeUsd: activePlayer.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                    },
                     status: 'confirmed'
                 });
 
@@ -1545,6 +1736,15 @@ io.on('connection', (socket) => {
     });
 
     socket.on('slitherInput', ({ dx, dy, boost }) => {
+        const br = findBRPlayerBySocket(socket.id);
+        if (br) {
+            const p = br.player;
+            if (p.isCashingOut) return;
+            p.inputDx = Number(dx) || 0;
+            p.inputDy = Number(dy) || 0;
+            p.boost = !!boost;
+            return;
+        }
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'slither');
         if (!p || p.isCashingOut) return;
@@ -1554,23 +1754,41 @@ io.on('connection', (socket) => {
     });
 });
 
+function getBattleRoyaleDeps() {
+    return {
+        User,
+        Transaction,
+        util,
+        c,
+        addFood,
+        calculateCellRadius,
+        rooms,
+        JWT_SECRET: process.env.JWT_SECRET,
+        DEV_FREE_PLAY,
+        SOL_PRICE_USD,
+        connection,
+        ensureUserDepositWallet,
+    };
+}
+
+setupBattleRoyale(io, getBattleRoyaleDeps());
+
 setInterval(() => {
+    const age = Date.now() - GLOBAL_ARENA_START;
+    if (age > c.roomDuration && !isArenaResetting()) {
+        performGlobalArenaReset();
+        return;
+    }
+    if (isArenaResetting()) return;
+
     rooms.forEach(room => {
         processRoom(room);
     });
+    processBattleRoyaleMatches(io, getBattleRoyaleDeps());
 }, 1000 / 40);
 
 function processRoom(room) {
-    const now = Date.now();
-    const age = now - room.startTime;
-
-    // Automated Reset Check
-    if (age > c.roomDuration && !room.isResetting) {
-        performRoomReset(room);
-        return; // Pause processing during reset
-    }
-
-    if (room.isResetting) return; // Step 1: Lock gameplay
+    if (room.isResetting) return; // Pause during global reset
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     const agarHumans = countActiveHumansByMode(room, 'agar');
@@ -1579,15 +1797,17 @@ function processRoom(room) {
     const slitherHumansInArena = countHumansInMode(room, 'slither');
 
     const agarTargetBots = getTargetBots(agarHumansInArena);
+    const agarBotStake = botStakeForRoom(room);
+    const slitherBotStake = botStakeForRoom(room);
     if (room.bots.length < agarTargetBots) {
-        addBots(room, agarTargetBots - room.bots.length);
+        addBots(room, agarTargetBots - room.bots.length, agarBotStake);
     } else if (room.bots.length > agarTargetBots) {
         room.bots.splice(0, room.bots.length - agarTargetBots);
     }
 
     const slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
     if (room.slitherBots.length < slitherTargetBots) {
-        addSlitherBots(room, slitherTargetBots - room.slitherBots.length);
+        addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
     } else if (room.slitherBots.length > slitherTargetBots) {
         trimSlitherBots(room, slitherTargetBots);
     }
@@ -1599,7 +1819,7 @@ function processRoom(room) {
     const slitherInArena = countHumansInMode(room, 'slither');
     const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
 
-    const agarFoodTarget = Math.min(agarInArena * 250.0, foodBudgets.agar);
+    const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
     const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
     if (agarInArena <= 0) {
         room.food.length = 0;
@@ -1608,7 +1828,7 @@ function processRoom(room) {
     } else if (room.food.length > agarTargetFoodCount) {
         room.food.splice(agarTargetFoodCount);
     }
-    syncSlitherFood(room, c.foodBlobValue, foodBudgets.slither, slitherInArena);
+    syncSlitherFood(room, c.foodBlobValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
@@ -1624,6 +1844,10 @@ function processRoom(room) {
         // Slither players use server-side physics in slither-engine — skip Agar cell physics
         if (player.mode === 'slither') return;
 
+        const pStartBal = player.isBot
+            ? (player.botStake ?? player.cells[0]?.balance ?? c.botStartBalance)
+            : playerStartBalance(player);
+
         // 0. Avancerad AI-logik för bottar
         if (player.isBot) {
             const botCells = player.cells;
@@ -1631,7 +1855,8 @@ function processRoom(room) {
 
             // SJÄLVSANERING: Despawn om botten blir för stor
             const totalBotBalance = botCells.reduce((sum, cl) => sum + cl.balance, 0);
-            if (totalBotBalance > c.botMaxBalance) {
+            const botMax = getEconomy(room.entryFeeUsd).botMaxBalance;
+            if (totalBotBalance > botMax) {
                 room.bots = room.bots.filter(b => b.id !== player.id);
                 if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
                 return;
@@ -1755,21 +1980,21 @@ function processRoom(room) {
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance || c.foodBlobValue;
-                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
+                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance;
-                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
+                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                         room.ejected = room.ejected.filter(e => e.id !== item.data.id);
                     }
                 } else if (item.type === 'virus') {
                     // Virusexplosion baserat på balans
-                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > 2.0) {
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > pStartBal * 2) {
                         if (player.cells.length < c.maxCells) {
                             cell.balance /= 2;
-                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
+                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                             player.cells.push({
                                 id: Math.random().toString(36).substr(2, 9),
                                 x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now()
@@ -1792,7 +2017,7 @@ function processRoom(room) {
                             // Om din mittpunkt är inne i den andra cellen
                             if (d < Math.max(r, r2) * 0.9) {
                                 cell.balance += otherCell.balance;
-                                cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
+                                cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                                 cellsToDelete.add(otherCell.id);
                             }
                             // Ingen repulsion när vi kan merga, så de kan "pressas ihop" mjukt
@@ -1809,7 +2034,7 @@ function processRoom(room) {
                         if (cell.balance > otherCell.balance * 1.05 && d < (r + r2 * 0.1)) {
                             // EKONOMI: Absorberar 100% av balansen
                             cell.balance += otherCell.balance;
-                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
+                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                             const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
                             if (victim) {
                                 victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
@@ -1822,6 +2047,18 @@ function processRoom(room) {
                                         // Uppdatera playtime i DB vid död
                                         User.findByIdAndUpdate(victimMongoId, { $inc: { playtime: sessionPlaytime } })
                                             .catch(err => console.error("Error updating playtime on death:", err));
+
+                                        Transaction.create({
+                                            userId: victimMongoId,
+                                            type: 'game',
+                                            amount: victim.balance,
+                                            meta: {
+                                                reason: 'Arena Death',
+                                                mode: victim.mode || 'agar',
+                                                entryFeeUsd: victim.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                                            },
+                                            status: 'confirmed',
+                                        }).catch(err => console.error("Error logging agar death:", err));
 
                                         room.players = room.players.filter(p => p.id !== victim.id);
                                     } else {
@@ -1862,7 +2099,7 @@ function processRoom(room) {
     rebuildQuadTree(room, allUsers);
 
     // Slither server-side physics tick
-    const slitherLeaderboard = processSlitherRoom(room, io, User);
+    const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
 
     const slitherMeta = {
         resetTime: room.startTime + c.roomDuration,
