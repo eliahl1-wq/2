@@ -367,8 +367,13 @@ async function scanDeposits() {
     }
 }
 
+// In-memory lock for scanDeposits to prevent concurrent runs
+let isScanningDeposits = false;
+
 // Starta scannern var 15:e sekund
-setInterval(scanDeposits, 15000);
+setInterval(async () => {
+    if (!isScanningDeposits) await scanDeposits();
+}, 15000);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -1535,10 +1540,10 @@ function processRoom(room) {
 
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
     // Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
-    const foodValueTarget = Math.min(room.players.length * 50.0, room.foodPoolBalance);
+    const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
     const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
     if (room.food.length < targetFoodCount) {
-        addFood(room, Math.min(5, targetFoodCount - room.food.length));
+        addFood(room, Math.min(10, targetFoodCount - room.food.length)); // Lägg till max 10 matbitar åt gången
     }
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
