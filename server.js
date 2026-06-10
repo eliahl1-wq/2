@@ -566,6 +566,60 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/update-profile', authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const { username, walletAddress } = req.body;
+        let changed = false;
+
+        if (username !== undefined && username !== user.username) {
+            const trimmed = String(username).trim();
+            if (trimmed.length < 3 || trimmed.length > 20) {
+                return res.status(400).json({ message: 'Username must be 3–20 characters' });
+            }
+            if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) {
+                return res.status(400).json({ message: 'Username can only contain letters, numbers, and underscores' });
+            }
+            const taken = await User.findOne({ username: trimmed, _id: { $ne: user._id } });
+            if (taken) return res.status(400).json({ message: 'Username already taken' });
+            user.username = trimmed;
+            changed = true;
+        }
+
+        if (walletAddress !== undefined && walletAddress !== (user.walletAddress || '')) {
+            const trimmed = String(walletAddress).trim();
+            if (trimmed && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(trimmed)) {
+                return res.status(400).json({ message: 'Invalid Solana wallet address' });
+            }
+            user.walletAddress = trimmed || undefined;
+            changed = true;
+        }
+
+        if (!changed) {
+            return res.status(400).json({ message: 'No changes to save' });
+        }
+
+        await user.save();
+
+        const userObj = user.toObject();
+        delete userObj.password;
+        delete userObj.depositSecret;
+        userObj.balanceSol = user.balance;
+        userObj.balanceUsd = user.balance * SOL_PRICE_USD;
+        userObj.solPrice = SOL_PRICE_USD;
+        userObj.freePlay = DEV_FREE_PLAY;
+
+        res.json({ user: userObj });
+    } catch (err) {
+        if (err.code === 11000) {
+            return res.status(400).json({ message: 'Username already taken' });
+        }
+        res.status(500).json({ message: err.message });
+    }
+});
+
 // --- ADMIN MIDDLEWARE ---
 const authenticateAdmin = (req, res, next) => {
     authenticateToken(req, res, async () => {
