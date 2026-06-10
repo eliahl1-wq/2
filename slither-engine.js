@@ -7,7 +7,7 @@ export const SLITHER = {
     boostMultiplier: 1.75,
     boostCostPerTick: 0.00015,
     headRadius: 10,
-    foodRadius: 5,
+    foodRadius: 7,
     segmentSpacing: 7,
     baseSegments: 40,
     segmentsPerCent: 0.15,
@@ -24,11 +24,44 @@ const BOT_NAMES = [
 ];
 
 // Agar arena is 18000×18000 — scale food count so Slither has the same visual density
-const AGAR_WORLD_SIDE = 18000;
+const AGAR_WORLD_SIDE = 6000;
+
+// Agar bot AI ranges (px in 18000 world) — scaled for slither arena
+const AGAR_BOT_THREAT_RANGE = 800;
+const AGAR_BOT_PREY_RANGE = 500;
+const AGAR_BOT_FOOD_RANGE = 500;
+const AGAR_BOT_FLEE_DISTANCE = 500;
+const AGAR_BOT_TARGET_INTERVAL_MS = 1000;
 
 function slitherFoodDensityScale() {
     const slitherSide = SLITHER.worldHalf * 2;
     return (slitherSide * slitherSide) / (AGAR_WORLD_SIDE * AGAR_WORLD_SIDE);
+}
+
+function scaleAgarBotDistance(agarDistance) {
+    const worldScale = (SLITHER.worldHalf * 2) / AGAR_WORLD_SIDE;
+    return Math.max(
+        SLITHER.viewRange * (agarDistance / AGAR_BOT_THREAT_RANGE),
+        agarDistance * worldScale,
+    );
+}
+
+function getSlitherFoodValue(room) {
+    return room.slitherFood.reduce((sum, f) => sum + f.balance, 0);
+}
+
+function clearSlitherFood(room) {
+    for (const f of room.slitherFood) {
+        room.foodPoolBalance += f.balance;
+    }
+    room.slitherFood.length = 0;
+}
+
+function trimSlitherFood(room, targetCount) {
+    while (room.slitherFood.length > targetCount) {
+        const removed = room.slitherFood.pop();
+        room.foodPoolBalance += removed.balance;
+    }
 }
 
 function randId() {
@@ -92,16 +125,20 @@ function randomSpawnCoord() {
     return (Math.random() - 0.5) * 2 * h;
 }
 
-export function addSlitherFood(room, n, foodBlobValue) {
+export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity) {
+    let currentValue = getSlitherFoodValue(room);
     for (let i = 0; i < n; i++) {
+        if (currentValue + foodBlobValue > maxBudgetValue + 1e-9) break;
         if (room.foodPoolBalance < foodBlobValue) break;
         room.foodPoolBalance -= foodBlobValue;
+        currentValue += foodBlobValue;
         room.slitherFood.push({
             id: randId(),
             x: randomSpawnCoord(),
             y: randomSpawnCoord(),
             balance: foodBlobValue,
             hue: Math.floor(Math.random() * 360),
+            radius: 7,
         });
     }
 }
@@ -121,7 +158,9 @@ export function createSlitherBot(room) {
         inputDx: Math.cos(angle),
         inputDy: Math.sin(angle),
         boost: false,
-        aiTimer: Math.floor(10 + Math.random() * 30),
+        lastTargetUpdate: 0,
+        targetX: x,
+        targetY: y,
         angle,
     };
 }
@@ -131,6 +170,14 @@ export function addSlitherBots(room, n) {
     for (let i = 0; i < spawnCount; i++) {
         room.aiBudgetBalance -= SLITHER.botStartBalance;
         room.slitherBots.push(createSlitherBot(room));
+    }
+}
+
+/** Remove excess bots from the front and return their stake to the AI budget (matches agar economy). */
+export function trimSlitherBots(room, targetCount) {
+    while (room.slitherBots.length > targetCount) {
+        room.slitherBots.shift();
+        room.aiBudgetBalance += SLITHER.botStartBalance;
     }
 }
 
@@ -204,54 +251,91 @@ function updateSnakeMovement(snake) {
     }
 }
 
-function runSlitherBotAI(snake, allSnakes, food) {
-    snake.aiTimer = (snake.aiTimer || 0) - 1;
+function applyWallAvoidance(snake) {
     const head = snake.segments[0];
+    const r = headRadiusForBalance(snake.balance);
+    const limit = SLITHER.worldHalf - r - 20;
+    const margin = 120;
+    let steerX = 0;
+    let steerY = 0;
+
+    if (head.x < -limit + margin) steerX += (-limit + margin - head.x);
+    else if (head.x > limit - margin) steerX += (limit - margin - head.x);
+    if (head.y < -limit + margin) steerY += (-limit + margin - head.y);
+    else if (head.y > limit - margin) steerY += (limit - margin - head.y);
+
+    if (steerX === 0 && steerY === 0) return false;
+
+    snake.targetX = head.x + steerX * 4;
+    snake.targetY = head.y + steerY * 4;
+    snake.inputDx = snake.targetX - head.x;
+    snake.inputDy = snake.targetY - head.y;
+    snake.boost = false;
+    return true;
+}
+
+/** Bot AI aligned with agar mode: flee → chase → food → wander, plus wall avoidance. */
+function runSlitherBotAI(snake, allSnakes, food) {
+    const head = snake.segments[0];
+    const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
+    const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
+    const minDistFood = scaleAgarBotDistance(AGAR_BOT_FOOD_RANGE);
+    const fleeDistance = scaleAgarBotDistance(AGAR_BOT_FLEE_DISTANCE);
+
     let threat = null;
-    let prey = null;
-    let nearestFood = null;
-    let minThreat = 350;
-    let minPrey = 300;
-    let minFood = 400;
+    let targetPrey = null;
+    let nearestThreatDist = minDistThreat;
+    let nearestPreyDist = minDistPrey;
 
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
         const oh = other.segments[0];
         const d = dist(head.x, head.y, oh.x, oh.y);
-        if (other.balance > snake.balance * 1.1 && d < minThreat) {
-            minThreat = d;
-            threat = oh;
-        } else if (snake.balance > other.balance * 1.1 && d < minPrey) {
-            minPrey = d;
-            prey = oh;
-        }
-    }
 
-    for (const f of food) {
-        const d = dist(head.x, head.y, f.x, f.y);
-        if (d < minFood) {
-            minFood = d;
-            nearestFood = f;
+        if (other.balance > snake.balance * 1.10 && d < nearestThreatDist) {
+            nearestThreatDist = d;
+            threat = oh;
+        } else if (snake.balance > other.balance * 1.10 && d < nearestPreyDist) {
+            nearestPreyDist = d;
+            targetPrey = oh;
         }
     }
 
     if (threat) {
-        snake.inputDx = head.x - threat.x;
-        snake.inputDy = head.y - threat.y;
-        snake.boost = minThreat < 150;
-    } else if (prey) {
-        snake.inputDx = prey.x - head.x;
-        snake.inputDy = prey.y - head.y;
-        snake.boost = minPrey < 120;
-    } else if (nearestFood) {
-        snake.inputDx = nearestFood.x - head.x;
-        snake.inputDy = nearestFood.y - head.y;
+        const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
+        snake.targetX = head.x + Math.cos(angle) * fleeDistance;
+        snake.targetY = head.y + Math.sin(angle) * fleeDistance;
+        snake.boost = nearestThreatDist < fleeDistance * 0.3;
+    } else if (targetPrey) {
+        snake.targetX = targetPrey.x;
+        snake.targetY = targetPrey.y;
+        snake.boost = nearestPreyDist < fleeDistance * 0.25;
+    } else if (Date.now() - (snake.lastTargetUpdate || 0) > AGAR_BOT_TARGET_INTERVAL_MS) {
+        let nearestFood = null;
+        let nearestFoodDist = minDistFood;
+
+        for (const f of food) {
+            const d = dist(head.x, head.y, f.x, f.y);
+            if (d < nearestFoodDist) {
+                nearestFoodDist = d;
+                nearestFood = f;
+            }
+        }
+
+        if (nearestFood) {
+            snake.targetX = nearestFood.x;
+            snake.targetY = nearestFood.y;
+        } else if (dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
+            snake.targetX = randomSpawnCoord();
+            snake.targetY = randomSpawnCoord();
+        }
+        snake.lastTargetUpdate = Date.now();
         snake.boost = false;
-    } else if (snake.aiTimer <= 0) {
-        snake.aiTimer = Math.floor(15 + Math.random() * 25);
-        snake.inputDx = Math.random() * 2 - 1;
-        snake.inputDy = Math.random() * 2 - 1;
-        snake.boost = false;
+    }
+
+    if (!applyWallAvoidance(snake)) {
+        snake.inputDx = snake.targetX - head.x;
+        snake.inputDy = snake.targetY - head.y;
     }
 }
 
@@ -302,7 +386,7 @@ function checkFoodCollisions(snake, room) {
     }
 }
 
-function eliminateSnake(room, snake, killer, io, User, isHuman) {
+function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = true) {
     const lostBalance = snake.balance;
 
     if (killer && killer.id !== snake.id) {
@@ -313,6 +397,8 @@ function eliminateSnake(room, snake, killer, io, User, isHuman) {
             const tail = killer.segments[killer.segments.length - 1];
             killer.segments.push({ x: tail.x, y: tail.y });
         }
+    } else if (lostBalance > 0 && returnToPool) {
+        room.foodPoolBalance += lostBalance;
     }
 
     if (isHuman) {
@@ -352,42 +438,42 @@ export function processSlitherRoom(room, io, User, foodBlobValue, foodBudget = n
     const humanCount = slitherHumans.length;
 
     if (humanCount === 0) {
-        room.slitherFood.length = 0;
-    }
-
-    const targetBots = getSlitherTargetBots(humanCount);
-    if (room.slitherBots.length < targetBots) {
-        addSlitherBots(room, targetBots - room.slitherBots.length);
-    } else if (room.slitherBots.length > targetBots) {
-        room.slitherBots.splice(0, room.slitherBots.length - targetBots);
+        clearSlitherFood(room);
     }
 
     const densityScale = slitherFoodDensityScale();
     const budget = foodBudget ?? room.foodPoolBalance;
     const foodValueTarget = Math.min(humanCount * 250.0 * densityScale, budget);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
-    if (room.slitherFood.length < targetFoodCount) {
-        addSlitherFood(room, Math.min(50, targetFoodCount - room.slitherFood.length), foodBlobValue);
+    if (humanCount > 0 && room.slitherFood.length < targetFoodCount) {
+        addSlitherFood(
+            room,
+            Math.min(50, targetFoodCount - room.slitherFood.length),
+            foodBlobValue,
+            foodValueTarget,
+        );
     } else if (room.slitherFood.length > targetFoodCount) {
-        room.slitherFood.splice(targetFoodCount);
+        trimSlitherFood(room, targetFoodCount);
     }
 
     const allSnakes = getAllSlitherSnakes(room);
     const toRemove = [];
 
     for (const { entity: snake, isHuman } of allSnakes) {
-        if (snake.isCashingOut) continue;
+        const frozenForCashout = isHuman && snake.isCashingOut;
 
         if (snake.isBot) {
             if (snake.balance > SLITHER.botMaxBalance) {
-                toRemove.push({ snake, isHuman, killer: null });
+                toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: false });
                 continue;
             }
             runSlitherBotAI(snake, allSnakes, room.slitherFood);
         }
 
-        updateSnakeMovement(snake);
-        checkFoodCollisions(snake, room);
+        if (!frozenForCashout) {
+            updateSnakeMovement(snake);
+            checkFoodCollisions(snake, room);
+        }
 
         if (isHuman) {
             snake.balance = Math.max(1.0, snake.balance);
@@ -405,8 +491,14 @@ export function processSlitherRoom(room, io, User, foodBlobValue, foodBudget = n
         }
     }
 
-    for (const { snake, isHuman, killer } of toRemove) {
-        eliminateSnake(room, snake, killer, io, User, isHuman);
+    for (const { snake, isHuman, killer, respawnBot, returnToPool = true } of toRemove) {
+        eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool);
+        if (respawnBot) {
+            const targetBots = getSlitherTargetBots(humanCount);
+            if (room.slitherBots.length < targetBots) {
+                addSlitherBots(room, 1);
+            }
+        }
     }
 
     const slitherLeaderboard = getAllSlitherSnakes(room)
@@ -443,7 +535,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
             const visibleFood = room.slitherFood
                 .filter(f => isInView(head.x, head.y, f.x, f.y, range))
-                .map(f => ({ id: f.id, x: f.x, y: f.y, hue: f.hue }));
+                .map(f => ({ id: f.id, x: f.x, y: f.y, hue: f.hue, radius: f.radius || 7 }));
 
             io.to(p.id).emit('slitherTick', {
                 you: p.id,

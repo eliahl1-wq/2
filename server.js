@@ -18,6 +18,7 @@ import {
     createSlitherPlayer,
     addSlitherBots,
     getSlitherTargetBots,
+    trimSlitherBots,
     processSlitherRoom,
     broadcastSlitherState,
 } from './slither-engine.js';
@@ -149,8 +150,8 @@ const TransactionSchema = new mongoose.Schema({
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 const c = {
-    worldWidth: 18000,
-    worldHeight: 18000,
+    worldWidth: 6000,
+    worldHeight: 6000,
     foodCount: 0,
     virusCount: 40,
     playerStartBalance: 1.0,
@@ -999,6 +1000,29 @@ function capAiBudget(room) {
     room.aiBudgetBalance = Math.min(room.aiBudgetBalance, getMaxAiBudgetForRoom(room));
 }
 
+function rebuildQuadTree(room, allUsers) {
+    room.qt.clear();
+    room.food.forEach(f => {
+        room.qt.insert(new Point(f.x, f.y, { type: 'food', data: f }));
+    });
+    room.viruses.forEach(v => {
+        room.qt.insert(new Point(v.x, v.y, { type: 'virus', data: v }));
+    });
+    room.ejected.forEach(e => {
+        room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e }));
+    });
+    allUsers.forEach(player => {
+        for (const cell of player.cells) {
+            room.qt.insert(new Point(cell.x, cell.y, {
+                type: player.isBot ? 'bot' : 'player',
+                socketId: player.isBot ? undefined : player.id,
+                botId: player.isBot ? player.id : undefined,
+                cell,
+            }));
+        }
+    });
+}
+
 function addBots(room, n) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
     const botCostSol = c.botStartBalance;
@@ -1199,7 +1223,7 @@ io.on('connection', (socket) => {
                 if (room.slitherBots.length < targetBots) {
                     addSlitherBots(room, targetBots - room.slitherBots.length);
                 } else if (room.slitherBots.length > targetBots) {
-                    room.slitherBots.splice(0, room.slitherBots.length - targetBots);
+                    trimSlitherBots(room, targetBots);
                 }
             } else {
                 if (room.bots.length < targetBots) {
@@ -1535,22 +1559,39 @@ function processRoom(room) {
     if (room.slitherBots.length < slitherTargetBots) {
         addSlitherBots(room, slitherTargetBots - room.slitherBots.length);
     } else if (room.slitherBots.length > slitherTargetBots) {
-        room.slitherBots.splice(0, room.slitherBots.length - slitherTargetBots);
+        trimSlitherBots(room, slitherTargetBots);
     }
 
     capAiBudget(room);
 
-    room.ejected.forEach(e => room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
+    // Agar food spawn (before physics — must be in quadtree for visibility + eating)
+    const totalModeHumans = agarHumans + slitherHumans;
+    const agarFoodBudget = totalModeHumans > 0
+        ? room.foodPoolBalance * (agarHumans / totalModeHumans)
+        : room.foodPoolBalance;
+    const slitherFoodBudget = totalModeHumans > 0
+        ? room.foodPoolBalance * (slitherHumans / totalModeHumans)
+        : room.foodPoolBalance;
+
+    const agarFoodTarget = Math.min(agarHumans * 250.0, agarFoodBudget);
+    const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
+    if (room.food.length < agarTargetFoodCount) {
+        addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
+    } else if (room.food.length > agarTargetFoodCount) {
+        room.food.splice(agarTargetFoodCount);
+    }
+    if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
     const allUsers = [
         ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected),
         ...room.bots,
     ];
+    rebuildQuadTree(room, allUsers);
     const userMap = new Map();
     allUsers.forEach(u => userMap.set(u.id, u));
 
     allUsers.forEach(player => {
-        // Slither-spelare körs client-side — hoppa över Agar-fysik
+        // Slither players use server-side physics in slither-engine — skip Agar cell physics
         if (player.mode === 'slither') return;
 
         // 0. Avancerad AI-logik för bottar
@@ -1788,21 +1829,7 @@ function processRoom(room) {
 
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
 
-    // Agar food spawn (funded from shared foodPoolBalance)
-    const totalModeHumans = agarHumans + slitherHumans;
-    const agarFoodBudget = totalModeHumans > 0
-        ? room.foodPoolBalance * (agarHumans / totalModeHumans)
-        : room.foodPoolBalance;
-    const slitherFoodBudget = totalModeHumans > 0
-        ? room.foodPoolBalance * (slitherHumans / totalModeHumans)
-        : room.foodPoolBalance;
-
-    const agarFoodTarget = Math.min(agarHumans * 250.0, agarFoodBudget);
-    const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
-    if (room.food.length < agarTargetFoodCount) {
-        addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
-    }
-    if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+    rebuildQuadTree(room, allUsers);
 
     // Slither server-side physics tick
     const slitherLeaderboard = processSlitherRoom(room, io, User, c.foodBlobValue, slitherFoodBudget);
