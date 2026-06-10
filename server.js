@@ -36,9 +36,10 @@ import {
     findBRPlayerBySocket,
     getBRMatchForMongo,
     isPlayerInBR,
+    getBRPlayerCountsByFee,
     BR,
 } from './battle-royale.js';
-import { validateBRWalletsOnStartup, BR_WALLETS } from './br-wallets.js';
+import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
 
 const app = express();
 
@@ -587,7 +588,8 @@ app.get('/api/config', (req, res) => {
         entryFeeUsd: DEV_FREE_PLAY ? 0 : DEFAULT_ENTRY_FEE,
         entryFees: DEV_FREE_PLAY ? [0] : ALLOWED_ENTRY_FEES,
         defaultEntryFee: DEFAULT_ENTRY_FEE,
-        brEntryFeeUsd: DEV_FREE_PLAY ? 0 : BR.entryFeeUsd,
+        brEntryFees: DEV_FREE_PLAY ? [0] : BR.entryFees,
+        brDefaultEntryFee: BR.defaultEntryFee,
         brMinPlayers: BR.minPlayers,
         brMaxPlayers: BR.maxPlayers,
     });
@@ -625,6 +627,7 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
                     inGame: true,
                     mode: brRoom.variant === 'slither' ? 'br-slither' : 'br-agar',
                     balance: brPlayer.balance ?? null,
+                    entryFeeUsd: brRoom.entryFeeUsd ?? BR.defaultEntryFee,
                     disconnected: brPlayer.disconnected ?? false,
                     isResetting: false,
                     battleRoyale: true,
@@ -848,15 +851,15 @@ app.get('/api/dev/room-status', async (req, res) => {
         houseBalanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
     }
     const brHouseWallets = {};
-    for (const variant of ['agar', 'slither']) {
-        const w = BR_WALLETS[variant];
-        if (w.address) {
-            const lamports = await connection.getBalance(new solanaWeb3.PublicKey(w.address));
-            brHouseWallets[variant] = {
-                address: w.address,
-                balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
-            };
-        }
+    for (const w of listBRHouseWallets()) {
+        const key = `${w.variant}_${w.entryFeeUsd}`;
+        const lamports = await connection.getBalance(new solanaWeb3.PublicKey(w.address));
+        brHouseWallets[key] = {
+            variant: w.variant,
+            entryFeeUsd: w.entryFeeUsd,
+            address: w.address,
+            balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+        };
     }
     res.json({
         isResetting: arenaResetting,
@@ -995,6 +998,7 @@ app.get('/api/stats', (req, res) => {
         let topPlayer = null;
         let topBalance = 0;
         let topIsBot = false;
+        const playersByEntryFee = { 5: 0, 10: 0, 20: 0 };
 
         const considerTop = (name, balance, isBot = false) => {
             const b = balance || 0;
@@ -1006,9 +1010,14 @@ app.get('/api/stats', (req, res) => {
         };
 
         rooms.forEach(room => {
+            const fee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
             room.players.forEach(player => {
-                if (!player.disconnected) humansOnline += 1;
-                if (!player.disconnected) considerTop(player.username, player.balance, false);
+                if (!player.disconnected) {
+                    humansOnline += 1;
+                    if (!playersByEntryFee[fee]) playersByEntryFee[fee] = 0;
+                    playersByEntryFee[fee] += 1;
+                    considerTop(player.username, player.balance, false);
+                }
             });
             room.bots.forEach(bot => {
                 aiOnline += 1;
@@ -1021,6 +1030,8 @@ app.get('/api/stats', (req, res) => {
             });
         });
 
+        const brPlayersByFee = getBRPlayerCountsByFee();
+
         res.json({
             playersOnline: humansOnline + aiOnline,
             biggestPayout: Number(topBalance.toFixed(2)),
@@ -1028,6 +1039,8 @@ app.get('/api/stats', (req, res) => {
             topBalance: Number(topBalance.toFixed(2)),
             topIsBot,
             solPrice: SOL_PRICE_USD,
+            playersByEntryFee,
+            brPlayersByFee,
         });
     } catch (err) {
         console.error('Error fetching stats:', err);

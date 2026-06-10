@@ -13,10 +13,11 @@ import {
     syncBRSlitherFood,
 } from './slither-engine.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
-import { getBRHouseWallet, isBRWalletConfigured } from './br-wallets.js';
+import { getBRHouseWallet, isBRWalletConfigured, normalizeBREntryFee } from './br-wallets.js';
 
 export const BR = {
-    entryFeeUsd: 5,
+    entryFees: [5, 10],
+    defaultEntryFee: 5,
     minPlayers: 4,
     maxPlayers: 16,
     queueTimeoutMs: 90_000,
@@ -29,10 +30,41 @@ export const BR = {
     agarWorld: 6000,
 };
 
-const queues = { agar: [], slither: [] };
+const queues = new Map();
 const matches = new Map();
 const socketToMatch = new Map();
 const mongoToMatch = new Map();
+
+function queueKey(variant, entryFeeUsd) {
+    return `${variant}:${normalizeBREntryFee(entryFeeUsd)}`;
+}
+
+function getQueue(variant, entryFeeUsd) {
+    const key = queueKey(variant, entryFeeUsd);
+    if (!queues.has(key)) queues.set(key, []);
+    return queues.get(key);
+}
+
+/** Humans in queue + active BR matches, per variant and entry fee (for pre-game stats). */
+export function getBRPlayerCountsByFee() {
+    const result = {
+        agar: { 5: 0, 10: 0 },
+        slither: { 5: 0, 10: 0 },
+    };
+    for (const [key, q] of queues.entries()) {
+        const [variant, feeStr] = key.split(':');
+        const fee = Number(feeStr);
+        if (result[variant]) result[variant][fee] = (result[variant][fee] || 0) + q.length;
+    }
+    for (const room of matches.values()) {
+        if (room.status === 'ended') continue;
+        const fee = normalizeBREntryFee(room.entryFeeUsd);
+        const variant = room.variant;
+        const n = room.players.filter(p => !p.disconnected).length;
+        if (result[variant]) result[variant][fee] = (result[variant][fee] || 0) + n;
+    }
+    return result;
+}
 
 function randId() {
     return Math.random().toString(36).substr(2, 9);
@@ -56,7 +88,7 @@ function initialZoneRadius(variant) {
     return BR.agarWorld * 0.46;
 }
 
-function createMatchRoom(variant, prizePool) {
+function createMatchRoom(variant, prizePool, entryFeeUsd) {
     const { cx, cy } = getZoneCenter(variant);
     const half = variant === 'slither' ? SLITHER.worldHalf : BR.agarWorld / 2;
     const room = {
@@ -73,7 +105,7 @@ function createMatchRoom(variant, prizePool) {
         ejected: [],
         prizePool,
         playerCount: 0,
-        entryFeeUsd: BR.entryFeeUsd,
+        entryFeeUsd: normalizeBREntryFee(entryFeeUsd),
         aiBudgetBalance: 0,
         ownerBalance: 0,
         startTime: Date.now(),
@@ -91,29 +123,37 @@ function createMatchRoom(variant, prizePool) {
 }
 
 function removeFromQueue(socketId) {
-    for (const key of ['agar', 'slither']) {
-        const idx = queues[key].findIndex(e => e.socketId === socketId);
-        if (idx >= 0) queues[key].splice(idx, 1);
-    }
-}
-
-function findQueueEntry(mongoId) {
-    for (const key of ['agar', 'slither']) {
-        const e = queues[key].find(q => q.mongoId === mongoId);
-        if (e) return { variant: key, entry: e };
+    for (const [key, q] of queues.entries()) {
+        const idx = q.findIndex(e => e.socketId === socketId);
+        if (idx >= 0) {
+            q.splice(idx, 1);
+            return key;
+        }
     }
     return null;
 }
 
-function emitQueueStatus(io, variant) {
-    const q = queues[variant];
+function findQueueEntry(mongoId) {
+    for (const [key, q] of queues.entries()) {
+        const e = q.find(x => x.mongoId === mongoId);
+        if (e) {
+            const [variant, feeStr] = key.split(':');
+            return { variant, entryFeeUsd: Number(feeStr), entry: e, key };
+        }
+    }
+    return null;
+}
+
+function emitQueueStatus(io, variant, entryFeeUsd) {
+    const q = getQueue(variant, entryFeeUsd);
     const oldest = q[0]?.joinedAt || Date.now();
+    const fee = normalizeBREntryFee(entryFeeUsd);
     const payload = {
         variant,
+        entryFeeUsd: fee,
         playersInQueue: q.length,
         minPlayers: BR.minPlayers,
         maxPlayers: BR.maxPlayers,
-        entryFeeUsd: BR.entryFeeUsd,
         waitMs: Math.max(0, BR.queueTimeoutMs - (Date.now() - oldest)),
     };
     q.forEach(e => io.to(e.socketId).emit('brQueueStatus', payload));
@@ -240,7 +280,7 @@ async function finishMatch(room, winner, io, deps) {
 
     try {
         const { User, Transaction, DEV_FREE_PLAY, SOL_PRICE_USD, connection, ensureUserDepositWallet } = deps;
-        const brWallet = getBRHouseWallet(room.variant);
+        const brWallet = getBRHouseWallet(room.variant, room.entryFeeUsd);
 
         if (DEV_FREE_PLAY) {
             const user = await User.findById(winner.mongoId);
@@ -440,9 +480,10 @@ function updateZone(room, io) {
     room.players.forEach(p => io.to(p.id).emit('brZoneUpdate', payload));
 }
 
-function startMatch(queuedPlayers, variant, io, deps) {
-    const prizePool = queuedPlayers.length * BR.entryFeeUsd * (1 - BR.houseFeePct);
-    const room = createMatchRoom(variant, prizePool);
+function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
+    const fee = normalizeBREntryFee(entryFeeUsd ?? queuedPlayers[0]?.entryFeeUsd);
+    const prizePool = queuedPlayers.length * fee * (1 - BR.houseFeePct);
+    const room = createMatchRoom(variant, prizePool, fee);
     room.playerCount = queuedPlayers.length;
     matches.set(room.id, room);
 
@@ -505,8 +546,8 @@ function startMatch(queuedPlayers, variant, io, deps) {
     }, BR.countdownMs);
 }
 
-function tryStartMatch(variant, io, deps) {
-    const q = queues[variant];
+function tryStartMatch(variant, entryFeeUsd, io, deps) {
+    const q = getQueue(variant, entryFeeUsd);
     if (q.length < BR.minPlayers) return;
 
     const oldest = q[0]?.joinedAt || Date.now();
@@ -518,25 +559,26 @@ function tryStartMatch(variant, io, deps) {
 
     const take = Math.min(BR.maxPlayers, q.length);
     const batch = q.splice(0, take);
-    startMatch(batch, variant, io, deps);
+    startMatch(batch, variant, entryFeeUsd, io, deps);
 }
 
-async function chargeEntryFee(user, deps, variant) {
+async function chargeEntryFee(user, deps, variant, entryFeeUsd) {
     const { DEV_FREE_PLAY, SOL_PRICE_USD, connection, Transaction } = deps;
-    const entryFeeInSol = BR.entryFeeUsd / SOL_PRICE_USD;
+    const fee = normalizeBREntryFee(entryFeeUsd);
+    const entryFeeInSol = fee / SOL_PRICE_USD;
 
     if (DEV_FREE_PLAY) {
         await Transaction.create({
             userId: user._id,
             type: 'game',
             amount: entryFeeInSol,
-            meta: { event: 'br_join', entryFeeUsd: BR.entryFeeUsd, variant, simulated: true },
+            meta: { event: 'br_join', entryFeeUsd: fee, variant, simulated: true },
             status: 'confirmed',
         });
         return true;
     }
 
-    const brWallet = getBRHouseWallet(variant);
+    const brWallet = getBRHouseWallet(variant, entryFeeUsd);
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const currentLamports = await connection.getBalance(userPubKey);
     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
@@ -559,7 +601,7 @@ async function chargeEntryFee(user, deps, variant) {
         amount: entryFeeInSol,
         meta: {
             event: 'br_join',
-            entryFeeUsd: BR.entryFeeUsd,
+            entryFeeUsd: fee,
             variant,
             brHouseWallet: brWallet.address,
         },
@@ -638,12 +680,13 @@ export function findBRPlayerByMongo(mongoId) {
 
 export function setupBattleRoyale(io, deps) {
     io.on('connection', (socket) => {
-        socket.on('brJoinQueue', async ({ variant, token, username }) => {
+        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee }) => {
             try {
                 if (variant !== 'agar' && variant !== 'slither') {
                     socket.emit('error', 'Invalid battle royale variant.');
                     return;
                 }
+                const entryFeeUsd = normalizeBREntryFee(rawEntryFee);
                 const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
@@ -656,42 +699,49 @@ export function setupBattleRoyale(io, deps) {
                     socket.emit('error', 'Already in queue.');
                     return;
                 }
-                const inNormal = deps.rooms[0].players.find(p => p.mongoId?.toString() === user._id.toString());
-                if (inNormal) {
-                    socket.emit('error', 'Leave the normal arena before joining battle royale.');
+                for (const room of deps.rooms) {
+                    const inNormal = room.players.find(p => p.mongoId?.toString() === user._id.toString());
+                    if (inNormal) {
+                        socket.emit('error', 'Leave the normal arena before joining battle royale.');
+                        return;
+                    }
+                }
+
+                if (!deps.DEV_FREE_PLAY && !isBRWalletConfigured(variant, entryFeeUsd)) {
+                    socket.emit('error', `Battle Royale (${variant} $${entryFeeUsd}) is not configured yet. Contact support.`);
                     return;
                 }
 
-                if (!DEV_FREE_PLAY && !isBRWalletConfigured(variant)) {
-                    socket.emit('error', `Battle Royale (${variant}) is not configured yet. Contact support.`);
-                    return;
-                }
-
-                const paid = await chargeEntryFee(user, deps, variant);
+                const paid = await chargeEntryFee(user, deps, variant, entryFeeUsd);
                 if (!paid) {
-                    socket.emit('error', `Insufficient balance for $${BR.entryFeeUsd} BR entry.`);
+                    socket.emit('error', `Insufficient balance for $${entryFeeUsd} BR entry.`);
                     return;
                 }
 
                 removeFromQueue(socket.id);
-                queues[variant].push({
+                getQueue(variant, entryFeeUsd).push({
                     socketId: socket.id,
                     mongoId: user._id.toString(),
                     username: username || user.username,
+                    entryFeeUsd,
                     joinedAt: Date.now(),
                     socket,
                 });
                 socket.brQueueVariant = variant;
-                emitQueueStatus(io, variant);
-                tryStartMatch(variant, io, deps);
+                socket.brQueueEntryFee = entryFeeUsd;
+                emitQueueStatus(io, variant, entryFeeUsd);
+                tryStartMatch(variant, entryFeeUsd, io, deps);
             } catch (err) {
                 socket.emit('error', 'Failed to join battle royale queue.');
             }
         });
 
         socket.on('brLeaveQueue', () => {
-            removeFromQueue(socket.id);
-            if (socket.brQueueVariant) emitQueueStatus(io, socket.brQueueVariant);
+            const key = removeFromQueue(socket.id);
+            if (key) {
+                const [variant, feeStr] = key.split(':');
+                emitQueueStatus(io, variant, Number(feeStr));
+            }
         });
 
         socket.on('brRejoinMatch', async ({ token }) => {
@@ -737,7 +787,11 @@ export function setupBattleRoyale(io, deps) {
         });
 
         socket.on('disconnect', () => {
-            removeFromQueue(socket.id);
+            const key = removeFromQueue(socket.id);
+            if (key) {
+                const [variant, feeStr] = key.split(':');
+                emitQueueStatus(io, variant, Number(feeStr));
+            }
             const matchId = socketToMatch.get(socket.id);
             if (!matchId) return;
             const room = matches.get(matchId);
