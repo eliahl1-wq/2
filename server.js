@@ -1712,7 +1712,15 @@ function processRoom(room) {
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
 
     // Agar food spawn (funded from shared foodPoolBalance)
-    const agarFoodTarget = Math.min(agarHumans * 250.0, room.foodPoolBalance);
+    const totalModeHumans = agarHumans + slitherHumans;
+    const agarFoodBudget = totalModeHumans > 0
+        ? room.foodPoolBalance * (agarHumans / totalModeHumans)
+        : room.foodPoolBalance;
+    const slitherFoodBudget = totalModeHumans > 0
+        ? room.foodPoolBalance * (slitherHumans / totalModeHumans)
+        : room.foodPoolBalance;
+
+    const agarFoodTarget = Math.min(agarHumans * 250.0, agarFoodBudget);
     const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
     if (room.food.length < agarTargetFoodCount) {
         addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
@@ -1720,7 +1728,7 @@ function processRoom(room) {
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
     // Slither server-side physics tick
-    const slitherLeaderboard = processSlitherRoom(room, io, User, c.foodBlobValue);
+    const slitherLeaderboard = processSlitherRoom(room, io, User, c.foodBlobValue, slitherFoodBudget);
 
     const slitherMeta = {
         resetTime: room.startTime + c.roomDuration,

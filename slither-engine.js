@@ -23,6 +23,14 @@ const BOT_NAMES = [
     'Wojak', 'Pepe', 'Doge', 'Viper', 'Cobra', 'Python', 'Anaconda',
 ];
 
+// Agar arena is 18000×18000 — scale food count so Slither has the same visual density
+const AGAR_WORLD_SIDE = 18000;
+
+function slitherFoodDensityScale() {
+    const slitherSide = SLITHER.worldHalf * 2;
+    return (slitherSide * slitherSide) / (AGAR_WORLD_SIDE * AGAR_WORLD_SIDE);
+}
+
 function randId() {
     return Math.random().toString(36).substr(2, 9);
 }
@@ -146,6 +154,10 @@ function normalizeSnakeInput(snake) {
     if (dx === 0 && dy === 0) {
         dx = Math.cos(snake.angle || 0);
         dy = Math.sin(snake.angle || 0);
+    } else {
+        const mag = Math.hypot(dx, dy) || 1;
+        dx /= mag;
+        dy /= mag;
     }
     return { dx, dy };
 }
@@ -167,11 +179,13 @@ function updateSnakeMovement(snake) {
     for (let i = 1; i < snake.segments.length; i++) {
         const prev = snake.segments[i - 1];
         const cur = snake.segments[i];
-        const d = dist(prev.x, prev.y, cur.x, cur.y);
+        const segDx = cur.x - prev.x;
+        const segDy = cur.y - prev.y;
+        const d = Math.hypot(segDx, segDy);
         if (d > SLITHER.segmentSpacing) {
-            const t = 0.45;
-            cur.x += (prev.x - cur.x) * t;
-            cur.y += (prev.y - cur.y) * t;
+            const ratio = SLITHER.segmentSpacing / d;
+            cur.x = prev.x + segDx * ratio;
+            cur.y = prev.y + segDy * ratio;
         }
     }
 
@@ -321,7 +335,7 @@ function serializeSnake(snake, isYou) {
         color: snake.color,
         isBot: !!snake.isBot,
         isYou,
-        segments: snake.segments.map(s => ({ x: Math.round(s.x), y: Math.round(s.y) })),
+        segments: snake.segments.map(s => ({ x: s.x, y: s.y })),
         angle: snake.angle || 0,
     };
 }
@@ -333,9 +347,13 @@ function isInView(cx, cy, x, y, range) {
 /**
  * Run one slither physics tick. Returns leaderboard entries for slither mode.
  */
-export function processSlitherRoom(room, io, User, foodBlobValue) {
+export function processSlitherRoom(room, io, User, foodBlobValue, foodBudget = null) {
     const slitherHumans = room.players.filter(p => !p.disconnected && p.mode === 'slither');
     const humanCount = slitherHumans.length;
+
+    if (humanCount === 0) {
+        room.slitherFood.length = 0;
+    }
 
     const targetBots = getSlitherTargetBots(humanCount);
     if (room.slitherBots.length < targetBots) {
@@ -344,10 +362,14 @@ export function processSlitherRoom(room, io, User, foodBlobValue) {
         room.slitherBots.splice(0, room.slitherBots.length - targetBots);
     }
 
-    const foodValueTarget = Math.min(humanCount * 250.0, room.foodPoolBalance);
+    const densityScale = slitherFoodDensityScale();
+    const budget = foodBudget ?? room.foodPoolBalance;
+    const foodValueTarget = Math.min(humanCount * 250.0 * densityScale, budget);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
     if (room.slitherFood.length < targetFoodCount) {
         addSlitherFood(room, Math.min(50, targetFoodCount - room.slitherFood.length), foodBlobValue);
+    } else if (room.slitherFood.length > targetFoodCount) {
+        room.slitherFood.splice(targetFoodCount);
     }
 
     const allSnakes = getAllSlitherSnakes(room);
