@@ -270,14 +270,15 @@ async function performRoomReset(room) {
     }
 }
 
+// In-memory lock for scanDeposits to prevent concurrent runs
+let isScanningDeposits = false;
+
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
     if (isScanningDeposits) return;
     isScanningDeposits = true;
     try {
-        // SOL_PRICE_USD is handled by the central updateSolPrice scanner.
-
-        // 2. Hitta alla användare som har en insättningsadress
+        // Hitta alla användare som har en insättningsadress
         const users = await User.find({ depositAddress: { $exists: true } });
 
         for (const user of users) {
@@ -365,9 +366,6 @@ async function scanDeposits() {
         isScanningDeposits = false;
     }
 }
-
-// In-memory lock for scanDeposits to prevent concurrent runs
-let isScanningDeposits = false;
 
 // Starta scannern var 15:e sekund
 setInterval(async () => {
@@ -466,26 +464,13 @@ app.get('/api/me', authenticateToken, async (req, res) => {
                 const lamports = await connection.getBalance(pubKey);
                 solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-                // AUTOMATIC RECONCILE: Scan for missed transactions before returning balance
-                const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 3 });
-                for (const sigInfo of signatures) {
-                    const existingTx = await Transaction.findOne({ "meta.signature": sigInfo.signature });
-                    if (existingTx) continue;
-
-                    // New uncredited transaction found!
-                    const txDetails = await connection.getTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 });
-                    if (!txDetails || txDetails.meta?.err) continue;
-
-                    const accountIndex = txDetails.transaction.message.staticAccountKeys.findIndex(k => k.equals(pubKey));
-                    if (accountIndex !== -1) {
-                        const change = (txDetails.meta.postBalances[accountIndex] - txDetails.meta.preBalances[accountIndex]) / solanaWeb3.LAMPORTS_PER_SOL;
-                        if (change > 0) {
-                            console.log(`[SYNC-ME] Found uncredited ${change} SOL for ${user.username}. Updating...`);
-                            user.balance += change;
-                            await user.save();
-                            await Transaction.create({ userId: user._id, type: 'deposit', amount: change, currency: 'SOL', meta: { signature: sigInfo.signature, automated: true }, status: 'confirmed' });
-                        }
-                    }
+                // AUTOMATIC RECONCILE: Om saldot på kedjan är högre än i DB (t.ex. vid manuell reset till 0),
+                // synka DB direkt så att användaren ser sina pengar omedelbart.
+                if (solOnChain > user.balance + 0.0001) {
+                    const recovered = solOnChain - user.balance;
+                    console.log(`[SYNC] Recovered ${recovered.toFixed(4)} SOL for ${user.username} from on-chain balance.`);
+                    user.balance = solOnChain;
+                    await user.save();
                 }
             } catch (e) { console.error("Sync error in /api/me:", e.message); }
         }
@@ -1608,6 +1593,214 @@ function processRoom(room) {
             solPrice: SOL_PRICE_USD
         });
     });
+}
+
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+// Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
+const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
+const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
+if (room.food.length < targetFoodCount) {
+    addFood(room, Math.min(20, targetFoodCount - room.food.length)); // Lägg till max 20 matbitar åt gången
+}
+if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+
+// Skicka leaderboard separat för prestanda (Inkludera bottar)
+const leaderboardData = allUsers
+    .map(p => ({ id: p.id, name: p.username, massTotal: p.balance, balance: p.balance }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
+
+room.players.forEach(p => {
+    io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
+
+    // OPTIMERING: Spatial Filtering. Skicka bara det som syns (plus buffert)
+    const rangeX = (p.screenWidth || 1920) / 2 + 500;
+    const rangeY = (p.screenHeight || 1080) / 2 + 500;
+    const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
+    const visibleItems = room.qt.query(viewRange);
+
+    const visibleFood = [];
+    const visibleViruses = [];
+    const visibleEjected = [];
+    const visibleUsersSet = new Set();
+    visibleUsersSet.add(p);
+    visibleItems.forEach(item => {
+        if (item.type === 'food') visibleFood.push(item.data);
+        else if (item.type === 'virus') visibleViruses.push(item.data);
+        else if (item.type === 'ejected') visibleEjected.push(item.data);
+        else if (item.type === 'player' || item.type === 'bot') {
+            const id = item.socketId || item.botId;
+            const found = userMap.get(id);
+            if (found) visibleUsersSet.add(found);
+        }
+    });
+    io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
+        unlocked: rewardsUnlocked,
+        unlockTime: room.startTime + c.rewardUnlockDelay,
+        playerCount: room.players.length,
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD
+    });
+});
+}
+
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+// Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
+const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
+const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
+if (room.food.length < targetFoodCount) {
+    addFood(room, Math.min(20, targetFoodCount - room.food.length)); // Lägg till max 20 matbitar åt gången
+}
+if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+
+// Skicka leaderboard separat för prestanda (Inkludera bottar)
+const leaderboardData = allUsers
+    .map(p => ({ id: p.id, name: p.username, massTotal: p.balance, balance: p.balance }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
+
+room.players.forEach(p => {
+    io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
+
+    // OPTIMERING: Spatial Filtering. Skicka bara det som syns (plus buffert)
+    const rangeX = (p.screenWidth || 1920) / 2 + 500;
+    const rangeY = (p.screenHeight || 1080) / 2 + 500;
+    const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
+    const visibleItems = room.qt.query(viewRange);
+
+    const visibleFood = [];
+    const visibleViruses = [];
+    const visibleEjected = [];
+    const visibleUsersSet = new Set();
+    visibleUsersSet.add(p);
+    visibleItems.forEach(item => {
+        if (item.type === 'food') visibleFood.push(item.data);
+        else if (item.type === 'virus') visibleViruses.push(item.data);
+        else if (item.type === 'ejected') visibleEjected.push(item.data);
+        else if (item.type === 'player' || item.type === 'bot') {
+            const id = item.socketId || item.botId;
+            const found = userMap.get(id);
+            if (found) visibleUsersSet.add(found);
+        }
+    });
+    io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
+        unlocked: rewardsUnlocked,
+        unlockTime: room.startTime + c.rewardUnlockDelay,
+        playerCount: room.players.length,
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD
+    });
+});
+}
+
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+// Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
+const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
+const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
+if (room.food.length < targetFoodCount) {
+    addFood(room, Math.min(20, targetFoodCount - room.food.length)); // Lägg till max 20 matbitar åt gången
+}
+if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+
+// Skicka leaderboard separat för prestanda (Inkludera bottar)
+const leaderboardData = allUsers
+    .map(p => ({ id: p.id, name: p.username, massTotal: p.balance, balance: p.balance }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
+
+room.players.forEach(p => {
+    io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
+
+    // OPTIMERING: Spatial Filtering. Skicka bara det som syns (plus buffert)
+    const rangeX = (p.screenWidth || 1920) / 2 + 500;
+    const rangeY = (p.screenHeight || 1080) / 2 + 500;
+    const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
+    const visibleItems = room.qt.query(viewRange);
+
+    const visibleFood = [];
+    const visibleViruses = [];
+    const visibleEjected = [];
+    const visibleUsersSet = new Set();
+    visibleUsersSet.add(p);
+    visibleItems.forEach(item => {
+        if (item.type === 'food') visibleFood.push(item.data);
+        else if (item.type === 'virus') visibleViruses.push(item.data);
+        else if (item.type === 'ejected') visibleEjected.push(item.data);
+        else if (item.type === 'player' || item.type === 'bot') {
+            const id = item.socketId || item.botId;
+            const found = userMap.get(id);
+            if (found) visibleUsersSet.add(found);
+        }
+    });
+    io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
+        unlocked: rewardsUnlocked,
+        unlockTime: room.startTime + c.rewardUnlockDelay,
+        playerCount: room.players.length,
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD
+    });
+});
+}
+
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+// Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
+const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
+const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
+if (room.food.length < targetFoodCount) {
+    addFood(room, Math.min(20, targetFoodCount - room.food.length)); // Lägg till max 20 matbitar åt gången
+}
+if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+
+// Skicka leaderboard separat för prestanda (Inkludera bottar)
+const leaderboardData = allUsers
+    .map(p => ({ id: p.id, name: p.username, massTotal: p.balance, balance: p.balance }))
+    .sort((a, b) => b.balance - a.balance)
+    .slice(0, 10);
+
+const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
+
+room.players.forEach(p => {
+    io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
+
+    // OPTIMERING: Spatial Filtering. Skicka bara det som syns (plus buffert)
+    const rangeX = (p.screenWidth || 1920) / 2 + 500;
+    const rangeY = (p.screenHeight || 1080) / 2 + 500;
+    const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
+    const visibleItems = room.qt.query(viewRange);
+
+    const visibleFood = [];
+    const visibleViruses = [];
+    const visibleEjected = [];
+    const visibleUsersSet = new Set();
+    visibleUsersSet.add(p);
+    visibleItems.forEach(item => {
+        if (item.type === 'food') visibleFood.push(item.data);
+        else if (item.type === 'virus') visibleViruses.push(item.data);
+        else if (item.type === 'ejected') visibleEjected.push(item.data);
+        else if (item.type === 'player' || item.type === 'bot') {
+            const id = item.socketId || item.botId;
+            const found = userMap.get(id);
+            if (found) visibleUsersSet.add(found);
+        }
+    });
+    io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
+        unlocked: rewardsUnlocked,
+        unlockTime: room.startTime + c.rewardUnlockDelay,
+        playerCount: room.players.length,
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD
+    });
+});
 }
 
 const PORT = process.env.PORT || 5000;
