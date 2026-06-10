@@ -122,8 +122,8 @@ const c = {
     botMaxBalance: 500.0,
     sizeMult: 18,
     growthBoost: 2,
-    foodValuePerPlayer: 7.0,
-    foodBlobValue: 0.02,
+    foodValuePerPlayer: 6.0,
+    foodBlobValue: 0.01,
     rewardUnlockDelay: 10 * 60 * 1000,
     roomDuration: 3 * 60 * 60 * 1000,
 };
@@ -853,8 +853,8 @@ function addBots(room, n) {
 rooms.forEach(room => {
     addViruses(room, c.virusCount);
     // Seed a small initial food + bot budget so the arena isn't empty on first join
-    room.aiBudgetBalance = 15.0;  // enough for 15 starter bots
-    room.foodPoolBalance = 35.0;  // initial food blobs
+    room.aiBudgetBalance = 20.0;  // enough for 20 starter bots
+    room.foodPoolBalance = 250.0; // Mycket mer mat från start
 });
 
 function getBestRoom() {
@@ -865,8 +865,8 @@ function getBestRoom() {
 
 // Helper för att beräkna radie med extra tillväxt-effekt
 function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
-    // Konvertera SOL-balans till USD för att få rätt visuell storlek (utgår från $1.00 som bas)
-    const balanceInUsd = cellBalance * SOL_PRICE_USD;
+    // Spelet körs nu i USD-enheter internt
+    const balanceInUsd = cellBalance;
     const startUsdPerCell = c.playerStartBalance / cellCount;
     const extraUsd = Math.max(0, balanceInUsd - startUsdPerCell);
     const visualMass = balanceInUsd + (extraUsd * (c.growthBoost - 1));
@@ -973,13 +973,13 @@ io.on('connection', (socket) => {
             const spawnX = Math.random() * c.worldWidth;
             const spawnY = Math.random() * c.worldHeight;
 
-            const startBalanceInSol = 1.0 / SOL_PRICE_USD; // Starta med massa värd exakt $1.00
+            const startBalanceUsd = 1.0; // Starta med massa värd exakt $1.00 USD
             const newPlayer = {
                 id: socket.id,
                 mongoId: user._id,
                 username: username || user.username,
                 kills: 0,
-                balance: startBalanceInSol,
+                balance: startBalanceUsd,
                 startTime: Date.now(),
                 color: util.randomColor(),
                 x: c.worldWidth / 2,
@@ -992,8 +992,8 @@ io.on('connection', (socket) => {
                     id: Math.random().toString(36).substr(2, 9),
                     x: spawnX,
                     y: spawnY,
-                    balance: startBalanceInSol,
-                    radius: calculateCellRadius(startBalanceInSol, startBalanceInSol, 1),
+                    balance: startBalanceUsd,
+                    radius: calculateCellRadius(startBalanceUsd, startBalanceUsd, 1),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
@@ -1110,7 +1110,7 @@ io.on('connection', (socket) => {
                 }
 
                 // 1. RAW SOL: Game balance is already in SOL units (cryptomass)
-                const solToWithdraw = totalCashout;
+                const solToWithdraw = totalCashout / SOL_PRICE_USD; // Konvertera USD-massa till SOL för utbetalning
                 const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
 
                 // Pre-flight liquidity check
@@ -1481,10 +1481,10 @@ function processRoom(room) {
 
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
     // Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
-    const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
+    const foodValueTarget = Math.min(room.players.length * 250.0, room.foodPoolBalance); // Ökat för bättre densitet
     const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
     if (room.food.length < targetFoodCount) {
-        addFood(room, Math.min(20, targetFoodCount - room.food.length)); // Lägg till max 20 matbitar åt gången
+        addFood(room, Math.min(50, targetFoodCount - room.food.length)); // Lägg till fler åt gången
     }
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
@@ -1496,10 +1496,17 @@ function processRoom(room) {
 
     const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
 
-    room.players.forEach(p => {
-        io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
+    // Skapa en kopia för leaderboard med USD-värden
+    const visualLeaderboard = leaderboardData.map(entry => ({
+        ...entry,
+        massTotal: Number(entry.massTotal).toFixed(2),
+        balance: Number(entry.balance).toFixed(2)
+    }));
 
-        // OPTIMERING: Spatial Filtering. Skicka bara det som syns (plus buffert)
+    room.players.forEach(p => {
+        io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
+
+        // OPTIMERING: Spatial Filtering.
         const rangeX = (p.screenWidth || 1920) / 2 + 500;
         const rangeY = (p.screenHeight || 1080) / 2 + 500;
         const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
