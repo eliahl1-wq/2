@@ -452,10 +452,30 @@ const authenticateToken = (req, res, next) => {
 
 app.get('/api/me', authenticateToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user.id).select('-password -depositSecret');
+        const user = await User.findById(req.user.id);
         if (!user) return res.status(404).json({ message: "Användare hittades ej" });
 
+        // AUTOMATISK SYNC: Kolla om det ligger SOL på insättningsadressen som inte krediterats i DB
+        if (user.depositAddress) {
+            try {
+                const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                const lamports = await connection.getBalance(pubKey);
+                const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+
+                // Om det finns pengar på adressen (mer än 0.0005 för att täcka damm/fees), 
+                // lägg till dem i DB-balansen direkt.
+                if (solOnChain > 0.0005) {
+                    console.log(`[SYNC] Hittade ${solOnChain.toFixed(4)} okrediterad SOL för ${user.username}. Uppdaterar DB...`);
+                    user.balance += solOnChain;
+                    await user.save();
+                }
+            } catch (e) { console.error("Sync error in /api/me:", e.message); }
+        }
+
         const userObj = user.toObject();
+        delete userObj.password;
+        delete userObj.depositSecret;
+
         // Map the internal raw SOL balance to what the frontend expects
         userObj.balanceSol = user.balance;
         userObj.balanceUsd = user.balance * SOL_PRICE_USD;
@@ -928,16 +948,12 @@ function getBestRoom() {
 
 // Helper för att beräkna radie med extra tillväxt-effekt
 function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
-    // c.playerStartBalance är i USD. cellBalance är i SOL.
-    // För att få en konsekvent visuell storlek baserad på USD-värde:
-    const playerStartBalanceUsd = c.playerStartBalance; // $1.00
-    const startBalancePerCellUsd = playerStartBalanceUsd / cellCount;
-
-    const cellBalanceUsd = cellBalance * SOL_PRICE_USD;
-    const extraBalanceUsd = Math.max(0, cellBalanceUsd - startBalancePerCellUsd);
-
-    const visualMassUsd = cellBalanceUsd + (extraBalanceUsd * (c.growthBoost - 1));
-    return util.massToRadius(visualMassUsd * c.sizeMult); // c.sizeMult är en skalningsfaktor
+    // Konvertera SOL-balans till USD för att få rätt visuell storlek (utgår från $1.00 som bas)
+    const balanceInUsd = cellBalance * SOL_PRICE_USD;
+    const startUsdPerCell = c.playerStartBalance / cellCount;
+    const extraUsd = Math.max(0, balanceInUsd - startUsdPerCell);
+    const visualMass = balanceInUsd + (extraUsd * (c.growthBoost - 1));
+    return util.massToRadius(visualMass * c.sizeMult);
 }
 
 io.on('connection', (socket) => {
@@ -1526,8 +1542,8 @@ function processRoom(room) {
     });
 
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
-    // Kontinuerlig mat-spawn: Food must come from the food pool and never be generated from nothing.
-    const foodValueTarget = Math.min(room.players.length * c.foodValuePerPlayer, room.foodPoolBalance);
+    // Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
+    const foodValueTarget = Math.min(room.players.length * 50.0, room.foodPoolBalance);
     const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
     if (room.food.length < targetFoodCount) {
         addFood(room, Math.min(5, targetFoodCount - room.food.length));
