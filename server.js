@@ -928,12 +928,16 @@ function getBestRoom() {
 
 // Helper för att beräkna radie med extra tillväxt-effekt
 function calculateCellRadius(cellBalance, playerTotalBalance, cellCount) {
-    // Vi utgår från att $1.00 (eller $1/antal celler) är baslinjen.
-    // Allt över det multipliceras med growthBoost för att man ska se större ut snabbare.
-    const startBalancePerCell = c.playerStartBalance / cellCount;
-    const extraBalance = Math.max(0, cellBalance - startBalancePerCell);
-    const visualMass = cellBalance + (extraBalance * (c.growthBoost - 1));
-    return util.massToRadius(visualMass * c.sizeMult);
+    // c.playerStartBalance är i USD. cellBalance är i SOL.
+    // För att få en konsekvent visuell storlek baserad på USD-värde:
+    const playerStartBalanceUsd = c.playerStartBalance; // $1.00
+    const startBalancePerCellUsd = playerStartBalanceUsd / cellCount;
+
+    const cellBalanceUsd = cellBalance * SOL_PRICE_USD;
+    const extraBalanceUsd = Math.max(0, cellBalanceUsd - startBalancePerCellUsd);
+
+    const visualMassUsd = cellBalanceUsd + (extraBalanceUsd * (c.growthBoost - 1));
+    return util.massToRadius(visualMassUsd * c.sizeMult); // c.sizeMult är en skalningsfaktor
 }
 
 io.on('connection', (socket) => {
