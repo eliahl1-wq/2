@@ -64,7 +64,9 @@ const allowedOrigins = [
     "http://127.0.0.1:5173",
     "https://www.agararena.space",
     "https://agararena.space",
-    "https://2-production-9e74.up.railway.app"
+    "https://2-production-9e74.up.railway.app",
+    /\.up\.railway\.app$/,
+    /\.agararena\.space$/
 ];
 
 app.use(cors({
@@ -784,12 +786,14 @@ app.get('/api/stats', (req, res) => {
         const playersOnline = rooms.reduce((sum, room) => sum + room.players.length, 0);
         let biggestPayout = 0;
         let topPlayer = null;
+        let topBalance = 0;
 
         rooms.forEach(room => {
             room.players.forEach(player => {
                 if ((player.balance || 0) > biggestPayout) {
                     biggestPayout = player.balance;
                     topPlayer = player.username;
+                    topBalance = player.balance;
                 }
             });
         });
@@ -799,6 +803,7 @@ app.get('/api/stats', (req, res) => {
             playersOnline,
             biggestPayout: Number(biggestPayoutUSD.toFixed(2)),
             topPlayer,
+            topBalance: Number((topBalance * SOL_PRICE_USD).toFixed(2)),
             solPrice: SOL_PRICE_USD
         });
     } catch (err) {
@@ -910,7 +915,9 @@ function addBots(room, n) {
 // Initiera alla rum
 rooms.forEach(room => {
     addViruses(room, c.virusCount);
-    room.aiBudgetBalance = 0; 
+    // Seed a small initial food + bot budget so the arena isn't empty on first join
+    room.aiBudgetBalance = 15.0;  // enough for 15 starter bots
+    room.foodPoolBalance = 35.0;  // initial food blobs
 });
 
 function getBestRoom() {
