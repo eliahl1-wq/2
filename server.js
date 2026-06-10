@@ -82,9 +82,9 @@ const UserSchema = new mongoose.Schema({
     googleId: { type: String, unique: true, sparse: true },
     password: { type: String, required: true },
     balance: { type: Number, default: 0 }, // Tracked in raw SOL
-    walletAddress: { type: String }, 
-    depositAddress: { type: String }, 
-    depositSecret: { type: String },  
+    walletAddress: { type: String },
+    depositAddress: { type: String },
+    depositSecret: { type: String },
     playtime: { type: Number, default: 0 }
 });
 
@@ -96,7 +96,7 @@ const TransactionSchema = new mongoose.Schema({
     amount: { type: Number, required: true },
     currency: { type: String, default: 'USD' },
     meta: { type: Object, default: {} },
-    status: { type: String, enum: ['pending','confirmed','failed'], default: 'confirmed' },
+    status: { type: String, enum: ['pending', 'confirmed', 'failed'], default: 'confirmed' },
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -168,7 +168,7 @@ async function performRoomReset(room) {
                 if (user && user.depositAddress && HOUSE_WALLET_SECRET) {
                     const solToTransfer = p.balance; // Balance is already in SOL units
                     const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
-                    
+
                     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
                         Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
                     );
@@ -183,15 +183,15 @@ async function performRoomReset(room) {
 
                     user.playtime += (Date.now() - p.startTime);
                     await user.save();
-                    
-                    await Transaction.create({ 
-                        userId: user._id, 
-                        type: 'withdraw', 
+
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'withdraw',
                         amount: p.balance,
                         currency: 'SOL',
-                        meta: { signature: sig, reason: 'Auto Room Reset to Account Address', roomId: room.id } 
+                        meta: { signature: sig, reason: 'Auto Room Reset to Account Address', roomId: room.id }
                     });
-                    
+
                     io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: sig });
                 }
             } catch (err) {
@@ -206,7 +206,7 @@ async function performRoomReset(room) {
                 const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                 // Step 1: Fetch exact, real-time Lamports balance from the blockchain
                 const totalLamports = await connection.getBalance(housePubKey);
-                
+
                 // Step 2 & 3: Reserve exactly 0.005 SOL buffer for gas fees
                 const bufferLamports = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
                 const sweepLamports = totalLamports - bufferLamports;
@@ -224,14 +224,14 @@ async function performRoomReset(room) {
                     );
                     // Step 4: Transfer 100% of remaining SOL directly to OWNER_VAULT_ADDRESS
                     const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
-                    
-                    await Transaction.create({ 
-                        type: 'withdraw', 
-                        amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, 
-                        meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' } 
+
+                    await Transaction.create({
+                        type: 'withdraw',
+                        amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+                        meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' }
                     });
                     console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
-                    
+
                     // Step 6: Reset allocation balances only after successful initiation
                     room.foodPoolBalance = 0;
                     room.aiBudgetBalance = 0;
@@ -282,7 +282,7 @@ async function scanDeposits() {
 
         // 2. Hitta alla användare som har en insättningsadress
         const users = await User.find({ depositAddress: { $exists: true } });
-        
+
         for (const user of users) {
             const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
             // Hämta de senaste 5 transaktionerna för denna adress
@@ -322,12 +322,12 @@ async function scanDeposits() {
                             const fromKeypair = solanaWeb3.Keypair.fromSecretKey(
                                 Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
                             );
-                            
+
                             // Vi lämnar en liten mängd (t.ex. 0.001 SOL) för att täcka framtida transaktionsavgifter 
                             // eller så skickar vi allt minus avgiften för denna transaktion.
                             const balance = await connection.getBalance(pubKey);
                             const fee = 5000; // Standardavgift på Solana (lamports)
-                            
+
                             if (balance > fee) {
                                 const sweepTx = new solanaWeb3.Transaction().add(
                                     solanaWeb3.SystemProgram.transfer({
@@ -371,7 +371,7 @@ async function scanDeposits() {
 setInterval(scanDeposits, 15000);
 
 const httpServer = createServer(app);
-const io = new Server(httpServer, { 
+const io = new Server(httpServer, {
     cors: {
         origin: allowedOrigins,
         methods: ["GET", "POST"],
@@ -389,36 +389,36 @@ passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID || "DIN_GOOGLE_CLIENT_ID",
     clientSecret: process.env.GOOGLE_CLIENT_SECRET || "DIN_GOOGLE_CLIENT_SECRET",
     callbackURL: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`
-  },
-  async (accessToken, refreshToken, profile, done) => {
-    try {
-        const profileEmail = profile.emails && profile.emails.length > 0 ? profile.emails[0].value : null;
-        let user = await User.findOne({ $or: [{ googleId: profile.id }, { email: profileEmail }].filter(q => q.email || q.googleId) });
-        
-        if (!user) {
-            // Skapa ny användare om den inte finns
-            const keypair = solanaWeb3.Keypair.generate();
-            user = new User({
-                googleId: profile.id,
-                username: (profile.displayName || 'Gladiator').replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
-                email: profileEmail,
-                password: await bcrypt.hash(Math.random().toString(36), 10), // Random lösenord för Google-användare
-                depositAddress: keypair.publicKey.toBase58(),
-                depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
-            });
-            await user.save();
+},
+    async (accessToken, refreshToken, profile, done) => {
+        try {
+            const profileEmail = profile.emails && profile.emails.length > 0 ? profile.emails[0].value : null;
+            let user = await User.findOne({ $or: [{ googleId: profile.id }, { email: profileEmail }].filter(q => q.email || q.googleId) });
+
+            if (!user) {
+                // Skapa ny användare om den inte finns
+                const keypair = solanaWeb3.Keypair.generate();
+                user = new User({
+                    googleId: profile.id,
+                    username: (profile.displayName || 'Gladiator').replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
+                    email: profileEmail,
+                    password: await bcrypt.hash(Math.random().toString(36), 10), // Random lösenord för Google-användare
+                    depositAddress: keypair.publicKey.toBase58(),
+                    depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
+                });
+                await user.save();
+            }
+            return done(null, user);
+        } catch (err) {
+            return done(err, null);
         }
-        return done(null, user);
-    } catch (err) {
-        return done(err, null);
     }
-  }
 ));
 
 // Google Auth Routes
 app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
-app.get('/api/auth/google/callback', 
+app.get('/api/auth/google/callback',
     passport.authenticate('google', { session: false, failureRedirect: '/login' }),
     (req, res) => {
         const secret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
@@ -439,10 +439,10 @@ const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.sendStatus(401);
-    
+
     // Använd en fallback hemlighet om JWT_SECRET inte är satt (endast för utveckling)
     const jwtSecret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
-    
+
     jwt.verify(token, jwtSecret, (err, user) => {
         if (err) return res.sendStatus(403);
         req.user = user;
@@ -457,7 +457,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
 
         const userObj = user.toObject();
         // Map the internal raw SOL balance to what the frontend expects
-        userObj.balanceSol = user.balance; 
+        userObj.balanceSol = user.balance;
         userObj.balanceUsd = user.balance * SOL_PRICE_USD;
         userObj.solPrice = SOL_PRICE_USD;
 
@@ -495,11 +495,11 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
 // --- NYTT: UTTAG (WITHDRAW) ---
 app.post('/api/withdraw', authenticateToken, async (req, res) => {
     const { amountUSD, destinationAddress } = req.body;
-    
+
     try {
         const user = await User.findById(req.user.id);
         // Calculate SOL amount to deduct (balance is already in SOL)
-        const solToWithdraw = amountUSD / SOL_PRICE_USD; 
+        const solToWithdraw = amountUSD / SOL_PRICE_USD;
 
         if (!user || user.balance < solToWithdraw || amountUSD < 1) {
             return res.status(400).json({ message: "Insufficient balance or invalid amount" });
@@ -563,13 +563,13 @@ app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
     try {
         const user = await User.findById(req.user.id);
         if (!user) return res.status(404).json({ message: "Användare hittades ej" });
-        
+
         user.balance += solAmount; // TRACK RAW SOL
         await user.save();
-        
+
         const tx = new Transaction({ userId: user._id, type: 'deposit', amount: solAmount, meta: { signature, solAmount } });
         await tx.save();
-        
+
         res.json({ success: true, balance: user.balance });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -621,13 +621,13 @@ app.post('/api/entry-pay', authenticateToken, async (req, res) => {
         user.balance += solReceived;
         await user.save();
 
-        await Transaction.create({ 
-            userId: user._id, 
-            type: 'deposit', 
-            amount: solReceived, 
+        await Transaction.create({
+            userId: user._id,
+            type: 'deposit',
+            amount: solReceived,
             currency: 'SOL',
-            meta: { signature, solAmount: solReceived, entryFor: 'arena-entry' }, 
-            status: 'confirmed' 
+            meta: { signature, solAmount: solReceived, entryFor: 'arena-entry' },
+            status: 'confirmed'
         });
 
         res.json({ success: true, solReceived });
@@ -647,7 +647,7 @@ app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) =>
         if (!user) return res.status(404).send("User not found");
         user.balance = balance;
         await user.save();
-        
+
         // Also update if they are active in-game
         const p = rooms[0].players.find(pl => pl.mongoId.toString() === userId);
         if (p) {
@@ -680,17 +680,17 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
     try {
         const p = rooms[0].players.find(pl => pl.mongoId.toString() === userId);
         if (!p) return res.status(404).send("Player not in arena");
-        
+
         const amount = p.balance;
         const user = await User.findById(userId);
         user.balance += amount;
         await user.save();
-        
+
         rooms[0].players = rooms[0].players.filter(pl => pl.mongoId.toString() !== userId);
-        
+
         await Transaction.create({ userId: user._id, type: 'withdraw', amount: amount, meta: { reason: 'Admin Forced Cashout' } });
         io.to(p.id).emit('cashOutSuccess', { amount });
-        
+
         res.json({ success: true });
     } catch (err) { res.status(500).send(err.message); }
 });
@@ -949,7 +949,7 @@ io.on('connection', (socket) => {
                 socket.emit('error', 'The arena is currently resetting. Please wait a moment.');
                 return;
             }
-            
+
             // --- REJOIN LOGIK ---
             const existingPlayer = room.players.find(p => p.mongoId.toString() === user._id.toString());
             if (existingPlayer) {
@@ -987,23 +987,23 @@ io.on('connection', (socket) => {
             await user.save();
 
             // Log Join
-            await Transaction.create({ 
-                userId: user._id, 
-                type: 'game', 
-                amount: entryFeeInSol, 
-                meta: { event: 'join', roomId: room.id, entryFeeUsd: 10.0 }, 
-                status: 'confirmed' 
+            await Transaction.create({
+                userId: user._id,
+                type: 'game',
+                amount: entryFeeInSol,
+                meta: { event: 'join', roomId: room.id, entryFeeUsd: 10.0 },
+                status: 'confirmed'
             });
 
             // EKONOMI: Distribute splits in mass units ($)
-            room.foodPoolBalance += 7.0; 
-            room.aiBudgetBalance += 1.0; 
-            room.ownerBalance += 2.0; 
-            
+            room.foodPoolBalance += 7.0;
+            room.aiBudgetBalance += 1.0;
+            room.ownerBalance += 2.0;
+
             // ENFORCE STRICT 1:1 HUMAN-BOT RATIO
             // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
             const activeHumans = room.players.filter(p => !p.disconnected).length + 1;
-            const targetBots = activeHumans > 0 ? Math.min(30, activeHumans + 14) : 0;
+            const targetBots = activeHumans > 0 ? 2 : 0; // Max 2 bottar om det finns människor
             if (room.bots.length < targetBots) {
                 addBots(room, targetBots - room.bots.length);
             } else if (room.bots.length > targetBots) {
@@ -1015,12 +1015,13 @@ io.on('connection', (socket) => {
             const spawnX = Math.random() * c.worldWidth;
             const spawnY = Math.random() * c.worldHeight;
 
+            const startBalanceInSol = 1.0 / SOL_PRICE_USD; // Starta med massa värd exakt $1.00
             const newPlayer = {
                 id: socket.id,
                 mongoId: user._id,
                 username: username || user.username,
                 kills: 0,
-                balance: c.playerStartBalance,
+                balance: startBalanceInSol,
                 startTime: Date.now(),
                 color: util.randomColor(),
                 x: c.worldWidth / 2,
@@ -1033,8 +1034,8 @@ io.on('connection', (socket) => {
                     id: Math.random().toString(36).substr(2, 9),
                     x: spawnX,
                     y: spawnY,
-                    balance: c.playerStartBalance,
-                    radius: calculateCellRadius(c.playerStartBalance, c.playerStartBalance, 1),
+                    balance: startBalanceInSol,
+                    radius: calculateCellRadius(startBalanceInSol, startBalanceInSol, 1),
                     vx: 0,
                     vy: 0,
                     lastSplit: Date.now()
@@ -1064,7 +1065,7 @@ io.on('connection', (socket) => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.cells.length >= c.maxCells) return;
-        
+
         let newCells = [];
         p.cells.forEach(cell => {
             if (cell.balance >= c.minMassSplit) {
@@ -1121,7 +1122,7 @@ io.on('connection', (socket) => {
         p.cashOutEndTime = Date.now() + duration;
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
-        
+
         // Meddela klienten att timern har börjat
         socket.emit('cashOutStarting', { seconds: 20 });
 
@@ -1267,13 +1268,13 @@ function processRoom(room) {
         performRoomReset(room);
         return; // Pause processing during reset
     }
-    
+
     if (room.isResetting) return; // Step 1: Lock gameplay
 
     // STRICT 1:1 BOT RATIO ENFORCEMENT
     // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
     const activeHumans = room.players.filter(p => !p.disconnected).length;
-    const targetBots = activeHumans > 0 ? Math.min(30, activeHumans + 14) : 0;
+    const targetBots = activeHumans > 0 ? 2 : 0; // Håll det till 2 bottar
     if (room.bots.length < targetBots) {
         addBots(room, targetBots - room.bots.length);
     } else if (room.bots.length > targetBots) {
@@ -1384,7 +1385,7 @@ function processRoom(room) {
             const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult;
             const angle = Math.atan2(player.mouseY, player.mouseX);
             const distToMouse = Math.hypot(player.mouseX, player.mouseY);
-            
+
             const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
             const velX = (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
             const velY = (Math.sin(angle) * moveSpeed) + (cell.vy || 0);
@@ -1417,13 +1418,13 @@ function processRoom(room) {
 
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
-                        cell.balance += item.data.balance || c.foodBlobValue; 
+                        cell.balance += item.data.balance || c.foodBlobValue;
                         cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
-                        cell.balance += item.data.balance; 
+                        cell.balance += item.data.balance;
                         cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                         room.ejected = room.ejected.filter(e => e.id !== item.data.id);
                     }
@@ -1434,8 +1435,8 @@ function processRoom(room) {
                             cell.balance /= 2;
                             cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length);
                             player.cells.push({
-                                id: Math.random().toString(36).substr(2, 9), 
-                                x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now() 
+                                id: Math.random().toString(36).substr(2, 9),
+                                x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now()
                             });
                             room.viruses = room.viruses.filter(v => v.id !== item.data.id);
                         }
@@ -1462,7 +1463,7 @@ function processRoom(room) {
                         } else if (d < r + r2) {
                             // Om vi INTE kan merga än: Knuffa bort dem mjukare (delat med 25 istället för 10)
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
-                            const force = (r + r2 - d) / 25; 
+                            const force = (r + r2 - d) / 25;
                             cell.vx += Math.cos(pushAngle) * force;
                             cell.vy += Math.sin(pushAngle) * force;
                         }
@@ -1481,7 +1482,7 @@ function processRoom(room) {
                                         io.to(victim.id).emit('RIP');
                                         const victimMongoId = victim.mongoId;
                                         const sessionPlaytime = Date.now() - victim.startTime;
-                                        
+
                                         // Uppdatera playtime i DB vid död
                                         User.findByIdAndUpdate(victimMongoId, { $inc: { playtime: sessionPlaytime } })
                                             .catch(err => console.error("Error updating playtime on death:", err));
@@ -1536,10 +1537,10 @@ function processRoom(room) {
         .slice(0, 10);
 
     const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
-    
+
     room.players.forEach(p => {
         io.to(p.id).emit('leaderboard', { leaderboard: leaderboardData });
-        
+
         // OPTIMERING: Spatial Filtering. Skicka bara det som syns (plus buffert)
         const rangeX = (p.screenWidth || 1920) / 2 + 500;
         const rangeY = (p.screenHeight || 1080) / 2 + 500;
@@ -1550,7 +1551,7 @@ function processRoom(room) {
         const visibleViruses = [];
         const visibleEjected = [];
         const visibleUsersSet = new Set();
-        visibleUsersSet.add(p); 
+        visibleUsersSet.add(p);
         visibleItems.forEach(item => {
             if (item.type === 'food') visibleFood.push(item.data);
             else if (item.type === 'virus') visibleViruses.push(item.data);
