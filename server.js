@@ -952,10 +952,11 @@ io.on('connection', (socket) => {
                 status: 'confirmed'
             });
 
-            // EKONOMI: Distribute splits in mass units ($)
-            room.foodPoolBalance += 7.0;
-            room.aiBudgetBalance += 1.0;
-            room.ownerBalance += 2.0;
+            // REAL MONEY GAME ECONOMY SPLIT ($10)
+            room.foodPoolBalance += 6.0;  // $6 to food
+            room.aiBudgetBalance += 2.0;  // $2 to AI budget
+            room.ownerBalance += 1.0;  // $1 to Owner
+            // The remaining $1 is used for the player's starting balance ($1.0)
 
             // ENFORCE STRICT 1:1 HUMAN-BOT RATIO
             // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
