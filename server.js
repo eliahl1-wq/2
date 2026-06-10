@@ -2114,6 +2114,7 @@ function processRoom(room) {
         .sort((a, b) => b.balance - a.balance)
         .slice(0, 10);
 
+    const age = Date.now() - room.startTime;
     const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
 
     // Skapa en kopia för leaderboard med USD-värden
