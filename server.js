@@ -206,9 +206,10 @@ async function performRoomReset(room) {
                 const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                 // Step 1: Fetch exact, real-time Lamports balance from the blockchain
                 const totalLamports = await connection.getBalance(housePubKey);
+                const solPrice = Number(SOL_PRICE_USD || 64);
 
-                // Step 2 & 3: Reserve exactly 0.005 SOL buffer for gas fees
-                const bufferLamports = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+                // Reserve exactly $1.00 USD worth of SOL as a permanent liquidity buffer for fees
+                const bufferLamports = Math.round((1.0 / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
                 const sweepLamports = totalLamports - bufferLamports;
 
                 if (sweepLamports > 0) {
@@ -271,14 +272,10 @@ async function performRoomReset(room) {
 
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
+    if (isScanningDeposits) return;
+    isScanningDeposits = true;
     try {
-        // 1. Uppdatera SOL-kursen (valfritt men bra)
-        const priceRes = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT').catch(() => null);
-        if (priceRes && priceRes.ok) {
-            const priceData = await priceRes.json();
-            SOL_PRICE_USD = parseFloat(priceData.price);
-        }
-        // SOL_PRICE_USD is now handled by the central updateSolPrice scanner.
+        // SOL_PRICE_USD is handled by the central updateSolPrice scanner.
 
         // 2. Hitta alla användare som har en insättningsadress
         const users = await User.find({ depositAddress: { $exists: true } });
@@ -310,7 +307,7 @@ async function scanDeposits() {
                 const changeLamports = postBalance - preBalance;
 
                 if (changeLamports > 0) {
-                    const solAmount = changeLamports / solanaWeb3.LAMPORTS_PER_SOL; // Amount deposited in this specific transaction
+                    const solAmount = changeLamports / solanaWeb3.LAMPORTS_PER_SOL;
 
                     // ADD RAW SOL DIRECTLY to prevent market insolvency
                     user.balance += solAmount;
@@ -323,9 +320,9 @@ async function scanDeposits() {
                                 Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
                             );
 
-                            // SWEEP: Skicka ALLT från insättningsadressen till hus-plånboken, minus en liten buffert för framtida fees
+                            // SWEEP: Skicka ALLT från insättningsadressen till hus-plånboken, minus en liten buffert för transaktionsavgifter
                             const currentDepositAddressBalanceLamports = await connection.getBalance(pubKey);
-                            const sweepBufferLamports = 5000; // 0.005 SOL för att täcka transaktionsavgifter
+                            const sweepBufferLamports = 5000; // 0.000005 SOL för att täcka transaktionsavgifter (minsta möjliga)
 
                             if (currentDepositAddressBalanceLamports > sweepBufferLamports) {
                                 const lamportsToSweep = currentDepositAddressBalanceLamports - sweepBufferLamports;
@@ -336,8 +333,8 @@ async function scanDeposits() {
                                         lamports: lamportsToSweep,
                                     })
                                 );
-                                const sweepSig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [fromKeypair]);
-                                console.log(`💸 SWEEP: Skickade ${lamportsToSweep / solanaWeb3.LAMPORTS_PER_SOL} SOL från ${user.username}'s deposit-adress till hus-plånboken. Sig: ${sweepSig}`);
+                                const sweepSig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [fromKeypair], { commitment: 'confirmed' });
+                                console.log(`💸 SWEEP: Skickade ${lamportsToSweep / solanaWeb3.LAMPORTS_PER_SOL} SOL från ${user.username}'s deposit-adress till hus-plånboken. Signature: ${sweepSig}`);
                             }
                         } catch (sweepErr) {
                             console.error("Sweep Error:", sweepErr.message);
@@ -364,6 +361,8 @@ async function scanDeposits() {
         }
     } catch (err) {
         console.error("Scanner Error:", err.message);
+    } finally {
+        isScanningDeposits = false;
     }
 }
 
@@ -466,6 +465,28 @@ app.get('/api/me', authenticateToken, async (req, res) => {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const lamports = await connection.getBalance(pubKey);
                 solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+
+                // AUTOMATIC RECONCILE: Scan for missed transactions before returning balance
+                const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 3 });
+                for (const sigInfo of signatures) {
+                    const existingTx = await Transaction.findOne({ "meta.signature": sigInfo.signature });
+                    if (existingTx) continue;
+
+                    // New uncredited transaction found!
+                    const txDetails = await connection.getTransaction(sigInfo.signature, { maxSupportedTransactionVersion: 0 });
+                    if (!txDetails || txDetails.meta?.err) continue;
+
+                    const accountIndex = txDetails.transaction.message.staticAccountKeys.findIndex(k => k.equals(pubKey));
+                    if (accountIndex !== -1) {
+                        const change = (txDetails.meta.postBalances[accountIndex] - txDetails.meta.preBalances[accountIndex]) / solanaWeb3.LAMPORTS_PER_SOL;
+                        if (change > 0) {
+                            console.log(`[SYNC-ME] Found uncredited ${change} SOL for ${user.username}. Updating...`);
+                            user.balance += change;
+                            await user.save();
+                            await Transaction.create({ userId: user._id, type: 'deposit', amount: change, currency: 'SOL', meta: { signature: sigInfo.signature, automated: true }, status: 'confirmed' });
+                        }
+                    }
+                }
             } catch (e) { console.error("Sync error in /api/me:", e.message); }
         }
 
@@ -1543,7 +1564,7 @@ function processRoom(room) {
     const foodValueTarget = Math.min(room.players.length * 100.0, room.foodPoolBalance); // Ökat från 50 till 100
     const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
     if (room.food.length < targetFoodCount) {
-        addFood(room, Math.min(10, targetFoodCount - room.food.length)); // Lägg till max 10 matbitar åt gången
+        addFood(room, Math.min(20, targetFoodCount - room.food.length)); // Lägg till max 20 matbitar åt gången
     }
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
