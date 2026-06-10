@@ -13,6 +13,14 @@ import passport from 'passport';
 import { randomUUID } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import {
+    SLITHER,
+    createSlitherPlayer,
+    addSlitherBots,
+    getSlitherTargetBots,
+    processSlitherRoom,
+    broadcastSlitherState,
+} from './slither-engine.js';
 
 const app = express();
 
@@ -134,7 +142,9 @@ const rooms = [0].map(id => ({
     id,
     players: [],
     bots: [],
+    slitherBots: [],
     food: [],
+    slitherFood: [],
     viruses: [],
     ejected: [],
     foodPoolBalance: 0,
@@ -249,7 +259,9 @@ async function performRoomReset(room) {
 
         // Step 6-8: Reset entities and game metadata
         room.bots = [];
+        room.slitherBots = [];
         room.food = [];
+        room.slitherFood = [];
         room.viruses = [];
         room.ejected = [];
         room.startTime = Date.now();
@@ -896,6 +908,16 @@ rooms.forEach(room => {
     room.foodPoolBalance = 250.0; // Mycket mer mat från start
 });
 
+function getTargetBots(humanCount) {
+    if (humanCount > 0 && humanCount < 3) return 2;
+    if (humanCount >= 3 && humanCount < 8) return humanCount;
+    return 0;
+}
+
+function countHumansByMode(room, mode) {
+    return room.players.filter(p => !p.disconnected && p.mode === mode).length;
+}
+
 function getBestRoom() {
     // Eftersom det bara finns en global arena nu tillåter vi anslutning när som helst
     // tills rummet resettas automatiskt varannan timme.
@@ -1014,61 +1036,69 @@ io.on('connection', (socket) => {
             room.ownerBalance += 1.0;  // Always $1 to Owner
             // The remaining $1 is used for the player's starting balance ($1.0)
 
-            // DYNAMIC BOT SCALING
-            let targetBots = 0;
-            if (activeHumansCount > 0 && activeHumansCount < 3) {
-                targetBots = 2;
-            } else if (activeHumansCount >= 3 && activeHumansCount < 8) {
-                targetBots = activeHumansCount; // 1 bot per human (1:1)
-            } else {
-                targetBots = 0; // 0 bots if 8+ humans
-            }
+            // DYNAMIC BOT SCALING (mode-specific)
+            const gameMode = mode === 'slither' ? 'slither' : 'agar';
+            const modeHumansAfterJoin = room.players.filter(p => !p.disconnected && p.mode === gameMode).length + 1;
+            const targetBots = gameMode === 'slither'
+                ? getSlitherTargetBots(modeHumansAfterJoin)
+                : getTargetBots(modeHumansAfterJoin);
 
-            if (room.bots.length < targetBots) {
-                addBots(room, targetBots - room.bots.length);
-            } else if (room.bots.length > targetBots) {
-                room.bots.splice(0, room.bots.length - targetBots);
+            if (gameMode === 'slither') {
+                if (room.slitherBots.length < targetBots) {
+                    addSlitherBots(room, targetBots - room.slitherBots.length);
+                } else if (room.slitherBots.length > targetBots) {
+                    room.slitherBots.splice(0, room.slitherBots.length - targetBots);
+                }
+            } else {
+                if (room.bots.length < targetBots) {
+                    addBots(room, targetBots - room.bots.length);
+                } else if (room.bots.length > targetBots) {
+                    room.bots.splice(0, room.bots.length - targetBots);
+                }
             }
 
             socket.roomId = room.id;
 
-            const spawnX = Math.random() * c.worldWidth;
-            const spawnY = Math.random() * c.worldHeight;
+            const startBalanceUsd = 1.0;
+            let newPlayer;
 
-            const startBalanceUsd = 1.0; // Starta med massa värd exakt $1.00 USD
-            const gameMode = mode === 'slither' ? 'slither' : 'agar';
-            const newPlayer = {
-                id: socket.id,
-                mongoId: user._id,
-                username: username || user.username,
-                mode: gameMode,
-                kills: 0,
-                balance: startBalanceUsd,
-                startTime: Date.now(),
-                color: util.randomColor(),
-                x: c.worldWidth / 2,
-                y: c.worldHeight / 2,
-                mouseX: 0,
-                mouseY: 0,
-                screenWidth: 1920,
-                screenHeight: 1080,
-                cells: [{
-                    id: Math.random().toString(36).substr(2, 9),
-                    x: spawnX,
-                    y: spawnY,
+            if (gameMode === 'slither') {
+                newPlayer = createSlitherPlayer(socket.id, user._id, username || user.username, util.randomColor());
+            } else {
+                const spawnX = Math.random() * c.worldWidth;
+                const spawnY = Math.random() * c.worldHeight;
+                newPlayer = {
+                    id: socket.id,
+                    mongoId: user._id,
+                    username: username || user.username,
+                    mode: 'agar',
+                    kills: 0,
                     balance: startBalanceUsd,
-                    radius: calculateCellRadius(startBalanceUsd, startBalanceUsd, 1),
-                    vx: 0,
-                    vy: 0,
-                    lastSplit: Date.now()
-                }]
-            };
+                    startTime: Date.now(),
+                    color: util.randomColor(),
+                    x: c.worldWidth / 2,
+                    y: c.worldHeight / 2,
+                    mouseX: 0,
+                    mouseY: 0,
+                    screenWidth: 1920,
+                    screenHeight: 1080,
+                    cells: [{
+                        id: Math.random().toString(36).substr(2, 9),
+                        x: spawnX,
+                        y: spawnY,
+                        balance: startBalanceUsd,
+                        radius: calculateCellRadius(startBalanceUsd, startBalanceUsd, 1),
+                        vx: 0,
+                        vy: 0,
+                        lastSplit: Date.now()
+                    }]
+                };
+            }
             room.players.push(newPlayer);
 
-            // Skicka 'welcome' som i original-repot, med spelarens initiala data och världsstorlek
             socket.emit('welcome', newPlayer, {
-                width: c.worldWidth,
-                height: c.worldHeight,
+                width: gameMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
+                height: gameMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
                 mode: gameMode,
                 solPrice: SOL_PRICE_USD,
             });
@@ -1268,42 +1298,13 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('playerDied', async () => {
+    socket.on('slitherInput', ({ dx, dy, boost }) => {
         const room = rooms.find(r => r.id === socket.roomId);
-        if (!room) return;
-        const p = room.players.find(pl => pl.id === socket.id);
-        if (!p) return;
-        p.isCashingOut = false;
-
-        if (p.mode === 'slither') {
-            room.players = room.players.filter(pl => pl.id !== socket.id);
-            try {
-                const user = await User.findById(p.mongoId);
-                if (user) {
-                    user.playtime += (Date.now() - p.startTime);
-                    await user.save();
-                }
-                await Transaction.create({
-                    userId: p.mongoId,
-                    type: 'game',
-                    amount: 0,
-                    meta: { event: 'slither_death', lostBalance: p.balance, roomId: room.id },
-                    status: 'confirmed',
-                });
-            } catch (err) {
-                console.error('Slither death cleanup error:', err.message);
-            }
-        }
-    });
-
-    socket.on('slitherUpdateBalance', ({ balance }) => {
-        const room = rooms.find(r => r.id === socket.roomId);
-        const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.mode !== 'slither' || p.isCashingOut) return;
-        const parsed = Number(balance);
-        if (!Number.isFinite(parsed) || parsed < 1.0) return;
-        p.balance = parsed;
-        if (p.cells[0]) p.cells[0].balance = parsed;
+        const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'slither');
+        if (!p || p.isCashingOut) return;
+        p.inputDx = Number(dx) || 0;
+        p.inputDy = Number(dy) || 0;
+        p.boost = !!boost;
     });
 });
 
@@ -1325,26 +1326,30 @@ function processRoom(room) {
 
     if (room.isResetting) return; // Step 1: Lock gameplay
 
-    // DYNAMIC BOT SCALING (Continuously maintained)
-    const activeHumansCount = room.players.filter(p => !p.disconnected).length;
-    let targetBots = 0;
-    if (activeHumansCount > 0 && activeHumansCount < 3) {
-        targetBots = 2;
-    } else if (activeHumansCount >= 3 && activeHumansCount < 8) {
-        targetBots = activeHumansCount; // 1 bot per human
-    } else {
-        targetBots = 0; // 0 bots if 8+ humans
+    // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
+    const agarHumans = countHumansByMode(room, 'agar');
+    const slitherHumans = countHumansByMode(room, 'slither');
+
+    const agarTargetBots = getTargetBots(agarHumans);
+    if (room.bots.length < agarTargetBots) {
+        addBots(room, agarTargetBots - room.bots.length);
+    } else if (room.bots.length > agarTargetBots) {
+        room.bots.splice(0, room.bots.length - agarTargetBots);
     }
 
-    if (room.bots.length < targetBots) {
-        addBots(room, targetBots - room.bots.length);
-    } else if (room.bots.length > targetBots) {
-        room.bots.splice(0, room.bots.length - targetBots);
+    const slitherTargetBots = getSlitherTargetBots(slitherHumans);
+    if (room.slitherBots.length < slitherTargetBots) {
+        addSlitherBots(room, slitherTargetBots - room.slitherBots.length);
+    } else if (room.slitherBots.length > slitherTargetBots) {
+        room.slitherBots.splice(0, room.slitherBots.length - slitherTargetBots);
     }
 
     room.ejected.forEach(e => room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e })));
 
-    const allUsers = [...room.players, ...room.bots];
+    const allUsers = [
+        ...room.players.filter(p => p.mode !== 'slither'),
+        ...room.bots,
+    ];
     const userMap = new Map();
     allUsers.forEach(u => userMap.set(u.id, u));
 
@@ -1586,13 +1591,24 @@ function processRoom(room) {
     });
 
     room.ejected.forEach(e => { e.x += e.vx; e.y += e.vy; e.vx *= 0.9; e.vy *= 0.9; });
-    // Öka mat-multiplikatorn markant (från 7 till 50) så mappen fylls upp bättre i stora arenor
-    const foodValueTarget = Math.min(room.players.length * 250.0, room.foodPoolBalance); // Ökat för bättre densitet
-    const targetFoodCount = Math.floor(foodValueTarget / c.foodBlobValue);
-    if (room.food.length < targetFoodCount) {
-        addFood(room, Math.min(50, targetFoodCount - room.food.length)); // Lägg till fler åt gången
+
+    // Agar food spawn (funded from shared foodPoolBalance)
+    const agarFoodTarget = Math.min(agarHumans * 250.0, room.foodPoolBalance);
+    const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
+    if (room.food.length < agarTargetFoodCount) {
+        addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
     }
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+
+    // Slither server-side physics tick
+    const slitherLeaderboard = processSlitherRoom(room, io, User, c.foodBlobValue);
+
+    const slitherMeta = {
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD,
+        isResetting: room.isResetting,
+    };
+    broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
 
     // Skicka leaderboard separat för prestanda (Inkludera bottar)
     const leaderboardData = allUsers
@@ -1610,17 +1626,9 @@ function processRoom(room) {
     }));
 
     room.players.forEach(p => {
-        io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
+        if (p.mode === 'slither') return;
 
-        if (p.mode === 'slither') {
-            io.to(p.id).emit('slitherState', {
-                balance: p.balance,
-                resetTime: room.startTime + c.roomDuration,
-                solPrice: SOL_PRICE_USD,
-                isResetting: room.isResetting,
-            });
-            return;
-        }
+        io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
 
         // OPTIMERING: Spatial Filtering.
         const rangeX = (p.screenWidth || 1920) / 2 + 500;
