@@ -590,7 +590,7 @@ app.get('/api/config', (req, res) => {
         defaultEntryFee: DEFAULT_ENTRY_FEE,
         brEntryFees: DEV_FREE_PLAY ? [0] : BR.entryFees,
         brDefaultEntryFee: BR.defaultEntryFee,
-        brMinPlayers: DEV_FREE_PLAY ? 1 : BR.minPlayers,
+        brMinPlayers: BR.minPlayers,
         brMaxPlayers: BR.maxPlayers,
     });
 });

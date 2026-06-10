@@ -18,8 +18,9 @@ import { getBRHouseWallet, isBRWalletConfigured, normalizeBREntryFee } from './b
 export const BR = {
     entryFees: [5, 10],
     defaultEntryFee: 5,
-    minPlayers: 4,
-    maxPlayers: 16,
+    minPlayers: 5,
+    maxPlayers: 10,
+    gracePeriodMs: 15_000,
     queueTimeoutMs: 90_000,
     countdownMs: 15_000,
     shrinkIntervalMs: 45_000,
@@ -34,6 +35,8 @@ const queues = new Map();
 const matches = new Map();
 const socketToMatch = new Map();
 const mongoToMatch = new Map();
+/** @type {Map<string, { readyAt: number, timer: ReturnType<typeof setTimeout> | null }>} */
+const queueGrace = new Map();
 
 function queueKey(variant, entryFeeUsd) {
     return `${variant}:${normalizeBREntryFee(entryFeeUsd)}`;
@@ -127,10 +130,81 @@ function removeFromQueue(socketId) {
         const idx = q.findIndex(e => e.socketId === socketId);
         if (idx >= 0) {
             q.splice(idx, 1);
+            if (q.length < BR.minPlayers) {
+                clearQueueGrace(key);
+            }
             return key;
         }
     }
     return null;
+}
+
+function clearQueueGrace(key) {
+    const grace = queueGrace.get(key);
+    if (grace?.timer) clearTimeout(grace.timer);
+    queueGrace.delete(key);
+}
+
+function emitQueueStatus(io, variant, entryFeeUsd, deps) {
+    const q = getQueue(variant, entryFeeUsd);
+    const fee = normalizeBREntryFee(entryFeeUsd);
+    const key = queueKey(variant, entryFeeUsd);
+    const grace = queueGrace.get(key);
+    const graceRemainingMs = grace
+        ? Math.max(0, BR.gracePeriodMs - (Date.now() - grace.readyAt))
+        : null;
+    const payload = {
+        variant,
+        entryFeeUsd: fee,
+        playersInQueue: q.length,
+        minPlayers: BR.minPlayers,
+        maxPlayers: BR.maxPlayers,
+        graceRemainingMs,
+        searching: q.length < BR.minPlayers
+            || (graceRemainingMs != null && graceRemainingMs > 0 && q.length < BR.maxPlayers),
+        devFreePlay: !!deps?.DEV_FREE_PLAY,
+    };
+    q.forEach(e => io.to(e.socketId).emit('brQueueStatus', payload));
+}
+
+function launchMatch(variant, entryFeeUsd, io, deps) {
+    const key = queueKey(variant, entryFeeUsd);
+    const q = getQueue(variant, entryFeeUsd);
+    if (q.length < BR.minPlayers) return;
+    clearQueueGrace(key);
+    const take = Math.min(BR.maxPlayers, q.length);
+    const batch = q.splice(0, take);
+    startMatch(batch, variant, entryFeeUsd, io, deps);
+}
+
+function tryStartMatch(variant, entryFeeUsd, io, deps) {
+    const key = queueKey(variant, entryFeeUsd);
+    const q = getQueue(variant, entryFeeUsd);
+
+    if (q.length < BR.minPlayers) {
+        clearQueueGrace(key);
+        return;
+    }
+
+    if (q.length >= BR.maxPlayers) {
+        launchMatch(variant, entryFeeUsd, io, deps);
+        return;
+    }
+
+    const grace = queueGrace.get(key);
+    if (!grace) {
+        const readyAt = Date.now();
+        const timer = setTimeout(() => {
+            tryStartMatch(variant, entryFeeUsd, io, deps);
+        }, BR.gracePeriodMs);
+        queueGrace.set(key, { readyAt, timer });
+        emitQueueStatus(io, variant, entryFeeUsd, deps);
+        return;
+    }
+
+    if (Date.now() - grace.readyAt >= BR.gracePeriodMs) {
+        launchMatch(variant, entryFeeUsd, io, deps);
+    }
 }
 
 function findQueueEntry(mongoId) {
@@ -142,30 +216,6 @@ function findQueueEntry(mongoId) {
         }
     }
     return null;
-}
-
-function brMinPlayers(deps) {
-    return deps?.DEV_FREE_PLAY ? 1 : BR.minPlayers;
-}
-
-function brQueueTimeoutMs(deps) {
-    return deps?.DEV_FREE_PLAY ? 3_000 : BR.queueTimeoutMs;
-}
-
-function emitQueueStatus(io, variant, entryFeeUsd, deps) {
-    const q = getQueue(variant, entryFeeUsd);
-    const oldest = q[0]?.joinedAt || Date.now();
-    const fee = normalizeBREntryFee(entryFeeUsd);
-    const payload = {
-        variant,
-        entryFeeUsd: fee,
-        playersInQueue: q.length,
-        minPlayers: brMinPlayers(deps),
-        maxPlayers: BR.maxPlayers,
-        waitMs: Math.max(0, brQueueTimeoutMs(deps) - (Date.now() - oldest)),
-        devFreePlay: !!deps?.DEV_FREE_PLAY,
-    };
-    q.forEach(e => io.to(e.socketId).emit('brQueueStatus', payload));
 }
 
 function createBRAgarPlayer(socketId, mongoId, username, color, room, deps) {
@@ -490,10 +540,6 @@ function updateZone(room, io) {
     room.players.forEach(p => io.to(p.id).emit('brZoneUpdate', payload));
 }
 
-function brCountdownMs(deps) {
-    return deps?.DEV_FREE_PLAY ? 3_000 : BR.countdownMs;
-}
-
 function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
     const fee = normalizeBREntryFee(entryFeeUsd ?? queuedPlayers[0]?.entryFeeUsd);
     const prizePool = queuedPlayers.length * fee * (1 - BR.houseFeePct);
@@ -520,7 +566,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
     room.players.forEach(p => {
         io.to(p.id).emit('brMatchCountdown', {
             matchId: room.id,
-            seconds: brCountdownMs(deps) / 1000,
+            seconds: BR.countdownMs / 1000,
             prizePool: room.prizePool,
             playerCount: room.players.length,
             variant,
@@ -557,25 +603,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
                 zone: room.zone,
             });
         });
-    }, brCountdownMs(deps));
-}
-
-function tryStartMatch(variant, entryFeeUsd, io, deps) {
-    const q = getQueue(variant, entryFeeUsd);
-    const minPlayers = brMinPlayers(deps);
-    if (q.length < minPlayers) return;
-
-    const oldest = q[0]?.joinedAt || Date.now();
-    const queueTimeout = brQueueTimeoutMs(deps);
-    const timedOut = Date.now() - oldest >= queueTimeout;
-    const enough = deps.DEV_FREE_PLAY ? q.length >= minPlayers : q.length >= 10;
-    const full = q.length >= BR.maxPlayers;
-
-    if (!full && !enough && !timedOut) return;
-
-    const take = Math.min(BR.maxPlayers, q.length);
-    const batch = q.splice(0, take);
-    startMatch(batch, variant, entryFeeUsd, io, deps);
+    }, BR.countdownMs);
 }
 
 async function chargeEntryFee(user, deps, variant, entryFeeUsd) {
@@ -813,9 +841,9 @@ export function setupBattleRoyale(io, deps) {
             if (!matchId) return;
             const room = matches.get(matchId);
             const player = room?.players.find(p => p.id === socket.id);
-            if (player && room?.status === 'active') {
-                eliminateBRPlayer(room, player, io, deps, 'disconnect');
-            }
+            if (!player || room?.status === 'ended') return;
+            player.disconnected = true;
+            socketToMatch.delete(socket.id);
         });
     });
 }
