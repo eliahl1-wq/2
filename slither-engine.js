@@ -430,22 +430,15 @@ function isInView(cx, cy, x, y, range) {
     return Math.abs(x - cx) <= range && Math.abs(y - cy) <= range;
 }
 
-/**
- * Run one slither physics tick. Returns leaderboard entries for slither mode.
- */
-export function processSlitherRoom(room, io, User, foodBlobValue, foodBudget = null) {
-    const slitherHumans = room.players.filter(p => !p.disconnected && p.mode === 'slither');
-    const humanCount = slitherHumans.length;
-
-    if (humanCount === 0) {
+export function syncSlitherFood(room, foodBlobValue, budget, humansInArena) {
+    if (humansInArena <= 0) {
         clearSlitherFood(room);
+        return;
     }
-
     const densityScale = slitherFoodDensityScale();
-    const budget = foodBudget ?? room.foodPoolBalance;
-    const foodValueTarget = Math.min(humanCount * 250.0 * densityScale, budget);
+    const foodValueTarget = Math.min(humansInArena * 250.0 * densityScale, budget);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
-    if (humanCount > 0 && room.slitherFood.length < targetFoodCount) {
+    if (room.slitherFood.length < targetFoodCount) {
         addSlitherFood(
             room,
             Math.min(50, targetFoodCount - room.slitherFood.length),
@@ -455,6 +448,14 @@ export function processSlitherRoom(room, io, User, foodBlobValue, foodBudget = n
     } else if (room.slitherFood.length > targetFoodCount) {
         trimSlitherFood(room, targetFoodCount);
     }
+}
+
+/**
+ * Run one slither physics tick. Returns leaderboard entries for slither mode.
+ */
+export function processSlitherRoom(room, io, User) {
+    const slitherHumans = room.players.filter(p => !p.disconnected && p.mode === 'slither');
+    const humanCount = slitherHumans.length;
 
     const allSnakes = getAllSlitherSnakes(room);
     const toRemove = [];

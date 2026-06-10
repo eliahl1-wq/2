@@ -21,6 +21,7 @@ import {
     trimSlitherBots,
     processSlitherRoom,
     broadcastSlitherState,
+    syncSlitherFood,
 } from './slither-engine.js';
 
 const app = express();
@@ -990,6 +991,17 @@ function addViruses(room, n) {
     }
 }
 
+function getModeFoodBudgets(room, agarActive, slitherActive) {
+    const total = agarActive + slitherActive;
+    if (total <= 0) {
+        return { agar: room.foodPoolBalance, slither: room.foodPoolBalance };
+    }
+    return {
+        agar: room.foodPoolBalance * (agarActive / total),
+        slither: room.foodPoolBalance * (slitherActive / total),
+    };
+}
+
 function getMaxAiBudgetForRoom(room) {
     const agarHumans = countHumansInMode(room, 'agar');
     const slitherHumans = countHumansInMode(room, 'slither');
@@ -1048,7 +1060,8 @@ rooms.forEach(room => {
     addViruses(room, c.virusCount);
     // No free AI budget — bots are funded only from entry-fee splits
     room.aiBudgetBalance = 0;
-    room.foodPoolBalance = 250.0;
+    // Food comes from entry-fee pool when players join — no free seed
+    room.foodPoolBalance = 0;
 });
 
 function getTargetBots(humanCount) {
@@ -1293,6 +1306,23 @@ io.on('connection', (socket) => {
             }
 
             room.players.push(newPlayer);
+
+            // Seed arena food from this join's pool share (same as agar — funded by entry, not free)
+            {
+                const agarActive = countActiveHumansByMode(room, 'agar');
+                const slitherActive = countActiveHumansByMode(room, 'slither');
+                const budgets = getModeFoodBudgets(room, agarActive, slitherActive);
+                if (gameMode === 'slither') {
+                    syncSlitherFood(room, c.foodBlobValue, budgets.slither, countHumansInMode(room, 'slither'));
+                } else {
+                    const agarInArena = countHumansInMode(room, 'agar');
+                    const agarFoodTarget = Math.min(agarInArena * 250.0, budgets.agar);
+                    const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
+                    if (room.food.length < agarTargetFoodCount) {
+                        addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
+                    }
+                }
+            }
 
             socket.emit('welcome', newPlayer, {
                 width: gameMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
@@ -1564,22 +1594,22 @@ function processRoom(room) {
 
     capAiBudget(room);
 
-    // Agar food spawn (before physics — must be in quadtree for visibility + eating)
-    const totalModeHumans = agarHumans + slitherHumans;
-    const agarFoodBudget = totalModeHumans > 0
-        ? room.foodPoolBalance * (agarHumans / totalModeHumans)
-        : room.foodPoolBalance;
-    const slitherFoodBudget = totalModeHumans > 0
-        ? room.foodPoolBalance * (slitherHumans / totalModeHumans)
-        : room.foodPoolBalance;
+    // Food spawn — funded from pool (entry fees on join), same rules for agar + slither
+    const agarInArena = countHumansInMode(room, 'agar');
+    const slitherInArena = countHumansInMode(room, 'slither');
+    const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
 
-    const agarFoodTarget = Math.min(agarHumans * 250.0, agarFoodBudget);
+    const agarFoodTarget = Math.min(agarInArena * 250.0, foodBudgets.agar);
     const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
-    if (room.food.length < agarTargetFoodCount) {
+    if (agarInArena <= 0) {
+        room.food.length = 0;
+    } else if (room.food.length < agarTargetFoodCount) {
         addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
     } else if (room.food.length > agarTargetFoodCount) {
         room.food.splice(agarTargetFoodCount);
     }
+    syncSlitherFood(room, c.foodBlobValue, foodBudgets.slither, slitherInArena);
+
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
     const allUsers = [
@@ -1832,7 +1862,7 @@ function processRoom(room) {
     rebuildQuadTree(room, allUsers);
 
     // Slither server-side physics tick
-    const slitherLeaderboard = processSlitherRoom(room, io, User, c.foodBlobValue, slitherFoodBudget);
+    const slitherLeaderboard = processSlitherRoom(room, io, User);
 
     const slitherMeta = {
         resetTime: room.startTime + c.roomDuration,
