@@ -590,7 +590,7 @@ app.get('/api/config', (req, res) => {
         defaultEntryFee: DEFAULT_ENTRY_FEE,
         brEntryFees: DEV_FREE_PLAY ? [0] : BR.entryFees,
         brDefaultEntryFee: BR.defaultEntryFee,
-        brMinPlayers: BR.minPlayers,
+        brMinPlayers: DEV_FREE_PLAY ? 1 : BR.minPlayers,
         brMaxPlayers: BR.maxPlayers,
     });
 });
@@ -999,6 +999,11 @@ app.get('/api/stats', (req, res) => {
         let topBalance = 0;
         let topIsBot = false;
         const playersByEntryFee = { 5: 0, 10: 0, 20: 0 };
+        const playersByModeAndFee = {
+            agar: { 5: 0, 10: 0, 20: 0 },
+            slither: { 5: 0, 10: 0, 20: 0 },
+        };
+        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0 };
 
         const considerTop = (name, balance, isBot = false) => {
             const b = balance || 0;
@@ -1016,6 +1021,11 @@ app.get('/api/stats', (req, res) => {
                     humansOnline += 1;
                     if (!playersByEntryFee[fee]) playersByEntryFee[fee] = 0;
                     playersByEntryFee[fee] += 1;
+                    const mode = player.mode === 'slither' ? 'slither' : 'agar';
+                    if (playersByModeAndFee[mode]) {
+                        playersByModeAndFee[mode][fee] = (playersByModeAndFee[mode][fee] || 0) + 1;
+                        playersByGamemode[mode] += 1;
+                    }
                     considerTop(player.username, player.balance, false);
                 }
             });
@@ -1031,6 +1041,8 @@ app.get('/api/stats', (req, res) => {
         });
 
         const brPlayersByFee = getBRPlayerCountsByFee();
+        playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
+        playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
 
         res.json({
             playersOnline: humansOnline + aiOnline,
@@ -1040,6 +1052,8 @@ app.get('/api/stats', (req, res) => {
             topIsBot,
             solPrice: SOL_PRICE_USD,
             playersByEntryFee,
+            playersByModeAndFee,
+            playersByGamemode,
             brPlayersByFee,
         });
     } catch (err) {
