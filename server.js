@@ -89,16 +89,36 @@ function isOriginAllowed(origin) {
 
 const corsOptions = {
     origin(origin, callback) {
-        if (isOriginAllowed(origin)) callback(null, true);
-        else callback(new Error(`CORS blocked origin: ${origin}`));
+        if (!origin || isOriginAllowed(origin)) callback(null, true);
+        else {
+            console.warn(`CORS blocked origin: ${origin}`);
+            callback(null, false);
+        }
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma'],
 };
 
+// Always answer preflight + attach ACAO even if a route throws (e.g. during Railway restarts)
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && isOriginAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
+    if (req.method === 'OPTIONS') {
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma');
+        return res.sendStatus(204);
+    }
+    next();
+});
+
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+app.use(express.json());
 
 // --- 1. MODELLER & KONFIGURATION (Flyttade till toppen för att undvika krascher) ---
 
@@ -362,7 +382,6 @@ const io = new Server(httpServer, {
     pingInterval: 25000
 });
 
-app.use(express.json());
 app.use(passport.initialize());
 
 // --- GOOGLE OAUTH KONFIGURATION ---
@@ -388,6 +407,8 @@ passport.use(new GoogleStrategy({
                     depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
                 });
                 await user.save();
+            } else if (!user.depositAddress || !user.depositSecret) {
+                await ensureUserDepositWallet(user);
             }
             return done(null, user);
         } catch (err) {
@@ -431,10 +452,21 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+async function ensureUserDepositWallet(user) {
+    if (user.depositAddress && user.depositSecret) return user;
+    const keypair = solanaWeb3.Keypair.generate();
+    user.depositAddress = keypair.publicKey.toBase58();
+    user.depositSecret = Buffer.from(keypair.secretKey).toString('hex');
+    await user.save();
+    console.log(`🔑 Created deposit wallet for ${user.username}`);
+    return user;
+}
+
 app.get('/api/me', authenticateToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user.id).select('-password -depositSecret'); // Exkludera känslig info
+        let user = await User.findById(req.user.id).select('-password');
         if (!user) return res.status(404).json({ message: "Användare hittades ej" });
+        user = await ensureUserDepositWallet(user);
 
         let solOnChain = 0;
         if (user.depositAddress) {
@@ -451,6 +483,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         }
 
         const userObj = user.toObject();
+        delete userObj.depositSecret;
         // Lägg till onChainBalance för frontend att visa, men ändra INTE DB-balansen här
         userObj.onChainBalance = solOnChain;
 
@@ -503,6 +536,7 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
             inGame: !!player,
             mode: player?.mode || null,
             balance: player?.balance ?? null,
+            disconnected: player?.disconnected ?? false,
             isResetting: rooms[0].isResetting,
         });
     } catch (err) {
@@ -796,6 +830,7 @@ app.post('/api/login', async (req, res) => {
             return res.status(400).json({ message: "Fel lösenord" });
         }
         console.log("Lösenord matchar!");
+        await ensureUserDepositWallet(user);
 
         // Skapa en JWT (Inloggningskvitto). Använd en hemlig nyckel från .env
         const secret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
@@ -959,9 +994,10 @@ rooms.forEach(room => {
 });
 
 function getTargetBots(humanCount) {
-    if (humanCount > 0 && humanCount < 3) return 2;
-    if (humanCount >= 3 && humanCount < 8) return humanCount;
-    return 0;
+    if (humanCount <= 0) return 0;
+    if (humanCount >= 8) return 0;
+    if (humanCount < 3) return 4; // 1–2 humans: fuller arena
+    return Math.min(humanCount * 2, 12);
 }
 
 function countHumansByMode(room, mode) {
@@ -1229,9 +1265,9 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
 
-        console.log(`⏱️ User ${p.username} started cashout timer (${DEV_FREE_PLAY ? '5s test' : '20s'})`);
+        console.log(`⏱️ User ${p.username} started cashout timer (20s)`);
         p.isCashingOut = true;
-        const duration = DEV_FREE_PLAY ? 5000 : 20000;
+        const duration = 20000;
         p.cashOutEndTime = Date.now() + duration;
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
@@ -1256,10 +1292,10 @@ io.on('connection', (socket) => {
             const mongoId = activePlayer.mongoId;
 
             try {
-                const user = await User.findById(mongoId);
-                if (!user || !user.depositAddress) {
-                    console.log(`❌ Cashout failed: User ${activePlayer.username} has no internal deposit address.`);
-                    io.to(activePlayer.id).emit('error', 'Account internal error.');
+                let user = await User.findById(mongoId);
+                if (!user) {
+                    console.log(`❌ Cashout failed: User ${activePlayer.username} not found in DB.`);
+                    io.to(activePlayer.id).emit('error', 'Account not found.');
                     activePlayer.isCashingOut = false;
                     return;
                 }
@@ -1277,6 +1313,14 @@ io.on('connection', (socket) => {
                     });
                     console.log(`🎮 [FREE PLAY] Cashout: $${totalCashout.toFixed(2)} (simulated)`);
                     io.to(activePlayer.id).emit('cashOutSuccess', { amount: totalCashout, signature: 'simulated' });
+                    return;
+                }
+
+                user = await ensureUserDepositWallet(user);
+                if (!user.depositAddress) {
+                    console.log(`❌ Cashout failed: User ${activePlayer.username} has no internal deposit address.`);
+                    io.to(activePlayer.id).emit('error', 'Account internal error.');
+                    activePlayer.isCashingOut = false;
                     return;
                 }
 

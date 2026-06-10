@@ -107,9 +107,10 @@ export function addSlitherBots(room, n) {
 }
 
 export function getSlitherTargetBots(humanCount) {
-    if (humanCount > 0 && humanCount < 3) return 2;
-    if (humanCount >= 3 && humanCount < 8) return humanCount;
-    return 0;
+    if (humanCount <= 0) return 0;
+    if (humanCount >= 8) return 0;
+    if (humanCount < 3) return 4;
+    return Math.min(humanCount * 2, 12);
 }
 
 function getAllSlitherSnakes(room) {
