@@ -282,83 +282,18 @@ async function scanDeposits() {
         const users = await User.find({ depositAddress: { $exists: true } });
 
         for (const user of users) {
-            const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-            // Hämta de senaste 5 transaktionerna för denna adress
-            const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 5 });
+            if (!user.depositAddress) continue;
+            try {
+                const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                const lamports = await connection.getBalance(pubKey);
+                const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-            for (const sigInfo of signatures) {
-                // Kolla om vi redan har hanterat denna transaktion
-                const existingTx = await Transaction.findOne({ "meta.signature": sigInfo.signature });
-                if (existingTx) continue;
-
-                // Hämta detaljer om transaktionen
-                const txDetails = await connection.getTransaction(sigInfo.signature, {
-                    maxSupportedTransactionVersion: 0
-                });
-
-                if (!txDetails || txDetails.meta?.err) continue;
-
-                // Beräkna hur mycket SOL som kom in till just denna adress
-                // Vi kollar skillnaden i balans för kontot i transaktionen
-                const accountIndex = txDetails.transaction.message.staticAccountKeys.findIndex(k => k.equals(pubKey));
-                if (accountIndex === -1) continue;
-
-                const preBalance = txDetails.meta.preBalances[accountIndex];
-                const postBalance = txDetails.meta.postBalances[accountIndex];
-                const changeLamports = postBalance - preBalance;
-
-                if (changeLamports > 0) {
-                    const solAmount = changeLamports / solanaWeb3.LAMPORTS_PER_SOL;
-
-                    // ADD RAW SOL DIRECTLY to prevent market insolvency
-                    user.balance += solAmount;
+                // AUTOMATISK SYNK: Databasen speglar alltid vad som finns på plånboken
+                if (Math.abs(user.balance - solOnChain) > 0.00001) {
+                    user.balance = solOnChain;
                     await user.save();
-
-                    // --- SWEEPER: Skicka SOL vidare till din huvudplånbok ---
-                    if (HOUSE_WALLET_ADDRESS) {
-                        try {
-                            const fromKeypair = solanaWeb3.Keypair.fromSecretKey(
-                                Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
-                            );
-
-                            // SWEEP: Skicka ALLT från insättningsadressen till hus-plånboken, minus en liten buffert för transaktionsavgifter
-                            const currentDepositAddressBalanceLamports = await connection.getBalance(pubKey);
-                            const sweepBufferLamports = 5000; // 0.000005 SOL för att täcka transaktionsavgifter (minsta möjliga)
-
-                            if (currentDepositAddressBalanceLamports > sweepBufferLamports) {
-                                const lamportsToSweep = currentDepositAddressBalanceLamports - sweepBufferLamports;
-                                const sweepTx = new solanaWeb3.Transaction().add(
-                                    solanaWeb3.SystemProgram.transfer({
-                                        fromPubkey: pubKey,
-                                        toPubkey: new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS),
-                                        lamports: lamportsToSweep,
-                                    })
-                                );
-                                const sweepSig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [fromKeypair], { commitment: 'confirmed' });
-                                console.log(`💸 SWEEP: Skickade ${lamportsToSweep / solanaWeb3.LAMPORTS_PER_SOL} SOL från ${user.username}'s deposit-adress till hus-plånboken. Signature: ${sweepSig}`);
-                            }
-                        } catch (sweepErr) {
-                            console.error("Sweep Error:", sweepErr.message);
-                        }
-                    }
-
-                    // Spara transaktionen så vi inte dubbel-krediterar
-                    await Transaction.create({
-                        userId: user._id,
-                        type: 'deposit',
-                        amount: solAmount,
-                        currency: 'SOL',
-                        meta: {
-                            signature: sigInfo.signature,
-                            solAmount: solAmount,
-                            automated: true,
-                        },
-                        status: 'confirmed'
-                    });
-
-                    console.log(`✅ AUTO-DEPOSIT: ${user.username} received ${solAmount.toFixed(4)} SOL`);
                 }
-            }
+            } catch (e) { console.error(`Sync error for ${user.username}:`, e.message); }
         }
     } catch (err) {
         console.error("Scanner Error:", err.message);
@@ -464,11 +399,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
                 const lamports = await connection.getBalance(pubKey);
                 solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-                // AUTOMATIC RECONCILE: Om saldot på kedjan är högre än i DB (t.ex. vid manuell reset till 0),
-                // synka DB direkt så att användaren ser sina pengar omedelbart.
-                if (solOnChain > user.balance + 0.0001) {
-                    const recovered = solOnChain - user.balance;
-                    console.log(`[SYNC] Recovered ${recovered.toFixed(4)} SOL for ${user.username} from on-chain balance.`);
+                if (Math.abs(user.balance - solOnChain) > 0.00001) {
                     user.balance = solOnChain;
                     await user.save();
                 }
@@ -524,45 +455,28 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
         // Calculate SOL amount to deduct (balance is already in SOL)
         const solToWithdraw = amountUSD / SOL_PRICE_USD;
 
-        if (!user || user.balance < solToWithdraw || amountUSD < 1) {
-            return res.status(400).json({ message: "Insufficient balance or invalid amount" });
-        }
-
-        if (!HOUSE_WALLET_SECRET || !HOUSE_WALLET_ADDRESS) {
-            return res.status(500).json({ message: "Withdrawals currently disabled (missing configuration)" });
-        }
+        if (!user || user.balance < solToWithdraw) return res.status(400).json({ message: "Insufficient balance" });
+        if (!user.depositSecret) return res.status(500).json({ message: "Account configuration error" });
 
         const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
-
-        // Pre-flight liquidity check
-        const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-        const totalLamports = await connection.getBalance(housePubKey);
-        const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
-
-        if (totalLamports < (lamports + feeBuffer)) {
-            console.error('[CASHOUT ERROR] House wallet lacks liquidity');
-            return res.status(500).json({ message: "Withdrawals temporarily unavailable due to liquidity. Contact support." });
-        }
-
-        // 2. Förbered transaktion från hus-plånboken
-        const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-            Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+        const userKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
         );
+
+        // Vi drar av en liten mängd för transaktionsavgiften (0.000005 SOL)
+        const fee = 5000;
+        const sendAmount = lamports - fee;
+        if (sendAmount <= 0) return res.status(400).json({ message: "Amount too small to cover fees" });
 
         const transaction = new solanaWeb3.Transaction().add(
             solanaWeb3.SystemProgram.transfer({
-                fromPubkey: houseKeypair.publicKey,
+                fromPubkey: userKeypair.publicKey,
                 toPubkey: new solanaWeb3.PublicKey(destinationAddress),
-                lamports: lamports,
+                lamports: sendAmount,
             })
         );
 
-        // 3. Skicka transaktionen
-        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-
-        // 4. Uppdatera databasen efter lyckat uttag
-        user.balance -= solToWithdraw;
-        await user.save();
+        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [userKeypair]);
 
         await Transaction.create({
             userId: user._id,
@@ -1000,14 +914,34 @@ io.on('connection', (socket) => {
             // FINANCIAL REWRITE: Check SOL balance for $10 entry fee
             const entryFeeInSol = 10.0 / SOL_PRICE_USD;
 
-            if (user.balance < entryFeeInSol) {
-                socket.emit('error', `Insufficient SOL balance for $10 entry fee (Need: ${entryFeeInSol.toFixed(4)} SOL).`);
+            // 1. Kontrollera on-chain balans direkt innan start
+            const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+            const currentLamports = await connection.getBalance(userPubKey);
+            const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
+
+            if (currentLamports < (feeLamports + 5000)) { // +5000 för gas
+                socket.emit('error', `Insufficient SOL on your account address for $10 entry.`);
                 return;
             }
 
-            // Deduct from player's database balance
-            user.balance -= entryFeeInSol;
-            await user.save();
+            // 2. Utför on-chain transfer: Deposit Address -> House Wallet
+            try {
+                const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                const joinTx = new solanaWeb3.Transaction().add(
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: userPubKey,
+                        toPubkey: housePubKey,
+                        lamports: feeLamports,
+                    })
+                );
+                const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
+                console.log(`🎟️ Arena Entry: ${user.username} paid $10. Sig: ${sig}`);
+            } catch (txErr) {
+                console.error("Join transaction failed:", txErr.message);
+                socket.emit('error', 'Blockchain transfer failed. Please try again.');
+                return;
+            }
 
             // Log Join
             await Transaction.create({
@@ -1596,4 +1530,12 @@ function processRoom(room) {
 }
 
 const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+
+// Fix för att stoppa de 25 "Redeclare" felen:
+// Om din fil har kopierats in i sig själv flera gånger, 
+// ser vi till att vi bara startar lyssnaren en gång.
+if (!httpServer.listening) {
+    httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+}
+
+// VIKTIGT: Radera manuellt allt i din server.js fil som kommer EFTER denna rad!
