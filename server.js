@@ -79,13 +79,26 @@ const allowedOrigins = [
     "https://agararena.space",
     "https://2-production-9e74.up.railway.app",
     /\.up\.railway\.app$/,
-    /\.agararena\.space$/
+    /\.agararena\.space$/,
 ];
 
-app.use(cors({
-    origin: allowedOrigins,
-    credentials: true
-}));
+function isOriginAllowed(origin) {
+    if (!origin) return true;
+    return allowedOrigins.some(o => (typeof o === 'string' ? o === origin : o.test(origin)));
+}
+
+const corsOptions = {
+    origin(origin, callback) {
+        if (isOriginAllowed(origin)) callback(null, true);
+        else callback(new Error(`CORS blocked origin: ${origin}`));
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma'],
+};
+
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 
 // --- 1. MODELLER & KONFIGURATION (Flyttade till toppen för att undvika krascher) ---
 
@@ -341,9 +354,9 @@ setInterval(async () => {
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
     cors: {
-        origin: allowedOrigins,
-        methods: ["GET", "POST"],
-        credentials: true
+        origin: (origin, cb) => cb(null, isOriginAllowed(origin)),
+        methods: ['GET', 'POST'],
+        credentials: true,
     },
     pingTimeout: 60000, // Öka timeout för att undvika att Render bryter anslutningen
     pingInterval: 25000
@@ -474,6 +487,10 @@ app.get('/api/config', (req, res) => {
         freePlay: DEV_FREE_PLAY,
         entryFeeUsd: DEV_FREE_PLAY ? 0 : 10,
     });
+});
+
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, freePlay: DEV_FREE_PLAY, uptime: process.uptime() });
 });
 
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
@@ -1212,15 +1229,15 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
 
-        console.log(`⏱️ User ${p.username} started cashout timer (20s)`);
+        console.log(`⏱️ User ${p.username} started cashout timer (${DEV_FREE_PLAY ? '5s test' : '20s'})`);
         p.isCashingOut = true;
-        const duration = 20000;
+        const duration = DEV_FREE_PLAY ? 5000 : 20000;
         p.cashOutEndTime = Date.now() + duration;
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
 
         // Meddela klienten att timern har börjat
-        socket.emit('cashOutStarting', { seconds: 20 });
+        socket.emit('cashOutStarting', { seconds: duration / 1000 });
 
         setTimeout(async () => {
             // Hämta färsk referens till rummet och spelaren för att se om de fortfarande lever
@@ -1328,7 +1345,7 @@ io.on('connection', (socket) => {
                 console.error("❌ Cashout error:", err.message);
                 io.to(activePlayer.id).emit('error', 'Transfer failed.');
             }
-        }, 20000); // 20 sekunders fördröjning
+        }, duration);
     });
 
     socket.on('disconnect', () => {
