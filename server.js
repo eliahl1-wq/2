@@ -952,16 +952,33 @@ io.on('connection', (socket) => {
                 status: 'confirmed'
             });
 
-            // REAL MONEY GAME ECONOMY SPLIT ($10)
-            room.foodPoolBalance += 6.0;  // $6 to food
-            room.aiBudgetBalance += 2.0;  // $2 to AI budget
-            room.ownerBalance += 1.0;  // $1 to Owner
+            // DYNAMIC ECONOMY SPLIT ($10)
+            const activeHumansCount = room.players.filter(p => !p.disconnected).length + 1;
+
+            if (activeHumansCount < 3) {
+                room.foodPoolBalance += 6.0;  // $6 to food
+                room.aiBudgetBalance += 2.0;  // $2 to AI budget
+            } else if (activeHumansCount < 8) {
+                room.foodPoolBalance += 7.0;  // $7 to food
+                room.aiBudgetBalance += 1.0;  // $1 to AI budget
+            } else {
+                room.foodPoolBalance += 8.0;  // $8 to food
+                room.aiBudgetBalance += 0.0;  // $0 to AI budget
+            }
+
+            room.ownerBalance += 1.0;  // Always $1 to Owner
             // The remaining $1 is used for the player's starting balance ($1.0)
 
-            // ENFORCE STRICT 1:1 HUMAN-BOT RATIO
-            // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
-            const activeHumans = room.players.filter(p => !p.disconnected).length + 1;
-            const targetBots = activeHumans > 0 ? 2 : 0; // Max 2 bottar om det finns människor
+            // DYNAMIC BOT SCALING
+            let targetBots = 0;
+            if (activeHumansCount > 0 && activeHumansCount < 3) {
+                targetBots = 2;
+            } else if (activeHumansCount >= 3 && activeHumansCount < 8) {
+                targetBots = activeHumansCount; // 1 bot per human (1:1)
+            } else {
+                targetBots = 0; // 0 bots if 8+ humans
+            }
+
             if (room.bots.length < targetBots) {
                 addBots(room, targetBots - room.bots.length);
             } else if (room.bots.length > targetBots) {
@@ -1000,9 +1017,6 @@ io.on('connection', (socket) => {
                 }]
             };
             room.players.push(newPlayer);
-
-            // Om vi har bottar inne, ta bort en för att göra plats åt den riktiga spelaren
-            if (room.bots.length > 0) room.bots.shift();
 
             // Skicka 'welcome' som i original-repot, med spelarens initiala data och världsstorlek
             socket.emit('welcome', newPlayer, { width: c.worldWidth, height: c.worldHeight });
@@ -1229,10 +1243,17 @@ function processRoom(room) {
 
     if (room.isResetting) return; // Step 1: Lock gameplay
 
-    // STRICT 1:1 BOT RATIO ENFORCEMENT
-    // ENFORCE POPULATED ARENA: Baseline of 15 bots if 1+ human, max 30.
-    const activeHumans = room.players.filter(p => !p.disconnected).length;
-    const targetBots = activeHumans > 0 ? 2 : 0; // Håll det till 2 bottar
+    // DYNAMIC BOT SCALING (Continuously maintained)
+    const activeHumansCount = room.players.filter(p => !p.disconnected).length;
+    let targetBots = 0;
+    if (activeHumansCount > 0 && activeHumansCount < 3) {
+        targetBots = 2;
+    } else if (activeHumansCount >= 3 && activeHumansCount < 8) {
+        targetBots = activeHumansCount; // 1 bot per human
+    } else {
+        targetBots = 0; // 0 bots if 8+ humans
+    }
+
     if (room.bots.length < targetBots) {
         addBots(room, targetBots - room.bots.length);
     } else if (room.bots.length > targetBots) {
