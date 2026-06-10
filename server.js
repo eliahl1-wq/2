@@ -30,7 +30,12 @@ const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET;
 const OWNER_VAULT_ADDRESS = process.env.OWNER_VAULT_ADDRESS; // Din personliga plånbok för vinst
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
+const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
 let SOL_PRICE_USD = 57; // Default fallback price, updated by market scanner
+
+if (DEV_FREE_PLAY) {
+    console.warn('⚠️ DEV_FREE_PLAY is ON — join/cashout/reset use simulated money (no real Solana).');
+}
 
 async function updateSolPrice() {
     try {
@@ -177,7 +182,19 @@ async function performRoomReset(room) {
         for (const p of playersToProcess) {
             try {
                 const user = await User.findById(p.mongoId);
-                if (user && user.depositAddress && HOUSE_WALLET_SECRET) {
+                if (!user) continue;
+
+                if (DEV_FREE_PLAY) {
+                    user.playtime += (Date.now() - p.startTime);
+                    await user.save();
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'withdraw',
+                        amount: p.balance,
+                        meta: { simulated: true, reason: 'Auto Room Reset (Free Play)', roomId: room.id },
+                    });
+                    io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: 'simulated' });
+                } else if (user.depositAddress && HOUSE_WALLET_SECRET) {
                     const solToTransfer = p.balance / SOL_PRICE_USD;
                     const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
 
@@ -213,7 +230,7 @@ async function performRoomReset(room) {
         room.players = []; // Step 4: Players are now cleared from memory
 
         // Step 5: Direct Blockchain Wallet Sweep (Transfer real SOL to owner)
-        if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
+        if (!DEV_FREE_PLAY && HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
             try {
                 const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                 // Step 1: Fetch exact, real-time Lamports balance from the blockchain
@@ -428,6 +445,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.balanceSol = user.balance;
         userObj.balanceUsd = user.balance * SOL_PRICE_USD;
         userObj.solPrice = SOL_PRICE_USD;
+        userObj.freePlay = DEV_FREE_PLAY;
 
         res.json(userObj);
     } catch (err) {
@@ -449,6 +467,14 @@ const authenticateAdmin = (req, res, next) => {
         } catch (err) { res.sendStatus(500); }
     });
 };
+
+// Public config (no auth) — frontend uses this for test-mode UI
+app.get('/api/config', (req, res) => {
+    res.json({
+        freePlay: DEV_FREE_PLAY,
+        entryFeeUsd: DEV_FREE_PLAY ? 0 : 10,
+    });
+});
 
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
 app.get('/api/game-status', authenticateToken, (req, res) => {
@@ -988,6 +1014,7 @@ io.on('connection', (socket) => {
             // FINANCIAL REWRITE: Check SOL balance for $10 entry fee
             const entryFeeInSol = 10.0 / SOL_PRICE_USD;
 
+            if (!DEV_FREE_PLAY) {
             // 1. Kontrollera on-chain balans direkt innan start
             const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
             const currentLamports = await connection.getBalance(userPubKey);
@@ -1016,13 +1043,21 @@ io.on('connection', (socket) => {
                 socket.emit('error', 'Blockchain transfer failed. Please try again.');
                 return;
             }
+            } else {
+                console.log(`🎮 [FREE PLAY] ${user.username} joined (simulated $10 entry)`);
+            }
 
             // Log Join
             await Transaction.create({
                 userId: user._id,
                 type: 'game',
                 amount: entryFeeInSol,
-                meta: { event: 'join', roomId: room.id, entryFeeUsd: 10.0 },
+                meta: {
+                    event: 'join',
+                    roomId: room.id,
+                    entryFeeUsd: 10.0,
+                    ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                },
                 status: 'confirmed'
             });
 
@@ -1209,6 +1244,22 @@ io.on('connection', (socket) => {
                     console.log(`❌ Cashout failed: User ${activePlayer.username} has no internal deposit address.`);
                     io.to(activePlayer.id).emit('error', 'Account internal error.');
                     activePlayer.isCashingOut = false;
+                    return;
+                }
+
+                if (DEV_FREE_PLAY) {
+                    activeRoom.players = activeRoom.players.filter(pl => pl.mongoId.toString() !== playerMongoId);
+                    user.playtime += (Date.now() - activePlayer.startTime);
+                    await user.save();
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'withdraw',
+                        amount: totalCashout,
+                        meta: { simulated: true, reason: 'Arena Cashout (Free Play)' },
+                        status: 'confirmed',
+                    });
+                    console.log(`🎮 [FREE PLAY] Cashout: $${totalCashout.toFixed(2)} (simulated)`);
+                    io.to(activePlayer.id).emit('cashOutSuccess', { amount: totalCashout, signature: 'simulated' });
                     return;
                 }
 
