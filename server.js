@@ -1158,7 +1158,7 @@ io.on('connection', (socket) => {
             let newPlayer;
 
             if (gameMode === 'slither') {
-                newPlayer = createSlitherPlayer(socket.id, user._id, username || user.username, util.randomColor());
+                newPlayer = createSlitherPlayer(socket.id, user._id, username || user.username, util.randomColor(), room);
             } else {
                 const spawnX = Math.random() * c.worldWidth;
                 const spawnY = Math.random() * c.worldHeight;

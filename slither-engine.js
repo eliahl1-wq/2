@@ -36,13 +36,33 @@ export function balanceToSegmentCount(balance) {
     return Math.min(500, Math.round(SLITHER.baseSegments + cents * SLITHER.segmentsPerCent));
 }
 
-export function createSegments(x, y, balance) {
+export function createSegments(x, y, balance, angle = 0) {
     const count = balanceToSegmentCount(balance);
     const segs = [];
     for (let i = 0; i < count; i++) {
-        segs.push({ x, y });
+        segs.push({
+            x: x - Math.cos(angle) * i * SLITHER.segmentSpacing,
+            y: y - Math.sin(angle) * i * SLITHER.segmentSpacing,
+        });
     }
     return segs;
+}
+
+function isSpawnClear(room, x, y, minDist = 100) {
+    for (const { entity: s } of getAllSlitherSnakes(room)) {
+        const h = s.segments?.[0];
+        if (h && dist(x, y, h.x, h.y) < minDist) return false;
+    }
+    return true;
+}
+
+function pickSlitherSpawn(room) {
+    for (let i = 0; i < 30; i++) {
+        const x = randomSpawnCoord();
+        const y = randomSpawnCoord();
+        if (isSpawnClear(room, x, y)) return { x, y };
+    }
+    return { x: randomSpawnCoord(), y: randomSpawnCoord() };
 }
 
 export function headRadiusForBalance(balance) {
@@ -79,9 +99,9 @@ export function addSlitherFood(room, n, foodBlobValue) {
 }
 
 export function createSlitherBot(room) {
-    const x = randomSpawnCoord();
-    const y = randomSpawnCoord();
+    const { x, y } = pickSlitherSpawn(room);
     const balance = SLITHER.botStartBalance;
+    const angle = Math.random() * Math.PI * 2;
     return {
         id: 'slither_bot_' + randId(),
         username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)] + ' [' + util.randomInRange(10, 99) + ']',
@@ -89,12 +109,12 @@ export function createSlitherBot(room) {
         balance,
         kills: 0,
         color: util.randomColor(),
-        segments: createSegments(x, y, balance),
-        inputDx: Math.random() * 2 - 1,
-        inputDy: Math.random() * 2 - 1,
+        segments: createSegments(x, y, balance, angle),
+        inputDx: Math.cos(angle),
+        inputDy: Math.sin(angle),
         boost: false,
         aiTimer: Math.floor(10 + Math.random() * 30),
-        angle: 0,
+        angle,
     };
 }
 
@@ -229,6 +249,7 @@ function checkWallCollision(snake) {
 }
 
 function checkSelfCollision(snake) {
+    if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return false;
     const head = snake.segments[0];
     const r = headRadiusForBalance(snake.balance);
     for (let i = SLITHER.selfCollisionSkip; i < snake.segments.length; i++) {
@@ -239,6 +260,7 @@ function checkSelfCollision(snake) {
 }
 
 function checkSnakeCollisions(snake, allSnakes) {
+    if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return null;
     const head = snake.segments[0];
     const r = headRadiusForBalance(snake.balance);
     for (const { entity: other } of allSnakes) {
@@ -412,10 +434,10 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
         });
 }
 
-export function createSlitherPlayer(socketId, mongoId, username, color) {
-    const x = randomSpawnCoord();
-    const y = randomSpawnCoord();
+export function createSlitherPlayer(socketId, mongoId, username, color, room) {
+    const { x, y } = pickSlitherSpawn(room);
     const balance = 1.0;
+    const angle = Math.random() * Math.PI * 2;
     return {
         id: socketId,
         mongoId,
@@ -424,14 +446,15 @@ export function createSlitherPlayer(socketId, mongoId, username, color) {
         kills: 0,
         balance,
         startTime: Date.now(),
+        spawnGraceUntil: Date.now() + 1500,
         color,
         x,
         y,
-        inputDx: 1,
-        inputDy: 0,
+        inputDx: Math.cos(angle),
+        inputDy: Math.sin(angle),
         boost: false,
-        angle: 0,
-        segments: createSegments(x, y, balance),
+        angle,
+        segments: createSegments(x, y, balance, angle),
         screenWidth: 1920,
         screenHeight: 1080,
         cells: [{
