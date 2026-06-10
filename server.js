@@ -310,7 +310,7 @@ async function scanDeposits() {
                 const changeLamports = postBalance - preBalance;
 
                 if (changeLamports > 0) {
-                    const solAmount = changeLamports / solanaWeb3.LAMPORTS_PER_SOL;
+                    const solAmount = changeLamports / solanaWeb3.LAMPORTS_PER_SOL; // Amount deposited in this specific transaction
 
                     // ADD RAW SOL DIRECTLY to prevent market insolvency
                     user.balance += solAmount;
@@ -323,21 +323,21 @@ async function scanDeposits() {
                                 Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
                             );
 
-                            // Vi lämnar en liten mängd (t.ex. 0.001 SOL) för att täcka framtida transaktionsavgifter 
-                            // eller så skickar vi allt minus avgiften för denna transaktion.
-                            const balance = await connection.getBalance(pubKey);
-                            const fee = 5000; // Standardavgift på Solana (lamports)
+                            // SWEEP: Skicka ALLT från insättningsadressen till hus-plånboken, minus en liten buffert för framtida fees
+                            const currentDepositAddressBalanceLamports = await connection.getBalance(pubKey);
+                            const sweepBufferLamports = 5000; // 0.005 SOL för att täcka transaktionsavgifter
 
-                            if (balance > fee) {
+                            if (currentDepositAddressBalanceLamports > sweepBufferLamports) {
+                                const lamportsToSweep = currentDepositAddressBalanceLamports - sweepBufferLamports;
                                 const sweepTx = new solanaWeb3.Transaction().add(
                                     solanaWeb3.SystemProgram.transfer({
                                         fromPubkey: pubKey,
                                         toPubkey: new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS),
-                                        lamports: balance - fee,
+                                        lamports: lamportsToSweep,
                                     })
                                 );
-                                await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [fromKeypair]);
-                                console.log(`💸 SWEEP: Skickade ${solAmount} SOL till hus-plånboken.`);
+                                const sweepSig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [fromKeypair]);
+                                console.log(`💸 SWEEP: Skickade ${lamportsToSweep / solanaWeb3.LAMPORTS_PER_SOL} SOL från ${user.username}'s deposit-adress till hus-plånboken. Sig: ${sweepSig}`);
                             }
                         } catch (sweepErr) {
                             console.error("Sweep Error:", sweepErr.message);
@@ -452,29 +452,21 @@ const authenticateToken = (req, res, next) => {
 
 app.get('/api/me', authenticateToken, async (req, res) => {
     try {
-        const user = await User.findById(req.user.id);
+        const user = await User.findById(req.user.id).select('-password -depositSecret'); // Exkludera känslig info
         if (!user) return res.status(404).json({ message: "Användare hittades ej" });
 
-        // AUTOMATISK SYNC: Kolla om det ligger SOL på insättningsadressen som inte krediterats i DB
+        let solOnChain = 0;
         if (user.depositAddress) {
             try {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const lamports = await connection.getBalance(pubKey);
-                const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
-
-                // Om det finns pengar på adressen (mer än 0.0005 för att täcka damm/fees), 
-                // lägg till dem i DB-balansen direkt.
-                if (solOnChain > 0.0005) {
-                    console.log(`[SYNC] Hittade ${solOnChain.toFixed(4)} okrediterad SOL för ${user.username}. Uppdaterar DB...`);
-                    user.balance += solOnChain;
-                    await user.save();
-                }
+                solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
             } catch (e) { console.error("Sync error in /api/me:", e.message); }
         }
 
         const userObj = user.toObject();
-        delete userObj.password;
-        delete userObj.depositSecret;
+        // Lägg till onChainBalance för frontend att visa, men ändra INTE DB-balansen här
+        userObj.onChainBalance = solOnChain;
 
         // Map the internal raw SOL balance to what the frontend expects
         userObj.balanceSol = user.balance;
