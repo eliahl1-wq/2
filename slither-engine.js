@@ -21,7 +21,7 @@ export const SLITHER = {
     turnRate: 4.8,
     maxInput: 4,
     boostMultiplier: 1.55,
-    boostCostPerTick: 0.00012,
+    boostCostPerTick: 0.0025,
     foodRadius: 3.5,
     segmentSpacing: 6,
     baseSegments: 6,
@@ -303,7 +303,7 @@ function minBalanceForSnake(snake) {
     return getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).playerStartBalance;
 }
 
-function updateSnakeMovement(snake) {
+function updateSnakeMovement(snake, room = null) {
     const head = snake.segments[0];
     const { dx, dy } = normalizeSnakeInput(snake);
 
@@ -319,14 +319,34 @@ function updateSnakeMovement(snake) {
     else if (da < -maxTurn) da = -maxTurn;
     snake.angle = current + da;
 
+    // Boost only works above min balance ($1 size) — at the floor it shuts off entirely
+    const minBal = minBalanceForSnake(snake);
+    const canBoost = !!snake.boost && snake.balance > minBal * 1.01;
+
     const mx = Math.cos(snake.angle);
     const my = Math.sin(snake.angle);
-    const step = speedForBalance(snake.balance, snake.boost);
+    const step = speedForBalance(snake.balance, canBoost);
     head.x += mx * step;
     head.y += my * step;
 
-    if (snake.boost && snake.balance > minBalanceForSnake(snake) * 1.05) {
-        snake.balance = Math.max(minBalanceForSnake(snake), snake.balance - SLITHER.boostCostPerTick);
+    if (canBoost) {
+        const cost = Math.min(SLITHER.boostCostPerTick, snake.balance - minBal);
+        snake.balance -= cost;
+        // slither.io-style: boosted mass drops as food pellets behind the tail
+        snake._boostDropAcc = (snake._boostDropAcc || 0) + cost;
+        if (room && snake._boostDropAcc >= SLITHER.foodBlobValue) {
+            const tail = snake.segments[snake.segments.length - 1];
+            room.slitherFood.push({
+                id: randId(),
+                x: tail.x + (Math.random() - 0.5) * 8,
+                y: tail.y + (Math.random() - 0.5) * 8,
+                balance: snake._boostDropAcc,
+                hue: Math.floor(Math.random() * 360),
+                radius: SLITHER.foodRadius,
+                deathDrop: true,
+            });
+            snake._boostDropAcc = 0;
+        }
     }
 
     const spacing = segmentSpacingForBalance(snake.balance);
@@ -668,7 +688,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         }
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
-        updateSnakeMovement(snake);
+        updateSnakeMovement(snake, room);
         checkFoodCollisions(snake, room);
 
         if (isHuman && !isBR) {
