@@ -610,7 +610,7 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
             foodBlobValue,
             foodValueTarget + goldenValueOnMap,
         );
-    } else if (normalCount > targetFoodCount) {
+    } else if (normalCount > targetFoodCount + 20) {
         trimSlitherFood(room, targetFoodCount);
     }
 }
@@ -691,6 +691,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const allSnakes = getAllSlitherSnakes(room);
     const range = SLITHER.viewRange;
+    const foodRange = range + 200;
 
     room.players
         .filter(p => p.mode === 'slither' && !p.disconnected)
@@ -708,7 +709,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 .map(({ entity: s }) => serializeSnake(s, s.id === p.id));
 
             const visibleFood = room.slitherFood
-                .filter(f => isInView(head.x, head.y, f.x, f.y, range))
+                .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
                 .map(f => ({
                     id: f.id,
                     x: f.x,

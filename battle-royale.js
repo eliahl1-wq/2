@@ -27,7 +27,9 @@ export const BR = {
     shrinkFactor: 0.72,
     minZoneRadius: 380,
     houseFeePct: 0.05,
-    agarStartMass: 25,
+    agarStartBalance: 1.0,
+    agarFoodPerPlayer: 140,
+    agarFoodMin: 350,
     agarWorld: 6000,
 };
 
@@ -255,10 +257,33 @@ function findQueueEntry(mongoId) {
     return null;
 }
 
+function addBRAgarFood(room, n) {
+    for (let i = 0; i < n; i++) {
+        const { x, y } = randomSpawnInZone(room);
+        room.food.push({
+            id: randId(),
+            x,
+            y,
+            hue: Math.floor(Math.random() * 360),
+            radius: 7,
+            balance: 0.01,
+        });
+    }
+}
+
+function syncBRAgarFood(room, playerCount) {
+    const target = Math.max(BR.agarFoodMin, playerCount * BR.agarFoodPerPlayer);
+    if (room.food.length < target) {
+        addBRAgarFood(room, Math.min(60, target - room.food.length));
+    } else if (room.food.length > target * 1.35) {
+        room.food.length = target;
+    }
+}
+
 function createBRAgarPlayer(socketId, mongoId, username, color, room, deps) {
     const { x, y } = randomSpawnInZone(room);
-    const mass = BR.agarStartMass;
-    const { calculateCellRadius } = deps;
+    const { calculateCellRadius, c } = deps;
+    const startBalance = c.playerStartBalance;
     return {
         id: socketId,
         mongoId,
@@ -267,7 +292,7 @@ function createBRAgarPlayer(socketId, mongoId, username, color, room, deps) {
         isBattleRoyale: true,
         brMatchId: room.id,
         kills: 0,
-        mass,
+        balance: startBalance,
         startTime: Date.now(),
         color,
         x,
@@ -279,8 +304,8 @@ function createBRAgarPlayer(socketId, mongoId, username, color, room, deps) {
         cells: [{
             id: randId(),
             x, y,
-            mass,
-            radius: calculateCellRadius(mass, mass, 1),
+            balance: startBalance,
+            radius: calculateCellRadius(startBalance, startBalance, 1, startBalance),
             vx: 0, vy: 0,
             lastSplit: Date.now(),
         }],
@@ -455,6 +480,9 @@ function endMatchNoWinner(room, io) {
 
 function rebuildBRQuadTree(room, allUsers) {
     room.qt.clear();
+    room.food.forEach(f => {
+        room.qt.insert(new Point(f.x, f.y, { type: 'food', data: f }));
+    });
     allUsers.forEach(player => {
         for (const cell of player.cells) {
             room.qt.insert(new Point(cell.x, cell.y, {
@@ -466,23 +494,26 @@ function rebuildBRQuadTree(room, allUsers) {
     });
 }
 
-function cellMass(cell) {
-    return cell.mass ?? cell.balance ?? 1;
+function cellBalance(cell) {
+    return cell.balance ?? cell.mass ?? 1;
 }
 
 function playerTotalMass(player) {
-    return player.cells.reduce((s, cl) => s + cellMass(cl), 0);
+    return player.cells.reduce((s, cl) => s + cellBalance(cl), 0);
 }
 
 function processBRAgarMatch(room, io, deps) {
     const { c, calculateCellRadius } = deps;
+    const startBal = c.playerStartBalance;
     const allUsers = room.players.filter(p => !p.disconnected);
     const userMap = new Map(allUsers.map(u => [u.id, u]));
 
+    rebuildBRQuadTree(room, allUsers);
+
     allUsers.forEach(player => {
         for (const cell of player.cells) {
-            const mass = cellMass(cell);
-            const speed = (6 / Math.pow(Math.max(mass, 1), 0.449)) * c.speedMult;
+            const bal = cellBalance(cell);
+            const speed = (6 / Math.pow(Math.max(bal, 1), 0.449)) * c.speedMult;
             const angle = Math.atan2(player.mouseY, player.mouseX);
             const distToMouse = Math.hypot(player.mouseX, player.mouseY);
             const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
@@ -501,21 +532,28 @@ function processBRAgarMatch(room, io, deps) {
 
             const range = new Rectangle(cell.x, cell.y, r * 2, r * 2);
             for (const item of room.qt.query(range)) {
-                if (item.type !== 'player' || item.socketId === player.id) continue;
-                const other = userMap.get(item.socketId);
-                const otherCell = item.cell;
-                if (!other) continue;
-                const d = Math.hypot(cell.x - otherCell.x, cell.y - otherCell.y);
-                if (cellMass(cell) > cellMass(otherCell) * 1.05 && d < (r + otherCell.radius) * 0.1) {
-                    cell.mass = cellMass(cell) + cellMass(otherCell);
-                    cell.radius = calculateCellRadius(cell.mass, cell.mass, player.cells.length);
-                    player.kills = (player.kills || 0) + 1;
-                    other.cells = other.cells.filter(cl => cl.id !== otherCell.id);
-                    if (other.cells.length === 0) eliminateBRPlayer(room, other, io, deps, 'killed');
+                if (item.type === 'food') {
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                        cell.balance = cellBalance(cell) + (item.data.balance || c.foodBlobValue);
+                        cell.radius = calculateCellRadius(cell.balance, playerTotalMass(player), player.cells.length, startBal);
+                        room.food = room.food.filter(f => f.id !== item.data.id);
+                    }
+                } else if (item.type === 'player' && item.socketId !== player.id) {
+                    const other = userMap.get(item.socketId);
+                    const otherCell = item.cell;
+                    if (!other) continue;
+                    const d = Math.hypot(cell.x - otherCell.x, cell.y - otherCell.y);
+                    if (cellBalance(cell) > cellBalance(otherCell) * 1.05 && d < (r + otherCell.radius) * 0.1) {
+                        cell.balance = cellBalance(cell) + cellBalance(otherCell);
+                        cell.radius = calculateCellRadius(cell.balance, playerTotalMass(player), player.cells.length, startBal);
+                        player.kills = (player.kills || 0) + 1;
+                        other.cells = other.cells.filter(cl => cl.id !== otherCell.id);
+                        if (other.cells.length === 0) eliminateBRPlayer(room, other, io, deps, 'killed');
+                    }
                 }
             }
         }
-        player.mass = playerTotalMass(player);
+        player.balance = playerTotalMass(player);
         if (player.cells.length) {
             player.x = player.cells.reduce((s, cl) => s + cl.x, 0) / player.cells.length;
             player.y = player.cells.reduce((s, cl) => s + cl.y, 0) / player.cells.length;
@@ -537,15 +575,17 @@ function processBRAgarMatch(room, io, deps) {
         io.to(p.id).emit('leaderboard', { leaderboard: lb, battleRoyale: true });
         const rangeX = (p.screenWidth || 1920) / 2 + 400;
         const rangeY = (p.screenHeight || 1080) / 2 + 400;
-        const visible = room.qt.query(new Rectangle(p.x, p.y, rangeX, rangeY));
+        const visibleItems = room.qt.query(new Rectangle(p.x, p.y, rangeX, rangeY));
         const visibleUsersSet = new Set([p]);
-        visible.forEach(item => {
-            if (item.type === 'player') {
+        const visibleFood = [];
+        visibleItems.forEach(item => {
+            if (item.type === 'food') visibleFood.push(item.data);
+            else if (item.type === 'player') {
                 const found = userMap.get(item.socketId);
                 if (found) visibleUsersSet.add(found);
             }
         });
-        io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), [], [], [], {
+        io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, [], [], {
             unlocked: false,
             unlockTime: 0,
             playerCount: allUsers.length,
@@ -623,7 +663,10 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
         if (!matches.has(room.id)) return;
         room.status = 'active';
         room.zone.nextShrinkAt = Date.now() + BR.shrinkIntervalMs;
-        if (variant === 'agar') rebuildBRQuadTree(room, room.players);
+        if (variant === 'agar') {
+            addBRAgarFood(room, Math.max(BR.agarFoodMin, room.players.length * BR.agarFoodPerPlayer));
+            rebuildBRQuadTree(room, room.players);
+        }
         room.players.forEach(p => {
             const meta = {
                 width: variant === 'slither' ? SLITHER.worldHalf * 2 : BR.agarWorld,
@@ -731,6 +774,8 @@ export function processBattleRoyaleMatches(io, deps) {
                 aliveCount: room.players.filter(p => !p.disconnected).length,
             });
         } else {
+            const humanCount = room.players.filter(p => !p.disconnected).length;
+            syncBRAgarFood(room, humanCount);
             processBRAgarMatch(room, io, deps);
         }
 

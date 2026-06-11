@@ -200,7 +200,7 @@ const c = {
         : 3 * 60 * 60 * 1000,
 };
 
-const joiningUsers = new Set();
+const CASHOUT_DURATION_MS = 10_000;
 
 let GLOBAL_ARENA_START = Date.now();
 let globalArenaResetting = false;
@@ -1725,9 +1725,9 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
 
-        console.log(`⏱️ User ${p.username} started cashout timer (20s)`);
+        console.log(`⏱️ User ${p.username} started cashout timer (${CASHOUT_DURATION_MS / 1000}s)`);
         p.isCashingOut = true;
-        const duration = 20000;
+        const duration = CASHOUT_DURATION_MS;
         p.cashOutEndTime = Date.now() + duration;
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
@@ -1976,7 +1976,7 @@ function processRoom(room) {
         const normalCount = countNormalAgarFood(room);
         if (normalCount < agarTargetFoodCount) {
             addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
-        } else if (normalCount > agarTargetFoodCount) {
+        } else if (normalCount > agarTargetFoodCount + 25) {
             trimNormalAgarFood(room, agarTargetFoodCount);
         }
     }
@@ -2283,7 +2283,9 @@ function processRoom(room) {
         const rangeX = (p.screenWidth || 1920) / 2 + 500;
         const rangeY = (p.screenHeight || 1080) / 2 + 500;
         const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
+        const foodRange = new Rectangle(p.x, p.y, rangeX + 220, rangeY + 220);
         const visibleItems = room.qt.query(viewRange);
+        const foodItems = room.qt.query(foodRange);
 
         const visibleFood = [];
         const visibleViruses = [];
@@ -2291,14 +2293,16 @@ function processRoom(room) {
         const visibleUsersSet = new Set();
         visibleUsersSet.add(p);
         visibleItems.forEach(item => {
-            if (item.type === 'food') visibleFood.push(item.data);
-            else if (item.type === 'virus') visibleViruses.push(item.data);
+            if (item.type === 'virus') visibleViruses.push(item.data);
             else if (item.type === 'ejected') visibleEjected.push(item.data);
             else if (item.type === 'player' || item.type === 'bot') {
                 const id = item.socketId || item.botId;
                 const found = userMap.get(id);
                 if (found) visibleUsersSet.add(found);
             }
+        });
+        foodItems.forEach(item => {
+            if (item.type === 'food') visibleFood.push(item.data);
         });
         io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
             resetTime: room.startTime + c.roomDuration,
