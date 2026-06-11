@@ -22,6 +22,7 @@ import {
     processSlitherRoom,
     broadcastSlitherState,
     syncSlitherFood,
+    spawnGoldenSlitherBlob,
 } from './slither-engine.js';
 import {
     ALLOWED_ENTRY_FEES,
@@ -29,6 +30,8 @@ import {
     normalizeEntryFee,
     getEconomy,
     getJoinPoolSplit,
+    getGoldenBlobValue,
+    wealthTaxDecayAmount,
 } from './economy.js';
 import {
     setupBattleRoyale,
@@ -192,7 +195,6 @@ const c = {
     growthBoost: 2,
     foodValuePerPlayer: 6.0,
     foodBlobValue: 0.01,
-    rewardUnlockDelay: 10 * 60 * 1000,
     roomDuration: process.env.DEV_ROOM_DURATION_MS
         ? parseInt(process.env.DEV_ROOM_DURATION_MS, 10)
         : 3 * 60 * 60 * 1000,
@@ -1185,6 +1187,50 @@ function addFood(room, n) {
     }
 }
 
+function countNormalAgarFood(room) {
+    return room.food.filter(f => !f.golden).length;
+}
+
+function trimNormalAgarFood(room, targetCount) {
+    const golden = room.food.filter(f => f.golden);
+    const normal = room.food.filter(f => !f.golden);
+    while (normal.length > targetCount) {
+        const removed = normal.pop();
+        room.foodPoolBalance += removed.balance;
+    }
+    room.food = normal.concat(golden);
+}
+
+/** One high-value blob per human join — value already deducted from food allocation. */
+function spawnGoldenAgarBlob(room, value) {
+    if (value <= 1e-9 || room.foodPoolBalance < value - 1e-9) return;
+    room.foodPoolBalance -= value;
+    room.food.push({
+        id: Math.random().toString(36).substr(2, 9),
+        x: Math.random() * c.worldWidth,
+        y: Math.random() * c.worldHeight,
+        hue: 48,
+        golden: true,
+        radius: Math.min(18, 10 + Math.sqrt(value / c.foodBlobValue) * 2),
+        balance: value,
+    });
+}
+
+function applyAgarWealthTax(player, room, startBalance) {
+    const total = player.cells.reduce((sum, cell) => sum + cell.balance, 0);
+    const decay = wealthTaxDecayAmount(total, startBalance);
+    if (decay <= 1e-9) return;
+    const actual = Math.min(decay, total - startBalance);
+    room.foodPoolBalance += actual;
+    for (const cell of player.cells) {
+        cell.balance -= actual * (cell.balance / total);
+    }
+    player.balance = player.cells.reduce((sum, cell) => sum + cell.balance, 0);
+    for (const cell of player.cells) {
+        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, startBalance);
+    }
+}
+
 function addViruses(room, n) {
     for (let i = 0; i < n; i++) {
         room.viruses.push({
@@ -1454,6 +1500,8 @@ io.on('connection', (socket) => {
             const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const activeHumansCount = room.players.filter(p => !p.disconnected).length + 1;
             const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, activeHumansCount);
+            const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
+            const foodToPool = Math.max(0, foodAlloc - goldenBlobValue);
 
             // Only fund bots up to the cap for current population; surplus → food pool
             const agarAfter = countHumansInMode(room, 'agar') + (gameMode === 'agar' ? 1 : 0);
@@ -1463,7 +1511,7 @@ io.on('connection', (socket) => {
             const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
             const aiToAdd = Math.min(aiAlloc, aiDeficit);
             room.aiBudgetBalance += aiToAdd;
-            room.foodPoolBalance += foodAlloc + (aiAlloc - aiToAdd);
+            room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd);
 
             room.ownerBalance += economy.ownerCut;
 
@@ -1566,8 +1614,16 @@ io.on('connection', (socket) => {
                     const agarInArena = countHumansInMode(room, 'agar');
                     const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), budgets.agar);
                     const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
-                    if (room.food.length < agarTargetFoodCount) {
-                        addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
+                    const normalCount = countNormalAgarFood(room);
+                    if (normalCount < agarTargetFoodCount) {
+                        addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
+                    }
+                }
+                if (goldenBlobValue > 1e-9) {
+                    if (gameMode === 'slither') {
+                        spawnGoldenSlitherBlob(room, goldenBlobValue);
+                    } else {
+                        spawnGoldenAgarBlob(room, goldenBlobValue);
                     }
                 }
             }
@@ -1909,10 +1965,13 @@ function processRoom(room) {
     const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
     if (agarInArena <= 0) {
         room.food.length = 0;
-    } else if (room.food.length < agarTargetFoodCount) {
-        addFood(room, Math.min(50, agarTargetFoodCount - room.food.length));
-    } else if (room.food.length > agarTargetFoodCount) {
-        room.food.splice(agarTargetFoodCount);
+    } else {
+        const normalCount = countNormalAgarFood(room);
+        if (normalCount < agarTargetFoodCount) {
+            addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
+        } else if (normalCount > agarTargetFoodCount) {
+            trimNormalAgarFood(room, agarTargetFoodCount);
+        }
     }
     syncSlitherFood(room, c.foodBlobValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
@@ -2024,7 +2083,7 @@ function processRoom(room) {
         let totalY = 0;
         const cellsToDelete = new Set();
 
-        // 1. Beräkna rörelse och decay för alla celler
+        // 1. Beräkna rörelse för alla celler
         for (let i = 0; i < player.cells.length; i++) {
             const cell = player.cells[i];
             // PHYSICS: Movement & Friction
@@ -2042,13 +2101,14 @@ function processRoom(room) {
             cell.vY = velY;
             cell.vx *= 0.85; cell.vy *= 0.85;
 
-            // DECAY: Ingen decay nu
-            if (c.massLossRate > 1.0 && cell.balance > 5.0) cell.balance /= c.massLossRate;
-
             // BOUNDS
             const r = cell.radius;
             cell.x = Math.max(r, Math.min(c.worldWidth - r, cell.x));
             cell.y = Math.max(r, Math.min(c.worldHeight - r, cell.y));
+        }
+
+        if (!player.isBot) {
+            applyAgarWealthTax(player, room, pStartBal);
         }
 
         // 2. Hantera kollisioner och merging
@@ -2200,9 +2260,6 @@ function processRoom(room) {
         .sort((a, b) => b.balance - a.balance)
         .slice(0, 10);
 
-    const age = Date.now() - room.startTime;
-    const rewardsUnlocked = (age > c.rewardUnlockDelay) && (room.players.length >= 4);
-
     // Skapa en kopia för leaderboard med USD-värden
     const visualLeaderboard = leaderboardData.map(entry => ({
         ...entry,
@@ -2237,9 +2294,6 @@ function processRoom(room) {
             }
         });
         io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
-            unlocked: rewardsUnlocked,
-            unlockTime: room.startTime + c.rewardUnlockDelay,
-            playerCount: room.players.length,
             resetTime: room.startTime + c.roomDuration,
             solPrice: SOL_PRICE_USD
         });

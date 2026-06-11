@@ -1,5 +1,5 @@
 import * as util from './utils.js';
-import { getEconomy, DEFAULT_ENTRY_FEE } from './economy.js';
+import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount } from './economy.js';
 
 export const SLITHER = {
     worldHalf: 3000,
@@ -72,10 +72,13 @@ function clearSlitherFood(room) {
 }
 
 function trimSlitherFood(room, targetCount) {
-    while (room.slitherFood.length > targetCount) {
-        const removed = room.slitherFood.pop();
+    const golden = room.slitherFood.filter(f => f.golden);
+    const normal = room.slitherFood.filter(f => !f.golden);
+    while (normal.length > targetCount) {
+        const removed = normal.pop();
         room.foodPoolBalance += removed.balance;
     }
+    room.slitherFood = normal.concat(golden);
 }
 
 function randId() {
@@ -180,6 +183,22 @@ export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity
             radius: SLITHER.foodRadius,
         });
     }
+}
+
+/** One high-value blob per human join — value already deducted from food allocation. */
+export function spawnGoldenSlitherBlob(room, value) {
+    if (value <= 1e-9 || room.foodPoolBalance < value - 1e-9) return;
+    room.foodPoolBalance -= value;
+    const { x, y } = pickSlitherSpawn(room);
+    room.slitherFood.push({
+        id: randId(),
+        x,
+        y,
+        balance: value,
+        hue: 48,
+        golden: true,
+        radius: SLITHER.foodRadius * 2.4,
+    });
 }
 
 /** BR-only pellets: growth mass only, not tied to prize pool or house wallet. */
@@ -533,16 +552,20 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
         return;
     }
     const densityScale = slitherFoodDensityScale();
-    const foodValueTarget = Math.min(humansInArena * densityPerHuman * densityScale, budget);
+    const goldenValueOnMap = room.slitherFood
+        .filter(f => f.golden)
+        .reduce((sum, f) => sum + f.balance, 0);
+    const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale, budget) - goldenValueOnMap);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
-    if (room.slitherFood.length < targetFoodCount) {
+    const normalCount = room.slitherFood.filter(f => !f.golden).length;
+    if (normalCount < targetFoodCount) {
         addSlitherFood(
             room,
-            Math.min(50, targetFoodCount - room.slitherFood.length),
+            Math.min(50, targetFoodCount - normalCount),
             foodBlobValue,
-            foodValueTarget,
+            foodValueTarget + goldenValueOnMap,
         );
-    } else if (room.slitherFood.length > targetFoodCount) {
+    } else if (normalCount > targetFoodCount) {
         trimSlitherFood(room, targetFoodCount);
     }
 }
@@ -577,6 +600,14 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 
         if (isHuman && !isBR) {
             const minBal = minBalanceForSnake(snake);
+            const decay = wealthTaxDecayAmount(snake.balance, minBal);
+            if (decay > 1e-9) {
+                const actual = Math.min(decay, snake.balance - minBal);
+                snake.balance -= actual;
+                room.foodPoolBalance += actual;
+                const targetCount = balanceToSegmentCount(snake.balance);
+                while (snake.segments.length > targetCount) snake.segments.pop();
+            }
             snake.balance = Math.max(minBal, snake.balance);
             if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
         }
@@ -636,7 +667,14 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
             const visibleFood = room.slitherFood
                 .filter(f => isInView(head.x, head.y, f.x, f.y, range))
-                .map(f => ({ id: f.id, x: f.x, y: f.y, hue: f.hue, radius: f.radius || SLITHER.foodRadius }));
+                .map(f => ({
+                    id: f.id,
+                    x: f.x,
+                    y: f.y,
+                    hue: f.hue,
+                    radius: f.radius || SLITHER.foodRadius,
+                    golden: !!f.golden,
+                }));
 
             io.to(p.id).emit('slitherTick', {
                 you: p.id,

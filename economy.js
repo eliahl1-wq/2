@@ -2,6 +2,12 @@
 export const ALLOWED_ENTRY_FEES = [5, 10, 20];
 export const DEFAULT_ENTRY_FEE = 10;
 
+/** Share of entry fee converted to one Golden Blob (deducted from food pool allocation). */
+export const GOLDEN_BLOB_ENTRY_SHARE = 0.10;
+
+/** Server tick rate used for wealth-tax decay (matches processRoom interval). */
+export const ECONOMY_TICKS_PER_SECOND = 40;
+
 /** Baseline economy at $10 entry — all values scale linearly with entry fee. */
 const BASE = {
     playerStart: 1.0,
@@ -15,8 +21,6 @@ const BASE = {
     botStart: 1.0,
     botMax: 500.0,
     foodDensityPerHuman: 250.0,
-    rankBonus1st: 20.0,
-    rankBonus2nd3rd: 10.0,
 };
 
 export function normalizeEntryFee(fee) {
@@ -45,9 +49,12 @@ export function getEconomy(entryFeeUsd) {
         botStartBalance: BASE.botStart * s,
         botMaxBalance: BASE.botMax * s,
         foodDensityPerHuman: BASE.foodDensityPerHuman * s,
-        rankBonus1st: BASE.rankBonus1st * s,
-        rankBonus2nd3rd: BASE.rankBonus2nd3rd * s,
     };
+}
+
+/** Golden Blob value for a join (= 10% of entry fee). */
+export function getGoldenBlobValue(entryFeeUsd) {
+    return normalizeEntryFee(entryFeeUsd) * GOLDEN_BLOB_ENTRY_SHARE;
 }
 
 /** Food + AI allocation for current population after a join. */
@@ -60,6 +67,19 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
         return { food: eco.foodMid, ai: eco.aiMid };
     }
     return { food: eco.foodHigh, ai: eco.aiHigh };
+}
+
+/**
+ * Soft wealth tax: decay scales with excess balance above starting size.
+ * Returns USD lost this tick (never below startBalance).
+ */
+export function wealthTaxDecayAmount(balance, startBalance, ticksPerSecond = ECONOMY_TICKS_PER_SECOND) {
+    const excess = balance - startBalance;
+    if (excess <= 1e-9) return 0;
+    const ratio = excess / startBalance;
+    const perSecondRate = 0.0015 * (1 + ratio * 0.5);
+    const decay = excess * perSecondRate / ticksPerSecond;
+    return Math.min(excess, decay);
 }
 
 /** Average entry fee for humans in a mode (defaults to $10 if empty). */
