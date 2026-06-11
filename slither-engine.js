@@ -18,6 +18,7 @@ export const SLITHER = {
     slitherTickRate: 125,
     serverTickRate: 40,
     speedMultiplier: 1.2,
+    turnRate: 4.8,
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00012,
@@ -301,11 +302,24 @@ function minBalanceForSnake(snake) {
 function updateSnakeMovement(snake) {
     const head = snake.segments[0];
     const { dx, dy } = normalizeSnakeInput(snake);
-    snake.angle = Math.atan2(dy, dx);
 
+    // slither.io-style turn-rate limit: heading rotates toward the cursor
+    // instead of snapping. Bigger snakes turn slower.
+    const desired = Math.atan2(dy, dx);
+    const sc = scaleForSegmentCount(snake.segments.length);
+    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
+    const current = snake.angle ?? desired;
+    let da = desired - current;
+    da = Math.atan2(Math.sin(da), Math.cos(da));
+    if (da > maxTurn) da = maxTurn;
+    else if (da < -maxTurn) da = -maxTurn;
+    snake.angle = current + da;
+
+    const mx = Math.cos(snake.angle);
+    const my = Math.sin(snake.angle);
     const step = speedForBalance(snake.balance, snake.boost);
-    head.x += dx * step;
-    head.y += dy * step;
+    head.x += mx * step;
+    head.y += my * step;
 
     if (snake.boost && snake.balance > minBalanceForSnake(snake) * 1.05) {
         snake.balance = Math.max(minBalanceForSnake(snake), snake.balance - SLITHER.boostCostPerTick);
@@ -399,12 +413,16 @@ function runSlitherBotAI(snake, allSnakes, food) {
         snake.boost = nearestPreyDist < fleeDistance * 0.25;
     } else if (Date.now() - (snake.lastTargetUpdate || 0) > AGAR_BOT_TARGET_INTERVAL_MS) {
         let nearestFood = null;
-        let nearestFoodDist = minDistFood;
+        let nearestFoodDist2 = minDistFood * minDistFood;
 
         for (const f of food) {
-            const d = dist(head.x, head.y, f.x, f.y);
-            if (d < nearestFoodDist) {
-                nearestFoodDist = d;
+            const fdx = head.x - f.x;
+            if (fdx > minDistFood || fdx < -minDistFood) continue;
+            const fdy = head.y - f.y;
+            if (fdy > minDistFood || fdy < -minDistFood) continue;
+            const d2 = fdx * fdx + fdy * fdy;
+            if (d2 < nearestFoodDist2) {
+                nearestFoodDist2 = d2;
                 nearestFood = f;
             }
         }
@@ -484,9 +502,18 @@ function checkSnakeCollisions(snake, allSnakes) {
 function checkFoodCollisions(snake, room) {
     const head = snake.segments[0];
     const r = headRadiusForBalance(snake.balance);
+    const reach = r + SLITHER.foodRadius;
+    const reach2 = reach * reach;
+    const hx = head.x;
+    const hy = head.y;
     for (let i = room.slitherFood.length - 1; i >= 0; i--) {
         const f = room.slitherFood[i];
-        if (dist(head.x, head.y, f.x, f.y) < r + SLITHER.foodRadius) {
+        // Cheap axis-aligned early-out before the full distance check
+        const fdx = hx - f.x;
+        if (fdx > reach || fdx < -reach) continue;
+        const fdy = hy - f.y;
+        if (fdy > reach || fdy < -reach) continue;
+        if (fdx * fdx + fdy * fdy < reach2) {
             snake.balance += f.balance;
             room.slitherFood.splice(i, 1);
         }
@@ -579,7 +606,7 @@ function serializeSnake(snake, isYou) {
         color: snake.color,
         isBot: !!snake.isBot,
         isYou,
-        segments: snake.segments.map(s => ({ x: s.x, y: s.y })),
+        segments: snake.segments.map(s => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 })),
         angle: snake.angle || 0,
         sc,
         radius: headRadiusForBalance(snake.balance),
@@ -712,8 +739,8 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
                 .map(f => ({
                     id: f.id,
-                    x: f.x,
-                    y: f.y,
+                    x: Math.round(f.x),
+                    y: Math.round(f.y),
                     hue: f.hue,
                     radius: f.radius || SLITHER.foodRadius,
                     golden: !!f.golden,
