@@ -5,7 +5,7 @@ export const SLITHER = {
     worldHalf: 3000,
     // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
     slitherGameRadius: 21600,
-    spawnSegments: 10,
+    spawnSegments: 6,
     maxSegments: 400,
     segmentsPerCent: 0.1,
     maxScale: 6,
@@ -17,13 +17,13 @@ export const SLITHER = {
     nsp3: 14,
     slitherTickRate: 125,
     serverTickRate: 40,
-    speedMultiplier: 3.0,
+    speedMultiplier: 1.85,
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00012,
     foodRadius: 5,
     segmentSpacing: 6,
-    baseSegments: 10,
+    baseSegments: 6,
     segmentsPerCentLegacy: 0.1,
     foodBlobValue: 0.01,
     botStartBalance: 1.0,
@@ -582,8 +582,6 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const toRemove = [];
 
     for (const { entity: snake, isHuman } of allSnakes) {
-        const frozenForCashout = isHuman && snake.isCashingOut && !isBR;
-
         if (!isBR && snake.isBot) {
             const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
             if (snake.balance > botMax) {
@@ -593,10 +591,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             runSlitherBotAI(snake, allSnakes, room.slitherFood);
         }
 
-        if (!frozenForCashout) {
-            updateSnakeMovement(snake);
-            checkFoodCollisions(snake, room);
-        }
+        // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
+        updateSnakeMovement(snake);
+        checkFoodCollisions(snake, room);
 
         if (isHuman && !isBR) {
             const minBal = minBalanceForSnake(snake);

@@ -1693,14 +1693,20 @@ io.on('connection', (socket) => {
             const startBal = playerStartBalance(p);
             if (cell.balance >= startBal * 1.5) {
                 cell.balance -= c.ejectMass;
+                cell.radius = calculateCellRadius(cell.balance, p.balance, p.cells.length, startBal);
                 const angle = Math.atan2(p.mouseY, p.mouseX);
+                const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
+                const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
+                // Recycle the spread (ejectMass − ejectMassGain) into the food pool so no money is lost
+                room.foodPoolBalance += Math.max(0, c.ejectMass - c.ejectMassGain);
                 room.ejected.push({
                     id: Math.random().toString(36).substr(2, 9),
-                    x: cell.x + Math.cos(angle) * (cell.radius + 20),
-                    y: cell.y + Math.sin(angle) * (cell.radius + 20),
+                    x: cell.x + dirX * (cell.radius + 20),
+                    y: cell.y + dirY * (cell.radius + 20),
                     radius: 10,
-                    vx: Math.cos(angle) * 15,
-                    vy: Math.sin(angle) * 15,
+                    vx: dirX * 22,
+                    vy: dirY * 22,
+                    hue: Math.floor(Math.random() * 360),
                     color: p.color,
                     balance: c.ejectMassGain
                 });
