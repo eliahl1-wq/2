@@ -265,7 +265,7 @@ function addBRAgarFood(room, n) {
             x,
             y,
             hue: Math.floor(Math.random() * 360),
-            radius: 7,
+            radius: 5,
             balance: 0.01,
         });
     }

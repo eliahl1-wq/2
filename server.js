@@ -1195,7 +1195,7 @@ function addFood(room, n) {
             x: Math.random() * c.worldWidth,
             y: Math.random() * c.worldHeight,
             hue: Math.floor(Math.random() * 360),
-            radius: 7, // Originalstorlek för mat
+            radius: 5,
             balance: foodBlobValue
         });
     }
@@ -1225,7 +1225,7 @@ function spawnGoldenAgarBlob(room, value) {
         y: Math.random() * c.worldHeight,
         hue: 48,
         golden: true,
-        radius: Math.min(18, 10 + Math.sqrt(value / c.foodBlobValue) * 2),
+        radius: Math.min(13, 7 + Math.sqrt(value / c.foodBlobValue) * 1.4),
         balance: value,
     });
 }

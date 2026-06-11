@@ -22,7 +22,7 @@ export const SLITHER = {
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00012,
-    foodRadius: 5,
+    foodRadius: 3.5,
     segmentSpacing: 6,
     baseSegments: 6,
     segmentsPerCentLegacy: 0.1,
