@@ -5,13 +5,13 @@ export const SLITHER = {
     worldHalf: 3000,
     // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
     slitherGameRadius: 21600,
-    spawnSegments: 5,
-    maxSegments: 400,
-    segmentsPerCent: 0.1,
+    spawnSegments: 6,
+    maxSegments: 500,
+    segmentsPerCent: 0.2,
     maxScale: 6,
     scaleDivisor: 106,
-    baseRadius: 8.0,
-    segmentSepFactor: 6,
+    baseRadius: 6.2,
+    segmentSepFactor: 3.6,
     nsp1: 5.39,
     nsp2: 0.4,
     nsp3: 14,
@@ -23,13 +23,13 @@ export const SLITHER = {
     boostCostPerTick: 0.00012,
     foodRadius: 5,
     segmentSpacing: 6,
-    baseSegments: 5,
+    baseSegments: 6,
     segmentsPerCentLegacy: 0.1,
     foodBlobValue: 0.01,
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
     viewRange: 520,
-    selfCollisionSkip: 4,
+    selfCollisionSkip: 2,
 };
 
 const BOT_NAMES = [
@@ -317,12 +317,10 @@ function updateSnakeMovement(snake) {
         const cur = snake.segments[i];
         const segDx = cur.x - prev.x;
         const segDy = cur.y - prev.y;
-        const d = Math.hypot(segDx, segDy);
-        if (d > spacing) {
-            const ratio = spacing / d;
-            cur.x = prev.x + segDx * ratio;
-            cur.y = prev.y + segDy * ratio;
-        }
+        const d = Math.hypot(segDx, segDy) || 0.001;
+        const ratio = spacing / d;
+        cur.x = prev.x + segDx * ratio;
+        cur.y = prev.y + segDy * ratio;
     }
 
     const targetCount = balanceToSegmentCount(snake.balance);
@@ -435,13 +433,33 @@ function checkWallCollision(snake) {
     return head.x < -limit || head.x > limit || head.y < -limit || head.y > limit;
 }
 
+function distPointToSegment(px, py, ax, ay, bx, by) {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-6) return dist(px, py, ax, ay);
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return dist(px, py, ax + t * dx, ay + t * dy);
+}
+
 function checkSelfCollision(snake) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return false;
     const head = snake.segments[0];
     const r = headRadiusForBalance(snake.balance);
-    for (let i = SLITHER.selfCollisionSkip; i < snake.segments.length; i++) {
+    const bodyR = r * 0.82;
+    const hitDist = r * 0.72 + bodyR * 0.55;
+    const start = SLITHER.selfCollisionSkip;
+
+    for (let i = start; i < snake.segments.length; i++) {
         const seg = snake.segments[i];
-        if (dist(head.x, head.y, seg.x, seg.y) < r * 0.85) return true;
+        if (dist(head.x, head.y, seg.x, seg.y) < hitDist) return true;
+    }
+
+    for (let i = start; i < snake.segments.length - 1; i++) {
+        const a = snake.segments[i];
+        const b = snake.segments[i + 1];
+        if (distPointToSegment(head.x, head.y, a.x, a.y, b.x, b.y) < hitDist) return true;
     }
     return false;
 }
