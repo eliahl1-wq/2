@@ -30,7 +30,7 @@ export const SLITHER = {
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
     viewRange: 520,
-    selfCollisionSkip: 2,
+    selfCollisionSkip: 4,
 };
 
 const BOT_NAMES = [
@@ -137,19 +137,23 @@ export function createSegments(x, y, balance, angle = 0) {
     return segs;
 }
 
-function isSpawnClear(room, x, y, minDist = 100) {
+function isSpawnClear(room, x, y, minDist = 120) {
     for (const { entity: s } of getAllSlitherSnakes(room)) {
-        const h = s.segments?.[0];
-        if (h && dist(x, y, h.x, h.y) < minDist) return false;
+        const r = headRadiusForBalance(s.balance ?? 1);
+        for (let i = 0; i < (s.segments?.length ?? 0); i++) {
+            const seg = s.segments[i];
+            const segR = i === 0 ? r : r * 0.75;
+            if (dist(x, y, seg.x, seg.y) < minDist + segR) return false;
+        }
     }
     return true;
 }
 
 function pickSlitherSpawn(room) {
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 40; i++) {
         const x = randomSpawnCoord();
         const y = randomSpawnCoord();
-        if (isSpawnClear(room, x, y, 60)) return { x, y };
+        if (isSpawnClear(room, x, y, 100)) return { x, y };
     }
     return { x: randomSpawnCoord(), y: randomSpawnCoord() };
 }
@@ -465,8 +469,8 @@ function checkSelfCollision(snake) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return false;
     const head = snake.segments[0];
     const r = headRadiusForBalance(snake.balance);
-    const bodyR = r * 0.82;
-    const hitDist = r * 0.72 + bodyR * 0.55;
+    // Must overlap meaningfully — thin grazing shouldn't kill
+    const hitDist = r * 0.52;
     const start = SLITHER.selfCollisionSkip;
 
     for (let i = start; i < snake.segments.length; i++) {
@@ -491,7 +495,7 @@ function checkSnakeCollisions(snake, allSnakes) {
         for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 3)) {
             const seg = other.segments[i];
             const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
-            if (dist(head.x, head.y, seg.x, seg.y) < r + segR * 0.5) {
+            if (dist(head.x, head.y, seg.x, seg.y) < r * 0.65 + segR * 0.45) {
                 return other;
             }
         }
@@ -770,7 +774,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         kills: 0,
         balance,
         startTime: Date.now(),
-        spawnGraceUntil: Date.now() + 1500,
+        spawnGraceUntil: Date.now() + 3500,
         color,
         x,
         y,

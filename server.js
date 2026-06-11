@@ -448,8 +448,10 @@ const io = new Server(httpServer, {
         methods: ['GET', 'POST'],
         credentials: true,
     },
-    pingTimeout: 60000, // Öka timeout för att undvika att Render bryter anslutningen
-    pingInterval: 25000
+    transports: ['polling', 'websocket'],
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    connectTimeout: 45000,
 });
 
 app.use(passport.initialize());
