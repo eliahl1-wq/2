@@ -105,11 +105,21 @@ const allowedOrigins = [
     "https://2-production-9e74.up.railway.app",
     /\.up\.railway\.app$/,
     /\.agararena\.space$/,
+    ...(process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
 ];
 
 function isOriginAllowed(origin) {
     if (!origin) return true;
     return allowedOrigins.some(o => (typeof o === 'string' ? o === origin : o.test(origin)));
+}
+
+function applyCorsHeaders(req, res) {
+    const origin = req.headers.origin;
+    if (origin && isOriginAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
 }
 
 const corsOptions = {
@@ -127,12 +137,7 @@ const corsOptions = {
 
 // Always answer preflight + attach ACAO even if a route throws (e.g. during Railway restarts)
 app.use((req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && isOriginAllowed(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-        res.setHeader('Vary', 'Origin');
-    }
+    applyCorsHeaders(req, res);
     if (req.method === 'OPTIONS') {
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma');
@@ -495,6 +500,12 @@ app.get('/api/auth/google/callback',
     }
 );
 
+// Lightweight health check — always returns CORS headers (used by frontend + uptime monitors)
+app.get('/api/health', (req, res) => {
+    applyCorsHeaders(req, res);
+    res.json({ ok: true, ts: Date.now() });
+});
+
 // Hälso-check för att se om servern är vaken
 app.get('/', (req, res) => {
     console.log("Health check requested at " + new Date().toISOString());
@@ -502,21 +513,21 @@ app.get('/', (req, res) => {
 });
 
 const authenticateToken = (req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && isOriginAllowed(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-        res.setHeader('Vary', 'Origin');
-    }
+    applyCorsHeaders(req, res);
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.sendStatus(401);
+    if (!token) return res.status(401).json({ message: 'No token provided' });
 
-    // Använd en fallback hemlighet om JWT_SECRET inte är satt (endast för utveckling)
     const jwtSecret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
 
     jwt.verify(token, jwtSecret, (err, user) => {
-        if (err) return res.sendStatus(403);
+        if (err) {
+            const expired = err.name === 'TokenExpiredError';
+            return res.status(403).json({
+                message: expired ? 'Session expired — please log in again' : 'Invalid token',
+                expired,
+            });
+        }
         req.user = user;
         next();
     });
@@ -1028,7 +1039,7 @@ app.post('/api/login', async (req, res) => {
 
         // Skapa en JWT (Inloggningskvitto). Använd en hemlig nyckel från .env
         const secret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
-        const token = jwt.sign({ id: user._id }, secret, { expiresIn: '1h' });
+        const token = jwt.sign({ id: user._id }, secret, { expiresIn: '7d' });
 
         console.log("✅ SUCCESS: Inloggning lyckades, skickar token för:", username);
         res.json({
@@ -1383,8 +1394,12 @@ io.on('connection', (socket) => {
             const entryFeeUsd = normalizeEntryFee(rawEntryFee);
             const economy = getEconomy(entryFeeUsd);
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
-            const user = await User.findById(decoded.id);
-            if (!user) return;
+            let user = await User.findById(decoded.id);
+            if (!user) {
+                socket.emit('error', 'Account not found — please log in again.');
+                return;
+            }
+            user = await ensureUserDepositWallet(user);
 
             if (getBRMatchForMongo(user._id.toString())) {
                 socket.emit('error', 'You are in an active Battle Royale match.');
@@ -1637,7 +1652,14 @@ io.on('connection', (socket) => {
                 solPrice: SOL_PRICE_USD,
             });
         } catch (err) {
-            socket.emit('error', 'Authentication failed');
+            console.error('joinGame error:', err.message);
+            if (err.name === 'TokenExpiredError') {
+                socket.emit('error', 'Session expired — please log in again.');
+            } else if (err.name === 'JsonWebTokenError') {
+                socket.emit('error', 'Invalid session — please log in again.');
+            } else {
+                socket.emit('error', err.message || 'Failed to join game');
+            }
         } finally {
             if (userKey) joiningUsers.delete(userKey);
         }
@@ -2318,12 +2340,7 @@ const PORT = process.env.PORT || 5000;
 
 // Keep CORS headers on unhandled errors (e.g. during Railway restarts)
 app.use((err, req, res, next) => {
-    const origin = req.headers.origin;
-    if (origin && isOriginAllowed(origin)) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-        res.setHeader('Access-Control-Allow-Credentials', 'true');
-        res.setHeader('Vary', 'Origin');
-    }
+    applyCorsHeaders(req, res);
     console.error('Unhandled error:', err);
     if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
 });
