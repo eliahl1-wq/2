@@ -21,8 +21,8 @@ export const SLITHER = {
     turnRate: 4.8,
     maxInput: 4,
     boostMultiplier: 1.55,
-    boostCostPerTick: 0.0025,
-    foodRadius: 3.5,
+    boostCostPerTick: 0.00125, // $0.05/s at 40Hz
+    foodRadius: 2.0,
     segmentSpacing: 6,
     baseSegments: 6,
     segmentsPerCentLegacy: 0.1,
@@ -329,24 +329,10 @@ function updateSnakeMovement(snake, room = null) {
     head.x += mx * step;
     head.y += my * step;
 
-    if (canBoost) {
+    if (canBoost && room) {
         const cost = Math.min(SLITHER.boostCostPerTick, snake.balance - minBal);
         snake.balance -= cost;
-        // slither.io-style: boosted mass drops as food pellets behind the tail
-        snake._boostDropAcc = (snake._boostDropAcc || 0) + cost;
-        if (room && snake._boostDropAcc >= SLITHER.foodBlobValue) {
-            const tail = snake.segments[snake.segments.length - 1];
-            room.slitherFood.push({
-                id: randId(),
-                x: tail.x + (Math.random() - 0.5) * 8,
-                y: tail.y + (Math.random() - 0.5) * 8,
-                balance: snake._boostDropAcc,
-                hue: Math.floor(Math.random() * 360),
-                radius: SLITHER.foodRadius,
-                deathDrop: true,
-            });
-            snake._boostDropAcc = 0;
-        }
+        room.foodPoolBalance += cost;
     }
 
     const spacing = segmentSpacingForBalance(snake.balance);

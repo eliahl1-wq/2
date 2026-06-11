@@ -1064,11 +1064,11 @@ app.post('/api/login', async (req, res) => {
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
+        const modeFilter = req.query.mode === 'slither' ? 'slither' : req.query.mode === 'agar' ? 'agar' : null;
         let humansOnline = 0;
         let aiOnline = 0;
         let topPlayer = null;
         let topBalance = 0;
-        let topIsBot = false;
         const playersByEntryFee = { 5: 0, 10: 0, 20: 0 };
         const playersByModeAndFee = {
             agar: { 5: 0, 10: 0, 20: 0 },
@@ -1076,44 +1076,61 @@ app.get('/api/stats', (req, res) => {
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0 };
 
-        const considerTop = (name, balance, isBot = false) => {
+        const considerTop = (name, balance) => {
             const b = balance || 0;
             if (b > topBalance) {
                 topBalance = b;
                 topPlayer = name;
-                topIsBot = isBot;
             }
+        };
+
+        const countBRForMode = (variant) => {
+            const br = getBRPlayerCountsByFee();
+            const fees = br[variant] || {};
+            return Object.values(fees).reduce((sum, n) => sum + (n || 0), 0);
         };
 
         rooms.forEach(room => {
             const fee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
             room.players.forEach(player => {
                 if (!player.disconnected) {
-                    humansOnline += 1;
+                    const mode = player.mode === 'slither' ? 'slither' : 'agar';
                     if (!playersByEntryFee[fee]) playersByEntryFee[fee] = 0;
                     playersByEntryFee[fee] += 1;
-                    const mode = player.mode === 'slither' ? 'slither' : 'agar';
                     if (playersByModeAndFee[mode]) {
                         playersByModeAndFee[mode][fee] = (playersByModeAndFee[mode][fee] || 0) + 1;
                         playersByGamemode[mode] += 1;
                     }
-                    considerTop(player.username, player.balance, false);
+                    if (!modeFilter || mode === modeFilter) {
+                        humansOnline += 1;
+                        considerTop(player.username, player.balance);
+                    }
                 }
             });
             room.bots.forEach(bot => {
-                aiOnline += 1;
                 const botBalance = bot.cells?.reduce((s, c) => s + c.balance, 0) ?? bot.balance ?? 0;
-                considerTop(bot.username, botBalance, true);
+                if (!modeFilter || modeFilter === 'agar') {
+                    aiOnline += 1;
+                    considerTop(bot.username, botBalance);
+                }
             });
             room.slitherBots.forEach(bot => {
-                aiOnline += 1;
-                considerTop(bot.username, bot.balance, true);
+                if (!modeFilter || modeFilter === 'slither') {
+                    aiOnline += 1;
+                    considerTop(bot.username, bot.balance);
+                }
             });
         });
 
         const brPlayersByFee = getBRPlayerCountsByFee();
         playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
+
+        if (modeFilter === 'agar') {
+            humansOnline += countBRForMode('agar');
+        } else if (modeFilter === 'slither') {
+            humansOnline += countBRForMode('slither');
+        }
 
         res.json({
             playersOnline: humansOnline + aiOnline,
@@ -1122,12 +1139,12 @@ app.get('/api/stats', (req, res) => {
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
-            topIsBot,
             solPrice: SOL_PRICE_USD,
             playersByEntryFee,
             playersByModeAndFee,
             playersByGamemode,
             brPlayersByFee,
+            statsMode: modeFilter,
         });
     } catch (err) {
         console.error('Error fetching stats:', err);
