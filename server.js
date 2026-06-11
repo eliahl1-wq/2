@@ -206,6 +206,7 @@ const c = {
 };
 
 const CASHOUT_DURATION_MS = 10_000;
+const joiningUsers = new Set();
 
 let GLOBAL_ARENA_START = Date.now();
 let globalArenaResetting = false;
