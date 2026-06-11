@@ -5,12 +5,12 @@ export const SLITHER = {
     worldHalf: 3000,
     // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
     slitherGameRadius: 21600,
-    spawnSegments: 4,
+    spawnSegments: 5,
     maxSegments: 400,
     segmentsPerCent: 0.1,
     maxScale: 6,
     scaleDivisor: 106,
-    baseRadius: 5.5,
+    baseRadius: 8.0,
     segmentSepFactor: 6,
     nsp1: 5.39,
     nsp2: 0.4,
@@ -23,7 +23,7 @@ export const SLITHER = {
     boostCostPerTick: 0.00012,
     foodRadius: 5,
     segmentSpacing: 6,
-    baseSegments: 4,
+    baseSegments: 5,
     segmentsPerCentLegacy: 0.1,
     foodBlobValue: 0.01,
     botStartBalance: 1.0,
@@ -475,19 +475,46 @@ function checkFoodCollisions(snake, room) {
     }
 }
 
+/** Drop a dead snake's mass as pick-up food along its body (slither.io style). */
+function dropSnakeAsFood(room, snake) {
+    const balance = Math.max(0, snake.balance || 0);
+    const segs = snake.segments;
+    if (balance <= 1e-9 || !segs?.length) return;
+
+    const blob = SLITHER.foodBlobValue;
+    const maxPellets = Math.min(segs.length * 4, 150, Math.max(segs.length, Math.floor(balance / blob)));
+    const pelletCount = Math.max(1, maxPellets);
+    const valueEach = balance / pelletCount;
+
+    for (let i = 0; i < pelletCount; i++) {
+        const seg = segs[i % segs.length];
+        const jitter = 14;
+        room.slitherFood.push({
+            id: randId(),
+            x: seg.x + (Math.random() - 0.5) * jitter,
+            y: seg.y + (Math.random() - 0.5) * jitter,
+            balance: valueEach,
+            hue: Math.floor(Math.random() * 360),
+            radius: SLITHER.foodRadius + Math.random() * 1.5,
+            deathDrop: true,
+        });
+    }
+}
+
 function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = true, Transaction = null) {
     const lostBalance = snake.balance;
 
     if (killer && killer.id !== snake.id) {
-        killer.balance += lostBalance;
         killer.kills = (killer.kills || 0) + 1;
-        const kCount = balanceToSegmentCount(killer.balance);
-        while (killer.segments.length < kCount) {
-            const tail = killer.segments[killer.segments.length - 1];
-            killer.segments.push({ x: tail.x, y: tail.y });
+    }
+
+    // slither.io: victim mass drops as pellets; killer does not absorb balance
+    if (lostBalance > 0) {
+        if (killer || isHuman) {
+            dropSnakeAsFood(room, snake);
+        } else if (returnToPool) {
+            room.foodPoolBalance += lostBalance;
         }
-    } else if (lostBalance > 0 && returnToPool) {
-        room.foodPoolBalance += lostBalance;
     }
 
     if (isHuman) {
@@ -537,7 +564,7 @@ function serializeSnake(snake, isYou) {
         segments: snake.segments.map(s => ({ x: s.x, y: s.y })),
         angle: snake.angle || 0,
         sc,
-        radius: SLITHER.baseRadius * sc,
+        radius: headRadiusForBalance(snake.balance),
         boost: !!snake.boost,
     };
 }
@@ -671,6 +698,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                     hue: f.hue,
                     radius: f.radius || SLITHER.foodRadius,
                     golden: !!f.golden,
+                    deathDrop: !!f.deathDrop,
                 }));
 
             io.to(p.id).emit('slitherTick', {

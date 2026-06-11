@@ -1891,10 +1891,11 @@ io.on('connection', (socket) => {
         }
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'slither');
-        if (!p || p.isCashingOut) return;
+        if (!p) return;
         p.inputDx = Number(dx) || 0;
         p.inputDy = Number(dy) || 0;
-        p.boost = !!boost;
+        // No boost while cashing out — steering still works
+        p.boost = p.isCashingOut ? false : !!boost;
     });
 });
 
