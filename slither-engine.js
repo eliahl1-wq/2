@@ -699,7 +699,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     for (const { snake, isHuman, killer, respawnBot, returnToPool = true } of toRemove) {
         eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
         if (!isBR && respawnBot) {
-            const targetBots = getSlitherTargetBots(humanCount);
+            const humansInArena = room.players.filter(p => p.mode === 'slither').length;
+            const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
+            const targetBots = getSlitherTargetBots(effectiveHumans);
             if (room.slitherBots.length < targetBots) {
                 addSlitherBots(room, 1, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
             }
@@ -743,8 +745,8 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
                 .map(f => ({
                     id: f.id,
-                    x: Math.round(f.x),
-                    y: Math.round(f.y),
+                    x: f.x,
+                    y: f.y,
                     hue: f.hue,
                     radius: f.radius || SLITHER.foodRadius,
                     golden: !!f.golden,

@@ -15,7 +15,7 @@ const BASE = {
     foodLow: 6.0,   // 1–2 humans
     foodMid: 7.0,   // 3–7 humans
     foodHigh: 8.0,  // 8+ humans
-    aiLow: 2.0,
+    aiLow: 4.0,   // 1–2 humans: fund 4 bots at botStart stake
     aiMid: 1.0,
     aiHigh: 0.0,
     botStart: 1.0,

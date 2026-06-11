@@ -1117,6 +1117,8 @@ app.get('/api/stats', (req, res) => {
 
         res.json({
             playersOnline: humansOnline + aiOnline,
+            humansOnline,
+            aiOnline,
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
@@ -1270,8 +1272,8 @@ function getModeFoodBudgets(room, agarActive, slitherActive) {
 
 function getMaxAiBudgetForRoom(room) {
     const stake = botStakeForRoom(room);
-    const agarHumans = countHumansInMode(room, 'agar');
-    const slitherHumans = countHumansInMode(room, 'slither');
+    const agarHumans = effectiveHumanCountForBots(room, 'agar');
+    const slitherHumans = effectiveHumanCountForBots(room, 'slither');
     return getTargetBots(agarHumans) * stake + getSlitherTargetBots(slitherHumans) * stake;
 }
 
@@ -1366,6 +1368,14 @@ function getTargetBots(humanCount) {
 
 function countHumansInMode(room, mode) {
     return room.players.filter(p => p.mode === mode || (mode === 'agar' && !p.mode)).length;
+}
+
+/** Keep bots alive while humans are disconnected or after death until arena reset. */
+function effectiveHumanCountForBots(room, mode) {
+    const humans = room.players.filter(p => p.mode === mode || (mode === 'agar' && !p.mode));
+    if (humans.length > 0) return humans.length;
+    const botCount = mode === 'slither' ? room.slitherBots.length : room.bots.length;
+    return botCount > 0 ? 1 : 0;
 }
 
 function countActiveHumansByMode(room, mode) {
@@ -1967,8 +1977,8 @@ function processRoom(room) {
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
-    const agarHumansInArena = countHumansInMode(room, 'agar');
-    const slitherHumansInArena = countHumansInMode(room, 'slither');
+    const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
+    const slitherHumansInArena = effectiveHumanCountForBots(room, 'slither');
 
     const agarTargetBots = getTargetBots(agarHumansInArena);
     const agarBotStake = botStakeForRoom(room);
