@@ -2303,18 +2303,15 @@ function processRoom(room) {
 
     rebuildQuadTree(room, allUsers);
 
-    // Slither server-side physics tick (40Hz) — network broadcast at 20Hz
+    // Slither server-side physics tick (40Hz) — network broadcast at 40Hz
     const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
 
-    room._slitherNetTick = (room._slitherNetTick || 0) + 1;
-    if (room._slitherNetTick % 2 === 0) {
-        const slitherMeta = {
-            resetTime: room.startTime + c.roomDuration,
-            solPrice: SOL_PRICE_USD,
-            isResetting: room.isResetting,
-        };
-        broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
-    }
+    const slitherMeta = {
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD,
+        isResetting: room.isResetting,
+    };
+    broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
 
     // Skicka leaderboard separat för prestanda (Inkludera bottar)
     const leaderboardData = allUsers

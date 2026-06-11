@@ -730,7 +730,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const allSnakes = getAllSlitherSnakes(room);
     const range = SLITHER.viewRange;
-    const foodRange = range + 750;
+    const foodRange = range + 1200;
 
     room.players
         .filter(p => p.mode === 'slither' && !p.disconnected)
