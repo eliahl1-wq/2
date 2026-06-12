@@ -2310,6 +2310,7 @@ function processRoom(room) {
         resetTime: room.startTime + c.roomDuration,
         solPrice: SOL_PRICE_USD,
         isResetting: room.isResetting,
+        battleRoyale: room.isBattleRoyale === true,
     };
     broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
 
