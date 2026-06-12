@@ -73,13 +73,37 @@ function clearSlitherFood(room) {
 }
 
 function trimSlitherFood(room, targetCount) {
-    const golden = room.slitherFood.filter(f => f.golden);
-    const normal = room.slitherFood.filter(f => !f.golden);
+    const protectedFood = room.slitherFood.filter(f => f.golden || f.deathDrop);
+    let normal = room.slitherFood.filter(f => !f.golden && !f.deathDrop);
+
+    // Remove farthest pellets first so visible/nearby food stays stable
+    const heads = [];
+    for (const p of room.players) {
+        if (p.mode === 'slither' && p.segments?.[0]) heads.push(p.segments[0]);
+    }
+    for (const b of room.slitherBots || []) {
+        if (b.segments?.[0]) heads.push(b.segments[0]);
+    }
+
     while (normal.length > targetCount) {
-        const removed = normal.pop();
+        let worstIdx = 0;
+        let worstScore = -1;
+        for (let i = 0; i < normal.length; i++) {
+            const f = normal[i];
+            let minDist = Infinity;
+            for (const h of heads) {
+                const d = dist(f.x, f.y, h.x, h.y);
+                if (d < minDist) minDist = d;
+            }
+            if (minDist > worstScore) {
+                worstScore = minDist;
+                worstIdx = i;
+            }
+        }
+        const removed = normal.splice(worstIdx, 1)[0];
         room.foodPoolBalance += removed.balance;
     }
-    room.slitherFood = normal.concat(golden);
+    room.slitherFood = normal.concat(protectedFood);
 }
 
 function randId() {
@@ -633,21 +657,31 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
         clearSlitherFood(room);
         return;
     }
+
+    const now = Date.now();
+    if (!room._lastSlitherFoodSync) room._lastSlitherFoodSync = 0;
+    if (now - room._lastSlitherFoodSync < 750) return;
+    room._lastSlitherFoodSync = now;
+
     const densityScale = slitherFoodDensityScale();
     const goldenValueOnMap = room.slitherFood
         .filter(f => f.golden)
         .reduce((sum, f) => sum + f.balance, 0);
     const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale, budget) - goldenValueOnMap);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
-    const normalCount = room.slitherFood.filter(f => !f.golden).length;
-    if (normalCount < targetFoodCount) {
+    const normalCount = room.slitherFood.filter(f => !f.golden && !f.deathDrop).length;
+
+    const addThreshold = Math.floor(targetFoodCount * 0.94);
+    const trimThreshold = Math.ceil(targetFoodCount * 1.12);
+
+    if (normalCount < addThreshold) {
         addSlitherFood(
             room,
-            Math.min(50, targetFoodCount - normalCount),
+            Math.min(12, addThreshold - normalCount),
             foodBlobValue,
             foodValueTarget + goldenValueOnMap,
         );
-    } else if (normalCount > targetFoodCount + 20) {
+    } else if (normalCount > trimThreshold) {
         trimSlitherFood(room, targetFoodCount);
     }
 }
@@ -730,7 +764,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const allSnakes = getAllSlitherSnakes(room);
     const range = SLITHER.viewRange;
-    const foodRange = range + 1200;
+    const foodRange = range + 2000;
 
     room.players
         .filter(p => p.mode === 'slither' && !p.disconnected)
