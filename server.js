@@ -1069,6 +1069,7 @@ app.get('/api/stats', (req, res) => {
         let aiOnline = 0;
         let topPlayer = null;
         let topBalance = 0;
+        const allPlayers = [];
         const playersByEntryFee = { 5: 0, 10: 0, 20: 0 };
         const playersByModeAndFee = {
             agar: { 5: 0, 10: 0, 20: 0 },
@@ -1081,6 +1082,9 @@ app.get('/api/stats', (req, res) => {
             if (b > topBalance) {
                 topBalance = b;
                 topPlayer = name;
+            }
+            if (name && b > 0) {
+                allPlayers.push({ username: name, balance: b });
             }
         };
 
@@ -1132,6 +1136,8 @@ app.get('/api/stats', (req, res) => {
             humansOnline += countBRForMode('slither');
         }
 
+        const topPlayers = allPlayers.sort((a, b) => b.balance - a.balance).slice(0, 3);
+
         res.json({
             playersOnline: humansOnline + aiOnline,
             humansOnline,
@@ -1139,6 +1145,7 @@ app.get('/api/stats', (req, res) => {
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
+            topPlayers,
             solPrice: SOL_PRICE_USD,
             playersByEntryFee,
             playersByModeAndFee,
