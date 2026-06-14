@@ -174,6 +174,7 @@ const TransactionSchema = new mongoose.Schema({
     currency: { type: String, default: 'USD' },
     meta: { type: Object, default: {} },
     status: { type: String, enum: ['pending', 'confirmed', 'failed'], default: 'confirmed' },
+    excludedFromReports: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -915,6 +916,9 @@ app.post('/api/entry-pay', authenticateToken, async (req, res) => {
 });
 
 // --- ADMIN DASHBOARD ---
+/** Transactions with this flag are hidden from admin stats/lists (not deleted). */
+const TX_REPORTED = { excludedFromReports: { $ne: true } };
+
 function txAmountUsd(tx) {
     if (tx.currency === 'SOL' || tx.meta?.solAmount != null) {
         const sol = tx.meta?.solAmount ?? tx.amount;
@@ -925,15 +929,16 @@ function txAmountUsd(tx) {
 
 app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
     try {
-        const [depositAgg, withdrawAgg] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedCount] = await Promise.all([
             Transaction.aggregate([
-                { $match: { type: 'deposit', status: 'confirmed' } },
+                { $match: { type: 'deposit', status: 'confirmed', ...TX_REPORTED } },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
             ]),
             Transaction.aggregate([
-                { $match: { type: 'withdraw', status: 'confirmed' } },
+                { $match: { type: 'withdraw', status: 'confirmed', ...TX_REPORTED } },
                 { $group: { _id: null, txs: { $push: { amount: '$amount', currency: '$currency', meta: '$meta' } }, count: { $sum: 1 } } },
             ]),
+            Transaction.countDocuments({ excludedFromReports: true }),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -953,6 +958,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             netGamingRevenue: Number(netGamingRevenue.toFixed(2)),
             depositCount: depositAgg[0]?.count ?? 0,
             withdrawalCount: withdrawAgg[0]?.count ?? 0,
+            excludedCount,
             solPrice: SOL_PRICE_USD,
         });
     } catch (err) {
@@ -978,7 +984,7 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
         }
 
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-        const recentUserIds = await Transaction.distinct('userId', { createdAt: { $gte: dayAgo } });
+        const recentUserIds = await Transaction.distinct('userId', { createdAt: { $gte: dayAgo }, ...TX_REPORTED });
 
         res.json({
             currentlyInGame: inGameUserIds.size,
@@ -995,7 +1001,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
     try {
         const users = await User.find().select('username walletAddress depositAddress balance').lean();
         const depositTotals = await Transaction.aggregate([
-            { $match: { type: 'deposit', status: 'confirmed' } },
+            { $match: { type: 'deposit', status: 'confirmed', ...TX_REPORTED } },
             { $group: { _id: '$userId', totalDepositedSol: { $sum: '$amount' }, depositCount: { $sum: 1 } } },
         ]);
         const depositMap = Object.fromEntries(depositTotals.map(d => [d._id.toString(), d]));
@@ -1026,7 +1032,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
 app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
-        const joins = await Transaction.find({ type: 'game', 'meta.event': 'join' })
+        const joins = await Transaction.find({ type: 'game', 'meta.event': 'join', ...TX_REPORTED })
             .sort({ createdAt: -1 })
             .limit(limit)
             .lean();
@@ -1039,6 +1045,7 @@ app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, r
             userId: { $in: userIds },
             type: 'withdraw',
             'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset/i },
+            ...TX_REPORTED,
         }).sort({ createdAt: 1 }).lean();
 
         const cashoutsByUser = {};
@@ -1152,15 +1159,20 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
         const sweeps = await Transaction.find({
-            $or: [
-                { 'meta.event': 'pool_sweep' },
-                { 'meta.event': 'br_owner_sweep' },
-                { 'meta.reason': 'Room Reset Wallet Sweep' },
-                { 'meta.reason': 'BR Owner Cut Sweep' },
-                { 'meta.event': 'reset_start' },
-                { 'meta.event': 'reset_complete' },
-                { 'meta.event': 'failure', 'meta.reason': 'pool_sweep_failed' },
-                { 'meta.event': 'failure', 'meta.reason': 'br_owner_sweep_failed' },
+            $and: [
+                {
+                    $or: [
+                        { 'meta.event': 'pool_sweep' },
+                        { 'meta.event': 'br_owner_sweep' },
+                        { 'meta.reason': 'Room Reset Wallet Sweep' },
+                        { 'meta.reason': 'BR Owner Cut Sweep' },
+                        { 'meta.event': 'reset_start' },
+                        { 'meta.event': 'reset_complete' },
+                        { 'meta.event': 'failure', 'meta.reason': 'pool_sweep_failed' },
+                        { 'meta.event': 'failure', 'meta.reason': 'br_owner_sweep_failed' },
+                    ],
+                },
+                TX_REPORTED,
             ],
         }).sort({ createdAt: -1 }).limit(limit).lean();
 
@@ -1200,9 +1212,11 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
 
 app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res) => {
     try {
-        const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+        const limit = Math.min(parseInt(req.query.limit, 10) || 500, 1000);
+        const showExcluded = req.query.showExcluded === 'true';
         const filter = {};
         if (req.query.userId) filter.userId = req.query.userId;
+        if (!showExcluded) Object.assign(filter, TX_REPORTED);
 
         const txs = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
         const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
@@ -1219,10 +1233,11 @@ app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res)
             amountUsd: Number(txAmountUsd(tx).toFixed(2)),
             status: tx.status,
             meta: tx.meta,
+            excludedFromReports: !!tx.excludedFromReports,
             createdAt: tx.createdAt,
         }));
 
-        res.json({ transactions: rows, total: rows.length });
+        res.json({ transactions: rows, total: rows.length, showExcluded });
     } catch (err) {
         console.error('Admin transactions error:', err);
         res.status(500).json({ error: err.message });
@@ -1232,7 +1247,7 @@ app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res)
 app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
-        const filter = { $or: [
+        const eventFilter = { $or: [
             { type: 'game', 'meta.event': 'join' },
             { type: 'game', 'meta.event': 'br_join' },
             { type: 'game', 'meta.reason': 'Arena Death' },
@@ -1240,7 +1255,9 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
             { type: 'game', 'meta.event': 'br_refund' },
             { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
         ]};
-        if (req.query.userId) filter.userId = req.query.userId;
+        const andClauses = [eventFilter, TX_REPORTED];
+        if (req.query.userId) andClauses.push({ userId: req.query.userId });
+        const filter = { $and: andClauses };
 
         const events = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
         const userIds = [...new Set(events.map(e => e.userId?.toString()).filter(Boolean))];
@@ -1275,6 +1292,50 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
         res.json({ history, total: history.length });
     } catch (err) {
         console.error('Admin game-history error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/transactions/exclude', authenticateAdmin, async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ message: 'ids array required' });
+        }
+        const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+        const result = await Transaction.updateMany(
+            { _id: { $in: objectIds } },
+            { $set: { excludedFromReports: true } }
+        );
+        res.json({
+            success: true,
+            modified: result.modifiedCount,
+            message: `${result.modifiedCount} transaction(s) excluded from reports (not deleted).`,
+        });
+    } catch (err) {
+        console.error('Admin exclude transactions error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/transactions/restore', authenticateAdmin, async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ message: 'ids array required' });
+        }
+        const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+        const result = await Transaction.updateMany(
+            { _id: { $in: objectIds } },
+            { $set: { excludedFromReports: false } }
+        );
+        res.json({
+            success: true,
+            modified: result.modifiedCount,
+            message: `${result.modifiedCount} transaction(s) restored to reports.`,
+        });
+    } catch (err) {
+        console.error('Admin restore transactions error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1538,7 +1599,11 @@ app.post('/api/register', async (req, res) => {
 
         await newUser.save();
         console.log("✅ SUCCESS: Användare skapad i databasen:", newUser.username);
-        res.status(201).json({ message: "Användare skapad!" });
+        res.status(201).json({
+            message: "Användare skapad!",
+            userId: newUser._id.toString(),
+            username: newUser.username,
+        });
     } catch (err) {
         console.error("Fel vid registrering:", err.message);
         res.status(500).json({ error: err.message });
