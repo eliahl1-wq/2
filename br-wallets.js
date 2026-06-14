@@ -3,6 +3,7 @@
  *
  * Entry fees flow:  player deposit wallet → BR house wallet (per variant + entry tier)
  * Winner payout:    same wallet → player deposit wallet
+ * Owner cut:        2.5% of pot swept to OWNER_VAULT after winner is paid
  *
  * Env naming:
  *   $5 Agar:    BR_AGAR_HOUSE_WALLET_*

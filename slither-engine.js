@@ -626,6 +626,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
                 amount: lostBalance,
                 meta: {
                     reason: 'Arena Death',
+                    event: 'death',
                     mode: 'slither',
                     entryFeeUsd: snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                 },

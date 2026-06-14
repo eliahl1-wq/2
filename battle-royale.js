@@ -26,7 +26,7 @@ export const BR = {
     shrinkIntervalMs: 45_000,
     shrinkFactor: 0.72,
     minZoneRadius: 380,
-    houseFeePct: 0.05,
+    houseFeePct: 0.025,
     agarStartBalance: 1.0,
     agarFoodPerPlayer: 140,
     agarFoodMin: 350,
@@ -220,6 +220,30 @@ function tryStartMatch(variant, entryFeeUsd, io, deps) {
 }
 
 /** Safety tick — ensures grace timers / stale queues still progress. */
+/** Admin / status — active BR matches (isolated from arena reset). */
+export function getBRServerStatus() {
+    const activeMatches = [];
+    for (const room of matches.values()) {
+        if (room.status === 'ended') continue;
+        activeMatches.push({
+            id: room.id,
+            variant: room.variant,
+            entryFeeUsd: room.entryFeeUsd,
+            status: room.status,
+            playerCount: room.players.filter(p => !p.disconnected).length,
+            prizePool: room.prizePool,
+        });
+    }
+    let queuedPlayers = 0;
+    for (const q of queues.values()) queuedPlayers += q.length;
+    return {
+        activeMatchCount: activeMatches.length,
+        queuedPlayers,
+        matches: activeMatches,
+        playersByFee: getBRPlayerCountsByFee(),
+    };
+}
+
 export function processBRQueues(io, deps) {
     for (const [key, q] of queues.entries()) {
         if (!q.length) continue;
@@ -465,7 +489,15 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
             userId: player.mongoId,
             type: 'game',
             amount: 0,
-            meta: { reason: 'BR Eliminated', mode: player.mode, placement, matchId: room.id },
+            meta: {
+                reason: 'BR Eliminated',
+                event: 'death',
+                mode: player.mode,
+                variant: room.variant,
+                entryFeeUsd: room.entryFeeUsd,
+                placement,
+                matchId: room.id,
+            },
             status: 'confirmed',
         }).catch(() => {});
     }
@@ -499,6 +531,95 @@ function tryDeclareBRWinner(room, io, deps) {
     }
 }
 
+async function sweepBROwnerCut(room, deps) {
+    const { DEV_FREE_PLAY, SOL_PRICE_USD, connection, Transaction, OWNER_VAULT_ADDRESS } = deps;
+    const totalPotUsd = room.playerCount * room.entryFeeUsd;
+    const ownerCutUsd = totalPotUsd * BR.houseFeePct;
+
+    if (DEV_FREE_PLAY || !OWNER_VAULT_ADDRESS) {
+        if (DEV_FREE_PLAY) {
+            await Transaction.create({
+                type: 'withdraw',
+                amount: ownerCutUsd,
+                meta: {
+                    event: 'br_owner_sweep',
+                    simulated: true,
+                    matchId: room.id,
+                    variant: room.variant,
+                    entryFeeUsd: room.entryFeeUsd,
+                    playerCount: room.playerCount,
+                    ownerCutPct: BR.houseFeePct,
+                    reason: 'BR Owner Cut Sweep',
+                },
+                status: 'confirmed',
+            });
+        }
+        return;
+    }
+
+    try {
+        const brWallet = getBRHouseWallet(room.variant, room.entryFeeUsd);
+        const ownerCutSol = ownerCutUsd / SOL_PRICE_USD;
+        let lamports = Math.round(ownerCutSol * solanaWeb3.LAMPORTS_PER_SOL);
+
+        const brPubKey = new solanaWeb3.PublicKey(brWallet.address);
+        const walletLamports = await connection.getBalance(brPubKey);
+        const feeBuffer = Math.round(0.0005 * solanaWeb3.LAMPORTS_PER_SOL);
+        lamports = Math.min(lamports, Math.max(0, walletLamports - feeBuffer));
+        if (lamports <= 0) {
+            console.warn(`BR owner sweep skipped (${room.variant} $${room.entryFeeUsd}): insufficient BR wallet balance`);
+            return;
+        }
+
+        const brKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(brWallet.secret, 'hex'))
+        );
+        const sweepTx = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: brKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports,
+            })
+        );
+        const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [brKeypair]);
+        const solAmount = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+
+        await Transaction.create({
+            type: 'withdraw',
+            amount: solAmount * SOL_PRICE_USD,
+            currency: 'SOL',
+            meta: {
+                event: 'br_owner_sweep',
+                signature: sig,
+                solAmount,
+                from: brWallet.address,
+                destination: OWNER_VAULT_ADDRESS,
+                matchId: room.id,
+                variant: room.variant,
+                entryFeeUsd: room.entryFeeUsd,
+                playerCount: room.playerCount,
+                ownerCutPct: BR.houseFeePct,
+                reason: 'BR Owner Cut Sweep',
+            },
+            status: 'confirmed',
+        });
+        console.log(`💸 BR Owner Sweep: ${solAmount.toFixed(6)} SOL (${room.variant} $${room.entryFeeUsd}, ${room.playerCount} players) → owner vault`);
+    } catch (err) {
+        console.error('BR owner sweep failed:', err.message);
+        await Transaction.create({
+            type: 'game',
+            amount: 0,
+            meta: {
+                event: 'failure',
+                reason: 'br_owner_sweep_failed',
+                matchId: room.id,
+                variant: room.variant,
+                error: err.message,
+            },
+        }).catch(() => {});
+    }
+}
+
 async function finishMatch(room, winner, io, deps) {
     if (room.status === 'ended') return;
     room.status = 'ended';
@@ -522,11 +643,12 @@ async function finishMatch(room, winner, io, deps) {
                 userId: winner.mongoId,
                 type: 'withdraw',
                 amount: payout,
-                meta: { simulated: true, freePlay: true, reason: 'BR Victory', matchId: room.id, mode: winner.mode },
+                meta: { simulated: true, freePlay: true, reason: 'BR Victory', matchId: room.id, mode: winner.mode, entryFeeUsd: room.entryFeeUsd, variant: room.variant },
                 status: 'confirmed',
             });
             console.log(`🎮 [FREE PLAY] BR victory: ${winner.username} won $${payout.toFixed(2)} (simulated)`);
             io.to(winner.id).emit('brVictory', { amount: payout, signature: 'simulated', placement: 1 });
+            await sweepBROwnerCut(room, deps);
         } else {
             const brWallet = getBRHouseWallet(room.variant, room.entryFeeUsd);
             let user = await User.findById(winner.mongoId);
@@ -557,11 +679,13 @@ async function finishMatch(room, winner, io, deps) {
                     matchId: room.id,
                     mode: winner.mode,
                     variant: room.variant,
+                    entryFeeUsd: room.entryFeeUsd,
                     brHouseWallet: brWallet.address,
                 },
                 status: 'confirmed',
             });
             io.to(winner.id).emit('brVictory', { amount: payout, signature: sig, placement: 1 });
+            await sweepBROwnerCut(room, deps);
         }
     } catch (err) {
         console.error('BR payout failed:', err.message);
@@ -675,17 +799,22 @@ function processBRAgarMatch(room, io, deps) {
 
     allUsers.forEach(p => {
         io.to(p.id).emit('leaderboard', { leaderboard: lb, battleRoyale: true });
-        const rangeX = (p.screenWidth || 1920) / 2 + 400;
-        const rangeY = (p.screenHeight || 1080) / 2 + 400;
+        const pad = 400;
+        const foodPad = 600;
+        const rangeX = (p.screenWidth || 1920) / 2 + pad;
+        const rangeY = (p.screenHeight || 1080) / 2 + pad;
         const visibleItems = room.qt.query(new Rectangle(p.x, p.y, rangeX, rangeY));
+        const foodItems = room.qt.query(new Rectangle(p.x, p.y, rangeX + foodPad, rangeY + foodPad));
         const visibleUsersSet = new Set([p]);
         const visibleFood = [];
         visibleItems.forEach(item => {
-            if (item.type === 'food') visibleFood.push(item.data);
-            else if (item.type === 'player') {
+            if (item.type === 'player') {
                 const found = userMap.get(item.socketId);
                 if (found) visibleUsersSet.add(found);
             }
+        });
+        foodItems.forEach(item => {
+            if (item.type === 'food') visibleFood.push(item.data);
         });
         io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, [], [], {
             unlocked: false,

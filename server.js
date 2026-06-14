@@ -41,6 +41,7 @@ import {
     getBRMatchForMongo,
     isPlayerInBR,
     getBRPlayerCountsByFee,
+    getBRServerStatus,
     BR,
 } from './battle-royale.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
@@ -332,6 +333,7 @@ function resetRoomEntities(room) {
 }
 
 async function sweepHouseWalletOnReset() {
+    // Only the main arena house wallet — BR house wallets are separate env keys and never touched here.
     if (DEV_FREE_PLAY || !HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET || !OWNER_VAULT_ADDRESS) return;
 
     const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
@@ -357,7 +359,15 @@ async function sweepHouseWalletOnReset() {
     await Transaction.create({
         type: 'withdraw',
         amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
-        meta: { event: 'pool_sweep', signature: sig, reason: 'Room Reset Wallet Sweep' },
+        currency: 'SOL',
+        meta: {
+            event: 'pool_sweep',
+            signature: sig,
+            reason: 'Room Reset Wallet Sweep',
+            solAmount: sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            from: HOUSE_WALLET_ADDRESS,
+            destination: OWNER_VAULT_ADDRESS,
+        },
     });
     console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
 }
@@ -367,7 +377,7 @@ async function performGlobalArenaReset() {
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
 
-    console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers)');
+    console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers — BR matches unaffected)');
     await Transaction.create({
         type: 'game',
         amount: 0,
@@ -589,6 +599,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.balanceUsd = user.balance * SOL_PRICE_USD;
         userObj.solPrice = SOL_PRICE_USD;
         userObj.freePlay = DEV_FREE_PLAY;
+        userObj.isAdmin = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
 
         res.json(userObj);
     } catch (err) {
@@ -903,6 +914,371 @@ app.post('/api/entry-pay', authenticateToken, async (req, res) => {
     } catch (err) { console.error('Entry pay error', err); res.status(500).json({ error: err.message }); }
 });
 
+// --- ADMIN DASHBOARD ---
+function txAmountUsd(tx) {
+    if (tx.currency === 'SOL' || tx.meta?.solAmount != null) {
+        const sol = tx.meta?.solAmount ?? tx.amount;
+        return sol * SOL_PRICE_USD;
+    }
+    return tx.amount;
+}
+
+app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
+    try {
+        const [depositAgg, withdrawAgg] = await Promise.all([
+            Transaction.aggregate([
+                { $match: { type: 'deposit', status: 'confirmed' } },
+                { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
+            ]),
+            Transaction.aggregate([
+                { $match: { type: 'withdraw', status: 'confirmed' } },
+                { $group: { _id: null, txs: { $push: { amount: '$amount', currency: '$currency', meta: '$meta' } }, count: { $sum: 1 } } },
+            ]),
+        ]);
+
+        const totalDepositsSol = depositAgg[0]?.total ?? 0;
+        const totalDepositsUsd = totalDepositsSol * SOL_PRICE_USD;
+
+        let totalWithdrawalsUsd = 0;
+        for (const tx of withdrawAgg[0]?.txs ?? []) {
+            totalWithdrawalsUsd += txAmountUsd(tx);
+        }
+
+        const netGamingRevenue = totalDepositsUsd - totalWithdrawalsUsd;
+
+        res.json({
+            totalDepositsUsd: Number(totalDepositsUsd.toFixed(2)),
+            totalDepositsSol: Number(totalDepositsSol.toFixed(6)),
+            totalWithdrawalsUsd: Number(totalWithdrawalsUsd.toFixed(2)),
+            netGamingRevenue: Number(netGamingRevenue.toFixed(2)),
+            depositCount: depositAgg[0]?.count ?? 0,
+            withdrawalCount: withdrawAgg[0]?.count ?? 0,
+            solPrice: SOL_PRICE_USD,
+        });
+    } catch (err) {
+        console.error('Admin overview error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res) => {
+    try {
+        const inGameUserIds = new Set();
+        const inGameUsernames = [];
+        for (const room of rooms) {
+            for (const p of room.players) {
+                if (!p.isBot && p.mongoId) {
+                    const id = p.mongoId.toString();
+                    if (!inGameUserIds.has(id)) {
+                        inGameUserIds.add(id);
+                        inGameUsernames.push({ id, username: p.username, mode: p.mode || 'agar', entryFeeUsd: room.entryFeeUsd });
+                    }
+                }
+            }
+        }
+
+        const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const recentUserIds = await Transaction.distinct('userId', { createdAt: { $gte: dayAgo } });
+
+        res.json({
+            currentlyInGame: inGameUserIds.size,
+            activeLast24h: recentUserIds.length,
+            inGamePlayers: inGameUsernames,
+        });
+    } catch (err) {
+        console.error('Admin active-users error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
+    try {
+        const users = await User.find().select('username walletAddress depositAddress balance').lean();
+        const depositTotals = await Transaction.aggregate([
+            { $match: { type: 'deposit', status: 'confirmed' } },
+            { $group: { _id: '$userId', totalDepositedSol: { $sum: '$amount' }, depositCount: { $sum: 1 } } },
+        ]);
+        const depositMap = Object.fromEntries(depositTotals.map(d => [d._id.toString(), d]));
+
+        const result = users.map(u => {
+            const dep = depositMap[u._id.toString()];
+            const balanceSol = u.balance ?? 0;
+            return {
+                id: u._id,
+                username: u.username,
+                wallet: u.walletAddress || '—',
+                depositAddress: u.depositAddress || '—',
+                balanceSol: Number(balanceSol.toFixed(6)),
+                balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
+                totalDepositedSol: Number((dep?.totalDepositedSol ?? 0).toFixed(6)),
+                totalDepositedUsd: Number(((dep?.totalDepositedSol ?? 0) * SOL_PRICE_USD).toFixed(2)),
+                depositCount: dep?.depositCount ?? 0,
+            };
+        });
+
+        res.json({ users: result, total: result.length });
+    } catch (err) {
+        console.error('Admin users error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const joins = await Transaction.find({ type: 'game', 'meta.event': 'join' })
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .lean();
+
+        const userIds = [...new Set(joins.map(j => j.userId?.toString()).filter(Boolean))];
+        const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
+
+        const cashouts = await Transaction.find({
+            userId: { $in: userIds },
+            type: 'withdraw',
+            'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset/i },
+        }).sort({ createdAt: 1 }).lean();
+
+        const cashoutsByUser = {};
+        for (const c of cashouts) {
+            const uid = c.userId?.toString();
+            if (!uid) continue;
+            if (!cashoutsByUser[uid]) cashoutsByUser[uid] = [];
+            cashoutsByUser[uid].push(c);
+        }
+
+        const history = joins.map(join => {
+            const uid = join.userId?.toString();
+            const wagerUsd = join.meta?.entryFeeUsd ?? (join.amount * SOL_PRICE_USD);
+            const game = join.meta?.mode || 'agar';
+            const joinTime = new Date(join.createdAt).getTime();
+
+            let outcome = 'Loss';
+            let payoutUsd = 0;
+
+            const userCashouts = cashoutsByUser[uid] || [];
+            const match = userCashouts.find(c => new Date(c.createdAt).getTime() >= joinTime);
+            if (match) {
+                payoutUsd = match.amount;
+                outcome = payoutUsd > wagerUsd ? 'Win' : (payoutUsd > 0 ? 'Loss' : 'Loss');
+                if (payoutUsd > wagerUsd) outcome = 'Win';
+                else if (payoutUsd >= wagerUsd * 0.99) outcome = 'Break-even';
+                else outcome = 'Loss';
+            }
+
+            return {
+                id: join._id,
+                userId: uid,
+                username: userMap[uid] || 'Unknown',
+                game,
+                wagerUsd: Number(wagerUsd.toFixed(2)),
+                payoutUsd: Number(payoutUsd.toFixed(2)),
+                outcome,
+                playedAt: join.createdAt,
+            };
+        });
+
+        res.json({ history, total: history.length });
+    } catch (err) {
+        console.error('Admin betting-history error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
+    try {
+        let mainHouse = null;
+        if (HOUSE_WALLET_ADDRESS) {
+            const lamports = await connection.getBalance(new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS));
+            mainHouse = {
+                label: 'Main Arena House',
+                address: HOUSE_WALLET_ADDRESS,
+                balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                balanceUsd: (lamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+                sweptOnReset: true,
+            };
+        }
+
+        const brWallets = [];
+        for (const w of listBRHouseWallets()) {
+            const lamports = await connection.getBalance(new solanaWeb3.PublicKey(w.address));
+            brWallets.push({
+                label: `BR ${w.variant} $${w.entryFeeUsd}`,
+                variant: w.variant,
+                entryFeeUsd: w.entryFeeUsd,
+                address: w.address,
+                balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                balanceUsd: (lamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+                sweptOnReset: false,
+            });
+        }
+
+        let ownerVault = null;
+        if (OWNER_VAULT_ADDRESS) {
+            const lamports = await connection.getBalance(new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS));
+            ownerVault = {
+                label: 'Owner Vault',
+                address: OWNER_VAULT_ADDRESS,
+                balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                balanceUsd: (lamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+            };
+        }
+
+        const roomPools = rooms.map(r => ({
+            entryFeeUsd: r.entryFeeUsd,
+            foodPoolBalance: r.foodPoolBalance,
+            aiBudgetBalance: r.aiBudgetBalance,
+            ownerBalance: r.ownerBalance,
+            playersInRoom: r.players.filter(p => !p.isBot).length,
+        }));
+
+        res.json({
+            mainHouse,
+            brWallets,
+            ownerVault,
+            roomPools,
+            solPrice: SOL_PRICE_USD,
+            devFreePlay: DEV_FREE_PLAY,
+        });
+    } catch (err) {
+        console.error('Admin wallets error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+        const sweeps = await Transaction.find({
+            $or: [
+                { 'meta.event': 'pool_sweep' },
+                { 'meta.event': 'br_owner_sweep' },
+                { 'meta.reason': 'Room Reset Wallet Sweep' },
+                { 'meta.reason': 'BR Owner Cut Sweep' },
+                { 'meta.event': 'reset_start' },
+                { 'meta.event': 'reset_complete' },
+                { 'meta.event': 'failure', 'meta.reason': 'pool_sweep_failed' },
+                { 'meta.event': 'failure', 'meta.reason': 'br_owner_sweep_failed' },
+            ],
+        }).sort({ createdAt: -1 }).limit(limit).lean();
+
+        const history = sweeps.map(tx => {
+            const sol = tx.meta?.solAmount ?? (tx.currency === 'SOL' ? tx.amount : null);
+            const usd = sol != null ? sol * SOL_PRICE_USD : tx.amount;
+            let kind = 'sweep';
+            if (tx.meta?.event === 'br_owner_sweep') kind = 'br_owner_sweep';
+            else if (tx.meta?.event === 'reset_start') kind = 'reset_start';
+            else if (tx.meta?.event === 'reset_complete') kind = 'reset_complete';
+            else if (tx.meta?.reason === 'pool_sweep_failed' || tx.meta?.reason === 'br_owner_sweep_failed') kind = 'sweep_failed';
+
+            return {
+                id: tx._id,
+                kind,
+                solAmount: sol != null ? Number(sol.toFixed(6)) : null,
+                usdAmount: usd != null ? Number(usd.toFixed(2)) : null,
+                signature: tx.meta?.signature || null,
+                from: tx.meta?.from || HOUSE_WALLET_ADDRESS || null,
+                destination: tx.meta?.destination || OWNER_VAULT_ADDRESS || null,
+                reason: tx.meta?.reason || tx.meta?.event || '—',
+                status: tx.status,
+                createdAt: tx.createdAt,
+            };
+        });
+
+        const totalSweptUsd = history
+            .filter(h => h.kind === 'sweep' && h.usdAmount)
+            .reduce((sum, h) => sum + h.usdAmount, 0);
+
+        res.json({ sweeps: history, totalSweptUsd: Number(totalSweptUsd.toFixed(2)), total: history.length });
+    } catch (err) {
+        console.error('Admin sweeps error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 200, 1000);
+        const filter = {};
+        if (req.query.userId) filter.userId = req.query.userId;
+
+        const txs = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+        const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
+        const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
+
+        const rows = txs.map(tx => ({
+            id: tx._id,
+            userId: tx.userId?.toString() || null,
+            username: tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : '—',
+            type: tx.type,
+            amount: tx.amount,
+            currency: tx.currency || 'USD',
+            amountUsd: Number(txAmountUsd(tx).toFixed(2)),
+            status: tx.status,
+            meta: tx.meta,
+            createdAt: tx.createdAt,
+        }));
+
+        res.json({ transactions: rows, total: rows.length });
+    } catch (err) {
+        console.error('Admin transactions error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
+        const filter = { $or: [
+            { type: 'game', 'meta.event': 'join' },
+            { type: 'game', 'meta.event': 'br_join' },
+            { type: 'game', 'meta.reason': 'Arena Death' },
+            { type: 'game', 'meta.reason': 'BR Eliminated' },
+            { type: 'game', 'meta.event': 'br_refund' },
+            { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
+        ]};
+        if (req.query.userId) filter.userId = req.query.userId;
+
+        const events = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+        const userIds = [...new Set(events.map(e => e.userId?.toString()).filter(Boolean))];
+        const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
+
+        const history = events.map(tx => {
+            let eventType = tx.meta?.event || tx.meta?.reason || tx.type;
+            if (tx.meta?.event === 'join' || tx.meta?.event === 'br_join') eventType = 'join';
+            else if (tx.meta?.reason === 'Arena Death' || tx.meta?.reason === 'BR Eliminated') eventType = 'death';
+            else if (/BR Victory/i.test(tx.meta?.reason || '')) eventType = 'br_win';
+            else if (/Arena Cashout/i.test(tx.meta?.reason || '')) eventType = 'cashout';
+            else if (/Auto Room Reset/i.test(tx.meta?.reason || '')) eventType = 'reset_cashout';
+            else if (/Admin Forced/i.test(tx.meta?.reason || '')) eventType = 'admin_cashout';
+
+            const mode = tx.meta?.mode || tx.meta?.variant || '—';
+            const entryFee = tx.meta?.entryFeeUsd ?? null;
+
+            return {
+                id: tx._id,
+                userId: tx.userId?.toString() || null,
+                username: tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : '—',
+                eventType,
+                game: mode,
+                amountUsd: Number(txAmountUsd(tx).toFixed(2)),
+                entryFeeUsd: entryFee,
+                meta: tx.meta,
+                createdAt: tx.createdAt,
+            };
+        });
+
+        res.json({ history, total: history.length });
+    } catch (err) {
+        console.error('Admin game-history error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- ADMIN TOOLS ---
 app.get('/api/admin/room-balances', authenticateAdmin, (req, res) => {
     res.json({
@@ -952,9 +1328,63 @@ app.post('/api/admin/set-bot-balance', authenticateAdmin, (req, res) => {
     res.status(404).send("Bot not found");
 });
 
+app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
+    const now = Date.now();
+    const resetAt = GLOBAL_ARENA_START + c.roomDuration;
+    const msUntilReset = Math.max(0, resetAt - now);
+    const resetting = isArenaResetting();
+
+    res.json({
+        serverTime: now,
+        arenaStartedAt: GLOBAL_ARENA_START,
+        arenaDurationMs: c.roomDuration,
+        arenaResetAt: resetAt,
+        msUntilReset: resetting ? 0 : msUntilReset,
+        msElapsed: now - GLOBAL_ARENA_START,
+        isResetting: resetting,
+        devFreePlay: DEV_FREE_PLAY,
+        sweepScope: 'main_house_wallet_only',
+        brUntouchedOnArenaReset: true,
+        mainHouseWallet: HOUSE_WALLET_ADDRESS || null,
+        ownerVault: OWNER_VAULT_ADDRESS || null,
+        arenaRooms: rooms.map(room => ({
+            entryFeeUsd: room.entryFeeUsd,
+            playerCount: room.players.filter(p => !p.isBot).length,
+            foodPoolBalance: room.foodPoolBalance,
+            aiBudgetBalance: room.aiBudgetBalance,
+            ownerBalance: room.ownerBalance,
+            isResetting: room.isResetting,
+        })),
+        battleRoyale: getBRServerStatus(),
+    });
+});
+
 app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
+    if (globalArenaResetting || rooms.some(r => r.isResetting)) {
+        return res.status(409).json({ message: 'Arena reset already in progress' });
+    }
     performGlobalArenaReset();
-    res.json({ success: true, message: "Global reset sequence initiated" });
+    res.json({
+        success: true,
+        message: 'Global arena reset started. Main house wallet will be swept. BR wallets and active BR matches are not affected.',
+    });
+});
+
+app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
+    if (globalArenaResetting || rooms.some(r => r.isResetting)) {
+        return res.status(409).json({ message: 'Cannot sweep while arena reset is in progress' });
+    }
+    try {
+        await sweepHouseWalletOnReset();
+        res.json({
+            success: true,
+            message: 'Main house wallet sweep completed. BR house wallets were not touched.',
+            wallet: HOUSE_WALLET_ADDRESS || null,
+        });
+    } catch (err) {
+        console.error('Admin manual sweep failed:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Dev-only reset endpoint (no JWT — uses DEV_RESET_SECRET header)
@@ -1838,11 +2268,26 @@ io.on('connection', (socket) => {
         if (br) {
             br.player.mouseX = data.x;
             br.player.mouseY = data.y;
+            if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
+                br.player.screenWidth = data.screenWidth;
+            }
+            if (Number.isFinite(data.screenHeight) && data.screenHeight > 0) {
+                br.player.screenHeight = data.screenHeight;
+            }
             return;
         }
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (p) { p.mouseX = data.x; p.mouseY = data.y; }
+        if (p) {
+            p.mouseX = data.x;
+            p.mouseY = data.y;
+            if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
+                p.screenWidth = data.screenWidth;
+            }
+            if (Number.isFinite(data.screenHeight) && data.screenHeight > 0) {
+                p.screenHeight = data.screenHeight;
+            }
+        }
     });
 
     // Protokoll-matchning: 2 = split
@@ -2114,6 +2559,7 @@ function getBattleRoyaleDeps() {
         SOL_PRICE_USD,
         connection,
         ensureUserDepositWallet,
+        OWNER_VAULT_ADDRESS,
     };
 }
 
@@ -2393,6 +2839,11 @@ function processRoom(room) {
                             cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                             const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
                             if (victim) {
+                                const willEliminate = !victim.isBot && victim.cells.length === 1 && victim.cells[0].id === otherCell.id;
+                                const balanceAtDeath = willEliminate
+                                    ? victim.cells.reduce((s, c) => s + c.balance, 0)
+                                    : 0;
+
                                 victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
                                 if (victim.cells.length === 0) {
                                     if (!victim.isBot) {
@@ -2400,18 +2851,19 @@ function processRoom(room) {
                                         const victimMongoId = victim.mongoId;
                                         const sessionPlaytime = Date.now() - victim.startTime;
 
-                                        // Uppdatera playtime i DB vid död
                                         User.findByIdAndUpdate(victimMongoId, { $inc: { playtime: sessionPlaytime } })
                                             .catch(err => console.error("Error updating playtime on death:", err));
 
                                         Transaction.create({
                                             userId: victimMongoId,
                                             type: 'game',
-                                            amount: victim.balance,
+                                            amount: balanceAtDeath,
                                             meta: {
                                                 reason: 'Arena Death',
+                                                event: 'death',
                                                 mode: victim.mode || 'agar',
                                                 entryFeeUsd: victim.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                                                inGameBalanceUsd: balanceAtDeath,
                                             },
                                             status: 'confirmed',
                                         }).catch(err => console.error("Error logging agar death:", err));
@@ -2483,11 +2935,13 @@ function processRoom(room) {
 
         io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
 
-        // OPTIMERING: Spatial Filtering.
-        const rangeX = (p.screenWidth || 1920) / 2 + 500;
-        const rangeY = (p.screenHeight || 1080) / 2 + 500;
+        // Spatial filtering — food range is wider than entity range to reduce edge pop-in.
+        const pad = 500;
+        const foodPad = 720;
+        const rangeX = (p.screenWidth || 1920) / 2 + pad;
+        const rangeY = (p.screenHeight || 1080) / 2 + pad;
         const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
-        const foodRange = new Rectangle(p.x, p.y, rangeX + 220, rangeY + 220);
+        const foodRange = new Rectangle(p.x, p.y, rangeX + foodPad, rangeY + foodPad);
         const visibleItems = room.qt.query(viewRange);
         const foodItems = room.qt.query(foodRange);
 
