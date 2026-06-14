@@ -161,23 +161,31 @@ export function createSegments(x, y, balance, angle = 0) {
     return segs;
 }
 
-function isSpawnClear(room, x, y, minDist = 120) {
+function isSpawnClear(room, x, y, minDist = 200) {
     for (const { entity: s } of getAllSlitherSnakes(room)) {
         const r = headRadiusForBalance(s.balance ?? 1);
+        const spacing = segmentSpacingForBalance(s.balance ?? 1);
+        const bodyLen = (s.segments?.length ?? 1) * spacing;
         for (let i = 0; i < (s.segments?.length ?? 0); i++) {
             const seg = s.segments[i];
             const segR = i === 0 ? r : r * 0.75;
-            if (dist(x, y, seg.x, seg.y) < minDist + segR) return false;
+            const need = minDist + segR + (i === 0 ? 0 : bodyLen * 0.15);
+            if (dist(x, y, seg.x, seg.y) < need) return false;
         }
     }
     return true;
 }
 
 function pickSlitherSpawn(room) {
+    for (let i = 0; i < 80; i++) {
+        const x = randomSpawnCoord();
+        const y = randomSpawnCoord();
+        if (isSpawnClear(room, x, y, 180)) return { x, y };
+    }
     for (let i = 0; i < 40; i++) {
         const x = randomSpawnCoord();
         const y = randomSpawnCoord();
-        if (isSpawnClear(room, x, y, 100)) return { x, y };
+        if (isSpawnClear(room, x, y, 120)) return { x, y };
     }
     return { x: randomSpawnCoord(), y: randomSpawnCoord() };
 }
@@ -522,6 +530,7 @@ function checkSnakeCollisions(snake, allSnakes) {
     const r = headRadiusForBalance(snake.balance);
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
+        if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) continue;
         for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 3)) {
             const seg = other.segments[i];
             const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
@@ -838,7 +847,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         kills: 0,
         balance,
         startTime: Date.now(),
-        spawnGraceUntil: Date.now() + 3500,
+        spawnGraceUntil: Date.now() + 4500,
         color,
         x,
         y,
