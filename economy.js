@@ -15,12 +15,14 @@ const BASE = {
     foodLow: 6.0,   // 1–2 humans
     foodMid: 7.0,   // 3–7 humans
     foodHigh: 8.0,  // 8+ humans
-    aiLow: 4.0,   // 1–2 humans: fund 4 bots at botStart stake
+    aiLow: 2.0,   // per join: fund 2 bots; 2 joins → 4 bots max at botStart stake
     aiMid: 1.0,
     aiHigh: 0.0,
     botStart: 1.0,
     botMax: 500.0,
     foodDensityPerHuman: 250.0,
+    /** Pellet value at $10 entry ($5→$0.01, $10→$0.02, $20→$0.04). Scales with density so blob count stays constant. */
+    foodBlobValue: 0.02,
 };
 
 export function normalizeEntryFee(fee) {
@@ -49,6 +51,7 @@ export function getEconomy(entryFeeUsd) {
         botStartBalance: BASE.botStart * s,
         botMaxBalance: BASE.botMax * s,
         foodDensityPerHuman: BASE.foodDensityPerHuman * s,
+        foodBlobValue: BASE.foodBlobValue * s,
     };
 }
 

@@ -199,7 +199,7 @@ const c = {
     sizeMult: 18,
     growthBoost: 2,
     foodValuePerPlayer: 6.0,
-    foodBlobValue: 0.01,
+    foodBlobValue: 0.02, // legacy default; use foodBlobValueForRoom(room) per arena tier
     roomDuration: process.env.DEV_ROOM_DURATION_MS
         ? parseInt(process.env.DEV_ROOM_DURATION_MS, 10)
         : 3 * 60 * 60 * 1000,
@@ -240,6 +240,10 @@ const processingCashouts = new Set(); // mongoId strings
 async function cashOutRoomPlayers(room) {
     const playersToProcess = [...room.players];
     for (const p of playersToProcess) {
+        if (p.isCashingOut || !acquireCashoutLock(p.mongoId)) {
+            console.log(`⏭️ Reset skip cashout for ${p.username} (cashout in progress)`);
+            continue;
+        }
         try {
             const user = await User.findById(p.mongoId);
             if (!user) continue;
@@ -292,6 +296,13 @@ async function cashOutRoomPlayers(room) {
                 });
 
                 io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: sig });
+            } else {
+                console.warn(`⚠️ Reset cashout skipped for ${p.username}: no depositAddress or house wallet`);
+                await Transaction.create({
+                    type: 'game',
+                    amount: 0,
+                    meta: { event: 'failure', reason: 'auto_cashout_no_wallet', userId: p.mongoId, balance: p.balance },
+                });
             }
         } catch (err) {
             await Transaction.create({
@@ -299,6 +310,8 @@ async function cashOutRoomPlayers(room) {
                 amount: 0,
                 meta: { event: 'failure', reason: 'auto_cashout_failed', userId: p.mongoId, error: err.message },
             });
+        } finally {
+            releaseCashoutLock(p.mongoId);
         }
     }
     room.players = [];
@@ -721,24 +734,34 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
 // --- NYTT: UTTAG (WITHDRAW) ---
 app.post('/api/withdraw', authenticateToken, async (req, res) => {
     const { amountUSD, destinationAddress } = req.body;
+    let solToWithdraw = null;
 
     try {
-        const user = await User.findById(req.user.id);
-        // Calculate SOL amount to deduct (balance is already in SOL)
-        const solToWithdraw = amountUSD / SOL_PRICE_USD;
+        solToWithdraw = amountUSD / SOL_PRICE_USD;
 
-        if (!user || user.balance < solToWithdraw) return res.status(400).json({ message: "Insufficient balance" });
-        if (!user.depositSecret) return res.status(500).json({ message: "Account configuration error" });
+        const reserved = await User.findOneAndUpdate(
+            { _id: req.user.id, balance: { $gte: solToWithdraw } },
+            { $inc: { balance: -solToWithdraw } },
+            { new: true },
+        );
+        if (!reserved) return res.status(400).json({ message: "Insufficient balance" });
+        const user = reserved;
+        if (!user.depositSecret) {
+            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } });
+            return res.status(500).json({ message: "Account configuration error" });
+        }
 
         const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
         const userKeypair = solanaWeb3.Keypair.fromSecretKey(
             Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
         );
 
-        // Vi drar av en liten mängd för transaktionsavgiften (0.000005 SOL)
         const fee = 5000;
         const sendAmount = lamports - fee;
-        if (sendAmount <= 0) return res.status(400).json({ message: "Amount too small to cover fees" });
+        if (sendAmount <= 0) {
+            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } });
+            return res.status(400).json({ message: "Amount too small to cover fees" });
+        }
 
         const transaction = new solanaWeb3.Transaction().add(
             solanaWeb3.SystemProgram.transfer({
@@ -762,24 +785,61 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
         res.json({ success: true, newBalance: user.balance, signature });
     } catch (err) {
         console.error("Withdraw Error:", err.message);
+        if (typeof solToWithdraw === 'number' && Number.isFinite(solToWithdraw)) {
+            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } }).catch(() => {});
+        }
         res.status(500).json({ error: "Blockchain transaction failed" });
     }
 });
 
 // --- NYTT: Endpoint för att verifiera insättning och spara i historik ---
 app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
-    const { signature, amountUSD, solAmount } = req.body;
+    const { signature } = req.body;
     try {
-        const user = await User.findById(req.user.id);
-        if (!user) return res.status(404).json({ message: "Användare hittades ej" });
+        if (!signature) return res.status(400).json({ message: 'Missing signature' });
 
-        user.balance += solAmount; // TRACK RAW SOL
+        const existing = await Transaction.findOne({ 'meta.signature': signature });
+        if (existing) return res.json({ success: true, message: 'Already processed' });
+
+        const txDetails = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        if (!txDetails || txDetails.meta?.err) {
+            return res.status(400).json({ message: 'Invalid on-chain transaction' });
+        }
+
+        const user = await User.findById(req.user.id);
+        if (!user?.depositAddress) return res.status(404).json({ message: 'Användare hittades ej' });
+
+        const depositPubkey = new solanaWeb3.PublicKey(user.depositAddress);
+        const accountKeys = txDetails.transaction.message.staticAccountKeys;
+        let creditedLamports = 0;
+        for (let i = 0; i < accountKeys.length; i++) {
+            if (accountKeys[i].equals(depositPubkey)) {
+                const pre = txDetails.meta.preBalances[i];
+                const post = txDetails.meta.postBalances[i];
+                if (post > pre) {
+                    creditedLamports = post - pre;
+                    break;
+                }
+            }
+        }
+        if (creditedLamports <= 0) {
+            return res.status(400).json({ message: 'Deposit address not credited in this transaction' });
+        }
+
+        const solReceived = creditedLamports / solanaWeb3.LAMPORTS_PER_SOL;
+        user.balance += solReceived;
         await user.save();
 
-        const tx = new Transaction({ userId: user._id, type: 'deposit', amount: solAmount, meta: { signature, solAmount } });
-        await tx.save();
+        await Transaction.create({
+            userId: user._id,
+            type: 'deposit',
+            amount: solReceived,
+            currency: 'SOL',
+            meta: { signature, solAmount: solReceived, verifiedOnChain: true },
+            status: 'confirmed',
+        });
 
-        res.json({ success: true, balance: user.balance });
+        res.json({ success: true, balance: user.balance, solReceived });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -962,16 +1022,57 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
 
         const { room, player: p } = found;
         const amount = p.balance;
-        const user = await User.findById(userId);
-        user.balance += amount;
-        await user.save();
+        if (!acquireCashoutLock(p.mongoId)) {
+            return res.status(409).json({ message: 'Cashout already in progress for this player' });
+        }
 
-        room.players = room.players.filter(pl => pl.mongoId.toString() !== userId);
+        try {
+            const user = await User.findById(userId);
+            if (!user) return res.status(404).send("User not found");
 
-        await Transaction.create({ userId: user._id, type: 'withdraw', amount: amount, meta: { reason: 'Admin Forced Cashout' } });
-        io.to(p.id).emit('cashOutSuccess', { amount });
+            if (DEV_FREE_PLAY) {
+                room.players = room.players.filter(pl => pl.mongoId.toString() !== userId);
+                await Transaction.create({
+                    userId: user._id,
+                    type: 'withdraw',
+                    amount,
+                    meta: { simulated: true, reason: 'Admin Forced Cashout' },
+                });
+                io.to(p.id).emit('cashOutSuccess', { amount });
+                return res.json({ success: true, simulated: true });
+            }
 
-        res.json({ success: true });
+            const userWithWallet = await ensureUserDepositWallet(user);
+            if (!userWithWallet.depositAddress || !HOUSE_WALLET_SECRET) {
+                return res.status(500).json({ message: 'House wallet or player deposit address not configured' });
+            }
+
+            const solToWithdraw = amount / SOL_PRICE_USD;
+            const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
+            const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+            );
+            const transaction = new solanaWeb3.Transaction().add(
+                solanaWeb3.SystemProgram.transfer({
+                    fromPubkey: houseKeypair.publicKey,
+                    toPubkey: new solanaWeb3.PublicKey(userWithWallet.depositAddress),
+                    lamports,
+                })
+            );
+            const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
+            room.players = room.players.filter(pl => pl.mongoId.toString() !== userId);
+            await Transaction.create({
+                userId: user._id,
+                type: 'withdraw',
+                amount,
+                meta: { signature, reason: 'Admin Forced Cashout', entryFeeUsd: room.entryFeeUsd },
+            });
+            io.to(p.id).emit('cashOutSuccess', { amount, signature });
+            res.json({ success: true, signature });
+        } finally {
+            releaseCashoutLock(p.mongoId);
+        }
     } catch (err) { res.status(500).send(err.message); }
 });
 
@@ -1212,7 +1313,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 // Radius beräknas via `util.massToRadius` (sqrt-baserad) för konsistens med klient och Agar.io
 
 function addFood(room, n) {
-    const foodBlobValue = c.foodBlobValue;
+    const foodBlobValue = foodBlobValueForRoom(room);
     for (let i = 0; i < n; i++) {
         if (room.foodPoolBalance < foodBlobValue) break;
         room.foodPoolBalance -= foodBlobValue;
@@ -1245,13 +1346,14 @@ function trimNormalAgarFood(room, targetCount) {
 function spawnGoldenAgarBlob(room, value) {
     if (value <= 1e-9 || room.foodPoolBalance < value - 1e-9) return;
     room.foodPoolBalance -= value;
+    const pelletValue = foodBlobValueForRoom(room);
     room.food.push({
         id: Math.random().toString(36).substr(2, 9),
         x: Math.random() * c.worldWidth,
         y: Math.random() * c.worldHeight,
         hue: 48,
         golden: true,
-        radius: Math.min(13, 7 + Math.sqrt(value / c.foodBlobValue) * 1.4),
+        radius: Math.min(13, 7 + Math.sqrt(value / pelletValue) * 1.4),
         balance: value,
     });
 }
@@ -1309,6 +1411,10 @@ function foodDensityForRoom(room) {
     return getEconomy(room.entryFeeUsd).foodDensityPerHuman;
 }
 
+function foodBlobValueForRoom(room) {
+    return getEconomy(room.entryFeeUsd).foodBlobValue;
+}
+
 function findPlayerInArena(mongoId) {
     const key = mongoId?.toString();
     for (const room of rooms) {
@@ -1328,7 +1434,22 @@ function isArenaResetting() {
 }
 
 function capAiBudget(room) {
-    room.aiBudgetBalance = Math.min(room.aiBudgetBalance, getMaxAiBudgetForRoom(room));
+    const max = getMaxAiBudgetForRoom(room);
+    if (room.aiBudgetBalance > max) {
+        room.foodPoolBalance += room.aiBudgetBalance - max;
+        room.aiBudgetBalance = max;
+    }
+}
+
+function acquireCashoutLock(mongoId) {
+    const key = mongoId?.toString();
+    if (!key || processingCashouts.has(key)) return false;
+    processingCashouts.add(key);
+    return true;
+}
+
+function releaseCashoutLock(mongoId) {
+    processingCashouts.delete(mongoId?.toString());
 }
 
 function rebuildQuadTree(room, allUsers) {
@@ -1383,10 +1504,18 @@ rooms.forEach(room => {
     room.foodPoolBalance = 0;
 });
 
+function trimAgarBots(room, targetCount) {
+    const stake = botStakeForRoom(room);
+    while (room.bots.length > targetCount) {
+        const removed = room.bots.shift();
+        room.aiBudgetBalance += removed?.cells?.[0]?.balance ?? stake;
+    }
+}
+
 function getTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
     if (humanCount >= 8) return 0;
-    if (humanCount < 3) return 4; // 1–2 humans: fuller arena
+    if (humanCount < 3) return humanCount * 2; // 1 human → 2 bots, 2 humans → 4 bots
     return Math.min(humanCount * 2, 12);
 }
 
@@ -1583,7 +1712,7 @@ io.on('connection', (socket) => {
                 if (room.bots.length < targetBots) {
                     addBots(room, targetBots - room.bots.length, joinBotStake);
                 } else if (room.bots.length > targetBots) {
-                    room.bots.splice(0, room.bots.length - targetBots);
+                    trimAgarBots(room, targetBots);
                 }
             }
 
@@ -1658,14 +1787,15 @@ io.on('connection', (socket) => {
                 const budgets = getModeFoodBudgets(room, agarActive, slitherActive);
                 if (gameMode === 'slither') {
                     syncSlitherFood(
-                        room, c.foodBlobValue, budgets.slither,
+                        room, foodBlobValueForRoom(room), budgets.slither,
                         countHumansInMode(room, 'slither'),
                         foodDensityForRoom(room),
                     );
                 } else {
                     const agarInArena = countHumansInMode(room, 'agar');
+                    const pelletValue = foodBlobValueForRoom(room);
                     const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), budgets.agar);
-                    const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
+                    const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
                     const normalCount = countNormalAgarFood(room);
                     if (normalCount < agarTargetFoodCount) {
                         addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
@@ -1783,6 +1913,10 @@ io.on('connection', (socket) => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
+        if (!acquireCashoutLock(p.mongoId)) {
+            socket.emit('error', 'Cashout already in progress.');
+            return;
+        }
 
         console.log(`⏱️ User ${p.username} started cashout timer (${CASHOUT_DURATION_MS / 1000}s)`);
         p.isCashingOut = true;
@@ -1803,6 +1937,7 @@ io.on('connection', (socket) => {
             // Om spelaren inte finns kvar i rummet (uppäten) eller flaggan nollställts, avbryt
             if (!activePlayer || !activePlayer.isCashingOut) {
                 console.log(`❌ Cashout cancelled (died or invalid state)`);
+                releaseCashoutLock(playerMongoId);
                 return;
             }
 
@@ -1816,6 +1951,7 @@ io.on('connection', (socket) => {
                     console.log(`❌ Cashout failed: User ${activePlayer.username} not found in DB.`);
                     io.to(activePlayer.id).emit('error', 'Account not found.');
                     activePlayer.isCashingOut = false;
+                    releaseCashoutLock(playerMongoId);
                     return;
                 }
 
@@ -1837,6 +1973,7 @@ io.on('connection', (socket) => {
                     });
                     console.log(`🎮 [FREE PLAY] Cashout: $${totalCashout.toFixed(2)} (simulated)`);
                     io.to(activePlayer.id).emit('cashOutSuccess', { amount: totalCashout, signature: 'simulated' });
+                    releaseCashoutLock(playerMongoId);
                     return;
                 }
 
@@ -1845,6 +1982,7 @@ io.on('connection', (socket) => {
                     console.log(`❌ Cashout failed: User ${activePlayer.username} has no internal deposit address.`);
                     io.to(activePlayer.id).emit('error', 'Account internal error.');
                     activePlayer.isCashingOut = false;
+                    releaseCashoutLock(playerMongoId);
                     return;
                 }
 
@@ -1861,6 +1999,7 @@ io.on('connection', (socket) => {
                     console.error('[CASHOUT ERROR] House wallet lacks liquidity');
                     io.to(activePlayer.id).emit('error', 'House wallet lacks liquidity. Try again later.');
                     activePlayer.isCashingOut = false;
+                    releaseCashoutLock(playerMongoId);
                     return;
                 }
 
@@ -1885,7 +2024,7 @@ io.on('connection', (socket) => {
                     console.error("Cashout transaction failed on-chain:", err.message);
                     io.to(activePlayer.id).emit('error', 'Blockchain transfer failed. Your game balance remains intact.');
                     activePlayer.isCashingOut = false;
-                    // DO NOT remove player from room; allow them to continue playing or retry.
+                    releaseCashoutLock(playerMongoId);
                     return;
                 }
 
@@ -1918,6 +2057,9 @@ io.on('connection', (socket) => {
             } catch (err) {
                 console.error("❌ Cashout error:", err.message);
                 io.to(activePlayer.id).emit('error', 'Transfer failed.');
+                if (activePlayer) activePlayer.isCashingOut = false;
+            } finally {
+                releaseCashoutLock(playerMongoId);
             }
         }, duration);
     });
@@ -2010,7 +2152,7 @@ function processRoom(room) {
     if (room.bots.length < agarTargetBots) {
         addBots(room, agarTargetBots - room.bots.length, agarBotStake);
     } else if (room.bots.length > agarTargetBots) {
-        room.bots.splice(0, room.bots.length - agarTargetBots);
+        trimAgarBots(room, agarTargetBots);
     }
 
     const slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
@@ -2027,8 +2169,9 @@ function processRoom(room) {
     const slitherInArena = countHumansInMode(room, 'slither');
     const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
 
+    const pelletValue = foodBlobValueForRoom(room);
     const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
-    const agarTargetFoodCount = Math.floor(agarFoodTarget / c.foodBlobValue);
+    const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
     if (agarInArena <= 0) {
         room.food.length = 0;
     } else {
@@ -2039,7 +2182,7 @@ function processRoom(room) {
             trimNormalAgarFood(room, agarTargetFoodCount);
         }
     }
-    syncSlitherFood(room, c.foodBlobValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
+    syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
 
@@ -2068,6 +2211,7 @@ function processRoom(room) {
             const totalBotBalance = botCells.reduce((sum, cl) => sum + cl.balance, 0);
             const botMax = getEconomy(room.entryFeeUsd).botMaxBalance;
             if (totalBotBalance > botMax) {
+                room.foodPoolBalance += totalBotBalance;
                 room.bots = room.bots.filter(b => b.id !== player.id);
                 if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
                 return;
@@ -2191,7 +2335,7 @@ function processRoom(room) {
 
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
-                        cell.balance += item.data.balance || c.foodBlobValue;
+                        cell.balance += item.data.balance || foodBlobValueForRoom(room);
                         cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }

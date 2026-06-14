@@ -246,6 +246,98 @@ export function processBRQueues(io, deps) {
     }
 }
 
+function findQueueEntryBySocket(socketId) {
+    for (const [key, q] of queues.entries()) {
+        const entry = q.find(x => x.socketId === socketId);
+        if (entry) {
+            const [variant, feeStr] = key.split(':');
+            return { variant, entryFeeUsd: Number(feeStr), entry, key };
+        }
+    }
+    return null;
+}
+
+async function refundBREntryFee(entry, variant, entryFeeUsd, deps, reason) {
+    const { DEV_FREE_PLAY, SOL_PRICE_USD, connection, Transaction, ensureUserDepositWallet, User } = deps;
+    const fee = normalizeBREntryFee(entryFeeUsd);
+    const entryFeeInSol = fee / SOL_PRICE_USD;
+
+    if (DEV_FREE_PLAY) {
+        await Transaction.create({
+            userId: entry.mongoId,
+            type: 'game',
+            amount: entryFeeInSol,
+            meta: { event: 'br_refund', entryFeeUsd: fee, variant, reason, simulated: true },
+            status: 'confirmed',
+        });
+        return true;
+    }
+
+    try {
+        const user = await User.findById(entry.mongoId);
+        if (!user) return false;
+        const userWithWallet = await ensureUserDepositWallet(user);
+        if (!userWithWallet.depositAddress) return false;
+
+        const brWallet = getBRHouseWallet(variant, fee);
+        const lamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
+        const brKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(brWallet.secret, 'hex'))
+        );
+        const refundTx = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: brKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(userWithWallet.depositAddress),
+                lamports,
+            })
+        );
+        const sig = await solanaWeb3.sendAndConfirmTransaction(connection, refundTx, [brKeypair]);
+        await Transaction.create({
+            userId: entry.mongoId,
+            type: 'withdraw',
+            amount: entryFeeInSol,
+            meta: { event: 'br_refund', signature: sig, reason, variant, entryFeeUsd: fee },
+            status: 'confirmed',
+        });
+        console.log(`↩️ BR refund $${fee} (${variant}) → ${entry.username}: ${reason}`);
+        return true;
+    } catch (err) {
+        console.error('BR refund failed:', err.message);
+        return false;
+    }
+}
+
+async function refundAllBRPlayers(room, deps, reason) {
+    for (const player of [...room.players]) {
+        await refundBREntryFee(
+            { mongoId: player.mongoId, username: player.username },
+            room.variant,
+            room.entryFeeUsd,
+            deps,
+            reason,
+        );
+    }
+}
+
+function processQueueTimeouts(io, deps) {
+    const now = Date.now();
+    for (const [key, q] of queues.entries()) {
+        const [variant, feeStr] = key.split(':');
+        const entryFeeUsd = Number(feeStr);
+        for (let i = q.length - 1; i >= 0; i--) {
+            const entry = q[i];
+            if (now - entry.joinedAt <= BR.queueTimeoutMs) continue;
+            q.splice(i, 1);
+            if (q.length < BR.minPlayers) clearQueueGrace(key);
+            refundBREntryFee(entry, variant, entryFeeUsd, deps, 'queue_timeout').catch(err => {
+                console.error('Queue timeout refund failed:', err.message);
+            });
+            entry.socket?.emit('error', 'Queue timed out — entry fee refunded.');
+            emitQueueStatus(io, variant, entryFeeUsd, deps);
+        }
+    }
+}
+
 function findQueueEntry(mongoId) {
     for (const [key, q] of queues.entries()) {
         const e = q.find(x => x.mongoId === mongoId);
@@ -387,13 +479,23 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
 
 function tryDeclareBRWinner(room, io, deps) {
     if (room.status !== 'active') return;
-    if (room.players.length === 1) {
-        const winner = room.players[0];
-        if (!winner.disconnected && socketToMatch.has(winner.id)) {
-            finishMatch(room, winner, io, deps);
-        }
+    const connected = room.players.filter(p => !p.disconnected && socketToMatch.has(p.id));
+
+    if (connected.length === 1) {
+        finishMatch(room, connected[0], io, deps);
     } else if (room.players.length === 0) {
         endMatchNoWinner(room, io);
+    } else if (connected.length === 0) {
+        if (!room._allDisconnectedSince) {
+            room._allDisconnectedSince = Date.now();
+        } else if (Date.now() - room._allDisconnectedSince >= 90_000) {
+            refundAllBRPlayers(room, deps, 'all_disconnected').finally(() => {
+                room.players.forEach(p => io.to(p.id).emit('brMatchEnd', { cancelled: true, reason: 'all_disconnected' }));
+                endMatchNoWinner(room, io);
+            });
+        }
+    } else {
+        room._allDisconnectedSince = null;
     }
 }
 
@@ -745,6 +847,8 @@ async function chargeEntryFee(user, deps, variant, entryFeeUsd) {
 
 /** Tick all active BR matches — call at 40Hz from server loop. */
 export function processBattleRoyaleMatches(io, deps) {
+    processQueueTimeouts(io, deps);
+
     for (const room of matches.values()) {
         if (room.status === 'countdown' || room.status === 'ended') continue;
 
@@ -869,12 +973,12 @@ export function setupBattleRoyale(io, deps) {
             }
         });
 
-        socket.on('brLeaveQueue', () => {
-            const key = removeFromQueue(socket.id);
-            if (key) {
-                const [variant, feeStr] = key.split(':');
-                emitQueueStatus(io, variant, Number(feeStr), deps);
-            }
+        socket.on('brLeaveQueue', async () => {
+            const found = findQueueEntryBySocket(socket.id);
+            if (!found) return;
+            removeFromQueue(socket.id);
+            await refundBREntryFee(found.entry, found.variant, found.entryFeeUsd, deps, 'queue_leave');
+            emitQueueStatus(io, found.variant, found.entryFeeUsd, deps);
         });
 
         socket.on('brRejoinMatch', async ({ token }) => {
@@ -920,10 +1024,11 @@ export function setupBattleRoyale(io, deps) {
         });
 
         socket.on('disconnect', () => {
-            const key = removeFromQueue(socket.id);
-            if (key) {
-                const [variant, feeStr] = key.split(':');
-                emitQueueStatus(io, variant, Number(feeStr), deps);
+            const found = findQueueEntryBySocket(socket.id);
+            if (found) {
+                removeFromQueue(socket.id);
+                refundBREntryFee(found.entry, found.variant, found.entryFeeUsd, deps, 'queue_disconnect').catch(() => {});
+                emitQueueStatus(io, found.variant, found.entryFeeUsd, deps);
             }
             const matchId = socketToMatch.get(socket.id);
             if (!matchId) return;
