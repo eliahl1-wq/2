@@ -633,6 +633,23 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 function serializeSnake(snake, isYou) {
     const sct = snake.segments.length;
     const sc = scaleForSegmentCount(sct);
+    let segments = snake.segments;
+    if (!isYou && segments.length > 72) {
+        const step = Math.ceil(segments.length / 72);
+        const slim = [];
+        for (let i = 0; i < segments.length; i += step) {
+            const s = segments[i];
+            slim.push({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 });
+        }
+        const last = segments[segments.length - 1];
+        const tail = slim[slim.length - 1];
+        if (!tail || tail.x !== Math.round(last.x * 10) / 10 || tail.y !== Math.round(last.y * 10) / 10) {
+            slim.push({ x: Math.round(last.x * 10) / 10, y: Math.round(last.y * 10) / 10 });
+        }
+        segments = slim;
+    } else {
+        segments = segments.map(s => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 }));
+    }
     return {
         id: snake.id,
         name: snake.username,
@@ -640,7 +657,7 @@ function serializeSnake(snake, isYou) {
         color: snake.color,
         isBot: !!snake.isBot,
         isYou,
-        segments: snake.segments.map(s => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 })),
+        segments,
         angle: snake.angle || 0,
         sc,
         radius: headRadiusForBalance(snake.balance),
@@ -765,6 +782,9 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const allSnakes = getAllSlitherSnakes(room);
     const range = SLITHER.viewRange;
     const foodRange = range + 2000;
+    const now = Date.now();
+    const sendLeaderboard = !room._lastLbAt || now - room._lastLbAt >= 500;
+    if (sendLeaderboard) room._lastLbAt = now;
 
     room.players
         .filter(p => p.mode === 'slither' && !p.disconnected)
@@ -772,7 +792,9 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
             const head = p.segments?.[0];
             if (!head) return;
 
-            io.to(p.id).emit('leaderboard', { leaderboard: slitherLeaderboard, battleRoyale: !!meta.battleRoyale });
+            if (sendLeaderboard) {
+                io.to(p.id).emit('leaderboard', { leaderboard: slitherLeaderboard, battleRoyale: !!meta.battleRoyale });
+            }
 
             const visibleSnakes = allSnakes
                 .filter(({ entity: s }) => {
