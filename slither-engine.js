@@ -640,9 +640,9 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 }
 
 const MAX_NETWORK_SEGMENTS = 96;
-const MAX_VISIBLE_FOOD = 450;
-const SLITHER_FOOD_VIEW_EXTRA = 900;
-const SLITHER_FOOD_BROADCAST_INTERVAL = 2;
+const MAX_VISIBLE_FOOD = 320;
+const SLITHER_FOOD_VIEW_EXTRA = 750;
+const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
     if (segments.length <= maxPoints) {
