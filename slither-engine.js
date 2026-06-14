@@ -5,7 +5,7 @@ export const SLITHER = {
     worldHalf: 3000,
     // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
     slitherGameRadius: 21600,
-    spawnSegments: 6,
+    spawnSegments: 12,
     maxSegments: 500,
     segmentsPerCent: 0.2,
     maxScale: 6,
@@ -24,7 +24,7 @@ export const SLITHER = {
     boostCostPerTick: 0.00125, // $0.05/s at 40Hz
     foodRadius: 2.0,
     segmentSpacing: 6,
-    baseSegments: 6,
+    baseSegments: 12,
     segmentsPerCentLegacy: 0.1,
     foodBlobValue: 0.01,
     botStartBalance: 1.0,
