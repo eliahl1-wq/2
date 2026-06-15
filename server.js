@@ -432,6 +432,21 @@ async function performRoomReset(_room) {
 
 // In-memory lock for scanDeposits to prevent concurrent runs
 let isScanningDeposits = false;
+let globalPlayerEarningsSol = 0;
+let globalPlayerEarningsUsd = 0;
+
+async function refreshGlobalPlayerEarnings() {
+    try {
+        const totals = await User.aggregate([
+            { $group: { _id: null, totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } } } },
+        ]);
+        const totalBalanceSol = Number(totals[0]?.totalBalanceSol || 0);
+        globalPlayerEarningsSol = Number(totalBalanceSol.toFixed(6));
+        globalPlayerEarningsUsd = Number((totalBalanceSol * SOL_PRICE_USD).toFixed(2));
+    } catch (err) {
+        console.error('Failed to refresh global player earnings:', err.message);
+    }
+}
 
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
@@ -466,6 +481,9 @@ async function scanDeposits() {
 setInterval(async () => {
     if (!isScanningDeposits) await scanDeposits();
 }, 15000);
+
+refreshGlobalPlayerEarnings();
+setInterval(refreshGlobalPlayerEarnings, 15000);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -2279,6 +2297,8 @@ app.get('/api/stats', (req, res) => {
             playersByModeAndFee,
             playersByGamemode,
             brPlayersByFee,
+            totalUserBalanceSol: globalPlayerEarningsSol,
+            totalUserBalanceUsd: globalPlayerEarningsUsd,
             statsMode: modeFilter,
         });
     } catch (err) {
