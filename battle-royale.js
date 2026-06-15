@@ -843,6 +843,16 @@ function processBRAgarMatch(room, io, deps) {
         foodItems.forEach(item => {
             if (item.type === 'food') visibleFood.push(item.data);
         });
+        const minimap = allUsers.map(u => {
+            const c = typeof u.color === 'object' && u.color !== null ? (u.color.fill || u.color) : u.color;
+            return {
+                x: Math.round(u.x),
+                y: Math.round(u.y),
+                c,
+                you: u.id === p.id,
+            };
+        });
+
         io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, [], [], {
             unlocked: false,
             unlockTime: 0,
@@ -853,6 +863,7 @@ function processBRAgarMatch(room, io, deps) {
             zone: room.zone,
             prizePool: room.prizePool,
             aliveCount: allUsers.length,
+            minimap,
         });
     });
 }

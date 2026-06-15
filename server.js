@@ -3559,9 +3559,20 @@ function processRoom(room) {
         foodItems.forEach(item => {
             if (item.type === 'food') visibleFood.push(item.data);
         });
+        const minimap = allUsers.map(u => {
+            const c = typeof u.color === 'object' && u.color !== null ? (u.color.fill || u.color) : u.color;
+            return {
+                x: Math.round(u.x),
+                y: Math.round(u.y),
+                c,
+                you: u.id === p.id,
+            };
+        });
+
         io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
             resetTime: room.startTime + c.roomDuration,
-            solPrice: SOL_PRICE_USD
+            solPrice: SOL_PRICE_USD,
+            minimap,
         });
     });
 }

@@ -850,11 +850,24 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 visibleFood = room._lastSlitherFoodByPlayer[p.id] || [];
             }
 
+            const minimap = allSnakes.map(({ entity: s }) => {
+                const h = s.segments[0];
+                if (!h) return null;
+                const c = typeof s.color === 'object' && s.color !== null ? s.color.fill : s.color;
+                return {
+                    x: Math.round(h.x),
+                    y: Math.round(h.y),
+                    c,
+                    you: s.id === p.id,
+                };
+            }).filter(Boolean);
+
             io.to(p.id).emit('slitherTick', {
                 you: p.id,
                 snakes: visibleSnakes,
                 food: visibleFood,
                 worldHalf: SLITHER.worldHalf,
+                minimap,
                 ...meta,
                 ...(meta.battleRoyale ? {} : { balance: p.balance }),
             });
