@@ -1814,6 +1814,7 @@ app.get('/api/stats', (req, res) => {
             });
             room.bots.forEach(bot => {
                 const botBalance = bot.cells?.reduce((s, c) => s + c.balance, 0) ?? bot.balance ?? 0;
+                playersByGamemode.agar += 1;
                 pushTop(agarPlayers, bot.username, botBalance);
                 if (!modeFilter || modeFilter === 'agar') {
                     filteredAiOnline += 1;
@@ -1821,6 +1822,7 @@ app.get('/api/stats', (req, res) => {
                 }
             });
             room.slitherBots.forEach(bot => {
+                playersByGamemode.slither += 1;
                 pushTop(slitherPlayers, bot.username, bot.balance);
                 if (!modeFilter || modeFilter === 'slither') {
                     filteredAiOnline += 1;
@@ -1834,8 +1836,7 @@ app.get('/api/stats', (req, res) => {
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
-            + playersByGamemode.brAgar + playersByGamemode.brSlither
-            + rooms.reduce((sum, room) => sum + room.bots.length + room.slitherBots.length, 0);
+            + playersByGamemode.brAgar + playersByGamemode.brSlither;
 
         if (modeFilter === 'agar') {
             filteredHumansOnline += countBRForMode('agar');
