@@ -973,11 +973,193 @@ function txAmountUsd(tx) {
     return tx.amount;
 }
 
+function txAmountSol(tx) {
+    if (tx.meta?.solAmount != null) return tx.meta.solAmount;
+    if (tx.currency === 'SOL') return tx.amount;
+    return tx.amount / SOL_PRICE_USD;
+}
+
+const OWNER_EARNING_EVENTS = {
+    status: 'confirmed',
+    $or: [
+        { 'meta.event': 'pool_sweep' },
+        { 'meta.event': 'br_owner_sweep' },
+    ],
+};
+
+async function computeOwnerEarnings() {
+    const match = await reportedTxMatch(OWNER_EARNING_EVENTS);
+    const txs = await Transaction.find(match).select('amount currency meta').lean();
+    let totalSol = 0;
+    let totalUsd = 0;
+    let arenaSweepSol = 0;
+    let brSweepSol = 0;
+    for (const tx of txs) {
+        const sol = txAmountSol(tx);
+        const usd = txAmountUsd(tx);
+        totalSol += sol;
+        totalUsd += usd;
+        if (tx.meta?.event === 'br_owner_sweep') brSweepSol += sol;
+        else arenaSweepSol += sol;
+    }
+    return {
+        totalSol: Number(totalSol.toFixed(6)),
+        totalUsd: Number(totalUsd.toFixed(2)),
+        sweepCount: txs.length,
+        arenaSweepSol: Number(arenaSweepSol.toFixed(6)),
+        brSweepSol: Number(brSweepSol.toFixed(6)),
+    };
+}
+
+function objectIdCreatedAt(id) {
+    try {
+        return new mongoose.Types.ObjectId(id).getTimestamp();
+    } catch {
+        return null;
+    }
+}
+
+function sortAdminUsers(users, sortKey) {
+    const list = [...users];
+    switch (sortKey) {
+        case 'balance_asc':
+            return list.sort((a, b) => a.balanceSol - b.balanceSol);
+        case 'newest':
+            return list.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+        case 'oldest':
+            return list.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+        case 'deposits_desc':
+            return list.sort((a, b) => b.totalDepositedUsd - a.totalDepositedUsd);
+        case 'username_asc':
+            return list.sort((a, b) => a.username.localeCompare(b.username));
+        case 'balance_desc':
+        default:
+            return list.sort((a, b) => b.balanceSol - a.balanceSol);
+    }
+}
+
+function classifyTxActivity(tx) {
+    const m = tx.meta || {};
+    if (tx.type === 'deposit') return 'deposit';
+    if (m.event === 'pool_sweep' || m.event === 'br_owner_sweep') return 'sweep';
+    if (tx.type === 'game') {
+        if (m.event === 'join' || m.event === 'br_join') return 'entry';
+        if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated') return 'death';
+        if (m.event === 'br_refund') return 'refund';
+        return 'game';
+    }
+    if (tx.type === 'withdraw') {
+        const r = m.reason || '';
+        if (/Arena Cashout|Admin Forced|Auto Room Reset|BR Victory/i.test(r)) return 'cashout';
+        return 'withdraw';
+    }
+    return 'other';
+}
+
+function txActivityLabel(tx) {
+    const m = tx.meta || {};
+    const cat = classifyTxActivity(tx);
+    switch (cat) {
+        case 'deposit': return 'Deposit';
+        case 'withdraw': return 'Withdrawal';
+        case 'entry':
+            if (m.event === 'br_join') return `BR entry · $${m.entryFeeUsd ?? '?'}`;
+            return `Arena entry · ${m.mode || 'agar'} · $${m.entryFeeUsd ?? '?'}`;
+        case 'cashout': return m.reason || 'Cashout';
+        case 'death': return m.reason || 'Eliminated';
+        case 'refund': return 'BR refund';
+        case 'sweep': return m.reason || 'Owner sweep';
+        default: return m.reason || m.event || tx.type;
+    }
+}
+
+function buildTxCategoryFilter(category) {
+    switch (category) {
+        case 'deposit':
+            return { type: 'deposit' };
+        case 'withdraw':
+            return {
+                type: 'withdraw',
+                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
+                'meta.reason': { $not: { $regex: /Arena Cashout|Admin Forced|Auto Room Reset|BR Victory/i } },
+            };
+        case 'entry':
+            return { type: 'game', 'meta.event': { $in: ['join', 'br_join'] } };
+        case 'cashout':
+            return { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } };
+        case 'death':
+            return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } };
+        case 'sweep':
+            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }] };
+        case 'game':
+            return { type: 'game' };
+        default:
+            return {};
+    }
+}
+
+function mapTxToAdminRow(tx, userMap) {
+    const category = classifyTxActivity(tx);
+    return {
+        id: tx._id,
+        userId: tx.userId?.toString() || null,
+        username: tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : '—',
+        type: tx.type,
+        category,
+        label: txActivityLabel(tx),
+        amount: tx.amount,
+        currency: tx.currency || 'USD',
+        amountUsd: Number(txAmountUsd(tx).toFixed(2)),
+        status: tx.status,
+        meta: tx.meta,
+        excludedFromReports: !!tx.excludedFromReports,
+        createdAt: tx.createdAt,
+    };
+}
+
+async function buildAdminTxQuery({ userId, showExcluded, type, category, search }) {
+    const clauses = [];
+    if (!showExcluded) clauses.push(TX_REPORTED);
+
+    if (userId) {
+        clauses.push({ userId });
+    } else if (search?.trim()) {
+        const matchingUsers = await User.find({
+            username: { $regex: search.trim(), $options: 'i' },
+        }).select('_id').lean();
+        const ids = matchingUsers.map(u => u._id);
+        if (!ids.length) return { _id: null };
+        clauses.push({ userId: { $in: ids } });
+    } else {
+        const excludedUserIds = await fetchExcludedUserIds();
+        if (excludedUserIds.length) {
+            clauses.push({
+                $or: [
+                    { userId: { $exists: false } },
+                    { userId: null },
+                    { userId: { $nin: excludedUserIds } },
+                ],
+            });
+        }
+    }
+
+    if (type) clauses.push({ type });
+    const catFilter = buildTxCategoryFilter(category);
+    if (Object.keys(catFilter).length) clauses.push(catFilter);
+
+    if (clauses.length === 0) return {};
+    return clauses.length === 1 ? clauses[0] : { $and: clauses };
+}
+
 app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
     try {
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
-        const withdrawMatch = await reportedTxMatch({ type: 'withdraw', status: 'confirmed' });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount] = await Promise.all([
+        const withdrawMatch = await reportedTxMatch({
+            type: 'withdraw',
+            status: 'confirmed',
+            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
+        });
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -988,6 +1170,11 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ]),
             Transaction.countDocuments({ excludedFromReports: true }),
             User.countDocuments({ excludedFromReports: true }),
+            computeOwnerEarnings(),
+            User.aggregate([
+                { $match: USER_REPORTED },
+                { $group: { _id: null, totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } }, accountCount: { $sum: 1 } } },
+            ]),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -998,15 +1185,23 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             totalWithdrawalsUsd += txAmountUsd(tx);
         }
 
-        const netGamingRevenue = totalDepositsUsd - totalWithdrawalsUsd;
+        const totalUserBalanceSol = userBalanceAgg[0]?.totalBalanceSol ?? 0;
+        const totalAccounts = userBalanceAgg[0]?.accountCount ?? 0;
 
         res.json({
             totalDepositsUsd: Number(totalDepositsUsd.toFixed(2)),
             totalDepositsSol: Number(totalDepositsSol.toFixed(6)),
             totalWithdrawalsUsd: Number(totalWithdrawalsUsd.toFixed(2)),
-            netGamingRevenue: Number(netGamingRevenue.toFixed(2)),
             depositCount: depositAgg[0]?.count ?? 0,
             withdrawalCount: withdrawAgg[0]?.count ?? 0,
+            ownerEarningsUsd: ownerEarnings.totalUsd,
+            ownerEarningsSol: ownerEarnings.totalSol,
+            ownerSweepCount: ownerEarnings.sweepCount,
+            ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
+            ownerEarningsBrSol: ownerEarnings.brSweepSol,
+            totalAccounts,
+            totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
+            totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
             excludedTxCount,
             excludedUsersCount,
             solPrice: SOL_PRICE_USD,
@@ -1051,8 +1246,9 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
 app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
     try {
         const showExcluded = req.query.showExcluded === 'true';
+        const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports playtime email').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
             { $match: depositMatch },
@@ -1066,6 +1262,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
             return {
                 id: u._id,
                 username: u.username,
+                email: u.email || null,
                 wallet: u.walletAddress || '—',
                 depositAddress: u.depositAddress || '—',
                 balanceSol: Number(balanceSol.toFixed(6)),
@@ -1073,13 +1270,148 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 totalDepositedSol: Number((dep?.totalDepositedSol ?? 0).toFixed(6)),
                 totalDepositedUsd: Number(((dep?.totalDepositedSol ?? 0) * SOL_PRICE_USD).toFixed(2)),
                 depositCount: dep?.depositCount ?? 0,
+                playtime: u.playtime ?? 0,
+                createdAt: objectIdCreatedAt(u._id),
                 excludedFromReports: !!u.excludedFromReports,
             };
         });
 
-        res.json({ users: result, total: result.length, showExcluded });
+        const sorted = sortAdminUsers(result, sortKey);
+
+        res.json({ users: sorted, total: sorted.length, showExcluded, sort: sortKey });
     } catch (err) {
         console.error('Admin users error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid user id' });
+        }
+
+        const user = await User.findById(userId).select('-password -depositSecret').lean();
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const uid = user._id;
+        const [allTxs, joinTxs, cashoutTxs] = await Promise.all([
+            Transaction.find({ userId: uid }).sort({ createdAt: -1 }).limit(500).lean(),
+            Transaction.find({ userId: uid, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } }).sort({ createdAt: -1 }).lean(),
+            Transaction.find({
+                userId: uid,
+                type: 'withdraw',
+                'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i },
+            }).sort({ createdAt: 1 }).lean(),
+        ]);
+
+        let totalDepositedSol = 0;
+        let totalWithdrawnUsd = 0;
+        let depositCount = 0;
+        let withdrawalCount = 0;
+        let gameJoinCount = 0;
+        let deathCount = 0;
+        let brWinCount = 0;
+
+        const transactions = allTxs.map(tx => ({
+            id: tx._id,
+            type: tx.type,
+            category: classifyTxActivity(tx),
+            label: txActivityLabel(tx),
+            amount: tx.amount,
+            currency: tx.currency || 'USD',
+            amountUsd: Number(txAmountUsd(tx).toFixed(2)),
+            amountSol: Number(txAmountSol(tx).toFixed(6)),
+            status: tx.status,
+            meta: tx.meta,
+            excludedFromReports: !!tx.excludedFromReports,
+            createdAt: tx.createdAt,
+        }));
+
+        for (const tx of allTxs) {
+            if (tx.excludedFromReports) continue;
+            if (tx.type === 'deposit' && tx.status === 'confirmed') {
+                totalDepositedSol += tx.amount;
+                depositCount += 1;
+            }
+            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep'].includes(tx.meta?.event)) {
+                totalWithdrawnUsd += txAmountUsd(tx);
+                withdrawalCount += 1;
+            }
+            if (tx.type === 'game' && ['join', 'br_join'].includes(tx.meta?.event)) gameJoinCount += 1;
+            if (tx.type === 'game' && ['Arena Death', 'BR Eliminated'].includes(tx.meta?.reason)) deathCount += 1;
+            if (tx.type === 'withdraw' && /BR Victory/i.test(tx.meta?.reason || '')) brWinCount += 1;
+        }
+
+        const cashoutsByTime = cashoutTxs.map(c => ({ time: new Date(c.createdAt).getTime(), payoutUsd: txAmountUsd(c) }));
+
+        const gameHistory = joinTxs.map(join => {
+            const wagerUsd = join.meta?.entryFeeUsd ?? (join.amount * SOL_PRICE_USD);
+            const game = join.meta?.mode || join.meta?.variant || 'agar';
+            const joinTime = new Date(join.createdAt).getTime();
+
+            let outcome = 'Loss';
+            let payoutUsd = 0;
+            const match = cashoutsByTime.find(c => c.time >= joinTime);
+            if (match) {
+                payoutUsd = match.payoutUsd;
+                if (payoutUsd > wagerUsd) outcome = 'Win';
+                else if (payoutUsd >= wagerUsd * 0.99) outcome = 'Break-even';
+                else outcome = 'Loss';
+            }
+
+            let eventType = join.meta?.event === 'br_join' ? 'br_join' : 'join';
+            if (join.meta?.reason === 'Arena Death' || join.meta?.reason === 'BR Eliminated') eventType = 'death';
+
+            return {
+                id: join._id,
+                eventType,
+                game,
+                wagerUsd: Number(wagerUsd.toFixed(2)),
+                payoutUsd: Number(payoutUsd.toFixed(2)),
+                outcome,
+                entryFeeUsd: join.meta?.entryFeeUsd ?? null,
+                createdAt: join.createdAt,
+                excludedFromReports: !!join.excludedFromReports,
+            };
+        });
+
+        const wins = gameHistory.filter(g => g.outcome === 'Win' && !g.excludedFromReports).length;
+        const losses = gameHistory.filter(g => g.outcome === 'Loss' && !g.excludedFromReports).length;
+        const balanceSol = user.balance ?? 0;
+
+        res.json({
+            user: {
+                id: user._id,
+                username: user.username,
+                email: user.email || null,
+                wallet: user.walletAddress || '—',
+                depositAddress: user.depositAddress || '—',
+                balanceSol: Number(balanceSol.toFixed(6)),
+                balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
+                playtime: user.playtime ?? 0,
+                createdAt: objectIdCreatedAt(user._id),
+                excludedFromReports: !!user.excludedFromReports,
+            },
+            stats: {
+                totalDepositedSol: Number(totalDepositedSol.toFixed(6)),
+                totalDepositedUsd: Number((totalDepositedSol * SOL_PRICE_USD).toFixed(2)),
+                totalWithdrawnUsd: Number(totalWithdrawnUsd.toFixed(2)),
+                depositCount,
+                withdrawalCount,
+                gamesPlayed: gameJoinCount,
+                wins,
+                losses,
+                deaths: deathCount,
+                brWins: brWinCount,
+                netGameResultUsd: Number((totalWithdrawnUsd - (totalDepositedSol * SOL_PRICE_USD)).toFixed(2)),
+            },
+            transactions,
+            gameHistory,
+        });
+    } catch (err) {
+        console.error('Admin user detail error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1252,13 +1584,78 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             };
         });
 
-        const totalSweptUsd = history
-            .filter(h => h.kind === 'sweep' && h.usdAmount)
-            .reduce((sum, h) => sum + h.usdAmount, 0);
+        const ownerEarnings = await computeOwnerEarnings();
 
-        res.json({ sweeps: history, totalSweptUsd: Number(totalSweptUsd.toFixed(2)), total: history.length });
+        res.json({
+            sweeps: history,
+            totalSweptUsd: ownerEarnings.totalUsd,
+            totalSweptSol: ownerEarnings.totalSol,
+            total: history.length,
+        });
     } catch (err) {
         console.error('Admin sweeps error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/admin/dashboard/live-feed', authenticateAdmin, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 60, 200);
+        const sinceRaw = req.query.since;
+        const since = sinceRaw ? new Date(sinceRaw) : null;
+        const hasSince = since && !Number.isNaN(since.getTime());
+
+        const noiseFilter = {
+            'meta.event': { $nin: ['reset_start', 'reset_complete', 'failure'] },
+        };
+        const baseMatch = await reportedTxMatch(noiseFilter);
+        const timeClause = hasSince ? { createdAt: { $gt: since } } : {};
+        const filter = Object.keys(timeClause).length
+            ? { $and: [baseMatch, timeClause] }
+            : baseMatch;
+
+        const [txs, inGamePlayers] = await Promise.all([
+            Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean(),
+            (async () => {
+                const players = [];
+                for (const room of rooms) {
+                    for (const p of room.players) {
+                        if (!p.isBot && p.mongoId) {
+                            players.push({
+                                id: p.mongoId.toString(),
+                                username: p.username,
+                                mode: p.mode || 'agar',
+                                entryFeeUsd: room.entryFeeUsd,
+                            });
+                        }
+                    }
+                }
+                return players;
+            })(),
+        ]);
+
+        const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
+        const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
+
+        const feed = txs.map(tx => {
+            const row = mapTxToAdminRow(tx, userMap);
+            return {
+                ...row,
+                game: tx.meta?.mode || tx.meta?.variant || null,
+                entryFeeUsd: tx.meta?.entryFeeUsd ?? null,
+            };
+        });
+
+        res.json({
+            feed,
+            inGamePlayers,
+            currentlyInGame: inGamePlayers.length,
+            serverTime: new Date().toISOString(),
+            since: hasSince ? since.toISOString() : null,
+        });
+    } catch (err) {
+        console.error('Admin live-feed error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1267,31 +1664,36 @@ app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res)
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 500, 1000);
         const showExcluded = req.query.showExcluded === 'true';
-        const filter = await buildAdminTxListFilter({
+        const filter = await buildAdminTxQuery({
             userId: req.query.userId,
             showExcluded,
+            type: req.query.type || '',
+            category: req.query.category || '',
+            search: req.query.search || '',
         });
+
+        if (filter._id === null) {
+            return res.json({ transactions: [], total: 0, showExcluded });
+        }
 
         const txs = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
         const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
         const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
         const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
 
-        const rows = txs.map(tx => ({
-            id: tx._id,
-            userId: tx.userId?.toString() || null,
-            username: tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : '—',
-            type: tx.type,
-            amount: tx.amount,
-            currency: tx.currency || 'USD',
-            amountUsd: Number(txAmountUsd(tx).toFixed(2)),
-            status: tx.status,
-            meta: tx.meta,
-            excludedFromReports: !!tx.excludedFromReports,
-            createdAt: tx.createdAt,
-        }));
+        const rows = txs.map(tx => mapTxToAdminRow(tx, userMap));
 
-        res.json({ transactions: rows, total: rows.length, showExcluded });
+        res.json({
+            transactions: rows,
+            total: rows.length,
+            showExcluded,
+            filters: {
+                userId: req.query.userId || null,
+                type: req.query.type || null,
+                category: req.query.category || null,
+                search: req.query.search || null,
+            },
+        });
     } catch (err) {
         console.error('Admin transactions error:', err);
         res.status(500).json({ error: err.message });
@@ -1313,6 +1715,18 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
         const reported = await reportedTxMatch({}, { skipUserExclusion });
         const andClauses = [eventFilter, reported];
         if (req.query.userId) andClauses.push({ userId: req.query.userId });
+
+        const eventType = req.query.eventType || '';
+        if (eventType === 'entry') {
+            andClauses.push({ type: 'game', 'meta.event': { $in: ['join', 'br_join'] } });
+        } else if (eventType === 'death') {
+            andClauses.push({ type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } });
+        } else if (eventType === 'cashout') {
+            andClauses.push({ type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } });
+        } else if (eventType === 'refund') {
+            andClauses.push({ type: 'game', 'meta.event': 'br_refund' });
+        }
+
         const filter = { $and: andClauses };
 
         const events = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
