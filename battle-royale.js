@@ -40,6 +40,12 @@ const mongoToMatch = new Map();
 /** @type {Map<string, { readyAt: number, timer: ReturnType<typeof setTimeout> | null }>} */
 const queueGrace = new Map();
 
+const MAX_RECENT_BR_VICTORIES = 5;
+const recentBRVictories = {
+    agar: [],
+    slither: [],
+};
+
 function queueKey(variant, entryFeeUsd) {
     return `${variant}:${normalizeBREntryFee(entryFeeUsd)}`;
 }
@@ -48,6 +54,25 @@ function getQueue(variant, entryFeeUsd) {
     const key = queueKey(variant, entryFeeUsd);
     if (!queues.has(key)) queues.set(key, []);
     return queues.get(key);
+}
+
+function recordBRVictory(variant, username, amount) {
+    const list = recentBRVictories[variant];
+    if (!list) return;
+    list.unshift({
+        username,
+        amount: Number(amount.toFixed(2)),
+        at: Date.now(),
+    });
+    if (list.length > MAX_RECENT_BR_VICTORIES) list.pop();
+}
+
+export function getRecentBRVictories(variant = null) {
+    if (variant === 'agar' || variant === 'slither') return recentBRVictories[variant];
+    return {
+        agar: recentBRVictories.agar,
+        slither: recentBRVictories.slither,
+    };
 }
 
 /** Humans in queue + active BR matches, per variant and entry fee (for pre-game stats). */
@@ -647,6 +672,7 @@ async function finishMatch(room, winner, io, deps) {
                 status: 'confirmed',
             });
             console.log(`🎮 [FREE PLAY] BR victory: ${winner.username} won $${payout.toFixed(2)} (simulated)`);
+            recordBRVictory(room.variant, winner.username, payout);
             io.to(winner.id).emit('brVictory', { amount: payout, signature: 'simulated', placement: 1 });
             await sweepBROwnerCut(room, deps);
         } else {
@@ -684,6 +710,7 @@ async function finishMatch(room, winner, io, deps) {
                 },
                 status: 'confirmed',
             });
+            recordBRVictory(room.variant, winner.username, payout);
             io.to(winner.id).emit('brVictory', { amount: payout, signature: sig, placement: 1 });
             await sweepBROwnerCut(room, deps);
         }

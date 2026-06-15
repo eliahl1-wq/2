@@ -41,6 +41,7 @@ import {
     getBRMatchForMongo,
     isPlayerInBR,
     getBRPlayerCountsByFee,
+    getRecentBRVictories,
     getBRServerStatus,
     BR,
 } from './battle-royale.js';
@@ -162,7 +163,8 @@ const UserSchema = new mongoose.Schema({
     walletAddress: { type: String },
     depositAddress: { type: String },
     depositSecret: { type: String },
-    playtime: { type: Number, default: 0 }
+    playtime: { type: Number, default: 0 },
+    excludedFromReports: { type: Boolean, default: false },
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -916,8 +918,52 @@ app.post('/api/entry-pay', authenticateToken, async (req, res) => {
 });
 
 // --- ADMIN DASHBOARD ---
-/** Transactions with this flag are hidden from admin stats/lists (not deleted). */
+/** Transactions / users hidden from admin stats (not deleted). */
 const TX_REPORTED = { excludedFromReports: { $ne: true } };
+const USER_REPORTED = { excludedFromReports: { $ne: true } };
+
+async function fetchExcludedUserIds() {
+    return User.find({ excludedFromReports: true }).distinct('_id');
+}
+
+async function reportedTxMatch(extra = {}, { skipUserExclusion = false } = {}) {
+    const clauses = [TX_REPORTED];
+    if (Object.keys(extra).length) clauses.push(extra);
+    if (!skipUserExclusion) {
+        const excludedUserIds = await fetchExcludedUserIds();
+        if (excludedUserIds.length) {
+            clauses.push({
+                $or: [
+                    { userId: { $exists: false } },
+                    { userId: null },
+                    { userId: { $nin: excludedUserIds } },
+                ],
+            });
+        }
+    }
+    return clauses.length === 1 ? clauses[0] : { $and: clauses };
+}
+
+async function buildAdminTxListFilter({ userId, showExcluded } = {}) {
+    const clauses = [];
+    if (!showExcluded) clauses.push(TX_REPORTED);
+    if (userId) {
+        clauses.push({ userId });
+    } else {
+        const excludedUserIds = await fetchExcludedUserIds();
+        if (excludedUserIds.length) {
+            clauses.push({
+                $or: [
+                    { userId: { $exists: false } },
+                    { userId: null },
+                    { userId: { $nin: excludedUserIds } },
+                ],
+            });
+        }
+    }
+    if (clauses.length === 0) return {};
+    return clauses.length === 1 ? clauses[0] : { $and: clauses };
+}
 
 function txAmountUsd(tx) {
     if (tx.currency === 'SOL' || tx.meta?.solAmount != null) {
@@ -929,16 +975,19 @@ function txAmountUsd(tx) {
 
 app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
     try {
-        const [depositAgg, withdrawAgg, excludedCount] = await Promise.all([
+        const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
+        const withdrawMatch = await reportedTxMatch({ type: 'withdraw', status: 'confirmed' });
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount] = await Promise.all([
             Transaction.aggregate([
-                { $match: { type: 'deposit', status: 'confirmed', ...TX_REPORTED } },
+                { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
             ]),
             Transaction.aggregate([
-                { $match: { type: 'withdraw', status: 'confirmed', ...TX_REPORTED } },
+                { $match: withdrawMatch },
                 { $group: { _id: null, txs: { $push: { amount: '$amount', currency: '$currency', meta: '$meta' } }, count: { $sum: 1 } } },
             ]),
             Transaction.countDocuments({ excludedFromReports: true }),
+            User.countDocuments({ excludedFromReports: true }),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -958,7 +1007,8 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             netGamingRevenue: Number(netGamingRevenue.toFixed(2)),
             depositCount: depositAgg[0]?.count ?? 0,
             withdrawalCount: withdrawAgg[0]?.count ?? 0,
-            excludedCount,
+            excludedTxCount,
+            excludedUsersCount,
             solPrice: SOL_PRICE_USD,
         });
     } catch (err) {
@@ -984,7 +1034,8 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
         }
 
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-        const recentUserIds = await Transaction.distinct('userId', { createdAt: { $gte: dayAgo }, ...TX_REPORTED });
+        const recentMatch = await reportedTxMatch({ createdAt: { $gte: dayAgo } });
+        const recentUserIds = await Transaction.distinct('userId', recentMatch);
 
         res.json({
             currentlyInGame: inGameUserIds.size,
@@ -999,9 +1050,12 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
 
 app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
     try {
-        const users = await User.find().select('username walletAddress depositAddress balance').lean();
+        const showExcluded = req.query.showExcluded === 'true';
+        const userFilter = showExcluded ? {} : USER_REPORTED;
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports').lean();
+        const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
-            { $match: { type: 'deposit', status: 'confirmed', ...TX_REPORTED } },
+            { $match: depositMatch },
             { $group: { _id: '$userId', totalDepositedSol: { $sum: '$amount' }, depositCount: { $sum: 1 } } },
         ]);
         const depositMap = Object.fromEntries(depositTotals.map(d => [d._id.toString(), d]));
@@ -1019,10 +1073,11 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 totalDepositedSol: Number((dep?.totalDepositedSol ?? 0).toFixed(6)),
                 totalDepositedUsd: Number(((dep?.totalDepositedSol ?? 0) * SOL_PRICE_USD).toFixed(2)),
                 depositCount: dep?.depositCount ?? 0,
+                excludedFromReports: !!u.excludedFromReports,
             };
         });
 
-        res.json({ users: result, total: result.length });
+        res.json({ users: result, total: result.length, showExcluded });
     } catch (err) {
         console.error('Admin users error:', err);
         res.status(500).json({ error: err.message });
@@ -1032,7 +1087,8 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
 app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
-        const joins = await Transaction.find({ type: 'game', 'meta.event': 'join', ...TX_REPORTED })
+        const joinMatch = await reportedTxMatch({ type: 'game', 'meta.event': 'join' });
+        const joins = await Transaction.find(joinMatch)
             .sort({ createdAt: -1 })
             .limit(limit)
             .lean();
@@ -1041,12 +1097,12 @@ app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, r
         const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
         const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
 
-        const cashouts = await Transaction.find({
+        const cashoutMatch = await reportedTxMatch({
             userId: { $in: userIds },
             type: 'withdraw',
             'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset/i },
-            ...TX_REPORTED,
-        }).sort({ createdAt: 1 }).lean();
+        });
+        const cashouts = await Transaction.find(cashoutMatch).sort({ createdAt: 1 }).lean();
 
         const cashoutsByUser = {};
         for (const c of cashouts) {
@@ -1158,23 +1214,20 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
 app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
-        const sweeps = await Transaction.find({
-            $and: [
-                {
-                    $or: [
-                        { 'meta.event': 'pool_sweep' },
-                        { 'meta.event': 'br_owner_sweep' },
-                        { 'meta.reason': 'Room Reset Wallet Sweep' },
-                        { 'meta.reason': 'BR Owner Cut Sweep' },
-                        { 'meta.event': 'reset_start' },
-                        { 'meta.event': 'reset_complete' },
-                        { 'meta.event': 'failure', 'meta.reason': 'pool_sweep_failed' },
-                        { 'meta.event': 'failure', 'meta.reason': 'br_owner_sweep_failed' },
-                    ],
-                },
-                TX_REPORTED,
+        const sweepEvents = {
+            $or: [
+                { 'meta.event': 'pool_sweep' },
+                { 'meta.event': 'br_owner_sweep' },
+                { 'meta.reason': 'Room Reset Wallet Sweep' },
+                { 'meta.reason': 'BR Owner Cut Sweep' },
+                { 'meta.event': 'reset_start' },
+                { 'meta.event': 'reset_complete' },
+                { 'meta.event': 'failure', 'meta.reason': 'pool_sweep_failed' },
+                { 'meta.event': 'failure', 'meta.reason': 'br_owner_sweep_failed' },
             ],
-        }).sort({ createdAt: -1 }).limit(limit).lean();
+        };
+        const match = await reportedTxMatch(sweepEvents);
+        const sweeps = await Transaction.find(match).sort({ createdAt: -1 }).limit(limit).lean();
 
         const history = sweeps.map(tx => {
             const sol = tx.meta?.solAmount ?? (tx.currency === 'SOL' ? tx.amount : null);
@@ -1214,9 +1267,10 @@ app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res)
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 500, 1000);
         const showExcluded = req.query.showExcluded === 'true';
-        const filter = {};
-        if (req.query.userId) filter.userId = req.query.userId;
-        if (!showExcluded) Object.assign(filter, TX_REPORTED);
+        const filter = await buildAdminTxListFilter({
+            userId: req.query.userId,
+            showExcluded,
+        });
 
         const txs = await Transaction.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
         const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
@@ -1255,7 +1309,9 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
             { type: 'game', 'meta.event': 'br_refund' },
             { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
         ]};
-        const andClauses = [eventFilter, TX_REPORTED];
+        const skipUserExclusion = !!req.query.userId;
+        const reported = await reportedTxMatch({}, { skipUserExclusion });
+        const andClauses = [eventFilter, reported];
         if (req.query.userId) andClauses.push({ userId: req.query.userId });
         const filter = { $and: andClauses };
 
@@ -1336,6 +1392,50 @@ app.post('/api/admin/transactions/restore', authenticateAdmin, async (req, res) 
         });
     } catch (err) {
         console.error('Admin restore transactions error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/users/exclude', authenticateAdmin, async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ message: 'ids array required' });
+        }
+        const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+        const result = await User.updateMany(
+            { _id: { $in: objectIds } },
+            { $set: { excludedFromReports: true } }
+        );
+        res.json({
+            success: true,
+            modified: result.modifiedCount,
+            message: `${result.modifiedCount} account(s) excluded from reports — all their transactions are hidden from stats (not deleted).`,
+        });
+    } catch (err) {
+        console.error('Admin exclude users error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/users/restore', authenticateAdmin, async (req, res) => {
+    try {
+        const { ids } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return res.status(400).json({ message: 'ids array required' });
+        }
+        const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+        const result = await User.updateMany(
+            { _id: { $in: objectIds } },
+            { $set: { excludedFromReports: false } }
+        );
+        res.json({
+            success: true,
+            modified: result.modifiedCount,
+            message: `${result.modifiedCount} account(s) restored to reports.`,
+        });
+    } catch (err) {
+        console.error('Admin restore users error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -1661,11 +1761,13 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/stats', (req, res) => {
     try {
         const modeFilter = req.query.mode === 'slither' ? 'slither' : req.query.mode === 'agar' ? 'agar' : null;
-        let humansOnline = 0;
-        let aiOnline = 0;
+        let filteredHumansOnline = 0;
+        let filteredAiOnline = 0;
         let topPlayer = null;
         let topBalance = 0;
-        const allPlayers = [];
+        const filteredPlayers = [];
+        const agarPlayers = [];
+        const slitherPlayers = [];
         const playersByEntryFee = { 5: 0, 10: 0, 20: 0 };
         const playersByModeAndFee = {
             agar: { 5: 0, 10: 0, 20: 0 },
@@ -1673,15 +1775,17 @@ app.get('/api/stats', (req, res) => {
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0 };
 
-        const considerTop = (name, balance) => {
+        const pushTop = (list, name, balance) => {
+            if (name && balance > 0) list.push({ username: name, balance });
+        };
+
+        const considerFilteredTop = (name, balance) => {
             const b = balance || 0;
             if (b > topBalance) {
                 topBalance = b;
                 topPlayer = name;
             }
-            if (name && b > 0) {
-                allPlayers.push({ username: name, balance: b });
-            }
+            if (name && b > 0) filteredPlayers.push({ username: name, balance: b });
         };
 
         const countBRForMode = (variant) => {
@@ -1701,23 +1805,26 @@ app.get('/api/stats', (req, res) => {
                         playersByModeAndFee[mode][fee] = (playersByModeAndFee[mode][fee] || 0) + 1;
                         playersByGamemode[mode] += 1;
                     }
+                    pushTop(mode === 'agar' ? agarPlayers : slitherPlayers, player.username, player.balance);
                     if (!modeFilter || mode === modeFilter) {
-                        humansOnline += 1;
-                        considerTop(player.username, player.balance);
+                        filteredHumansOnline += 1;
+                        considerFilteredTop(player.username, player.balance);
                     }
                 }
             });
             room.bots.forEach(bot => {
                 const botBalance = bot.cells?.reduce((s, c) => s + c.balance, 0) ?? bot.balance ?? 0;
+                pushTop(agarPlayers, bot.username, botBalance);
                 if (!modeFilter || modeFilter === 'agar') {
-                    aiOnline += 1;
-                    considerTop(bot.username, botBalance);
+                    filteredAiOnline += 1;
+                    considerFilteredTop(bot.username, botBalance);
                 }
             });
             room.slitherBots.forEach(bot => {
+                pushTop(slitherPlayers, bot.username, bot.balance);
                 if (!modeFilter || modeFilter === 'slither') {
-                    aiOnline += 1;
-                    considerTop(bot.username, bot.balance);
+                    filteredAiOnline += 1;
+                    considerFilteredTop(bot.username, bot.balance);
                 }
             });
         });
@@ -1726,22 +1833,32 @@ app.get('/api/stats', (req, res) => {
         playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
 
+        const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
+            + playersByGamemode.brAgar + playersByGamemode.brSlither
+            + rooms.reduce((sum, room) => sum + room.bots.length + room.slitherBots.length, 0);
+
         if (modeFilter === 'agar') {
-            humansOnline += countBRForMode('agar');
+            filteredHumansOnline += countBRForMode('agar');
         } else if (modeFilter === 'slither') {
-            humansOnline += countBRForMode('slither');
+            filteredHumansOnline += countBRForMode('slither');
         }
 
-        const topPlayers = allPlayers.sort((a, b) => b.balance - a.balance).slice(0, 3);
+        const sortTop = (list) => list.sort((a, b) => b.balance - a.balance).slice(0, 3);
+        const topPlayers = filteredPlayers.sort((a, b) => b.balance - a.balance).slice(0, 3);
+        const topPlayersByGamemode = {
+            agar: sortTop(agarPlayers),
+            slither: sortTop(slitherPlayers),
+        };
 
         res.json({
-            playersOnline: humansOnline + aiOnline,
-            humansOnline,
-            aiOnline,
+            playersOnline: filteredHumansOnline + filteredAiOnline,
+            totalPlayersOnline,
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
             topPlayers,
+            topPlayersByGamemode,
+            recentBRVictories: getRecentBRVictories(),
             solPrice: SOL_PRICE_USD,
             playersByEntryFee,
             playersByModeAndFee,
