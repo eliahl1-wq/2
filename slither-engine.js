@@ -30,6 +30,8 @@ export const SLITHER = {
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
     viewRange: 520,
+    minimapRange: 1050,
+    minimapThreatRange: 1700,
     selfCollisionSkip: 4,
 };
 
@@ -850,17 +852,38 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 visibleFood = room._lastSlitherFoodByPlayer[p.id] || [];
             }
 
-            const minimap = allSnakes.map(({ entity: s }) => {
+            const minimapPlayers = allSnakes.map(({ entity: s }) => {
                 const h = s.segments[0];
                 if (!h) return null;
-                const c = typeof s.color === 'object' && s.color !== null ? s.color.fill : s.color;
+                if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange)) return null;
                 return {
                     x: Math.round(h.x),
                     y: Math.round(h.y),
-                    c,
                     you: s.id === p.id,
                 };
             }).filter(Boolean);
+
+            const minimapFood = room.slitherFood
+                .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange))
+                .map(f => ({
+                    x: Math.round(f.x),
+                    y: Math.round(f.y),
+                    g: !!f.golden,
+                    h: f.hue,
+                }));
+            if (minimapFood.length > 200) {
+                minimapFood.sort((a, b) => {
+                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                    return da - db;
+                });
+                minimapFood.length = 200;
+            }
+
+            const minimap = {
+                players: minimapPlayers,
+                food: minimapFood,
+            };
 
             io.to(p.id).emit('slitherTick', {
                 you: p.id,

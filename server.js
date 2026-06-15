@@ -3559,15 +3559,48 @@ function processRoom(room) {
         foodItems.forEach(item => {
             if (item.type === 'food') visibleFood.push(item.data);
         });
-        const minimap = allUsers.map(u => {
-            const c = typeof u.color === 'object' && u.color !== null ? (u.color.fill || u.color) : u.color;
-            return {
+        const minimapHalf = Math.max((p.screenWidth || 1920) / 2, (p.screenHeight || 1080) / 2) * 2.35;
+        const threatHalf = minimapHalf * 1.55;
+        const minimapRange = new Rectangle(p.x, p.y, minimapHalf, minimapHalf);
+        const minimapItems = room.qt.query(minimapRange);
+
+        const minimapPlayers = allUsers
+            .filter(u => {
+                const dx = u.x - p.x;
+                const dy = u.y - p.y;
+                return dx * dx + dy * dy <= threatHalf * threatHalf;
+            })
+            .map(u => ({
                 x: Math.round(u.x),
                 y: Math.round(u.y),
-                c,
                 you: u.id === p.id,
-            };
+            }));
+
+        const minimapFood = [];
+        const minimapViruses = [];
+        const minimapEjected = [];
+        minimapItems.forEach(item => {
+            if (item.type === 'food') {
+                minimapFood.push({
+                    x: Math.round(item.data.x),
+                    y: Math.round(item.data.y),
+                    g: !!item.data.golden,
+                    h: item.data.hue,
+                });
+            } else if (item.type === 'virus') {
+                minimapViruses.push({ x: Math.round(item.data.x), y: Math.round(item.data.y) });
+            } else if (item.type === 'ejected') {
+                minimapEjected.push({ x: Math.round(item.data.x), y: Math.round(item.data.y) });
+            }
         });
+        if (minimapFood.length > 220) minimapFood.length = 220;
+
+        const minimap = {
+            players: minimapPlayers,
+            food: minimapFood,
+            viruses: minimapViruses,
+            ejected: minimapEjected,
+        };
 
         io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
             resetTime: room.startTime + c.roomDuration,
