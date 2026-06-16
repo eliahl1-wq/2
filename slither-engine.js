@@ -933,3 +933,442 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         }],
     };
 }
+
+// ─── Competitive Slither ───────────────────────────────────────────────────
+// Snake mass (balance) and dollar balance are fully independent systems.
+
+export const COMPETITIVE_SLITHER = {
+    entryFeeUsd: 5,
+    dollarStart: 5,
+    worldHalf: SLITHER.worldHalf * 0.3,
+    shrinkBeforeResetMs: 2 * 60 * 1000,
+    cashoutPlayerPct: 0.965,
+    cashoutFeePct: 0.035,
+    foodRadius: SLITHER.foodRadius,
+    deathFoodRadius: SLITHER.foodRadius * 1.35,
+    foodDensityPerHuman: 125,
+    massPerPellet: 0.01,
+};
+
+function competitiveFoodDensityScale() {
+    const side = COMPETITIVE_SLITHER.worldHalf * 2;
+    return (side * side) / (AGAR_WORLD_SIDE * AGAR_WORLD_SIDE);
+}
+
+function randomCompetitiveSpawnCoord() {
+    const maxR = COMPETITIVE_SLITHER.worldHalf * 0.85;
+    const r = maxR * Math.sqrt(Math.random());
+    const a = Math.random() * Math.PI * 2;
+    return { x: Math.cos(a) * r, y: Math.sin(a) * r };
+}
+
+function isCompetitiveSpawnClear(room, x, y, minDist = 120) {
+    for (const { entity: s } of getCompetitiveSnakes(room)) {
+        const r = headRadiusForBalance(s.balance ?? competitiveMinMass());
+        const spacing = segmentSpacingForBalance(s.balance ?? competitiveMinMass());
+        const bodyLen = (s.segments?.length ?? 1) * spacing;
+        for (let i = 0; i < (s.segments?.length ?? 0); i++) {
+            const seg = s.segments[i];
+            const segR = i === 0 ? r : r * 0.75;
+            const need = minDist + segR + (i === 0 ? 0 : bodyLen * 0.15);
+            if (dist(x, y, seg.x, seg.y) < need) return false;
+        }
+    }
+    return true;
+}
+
+function pickCompetitiveSpawn(room) {
+    for (let i = 0; i < 80; i++) {
+        const { x, y } = randomCompetitiveSpawnCoord();
+        if (isCompetitiveSpawnClear(room, x, y, 120)) return { x, y };
+    }
+    return randomCompetitiveSpawnCoord();
+}
+
+export function getCompetitiveEffectiveRadius(resetTime) {
+    const worldHalf = COMPETITIVE_SLITHER.worldHalf;
+    const msUntilReset = resetTime - Date.now();
+    const shrinkMs = COMPETITIVE_SLITHER.shrinkBeforeResetMs;
+    if (msUntilReset >= shrinkMs) return worldHalf;
+    if (msUntilReset <= 0) return 0;
+    return worldHalf * (msUntilReset / shrinkMs);
+}
+
+export function getCompetitiveZone(resetTime) {
+    const radius = getCompetitiveEffectiveRadius(resetTime);
+    const msUntilReset = resetTime - Date.now();
+    return {
+        cx: 0,
+        cy: 0,
+        radius,
+        shrinking: msUntilReset < COMPETITIVE_SLITHER.shrinkBeforeResetMs,
+    };
+}
+
+function getCompetitiveSnakes(room) {
+    return room.players
+        .filter(p => p.mode === 'competitive-slither' && !p.disconnected && p.segments?.length)
+        .map(p => ({ entity: p, isHuman: true }));
+}
+
+function competitiveMinMass() {
+    return getEconomy(COMPETITIVE_SLITHER.entryFeeUsd).playerStartBalance;
+}
+
+function updateCompetitiveSnakeMovement(snake) {
+    const head = snake.segments[0];
+    const { dx, dy } = normalizeSnakeInput(snake);
+
+    const desired = Math.atan2(dy, dx);
+    const sc = scaleForSegmentCount(snake.segments.length);
+    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
+    const current = snake.angle ?? desired;
+    let da = desired - current;
+    da = Math.atan2(Math.sin(da), Math.cos(da));
+    if (da > maxTurn) da = maxTurn;
+    else if (da < -maxTurn) da = -maxTurn;
+    snake.angle = current + da;
+
+    const minMass = competitiveMinMass();
+    const canBoost = !!snake.boost && snake.balance > minMass * 1.01;
+
+    const mx = Math.cos(snake.angle);
+    const my = Math.sin(snake.angle);
+    const step = speedForBalance(snake.balance, canBoost);
+    head.x += mx * step;
+    head.y += my * step;
+
+    if (canBoost) {
+        const cost = Math.min(SLITHER.boostCostPerTick, snake.balance - minMass);
+        snake.balance -= cost;
+    }
+
+    const spacing = segmentSpacingForBalance(snake.balance);
+    for (let i = 1; i < snake.segments.length; i++) {
+        const prev = snake.segments[i - 1];
+        const cur = snake.segments[i];
+        const segDx = cur.x - prev.x;
+        const segDy = cur.y - prev.y;
+        const d = Math.hypot(segDx, segDy) || 0.001;
+        const ratio = spacing / d;
+        cur.x = prev.x + segDx * ratio;
+        cur.y = prev.y + segDy * ratio;
+    }
+
+    const targetCount = balanceToSegmentCount(snake.balance);
+    while (snake.segments.length < targetCount) {
+        const tail = snake.segments[snake.segments.length - 1];
+        snake.segments.push({ x: tail.x, y: tail.y });
+    }
+    while (snake.segments.length > targetCount) {
+        snake.segments.pop();
+    }
+
+    snake.x = head.x;
+    snake.y = head.y;
+    snake.balance = Math.max(minMass, snake.balance);
+}
+
+function checkCompetitiveBoundary(snake, effectiveRadius) {
+    const head = snake.segments[0];
+    const r = headRadiusForBalance(snake.balance);
+    return Math.hypot(head.x, head.y) + r > effectiveRadius;
+}
+
+function checkCompetitiveFoodCollisions(snake, room) {
+    const head = snake.segments[0];
+    const r = headRadiusForBalance(snake.balance);
+    const reach = r + COMPETITIVE_SLITHER.foodRadius;
+    const reach2 = reach * reach;
+    const hx = head.x;
+    const hy = head.y;
+    for (let i = room.slitherFood.length - 1; i >= 0; i--) {
+        const f = room.slitherFood[i];
+        const foodR = f.radius || COMPETITIVE_SLITHER.foodRadius;
+        const reachFood = r + foodR;
+        const fdx = hx - f.x;
+        if (fdx > reachFood || fdx < -reachFood) continue;
+        const fdy = hy - f.y;
+        if (fdy > reachFood || fdy < -reachFood) continue;
+        if (fdx * fdx + fdy * fdy < reachFood * reachFood) {
+            snake.balance += f.balance;
+            if (f.dollarValue > 1e-9) {
+                snake.dollarBalance = (snake.dollarBalance || 0) + f.dollarValue;
+            }
+            room.slitherFood.splice(i, 1);
+        }
+    }
+}
+
+function dropCompetitiveSnakeAsFood(room, snake) {
+    const mass = Math.max(0, snake.balance || 0);
+    const dollars = Math.max(0, snake.dollarBalance || 0);
+    const segs = snake.segments;
+    if (mass <= 1e-9 || !segs?.length) return;
+
+    const blob = COMPETITIVE_SLITHER.massPerPellet;
+    const maxPellets = Math.min(segs.length * 4, 150, Math.max(segs.length, Math.floor(mass / blob)));
+    const pelletCount = Math.max(1, maxPellets);
+    const massEach = mass / pelletCount;
+    const dollarEach = dollars / pelletCount;
+
+    for (let i = 0; i < pelletCount; i++) {
+        const seg = segs[i % segs.length];
+        const jitter = 14;
+        room.slitherFood.push({
+            id: randId(),
+            x: seg.x + (Math.random() - 0.5) * jitter,
+            y: seg.y + (Math.random() - 0.5) * jitter,
+            balance: massEach,
+            dollarValue: dollarEach,
+            hue: 48,
+            golden: true,
+            deathDrop: true,
+            competitiveDeathDrop: true,
+            radius: COMPETITIVE_SLITHER.deathFoodRadius,
+        });
+    }
+}
+
+function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
+    if (killer && killer.id !== snake.id) {
+        killer.kills = (killer.kills || 0) + 1;
+    }
+
+    dropCompetitiveSnakeAsFood(room, snake);
+
+    const socketId = snake.id;
+    io.to(socketId).emit('RIP');
+    room.players = room.players.filter(p => p.id !== snake.id);
+    User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
+    if (Transaction && snake.mongoId) {
+        Transaction.create({
+            userId: snake.mongoId,
+            type: 'game',
+            amount: snake.dollarBalance || 0,
+            meta: {
+                reason: 'Competitive Slither Death',
+                event: 'death',
+                mode: 'competitive-slither',
+                entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+            },
+            status: 'confirmed',
+        }).catch(err => console.error('Error logging competitive slither death:', err));
+    }
+}
+
+export function addCompetitiveSlitherFood(room, n) {
+    for (let i = 0; i < n; i++) {
+        const { x, y } = randomCompetitiveSpawnCoord();
+        room.slitherFood.push({
+            id: randId(),
+            x,
+            y,
+            balance: COMPETITIVE_SLITHER.massPerPellet,
+            hue: Math.floor(Math.random() * 360),
+            radius: COMPETITIVE_SLITHER.foodRadius,
+        });
+    }
+}
+
+export function syncCompetitiveSlitherFood(room, playerCount) {
+    if (playerCount <= 0) {
+        const protectedFood = room.slitherFood.filter(f => f.competitiveDeathDrop);
+        room.slitherFood = protectedFood;
+        return;
+    }
+
+    const now = Date.now();
+    if (!room._lastCompetitiveFoodSync) room._lastCompetitiveFoodSync = 0;
+    if (now - room._lastCompetitiveFoodSync < 750) return;
+    room._lastCompetitiveFoodSync = now;
+
+    const densityScale = competitiveFoodDensityScale();
+    const target = Math.max(40, Math.floor(playerCount * COMPETITIVE_SLITHER.foodDensityPerHuman * densityScale));
+    const normalCount = room.slitherFood.filter(f => !f.competitiveDeathDrop).length;
+
+    if (normalCount < target * 0.94) {
+        addCompetitiveSlitherFood(room, Math.min(12, Math.floor(target * 0.94) - normalCount));
+    } else if (normalCount > target * 1.12) {
+        trimSlitherFood(room, target);
+    }
+}
+
+export function createCompetitiveSlitherPlayer(socketId, mongoId, username, color, room) {
+    const startMass = competitiveMinMass();
+    const { x, y } = pickCompetitiveSpawn(room);
+    const angle = Math.random() * Math.PI * 2;
+    return {
+        id: socketId,
+        mongoId,
+        username,
+        mode: 'competitive-slither',
+        kills: 0,
+        balance: startMass,
+        dollarBalance: COMPETITIVE_SLITHER.dollarStart,
+        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+        startTime: Date.now(),
+        spawnGraceUntil: Date.now() + 4500,
+        color,
+        x,
+        y,
+        inputDx: Math.cos(angle),
+        inputDy: Math.sin(angle),
+        boost: false,
+        angle,
+        segments: createSegments(x, y, startMass, angle),
+        screenWidth: 1920,
+        screenHeight: 1080,
+    };
+}
+
+function serializeCompetitiveSnake(snake, isYou) {
+    const sct = snake.segments.length;
+    const sc = scaleForSegmentCount(sct);
+    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
+    return {
+        id: snake.id,
+        name: snake.username,
+        balance: snake.balance,
+        dollarBalance: snake.dollarBalance,
+        color: snake.color,
+        isBot: false,
+        isYou,
+        segments,
+        angle: snake.angle || 0,
+        sc,
+        radius: headRadiusForBalance(snake.balance),
+        boost: !!snake.boost,
+        ...(isYou ? { kills: snake.kills || 0 } : {}),
+    };
+}
+
+export function processCompetitiveSlitherRoom(room, io, User, Transaction, resetTime) {
+    const effectiveRadius = getCompetitiveEffectiveRadius(resetTime);
+    const allSnakes = getCompetitiveSnakes(room);
+    const toRemove = [];
+
+    for (const { entity: snake } of allSnakes) {
+        updateCompetitiveSnakeMovement(snake);
+        checkCompetitiveFoodCollisions(snake, room);
+
+        if (checkCompetitiveBoundary(snake, effectiveRadius) || checkSelfCollision(snake)) {
+            toRemove.push({ snake, killer: null });
+            continue;
+        }
+
+        const hit = checkSnakeCollisions(snake, allSnakes);
+        if (hit) {
+            toRemove.push({ snake, killer: hit });
+        }
+    }
+
+    for (const { snake, killer } of toRemove) {
+        eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction);
+    }
+
+    return getCompetitiveSnakes(room)
+        .map(({ entity: s }) => ({
+            id: s.id,
+            name: s.username,
+            massTotal: (s.dollarBalance || 0).toFixed(2),
+            balance: (s.dollarBalance || 0).toFixed(2),
+        }))
+        .sort((a, b) => parseFloat(b.balance) - parseFloat(a.balance))
+        .slice(0, 10);
+}
+
+export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
+    const allSnakes = getCompetitiveSnakes(room);
+    const range = SLITHER.viewRange * 0.65;
+    const foodRange = range + SLITHER_FOOD_VIEW_EXTRA * 0.65;
+    const now = Date.now();
+    const sendLeaderboard = !room._lastCompLbAt || now - room._lastCompLbAt >= 500;
+    if (sendLeaderboard) room._lastCompLbAt = now;
+
+    room._compSlitherBroadcastTick = (room._compSlitherBroadcastTick || 0) + 1;
+    const sendFoodThisTick = room._compSlitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
+
+    room.players
+        .filter(p => p.mode === 'competitive-slither' && !p.disconnected)
+        .forEach(p => {
+            const head = p.segments?.[0];
+            if (!head) return;
+
+            if (sendLeaderboard) {
+                io.to(p.id).emit('leaderboard', { leaderboard, competitiveSlither: true });
+            }
+
+            const visibleSnakes = allSnakes
+                .filter(({ entity: s }) => {
+                    const h = s.segments[0];
+                    return isInView(head.x, head.y, h.x, h.y, range);
+                })
+                .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === p.id));
+
+            let visibleFood = [];
+            if (sendFoodThisTick || !room._lastCompFoodByPlayer?.[p.id]) {
+                visibleFood = room.slitherFood
+                    .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
+                    .map(f => ({
+                        id: f.id,
+                        x: f.x,
+                        y: f.y,
+                        hue: f.hue,
+                        radius: f.radius || COMPETITIVE_SLITHER.foodRadius,
+                        golden: !!f.golden,
+                        deathDrop: !!f.deathDrop,
+                    }));
+                if (visibleFood.length > MAX_VISIBLE_FOOD) {
+                    visibleFood.sort((a, b) => {
+                        const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                        const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                        return da - db;
+                    });
+                    visibleFood = visibleFood.slice(0, MAX_VISIBLE_FOOD);
+                }
+                if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
+                room._lastCompFoodByPlayer[p.id] = visibleFood;
+            } else {
+                visibleFood = room._lastCompFoodByPlayer[p.id] || [];
+            }
+
+            const minimapPlayers = allSnakes.map(({ entity: s }) => {
+                const h = s.segments[0];
+                if (!h) return null;
+                if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange * 0.65)) return null;
+                return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === p.id };
+            }).filter(Boolean);
+
+            const minimapFood = room.slitherFood
+                .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange * 0.65))
+                .map(f => ({
+                    x: Math.round(f.x),
+                    y: Math.round(f.y),
+                    g: !!f.golden,
+                    h: f.hue,
+                }));
+            if (minimapFood.length > 200) {
+                minimapFood.sort((a, b) => {
+                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                    return da - db;
+                });
+                minimapFood.length = 200;
+            }
+
+            io.to(p.id).emit('slitherTick', {
+                you: p.id,
+                snakes: visibleSnakes,
+                food: visibleFood,
+                worldHalf: COMPETITIVE_SLITHER.worldHalf,
+                minimap: { players: minimapPlayers, food: minimapFood },
+                competitiveSlither: true,
+                circularMap: true,
+                zone: meta.zone,
+                dollarBalance: p.dollarBalance,
+                balance: p.dollarBalance,
+                ...meta,
+            });
+        });
+}

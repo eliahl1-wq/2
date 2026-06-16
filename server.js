@@ -15,14 +15,20 @@ import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import {
     SLITHER,
+    COMPETITIVE_SLITHER,
     createSlitherPlayer,
+    createCompetitiveSlitherPlayer,
     addSlitherBots,
     getSlitherTargetBots,
     trimSlitherBots,
     processSlitherRoom,
+    processCompetitiveSlitherRoom,
     broadcastSlitherState,
+    broadcastCompetitiveSlitherState,
     syncSlitherFood,
+    syncCompetitiveSlitherFood,
     spawnGoldenSlitherBlob,
+    getCompetitiveZone,
 } from './slither-engine.js';
 import {
     ALLOWED_ENTRY_FEES,
@@ -237,8 +243,147 @@ function createArenaRoom(entryFeeUsd) {
 
 const rooms = ALLOWED_ENTRY_FEES.map(fee => createArenaRoom(fee));
 
+function createCompetitiveSlitherRoom() {
+    return {
+        id: 'competitive-slither',
+        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+        isCompetitiveSlither: true,
+        players: [],
+        slitherFood: [],
+        startTime: GLOBAL_ARENA_START,
+        isResetting: false,
+    };
+}
+
+const competitiveSlitherRoom = createCompetitiveSlitherRoom();
+
 // In-memory locks and maps for idempotency / processing
 const processingCashouts = new Set(); // mongoId strings
+
+async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
+    const dollarBalance = Number(player.dollarBalance) || 0;
+    const playerPayout = dollarBalance * COMPETITIVE_SLITHER.cashoutPlayerPct;
+    const platformFee = dollarBalance * COMPETITIVE_SLITHER.cashoutFeePct;
+    const mongoId = player.mongoId?.toString();
+    const playerId = player.id;
+
+    let user = await User.findById(mongoId);
+    if (!user) throw new Error('Account not found');
+
+    const logMeta = {
+        reason,
+        mode: 'competitive-slither',
+        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+        dollarBalance,
+        playerPayout,
+        platformFee,
+        playerId: mongoId,
+        timestamp: new Date().toISOString(),
+    };
+
+    if (DEV_FREE_PLAY) {
+        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        user.playtime += (Date.now() - player.startTime);
+        await user.save();
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            meta: { ...logMeta, simulated: true, signature: 'simulated' },
+            status: 'confirmed',
+        });
+        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
+        return { playerPayout, platformFee, signature: 'simulated' };
+    }
+
+    user = await ensureUserDepositWallet(user);
+    if (!user.depositAddress) throw new Error('No deposit address');
+
+    const solPayout = playerPayout / SOL_PRICE_USD;
+    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+
+    if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+    );
+    const housePubKey = houseKeypair.publicKey;
+
+    const totalLamports = await connection.getBalance(housePubKey);
+    const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+    if (totalLamports < payoutLamports + feeLamports + feeBuffer) {
+        throw new Error('House wallet lacks liquidity');
+    }
+
+    const transaction = new solanaWeb3.Transaction();
+    transaction.add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: housePubKey,
+            toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
+            lamports: payoutLamports,
+        })
+    );
+    if (feeLamports > 0 && OWNER_VAULT_ADDRESS) {
+        transaction.add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: housePubKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: feeLamports,
+            })
+        );
+    }
+
+    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
+    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+    user.playtime += (Date.now() - player.startTime);
+    await user.save();
+
+    await Transaction.create({
+        userId: user._id,
+        type: 'withdraw',
+        amount: playerPayout,
+        meta: {
+            ...logMeta,
+            signature,
+            solAmount: solPayout,
+            feeSolAmount: feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            feeDestination: OWNER_VAULT_ADDRESS || null,
+        },
+        status: 'confirmed',
+    });
+
+    console.log(`💰 COMPETITIVE CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
+    io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature });
+    return { playerPayout, platformFee, signature };
+}
+
+async function cashOutCompetitiveRoomPlayers(room) {
+    const playersToProcess = [...room.players];
+    for (const p of playersToProcess) {
+        if (p.isCashingOut) continue;
+        const mongoId = p.mongoId?.toString();
+        if (!acquireCashoutLock(mongoId)) continue;
+        try {
+            await executeCompetitiveCashout(p, room, 'Auto Room Reset');
+        } catch (err) {
+            console.error(`Competitive reset cashout failed for ${p.username}:`, err.message);
+            await Transaction.create({
+                type: 'game',
+                amount: 0,
+                meta: {
+                    event: 'failure',
+                    reason: 'competitive_auto_cashout_failed',
+                    userId: mongoId,
+                    error: err.message,
+                },
+            });
+        } finally {
+            releaseCashoutLock(mongoId);
+        }
+    }
+    room.players = [];
+}
 
 // --- RESET FLOW LOGIC ---
 async function cashOutRoomPlayers(room) {
@@ -379,6 +524,7 @@ async function performGlobalArenaReset() {
     if (globalArenaResetting) return;
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
+    competitiveSlitherRoom.isResetting = true;
 
     console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers — BR matches unaffected)');
     await Transaction.create({
@@ -392,6 +538,7 @@ async function performGlobalArenaReset() {
         for (const room of rooms) {
             await cashOutRoomPlayers(room);
         }
+        await cashOutCompetitiveRoomPlayers(competitiveSlitherRoom);
 
         try {
             await sweepHouseWalletOnReset();
@@ -407,11 +554,14 @@ async function performGlobalArenaReset() {
         for (const room of rooms) {
             resetRoomEntities(room);
         }
+        competitiveSlitherRoom.players = [];
+        competitiveSlitherRoom.slitherFood = [];
 
         GLOBAL_ARENA_START = Date.now();
         for (const room of rooms) {
             room.startTime = GLOBAL_ARENA_START;
         }
+        competitiveSlitherRoom.startTime = GLOBAL_ARENA_START;
 
         console.log('✅ GLOBAL ARENA RESET COMPLETE');
         await Transaction.create({
@@ -422,6 +572,7 @@ async function performGlobalArenaReset() {
         });
     } finally {
         for (const room of rooms) room.isResetting = false;
+        competitiveSlitherRoom.isResetting = false;
         globalArenaResetting = false;
     }
 }
@@ -1885,6 +2036,34 @@ app.get('/api/admin/room-balances', authenticateAdmin, (req, res) => {
     });
 });
 
+app.post('/api/admin/set-competitive-dollar-balance', authenticateAdmin, async (req, res) => {
+    const { userId, dollarBalance } = req.body;
+    const balance = Number(dollarBalance);
+    if (!userId || !Number.isFinite(balance) || balance < 0) {
+        return res.status(400).json({ message: 'userId and non-negative dollarBalance required' });
+    }
+    try {
+        const compPlayer = competitiveSlitherRoom.players.find(pl => pl.mongoId?.toString() === userId);
+        if (!compPlayer) {
+            return res.status(404).json({ message: 'Player not active in Competitive Slither' });
+        }
+        compPlayer.dollarBalance = balance;
+        await Transaction.create({
+            type: 'game',
+            amount: 0,
+            meta: {
+                event: 'admin_action',
+                action: 'set_competitive_dollar_balance',
+                target: userId,
+                newValue: balance,
+            },
+        });
+        res.json({ success: true, dollarBalance: balance });
+    } catch (err) {
+        res.status(500).send(err.message);
+    }
+});
+
 app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) => {
     const { userId, balance } = req.body;
     try {
@@ -2041,9 +2220,25 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
             const p = room.players.find(pl => pl.mongoId.toString() === userId);
             if (p) { found = { room, player: p }; break; }
         }
+        if (!found) {
+            const compP = competitiveSlitherRoom.players.find(pl => pl.mongoId.toString() === userId);
+            if (compP) found = { room: competitiveSlitherRoom, player: compP };
+        }
         if (!found) return res.status(404).send("Player not in arena");
 
         const { room, player: p } = found;
+        if (p.mode === 'competitive-slither') {
+            if (!acquireCashoutLock(p.mongoId)) {
+                return res.status(409).json({ message: 'Cashout already in progress for this player' });
+            }
+            try {
+                await executeCompetitiveCashout(p, room, 'Admin Forced Cashout');
+                return res.json({ success: true, competitive: true });
+            } finally {
+                releaseCashoutLock(p.mongoId);
+            }
+        }
+
         const amount = p.balance;
         if (!acquireCashoutLock(p.mongoId)) {
             return res.status(409).json({ message: 'Cashout already in progress for this player' });
@@ -2205,7 +2400,7 @@ app.get('/api/stats', (req, res) => {
             agar: { 5: 0, 10: 0, 20: 0 },
             slither: { 5: 0, 10: 0, 20: 0 },
         };
-        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0 };
+        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
 
         const pushTop = (list, name, balance) => {
             if (name && balance > 0) list.push({ username: name, balance });
@@ -2266,9 +2461,11 @@ app.get('/api/stats', (req, res) => {
         const brPlayersByFee = getBRPlayerCountsByFee();
         playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
+        playersByGamemode.competitiveSlither = competitiveSlitherRoom.players.filter(p => !p.disconnected).length;
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
-            + playersByGamemode.brAgar + playersByGamemode.brSlither;
+            + playersByGamemode.brAgar + playersByGamemode.brSlither
+            + playersByGamemode.competitiveSlither;
 
         if (modeFilter === 'agar') {
             filteredHumansOnline += countBRForMode('agar');
@@ -2512,6 +2709,8 @@ function findPlayerInArena(mongoId) {
         const player = room.players.find(p => p.mongoId?.toString() === key);
         if (player) return { room, player };
     }
+    const compPlayer = competitiveSlitherRoom.players.find(p => p.mongoId?.toString() === key);
+    if (compPlayer) return { room: competitiveSlitherRoom, player: compPlayer };
     return null;
 }
 
@@ -2521,7 +2720,7 @@ function getRoomForEntry(entryFeeUsd) {
 }
 
 function isArenaResetting() {
-    return globalArenaResetting || rooms.some(r => r.isResetting);
+    return globalArenaResetting || rooms.some(r => r.isResetting) || competitiveSlitherRoom.isResetting;
 }
 
 function capAiBudget(room) {
@@ -2648,8 +2847,6 @@ io.on('connection', (socket) => {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
                 return;
             }
-            const entryFeeUsd = normalizeEntryFee(rawEntryFee);
-            const economy = getEconomy(entryFeeUsd);
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             let user = await User.findById(decoded.id);
             if (!user) {
@@ -2672,16 +2869,154 @@ io.on('connection', (socket) => {
             if (joiningUsers.has(userKey)) return;
             joiningUsers.add(userKey);
 
+            // ── Competitive Slither ($5 only, separate room) ──
+            if (mode === 'competitive-slither') {
+                const room = competitiveSlitherRoom;
+                const existing = findPlayerInArena(userKey);
+                if (existing && existing.room.id !== room.id) {
+                    socket.emit('error', 'You have an active game in another mode. Finish or cash out first.');
+                    return;
+                }
+
+                const existingPlayer = existing?.player ?? null;
+                if (existingPlayer) {
+                    const oldSocketId = existingPlayer.id;
+                    const oldSocket = io.sockets.sockets.get(oldSocketId);
+                    if (oldSocket?.connected && oldSocket.id !== socket.id) {
+                        oldSocket.emit('forcedDisconnect');
+                    }
+                    if (existingPlayer.removeTimeout) {
+                        clearTimeout(existingPlayer.removeTimeout);
+                        delete existingPlayer.removeTimeout;
+                    }
+                    existingPlayer.id = socket.id;
+                    existingPlayer.disconnected = false;
+                    socket.roomId = room.id;
+                    let remaining = 0;
+                    if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
+                        remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
+                    }
+                    socket.emit('welcome', existingPlayer, {
+                        width: COMPETITIVE_SLITHER.worldHalf * 2,
+                        height: COMPETITIVE_SLITHER.worldHalf * 2,
+                        cashOutRemaining: remaining,
+                        mode: 'competitive-slither',
+                        rejoin: true,
+                        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+                        solPrice: SOL_PRICE_USD,
+                        competitiveSlither: true,
+                        circularMap: true,
+                        zone: getCompetitiveZone(room.startTime + c.roomDuration),
+                    });
+                    return;
+                }
+
+                const entryFeeUsd = COMPETITIVE_SLITHER.entryFeeUsd;
+                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+
+                if (!DEV_FREE_PLAY) {
+                    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                    const currentLamports = await connection.getBalance(userPubKey);
+                    const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
+                    if (currentLamports < (feeLamports + 5000)) {
+                        socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
+                        return;
+                    }
+                    try {
+                        const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                        const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                        const joinTx = new solanaWeb3.Transaction().add(
+                            solanaWeb3.SystemProgram.transfer({
+                                fromPubkey: userPubKey,
+                                toPubkey: housePubKey,
+                                lamports: feeLamports,
+                            })
+                        );
+                        const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
+                        console.log(`🎟️ Competitive Slither Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
+                    } catch (txErr) {
+                        console.error('Competitive join transaction failed:', txErr.message);
+                        socket.emit('error', 'Blockchain transfer failed. Please try again.');
+                        return;
+                    }
+                } else {
+                    console.log(`🎮 [FREE PLAY] ${user.username} joined Competitive Slither (simulated $${entryFeeUsd} entry)`);
+                }
+
+                await Transaction.create({
+                    userId: user._id,
+                    type: 'game',
+                    amount: entryFeeInSol,
+                    meta: {
+                        event: 'join',
+                        roomId: room.id,
+                        entryFeeUsd,
+                        mode: 'competitive-slither',
+                        ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                    },
+                    status: 'confirmed',
+                });
+
+                socket.roomId = room.id;
+                const newPlayer = createCompetitiveSlitherPlayer(
+                    socket.id,
+                    user._id,
+                    username || user.username,
+                    util.randomColor(),
+                    room,
+                );
+
+                const raced = room.players.find(p => p.mongoId?.toString() === userKey);
+                if (raced) {
+                    raced.id = socket.id;
+                    raced.disconnected = false;
+                    socket.emit('welcome', raced, {
+                        width: COMPETITIVE_SLITHER.worldHalf * 2,
+                        height: COMPETITIVE_SLITHER.worldHalf * 2,
+                        mode: 'competitive-slither',
+                        rejoin: true,
+                        entryFeeUsd,
+                        solPrice: SOL_PRICE_USD,
+                        competitiveSlither: true,
+                        circularMap: true,
+                        zone: getCompetitiveZone(room.startTime + c.roomDuration),
+                    });
+                    return;
+                }
+
+                room.players.push(newPlayer);
+                syncCompetitiveSlitherFood(room, room.players.length);
+
+                socket.emit('welcome', newPlayer, {
+                    width: COMPETITIVE_SLITHER.worldHalf * 2,
+                    height: COMPETITIVE_SLITHER.worldHalf * 2,
+                    mode: 'competitive-slither',
+                    rejoin: false,
+                    entryFeeUsd,
+                    solPrice: SOL_PRICE_USD,
+                    competitiveSlither: true,
+                    circularMap: true,
+                    zone: getCompetitiveZone(room.startTime + c.roomDuration),
+                });
+                return;
+            }
+
+            const entryFeeUsd = normalizeEntryFee(rawEntryFee);
+            const economy = getEconomy(entryFeeUsd);
+
             const existing = findPlayerInArena(userKey);
+            if (existing && existing.room.isCompetitiveSlither) {
+                socket.emit('error', 'You have an active Competitive Slither game. Rejoin or cash out first.');
+                return;
+            }
             if (existing && existing.room.entryFeeUsd !== entryFeeUsd) {
                 socket.emit('error', `You have an active $${existing.room.entryFeeUsd} game. Rejoin that stake tier first.`);
                 return;
             }
 
             const room = existing?.room ?? getRoomForEntry(entryFeeUsd);
-
-            // --- REJOIN LOGIK ---
             const existingPlayer = existing?.player ?? null;
+
             if (existingPlayer) {
                 const oldSocketId = existingPlayer.id;
                 const oldSocket = io.sockets.sockets.get(oldSocketId);
@@ -3016,7 +3351,7 @@ io.on('connection', (socket) => {
             socket.emit('error', 'Cash out is disabled in Battle Royale.');
             return;
         }
-        const room = rooms.find(r => r.id === socket.roomId);
+        const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.isCashingOut) return;
         if (!acquireCashoutLock(p.mongoId)) {
@@ -3030,20 +3365,31 @@ io.on('connection', (socket) => {
         p.cashOutEndTime = Date.now() + duration;
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
+        const isCompetitive = p.mode === 'competitive-slither';
 
         // Meddela klienten att timern har börjat
         socket.emit('cashOutStarting', { seconds: duration / 1000 });
 
         setTimeout(async () => {
-            // Hämta färsk referens till rummet och spelaren för att se om de fortfarande lever
-            const activeRoom = rooms.find(r => r.id === roomId);
-            // Hitta spelaren via mongoId för att hantera reconnects korrekt
+            const activeRoom = getArenaRoomById(roomId);
             const activePlayer = activeRoom?.players.find(pl => pl.mongoId.toString() === playerMongoId);
 
-            // Om spelaren inte finns kvar i rummet (uppäten) eller flaggan nollställts, avbryt
             if (!activePlayer || !activePlayer.isCashingOut) {
                 console.log(`❌ Cashout cancelled (died or invalid state)`);
                 releaseCashoutLock(playerMongoId);
+                return;
+            }
+
+            if (isCompetitive || activePlayer.mode === 'competitive-slither') {
+                try {
+                    await executeCompetitiveCashout(activePlayer, activeRoom, 'Arena Cashout');
+                } catch (err) {
+                    console.error('❌ Competitive cashout error:', err.message);
+                    io.to(activePlayer.id).emit('error', err.message || 'Transfer failed.');
+                    activePlayer.isCashingOut = false;
+                } finally {
+                    releaseCashoutLock(playerMongoId);
+                }
                 return;
             }
 
@@ -3171,9 +3517,8 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        const room = rooms.find(r => r.id === socket.roomId);
+        const room = getArenaRoomById(socket.roomId);
         if (!room) return;
-        // Mark player as disconnected but preserve their entity/state for 5 minutes
         const p = room.players.find(pl => pl.id === socket.id);
         if (p) {
             p.disconnected = true;
@@ -3196,15 +3541,42 @@ io.on('connection', (socket) => {
             p.boost = !!boost;
             return;
         }
-        const room = rooms.find(r => r.id === socket.roomId);
-        const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'slither');
+        const room = getArenaRoomById(socket.roomId);
+        const p = room?.players.find(pl =>
+            pl.id === socket.id && (pl.mode === 'slither' || pl.mode === 'competitive-slither')
+        );
         if (!p) return;
         p.inputDx = Number(dx) || 0;
         p.inputDy = Number(dy) || 0;
-        // No boost while cashing out — steering still works
         p.boost = p.isCashingOut ? false : !!boost;
     });
 });
+
+function getArenaRoomById(roomId) {
+    if (roomId === competitiveSlitherRoom.id) return competitiveSlitherRoom;
+    return rooms.find(r => r.id === roomId);
+}
+
+function processCompetitiveSlitherTick() {
+    if (competitiveSlitherRoom.isResetting) return;
+    const resetTime = competitiveSlitherRoom.startTime + c.roomDuration;
+    const humanCount = competitiveSlitherRoom.players.filter(p => !p.disconnected).length;
+    syncCompetitiveSlitherFood(competitiveSlitherRoom, humanCount);
+    const lb = processCompetitiveSlitherRoom(
+        competitiveSlitherRoom,
+        io,
+        User,
+        Transaction,
+        resetTime,
+    );
+    broadcastCompetitiveSlitherState(competitiveSlitherRoom, io, lb, {
+        resetTime,
+        solPrice: SOL_PRICE_USD,
+        isResetting: competitiveSlitherRoom.isResetting,
+        zone: getCompetitiveZone(resetTime),
+        competitiveSlither: true,
+    });
+}
 
 function getBattleRoyaleDeps() {
     return {
@@ -3241,6 +3613,7 @@ setInterval(() => {
     rooms.forEach(room => {
         processRoom(room);
     });
+    processCompetitiveSlitherTick();
     processBattleRoyaleMatches(io, getBattleRoyaleDeps());
 }, 1000 / 40);
 
