@@ -2384,9 +2384,29 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
+// Site-wide presence (pregame + any page polling /api/stats with X-Presence-Id)
+const sitePresence = new Map();
+const PRESENCE_TTL_MS = 90_000;
+
+function touchSitePresence(key) {
+    if (!key) return;
+    sitePresence.set(String(key), Date.now());
+}
+
+function getSiteUsersOnline() {
+    const cutoff = Date.now() - PRESENCE_TTL_MS;
+    for (const [key, seenAt] of sitePresence) {
+        if (seenAt < cutoff) sitePresence.delete(key);
+    }
+    return sitePresence.size;
+}
+
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
+        const presenceKey = req.headers['x-presence-id'] || req.ip;
+        touchSitePresence(presenceKey);
+
         const modeFilter = req.query.mode === 'slither' ? 'slither' : req.query.mode === 'agar' ? 'agar' : null;
         let filteredHumansOnline = 0;
         let filteredAiOnline = 0;
@@ -2483,6 +2503,7 @@ app.get('/api/stats', (req, res) => {
         res.json({
             playersOnline: filteredHumansOnline + filteredAiOnline,
             totalPlayersOnline,
+            siteUsersOnline: getSiteUsersOnline(),
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
@@ -2840,6 +2861,8 @@ function calculateCellRadius(cellBalance, playerTotalBalance, cellCount, startBa
 }
 
 io.on('connection', (socket) => {
+    touchSitePresence(socket.id);
+
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
         let userKey = null;
         try {
