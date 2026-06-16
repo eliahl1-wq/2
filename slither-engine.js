@@ -337,6 +337,154 @@ function minBalanceForSnake(snake) {
     return getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).playerStartBalance;
 }
 
+function pathArcLength(path) {
+    let arc = 0;
+    for (let i = 0; i < path.length - 1; i++) {
+        arc += dist(path[i].x, path[i].y, path[i + 1].x, path[i + 1].y);
+    }
+    return arc;
+}
+
+/** Trim oldest path points once the trail is longer than we need for the spine. */
+function trimSnakePath(path, maxArcLength) {
+    if (path.length <= 2) return;
+    let arc = pathArcLength(path);
+    while (path.length > 2 && arc > maxArcLength) {
+        const last = path.pop();
+        const prev = path[path.length - 1];
+        arc -= dist(prev.x, prev.y, last.x, last.y);
+    }
+}
+
+/** Extend the path tail when the snake outgrows its recorded history (e.g. after eating). */
+function ensurePathArcLength(path, segments, spacing, angle = 0) {
+    const required = Math.max(spacing, (segments.length - 1) * spacing);
+    let arc = pathArcLength(path);
+    if (arc >= required * 0.98) return;
+
+    let dirX = 0;
+    let dirY = 0;
+    if (path.length >= 2) {
+        const tail = path[path.length - 1];
+        const prev = path[path.length - 2];
+        dirX = tail.x - prev.x;
+        dirY = tail.y - prev.y;
+    } else if (segments.length >= 2) {
+        const tail = segments[segments.length - 1];
+        const prev = segments[segments.length - 2];
+        dirX = tail.x - prev.x;
+        dirY = tail.y - prev.y;
+    }
+    let d = Math.hypot(dirX, dirY);
+    if (d < 1e-6) {
+        dirX = -Math.cos(angle);
+        dirY = -Math.sin(angle);
+        d = 1;
+    } else {
+        dirX /= d;
+        dirY /= d;
+    }
+
+    let last = path[path.length - 1];
+    while (arc < required) {
+        const add = Math.min(spacing, required - arc);
+        last = { x: last.x + dirX * add, y: last.y + dirY * add };
+        path.push(last);
+        arc += add;
+    }
+}
+
+function growSnakeSegments(segments, targetCount, spacing) {
+    while (segments.length < targetCount) {
+        const tail = segments[segments.length - 1];
+        const prev = segments.length >= 2 ? segments[segments.length - 2] : tail;
+        let dx = tail.x - prev.x;
+        let dy = tail.y - prev.y;
+        const d = Math.hypot(dx, dy);
+        if (d > 1e-6) {
+            dx /= d;
+            dy /= d;
+        } else {
+            dx = 1;
+            dy = 0;
+        }
+        segments.push({ x: tail.x - dx * spacing, y: tail.y - dy * spacing });
+    }
+    while (segments.length > targetCount) {
+        segments.pop();
+    }
+}
+
+/**
+ * Slither.io-style body: each segment sits a fixed spacing behind the previous
+ * one along the head's traveled path, so circles stay round and growth does
+ * not collapse the tail when history is still catching up.
+ */
+function updateSnakeBodyFromPath(snake, spacing) {
+    const segments = snake.segments;
+    const head = segments[0];
+    let path = snake.path;
+
+    if (!path || path.length < 2) {
+        path = segments.map(s => ({ x: s.x, y: s.y }));
+        snake.path = path;
+    }
+
+    if (dist(path[0].x, path[0].y, head.x, head.y) > 0.01) {
+        path.unshift({ x: head.x, y: head.y });
+    } else {
+        path[0].x = head.x;
+        path[0].y = head.y;
+    }
+
+    ensurePathArcLength(path, segments, spacing, snake.angle || 0);
+
+    let pathIndex = 0;
+    let pathOffset = 0;
+
+    for (let i = 1; i < segments.length; i++) {
+        let need = spacing;
+        let placed = false;
+
+        while (need > 1e-6 && pathIndex < path.length - 1) {
+            const ax = path[pathIndex].x;
+            const ay = path[pathIndex].y;
+            const bx = path[pathIndex + 1].x;
+            const by = path[pathIndex + 1].y;
+            const edgeLen = dist(ax, ay, bx, by);
+
+            if (edgeLen < 1e-6) {
+                pathIndex++;
+                pathOffset = 0;
+                continue;
+            }
+
+            const avail = edgeLen - pathOffset;
+
+            if (avail >= need) {
+                const t = (pathOffset + need) / edgeLen;
+                segments[i].x = ax + (bx - ax) * t;
+                segments[i].y = ay + (by - ay) * t;
+                pathOffset += need;
+                placed = true;
+                need = 0;
+            } else {
+                need -= avail;
+                pathIndex++;
+                pathOffset = 0;
+            }
+        }
+
+        if (!placed) {
+            const tail = path[path.length - 1];
+            segments[i].x = tail.x;
+            segments[i].y = tail.y;
+        }
+    }
+
+    trimSnakePath(path, segments.length * spacing + spacing * 4);
+}
+
 function updateSnakeMovement(snake, room = null) {
     const head = snake.segments[0];
     const { dx, dy } = normalizeSnakeInput(snake);
@@ -370,25 +518,9 @@ function updateSnakeMovement(snake, room = null) {
     }
 
     const spacing = segmentSpacingForBalance(snake.balance);
-    for (let i = 1; i < snake.segments.length; i++) {
-        const prev = snake.segments[i - 1];
-        const cur = snake.segments[i];
-        const segDx = cur.x - prev.x;
-        const segDy = cur.y - prev.y;
-        const d = Math.hypot(segDx, segDy) || 0.001;
-        const ratio = spacing / d;
-        cur.x = prev.x + segDx * ratio;
-        cur.y = prev.y + segDy * ratio;
-    }
-
     const targetCount = balanceToSegmentCount(snake.balance);
-    while (snake.segments.length < targetCount) {
-        const tail = snake.segments[snake.segments.length - 1];
-        snake.segments.push({ x: tail.x, y: tail.y });
-    }
-    while (snake.segments.length > targetCount) {
-        snake.segments.pop();
-    }
+    growSnakeSegments(snake.segments, targetCount, spacing);
+    updateSnakeBodyFromPath(snake, spacing);
 
     if (snake.x !== undefined) {
         snake.x = head.x;
@@ -626,7 +758,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
     return lostBalance;
 }
 
-const MAX_NETWORK_SEGMENTS = 96;
+const MAX_NETWORK_SEGMENTS = 160;
 const MAX_VISIBLE_FOOD = 320;
 const SLITHER_FOOD_VIEW_EXTRA = 750;
 const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
@@ -1028,25 +1160,9 @@ function updateCompetitiveSnakeMovement(snake) {
     }
 
     const spacing = segmentSpacingForBalance(snake.balance);
-    for (let i = 1; i < snake.segments.length; i++) {
-        const prev = snake.segments[i - 1];
-        const cur = snake.segments[i];
-        const segDx = cur.x - prev.x;
-        const segDy = cur.y - prev.y;
-        const d = Math.hypot(segDx, segDy) || 0.001;
-        const ratio = spacing / d;
-        cur.x = prev.x + segDx * ratio;
-        cur.y = prev.y + segDy * ratio;
-    }
-
     const targetCount = balanceToSegmentCount(snake.balance);
-    while (snake.segments.length < targetCount) {
-        const tail = snake.segments[snake.segments.length - 1];
-        snake.segments.push({ x: tail.x, y: tail.y });
-    }
-    while (snake.segments.length > targetCount) {
-        snake.segments.pop();
-    }
+    growSnakeSegments(snake.segments, targetCount, spacing);
+    updateSnakeBodyFromPath(snake, spacing);
 
     snake.x = head.x;
     snake.y = head.y;
