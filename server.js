@@ -588,12 +588,17 @@ let globalPlayerEarningsUsd = 0;
 
 async function refreshGlobalPlayerEarnings() {
     try {
-        const totals = await User.aggregate([
-            { $group: { _id: null, totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } } } },
-        ]);
-        const totalBalanceSol = Number(totals[0]?.totalBalanceSol || 0);
-        globalPlayerEarningsSol = Number(totalBalanceSol.toFixed(6));
-        globalPlayerEarningsUsd = Number((totalBalanceSol * SOL_PRICE_USD).toFixed(2));
+        const match = await reportedTxMatch({
+            type: 'withdraw',
+            'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i },
+        });
+        const txs = await Transaction.find(match).select('amount currency meta').lean();
+        let totalUsd = 0;
+        for (const tx of txs) {
+            totalUsd += txAmountUsd(tx);
+        }
+        globalPlayerEarningsUsd = Number(totalUsd.toFixed(2));
+        globalPlayerEarningsSol = Number((totalUsd / SOL_PRICE_USD).toFixed(6));
     } catch (err) {
         console.error('Failed to refresh global player earnings:', err.message);
     }
