@@ -18,7 +18,7 @@ export const SLITHER = {
     slitherTickRate: 125,
     serverTickRate: 40,
     speedMultiplier: 1.2,
-    turnRate: 5.2,
+    turnRate: 4.8,
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00125, // $0.05/s at 40Hz
