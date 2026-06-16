@@ -2346,6 +2346,50 @@ app.get('/api/leaderboard', async (req, res) => {
     }
 });
 
+app.get('/api/leaderboard-live', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
+        const baseMatch = await reportedTxMatch({
+            $or: [
+                { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
+                { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } },
+            ],
+        });
+
+        const txs = await Transaction.find(baseMatch).sort({ createdAt: -1 }).limit(limit).lean();
+        const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
+        const users = await User.find({ _id: { $in: userIds } }).select('username').lean();
+        const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
+
+        const events = txs.map((tx) => {
+            const username = tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : 'Unknown';
+            const amountUsd = Number(txAmountUsd(tx).toFixed(2));
+            const isDeath = tx.type === 'game' && ['Arena Death', 'BR Eliminated'].includes(tx.meta?.reason);
+            const text = isDeath
+                ? `${username} died with $${amountUsd.toFixed(2)}`
+                : `${username} cashed out $${amountUsd.toFixed(2)}`;
+
+            return {
+                id: tx._id?.toString(),
+                userId: tx.userId?.toString() || null,
+                username,
+                amountUsd,
+                type: isDeath ? 'death' : 'cashout',
+                text,
+                createdAt: tx.createdAt,
+            };
+        });
+
+        res.json({
+            events,
+            serverTime: new Date().toISOString(),
+        });
+    } catch (err) {
+        console.error('Error fetching live leaderboard:', err);
+        res.status(500).json({ error: 'Unable to fetch live leaderboard' });
+    }
+});
+
 // Hämta användartransaktioner (deposits, withdrawals, game tx)
 app.get('/api/transactions', authenticateToken, async (req, res) => {
     try {

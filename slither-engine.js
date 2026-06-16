@@ -681,6 +681,7 @@ function serializeSnake(snake, isYou) {
         sc,
         radius: headRadiusForBalance(snake.balance),
         boost: !!snake.boost,
+        ...(isYou ? { kills: snake.kills || 0 } : {}),
     };
 }
 
