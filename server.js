@@ -188,6 +188,18 @@ const TransactionSchema = new mongoose.Schema({
 
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
+/** In-game cashouts only — excludes account withdrawals to external wallets. */
+const GAME_CASHOUT_REASON_RE = /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i;
+
+function buildGameCashoutTxFilter() {
+    return {
+        type: 'withdraw',
+        'meta.reason': { $regex: GAME_CASHOUT_REASON_RE },
+        'meta.destination': { $exists: false },
+        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
+    };
+}
+
 const c = {
     worldWidth: 6000,
     worldHeight: 6000,
@@ -586,24 +598,6 @@ let isScanningDeposits = false;
 let globalPlayerEarningsSol = 0;
 let globalPlayerEarningsUsd = 0;
 
-async function refreshGlobalPlayerEarnings() {
-    try {
-        const match = await reportedTxMatch({
-            type: 'withdraw',
-            'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i },
-        });
-        const txs = await Transaction.find(match).select('amount currency meta').lean();
-        let totalUsd = 0;
-        for (const tx of txs) {
-            totalUsd += txAmountUsd(tx);
-        }
-        globalPlayerEarningsUsd = Number(totalUsd.toFixed(2));
-        globalPlayerEarningsSol = Number((totalUsd / SOL_PRICE_USD).toFixed(6));
-    } catch (err) {
-        console.error('Failed to refresh global player earnings:', err.message);
-    }
-}
-
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
     if (isScanningDeposits) return;
@@ -637,9 +631,6 @@ async function scanDeposits() {
 setInterval(async () => {
     if (!isScanningDeposits) await scanDeposits();
 }, 15000);
-
-refreshGlobalPlayerEarnings();
-setInterval(refreshGlobalPlayerEarnings, 15000);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -1140,12 +1131,38 @@ async function buildAdminTxListFilter({ userId, showExcluded } = {}) {
 }
 
 function txAmountUsd(tx) {
+    const reason = tx.meta?.reason || '';
+    if (GAME_CASHOUT_REASON_RE.test(reason)) {
+        return tx.amount;
+    }
     if (tx.currency === 'SOL' || tx.meta?.solAmount != null) {
         const sol = tx.meta?.solAmount ?? tx.amount;
         return sol * SOL_PRICE_USD;
     }
     return tx.amount;
 }
+
+async function sumGameCashoutUsd(extra = {}) {
+    const match = await reportedTxMatch({ ...buildGameCashoutTxFilter(), ...extra });
+    const txs = await Transaction.find(match).select('amount currency meta').lean();
+    let totalUsd = 0;
+    for (const tx of txs) {
+        totalUsd += txAmountUsd(tx);
+    }
+    return Number(totalUsd.toFixed(2));
+}
+
+async function refreshGlobalPlayerEarnings() {
+    try {
+        globalPlayerEarningsUsd = await sumGameCashoutUsd();
+        globalPlayerEarningsSol = Number((globalPlayerEarningsUsd / SOL_PRICE_USD).toFixed(6));
+    } catch (err) {
+        console.error('Failed to refresh global player earnings:', err.message);
+    }
+}
+
+refreshGlobalPlayerEarnings();
+setInterval(refreshGlobalPlayerEarnings, 15000);
 
 function txAmountSol(tx) {
     if (tx.meta?.solAmount != null) return tx.meta.solAmount;
@@ -1224,7 +1241,7 @@ function classifyTxActivity(tx) {
     }
     if (tx.type === 'withdraw') {
         const r = m.reason || '';
-        if (/Arena Cashout|Admin Forced|Auto Room Reset|BR Victory/i.test(r)) return 'cashout';
+        if (GAME_CASHOUT_REASON_RE.test(r)) return 'cashout';
         return 'withdraw';
     }
     return 'other';
@@ -1255,12 +1272,12 @@ function buildTxCategoryFilter(category) {
             return {
                 type: 'withdraw',
                 'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
-                'meta.reason': { $not: { $regex: /Arena Cashout|Admin Forced|Auto Room Reset|BR Victory/i } },
+                'meta.reason': { $not: { $regex: GAME_CASHOUT_REASON_RE } },
             };
         case 'entry':
             return { type: 'game', 'meta.event': { $in: ['join', 'br_join'] } };
         case 'cashout':
-            return { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } };
+            return buildGameCashoutTxFilter();
         case 'death':
             return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } };
         case 'sweep':
@@ -2520,6 +2537,8 @@ app.get('/api/stats', (req, res) => {
             playersByModeAndFee,
             playersByGamemode,
             brPlayersByFee,
+            globalPlayerEarningsSol,
+            globalPlayerEarningsUsd,
             totalUserBalanceSol: globalPlayerEarningsSol,
             totalUserBalanceUsd: globalPlayerEarningsUsd,
             statsMode: modeFilter,
@@ -2530,39 +2549,46 @@ app.get('/api/stats', (req, res) => {
     }
 });
 
+async function buildLeaderboardRankings({ since = null } = {}) {
+    const match = await reportedTxMatch({
+        ...buildGameCashoutTxFilter(),
+        ...(since ? { createdAt: { $gte: since } } : {}),
+    });
+    const txs = await Transaction.find(match).select('userId amount currency meta').lean();
+    const totalsByUser = {};
+    for (const tx of txs) {
+        const uid = tx.userId?.toString();
+        if (!uid) continue;
+        totalsByUser[uid] = (totalsByUser[uid] || 0) + txAmountUsd(tx);
+    }
+
+    const sorted = Object.entries(totalsByUser)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10);
+    if (!sorted.length) return [];
+
+    const users = await User.find({ _id: { $in: sorted.map(([id]) => id) } }).select('username').lean();
+    const userMap = Object.fromEntries(users.map(u => [u._id.toString(), u.username]));
+
+    return sorted.map(([userId, amount]) => ({
+        username: userMap[userId] || 'Unknown',
+        amount: Number(amount.toFixed(2)),
+    }));
+}
+
 // 7. Leaderboard - all time and this week
 app.get('/api/leaderboard', async (req, res) => {
     try {
-        // All time: sum cashout transactions per user
-        const alltimePipeline = [
-            { $match: { type: 'withdraw', 'meta.reason': { $regex: 'Arena Cashout' } } },
-            { $group: { _id: '$userId', total: { $sum: '$amount' } } },
-            { $sort: { total: -1 } },
-            { $limit: 10 },
-            { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
-            { $unwind: '$user' },
-            { $project: { username: '$user.username', amount: '$total' } }
-        ];
-
-        // This week
         const weekStart = new Date();
         weekStart.setDate(weekStart.getDate() - 7);
-        const weekPipeline = [
-            { $match: { type: 'withdraw', 'meta.reason': { $regex: 'Arena Cashout' }, createdAt: { $gte: weekStart } } },
-            { $group: { _id: '$userId', total: { $sum: '$amount' } } },
-            { $sort: { total: -1 } },
-            { $limit: 10 },
-            { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
-            { $unwind: '$user' },
-            { $project: { username: '$user.username', amount: '$total' } }
-        ];
 
-        const [alltime, week] = await Promise.all([
-            Transaction.aggregate(alltimePipeline),
-            Transaction.aggregate(weekPipeline)
+        const [alltime, week, globalEarningsUsd] = await Promise.all([
+            buildLeaderboardRankings(),
+            buildLeaderboardRankings({ since: weekStart }),
+            sumGameCashoutUsd(),
         ]);
 
-        res.json({ alltime, week });
+        res.json({ alltime, week, globalEarningsUsd });
     } catch (err) {
         console.error('Error fetching leaderboard:', err);
         res.status(500).json({ error: 'Unable to fetch leaderboard' });
@@ -2574,7 +2600,7 @@ app.get('/api/leaderboard-live', async (req, res) => {
         const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
         const baseMatch = await reportedTxMatch({
             $or: [
-                { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
+                buildGameCashoutTxFilter(),
                 { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } },
             ],
         });

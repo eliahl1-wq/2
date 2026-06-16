@@ -18,7 +18,7 @@ export const SLITHER = {
     slitherTickRate: 125,
     serverTickRate: 40,
     speedMultiplier: 1.2,
-    turnRate: 6.0,
+    turnRate: 5.2,
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00125, // $0.05/s at 40Hz
@@ -345,7 +345,7 @@ function updateSnakeMovement(snake, room = null) {
     // instead of snapping. Bigger snakes turn slower.
     const desired = Math.atan2(dy, dx);
     const sc = scaleForSegmentCount(snake.segments.length);
-    const maxTurn = (SLITHER.turnRate / (0.78 + 0.22 * sc)) / SLITHER.serverTickRate;
+    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
     let da = desired - current;
     da = Math.atan2(Math.sin(da), Math.cos(da));
@@ -1005,7 +1005,7 @@ function updateCompetitiveSnakeMovement(snake) {
 
     const desired = Math.atan2(dy, dx);
     const sc = scaleForSegmentCount(snake.segments.length);
-    const maxTurn = (SLITHER.turnRate / (0.78 + 0.22 * sc)) / SLITHER.serverTickRate;
+    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
     let da = desired - current;
     da = Math.atan2(Math.sin(da), Math.cos(da));
