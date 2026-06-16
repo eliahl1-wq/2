@@ -18,7 +18,7 @@ export const SLITHER = {
     slitherTickRate: 125,
     serverTickRate: 40,
     speedMultiplier: 1.2,
-    turnRate: 4.8,
+    turnRate: 6.0,
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00125, // $0.05/s at 40Hz
@@ -345,7 +345,7 @@ function updateSnakeMovement(snake, room = null) {
     // instead of snapping. Bigger snakes turn slower.
     const desired = Math.atan2(dy, dx);
     const sc = scaleForSegmentCount(snake.segments.length);
-    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
+    const maxTurn = (SLITHER.turnRate / (0.78 + 0.22 * sc)) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
     let da = desired - current;
     da = Math.atan2(Math.sin(da), Math.cos(da));
@@ -505,24 +505,8 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
     return dist(px, py, ax + t * dx, ay + t * dy);
 }
 
-function checkSelfCollision(snake) {
-    if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return false;
-    const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
-    // Must overlap meaningfully — thin grazing shouldn't kill
-    const hitDist = r * 0.52;
-    const start = SLITHER.selfCollisionSkip;
-
-    for (let i = start; i < snake.segments.length; i++) {
-        const seg = snake.segments[i];
-        if (dist(head.x, head.y, seg.x, seg.y) < hitDist) return true;
-    }
-
-    for (let i = start; i < snake.segments.length - 1; i++) {
-        const a = snake.segments[i];
-        const b = snake.segments[i + 1];
-        if (distPointToSegment(head.x, head.y, a.x, a.y, b.x, b.y) < hitDist) return true;
-    }
+function checkSelfCollision(_snake) {
+    // Self-overlap is allowed — crossing your own body does not kill you.
     return false;
 }
 
@@ -1021,7 +1005,7 @@ function updateCompetitiveSnakeMovement(snake) {
 
     const desired = Math.atan2(dy, dx);
     const sc = scaleForSegmentCount(snake.segments.length);
-    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
+    const maxTurn = (SLITHER.turnRate / (0.78 + 0.22 * sc)) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
     let da = desired - current;
     da = Math.atan2(Math.sin(da), Math.cos(da));

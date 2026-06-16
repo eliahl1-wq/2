@@ -140,7 +140,7 @@ const corsOptions = {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma', 'X-Presence-Id'],
 };
 
 // Always answer preflight + attach ACAO even if a route throws (e.g. during Railway restarts)
@@ -148,7 +148,7 @@ app.use((req, res, next) => {
     applyCorsHeaders(req, res);
     if (req.method === 'OPTIONS') {
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma, X-Presence-Id');
         return res.sendStatus(204);
     }
     next();
