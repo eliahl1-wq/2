@@ -9,7 +9,7 @@ export const SLITHER = {
     maxSegments: 500,
     segmentsPerCent: 0.2,
     maxScale: 6,
-    scaleDivisor: 106,
+    scaleDivisor: 62,
     baseRadius: 6.2,
     segmentSepFactor: 3.6,
     nsp1: 5.39,
@@ -131,8 +131,25 @@ export function segmentCountForBalance(balance, referenceBalance = 1.0) {
     return Math.min(SLITHER.maxSegments, SLITHER.spawnSegments + extra);
 }
 
+/** Fractional segment count — used for smooth radius growth between segment adds. */
+export function exactSegmentCountForBalance(balance, referenceBalance = 1.0) {
+    const cents = Math.max(0, (balance - referenceBalance) * 100);
+    return Math.min(
+        SLITHER.maxSegments,
+        SLITHER.spawnSegments + cents * SLITHER.segmentsPerCent,
+    );
+}
+
 export function scaleForSegmentCount(sct) {
     return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
+}
+
+function scaleForBalanceSmooth(balance, referenceBalance = 1.0) {
+    const exact = exactSegmentCountForBalance(balance, referenceBalance);
+    const s0 = Math.max(2, Math.floor(exact));
+    const s1 = Math.min(SLITHER.maxSegments, s0 + 1);
+    const t = exact - Math.floor(exact);
+    return scaleForSegmentCount(s0) * (1 - t) + scaleForSegmentCount(s1) * t;
 }
 
 export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
@@ -140,17 +157,15 @@ export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
 }
 
 export function headRadiusForBalance(balance, referenceBalance = 1.0) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
-    return SLITHER.baseRadius * sc;
+    return SLITHER.baseRadius * scaleForBalanceSmooth(balance, referenceBalance);
 }
 
 export function segmentSpacingForBalance(balance, referenceBalance = 1.0) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
-    return SLITHER.segmentSepFactor * sc;
+    return SLITHER.segmentSepFactor * scaleForBalanceSmooth(balance, referenceBalance);
 }
 
 export function speedForBalance(balance, boosting = false, referenceBalance = 1.0) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
+    const sc = scaleForBalanceSmooth(balance, referenceBalance);
     const worldScale = (SLITHER.worldHalf * 2) / (SLITHER.slitherGameRadius * 2);
     const slitherUnitsPerFrame = boosting
         ? SLITHER.nsp3
