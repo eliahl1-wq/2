@@ -40,7 +40,12 @@ export function getEconomy(entryFeeUsd) {
     const s = entry / DEFAULT_ENTRY_FEE;
     return {
         entryFeeUsd: entry,
+        /** In-game dollars (HUD, cashout, wealth tax). Scales with entry tier. */
         playerStartBalance: BASE.playerStart * s,
+        /** Snake mass / visual size — fixed baseline, not tied to entry tier. */
+        massStartBalance: BASE.playerStart,
+        massPerPellet: BASE.foodBlobValue,
+        goldenBlobMass: getGoldenBlobValue(DEFAULT_ENTRY_FEE),
         ownerCut: BASE.ownerCut * s,
         foodLow: BASE.foodLow * s,
         foodMid: BASE.foodMid * s,
@@ -97,4 +102,34 @@ export function avgEntryFeeForMode(players, mode) {
 
 export function botStakeForMode(players, mode) {
     return getEconomy(avgEntryFeeForMode(players, mode)).botStartBalance;
+}
+
+/** Slither Arena entry tiers (USD) — separate pools from normal mode. */
+export const COMPETITIVE_SLITHER_ENTRY_FEES = [2, 5];
+export const DEFAULT_COMPETITIVE_ENTRY_FEE = 5;
+
+/** Platform cut on Slither Arena cashouts by entry tier ($5 keeps legacy 3.5%). */
+const COMPETITIVE_CASHOUT_FEE_PCT = {
+    2: 0.05,
+    5: 0.035,
+};
+
+export function normalizeCompetitiveEntryFee(fee) {
+    const n = Number(fee);
+    return COMPETITIVE_SLITHER_ENTRY_FEES.includes(n) ? n : DEFAULT_COMPETITIVE_ENTRY_FEE;
+}
+
+/** Scaled Slither Arena economy for a given entry tier. */
+export function getCompetitiveEconomy(entryFeeUsd) {
+    const entry = normalizeCompetitiveEntryFee(entryFeeUsd);
+    const cashoutFeePct = COMPETITIVE_CASHOUT_FEE_PCT[entry] ?? 0.035;
+    return {
+        entryFeeUsd: entry,
+        dollarStart: entry,
+        // Snake mass uses the same baseline as $10 normal slither — size is not tied to entry tier or dollars.
+        playerStartBalance: BASE.playerStart,
+        massPerPellet: BASE.foodBlobValue,
+        cashoutFeePct,
+        cashoutPlayerPct: 1 - cashoutFeePct,
+    };
 }

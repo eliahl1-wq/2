@@ -1,5 +1,5 @@
 import * as util from './utils.js';
-import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount } from './economy.js';
+import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy } from './economy.js';
 
 export const SLITHER = {
     worldHalf: 3000,
@@ -23,6 +23,10 @@ export const SLITHER = {
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00125, // $0.05/s at 40Hz
     foodRadius: 2.0,
+    /** Extra pickup generosity — mouth point + swept path (see food pickup helpers). */
+    foodPickupReachMult: 1.55,
+    foodPickupReachPad: 14,
+    foodMouthForward: 0.8,
     segmentSpacing: 6,
     baseSegments: 12,
     segmentsPerCentLegacy: 0.1,
@@ -63,13 +67,18 @@ function scaleAgarBotDistance(agarDistance) {
     );
 }
 
+function slitherFoodDollarValue(f) {
+    if (f.dollarValue != null && f.dollarValue > 0) return f.dollarValue;
+    return f.balance;
+}
+
 function getSlitherFoodValue(room) {
-    return room.slitherFood.reduce((sum, f) => sum + f.balance, 0);
+    return room.slitherFood.reduce((sum, f) => sum + slitherFoodDollarValue(f), 0);
 }
 
 function clearSlitherFood(room) {
     for (const f of room.slitherFood) {
-        room.foodPoolBalance += f.balance;
+        room.foodPoolBalance += slitherFoodDollarValue(f);
     }
     room.slitherFood.length = 0;
 }
@@ -103,7 +112,7 @@ function trimSlitherFood(room, targetCount) {
             }
         }
         const removed = normal.splice(worstIdx, 1)[0];
-        room.foodPoolBalance += removed.balance;
+        room.foodPoolBalance += slitherFoodDollarValue(removed);
     }
     room.slitherFood = normal.concat(protectedFood);
 }
@@ -116,8 +125,8 @@ function dist(x1, y1, x2, y2) {
     return Math.hypot(x1 - x2, y1 - y2);
 }
 
-export function segmentCountForBalance(balance) {
-    const cents = Math.max(0, (balance - 1.0) * 100);
+export function segmentCountForBalance(balance, referenceBalance = 1.0) {
+    const cents = Math.max(0, (balance - referenceBalance) * 100);
     const extra = Math.floor(cents * SLITHER.segmentsPerCent);
     return Math.min(SLITHER.maxSegments, SLITHER.spawnSegments + extra);
 }
@@ -126,22 +135,22 @@ export function scaleForSegmentCount(sct) {
     return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
 }
 
-export function balanceToSegmentCount(balance) {
-    return segmentCountForBalance(balance);
+export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
+    return segmentCountForBalance(balance, referenceBalance);
 }
 
-export function headRadiusForBalance(balance) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance));
+export function headRadiusForBalance(balance, referenceBalance = 1.0) {
+    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
     return SLITHER.baseRadius * sc;
 }
 
-export function segmentSpacingForBalance(balance) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance));
+export function segmentSpacingForBalance(balance, referenceBalance = 1.0) {
+    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
     return SLITHER.segmentSepFactor * sc;
 }
 
-export function speedForBalance(balance, boosting = false) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance));
+export function speedForBalance(balance, boosting = false, referenceBalance = 1.0) {
+    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
     const worldScale = (SLITHER.worldHalf * 2) / (SLITHER.slitherGameRadius * 2);
     const slitherUnitsPerFrame = boosting
         ? SLITHER.nsp3
@@ -207,6 +216,8 @@ function randomSpawnCoord() {
 }
 
 export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity) {
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+    const massPerPellet = eco.massPerPellet;
     let currentValue = getSlitherFoodValue(room);
     for (let i = 0; i < n; i++) {
         if (currentValue + foodBlobValue > maxBudgetValue + 1e-9) break;
@@ -217,7 +228,8 @@ export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity
             id: randId(),
             x: randomSpawnCoord(),
             y: randomSpawnCoord(),
-            balance: foodBlobValue,
+            balance: massPerPellet,
+            dollarValue: foodBlobValue,
             hue: Math.floor(Math.random() * 360),
             radius: SLITHER.foodRadius,
         });
@@ -225,15 +237,17 @@ export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity
 }
 
 /** One high-value blob per human join — value already deducted from food allocation. */
-export function spawnGoldenSlitherBlob(room, value) {
-    if (value <= 1e-9 || room.foodPoolBalance < value - 1e-9) return;
-    room.foodPoolBalance -= value;
+export function spawnGoldenSlitherBlob(room, dollarValue) {
+    if (dollarValue <= 1e-9 || room.foodPoolBalance < dollarValue - 1e-9) return;
+    room.foodPoolBalance -= dollarValue;
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
     const { x, y } = pickSlitherSpawn(room);
     room.slitherFood.push({
         id: randId(),
         x,
         y,
-        balance: value,
+        balance: eco.goldenBlobMass,
+        dollarValue,
         hue: 48,
         golden: true,
         radius: SLITHER.foodRadius * 2.4,
@@ -265,17 +279,18 @@ export function syncBRSlitherFood(room, playerCount) {
 
 export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
     const { x, y } = pickSlitherSpawn(room);
-    const balance = botBalance;
+    const startMass = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
     const angle = Math.random() * Math.PI * 2;
     return {
         id: 'slither_bot_' + randId(),
         username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)] + ' [' + util.randomInRange(10, 99) + ']',
         isBot: true,
-        balance,
+        balance: startMass,
+        dollarBalance: botBalance,
         botStake: botBalance,
         kills: 0,
         color: util.randomColor(),
-        segments: createSegments(x, y, balance, angle),
+        segments: createSegments(x, y, startMass, angle),
         inputDx: Math.cos(angle),
         inputDy: Math.sin(angle),
         boost: false,
@@ -332,9 +347,41 @@ function normalizeSnakeInput(snake) {
 
 function minBalanceForSnake(snake) {
     if (snake.isBot) {
-        return snake.botStake ?? SLITHER.botStartBalance;
+        return getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
+    }
+    return getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
+}
+
+function minDollarsForSnake(snake) {
+    if (snake.isBot) {
+        return snake.botStake ?? getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance;
     }
     return getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).playerStartBalance;
+}
+
+function applySlitherFoodPickup(snake, food, room) {
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+    let massGain = food.balance;
+    let dollarGain = food.dollarValue ?? 0;
+
+    if (food.dollarValue == null) {
+        dollarGain = food.balance;
+        if (food.golden) {
+            massGain = eco.goldenBlobMass;
+        } else if (food.deathDrop) {
+            const blob = eco.foodBlobValue;
+            massGain = blob > 1e-9 ? eco.massPerPellet * (food.balance / blob) : eco.massPerPellet;
+        } else {
+            massGain = eco.massPerPellet;
+        }
+    }
+
+    snake.balance += massGain;
+    if (snake.dollarBalance != null) {
+        snake.dollarBalance = (snake.dollarBalance || 0) + dollarGain;
+    } else {
+        snake.balance += dollarGain;
+    }
 }
 
 function pathArcLength(path) {
@@ -345,11 +392,14 @@ function pathArcLength(path) {
     return arc;
 }
 
+const MAX_SNAKE_PATH_POINTS = 420;
+const MIN_HEAD_PATH_DIST = 0.35;
+
 /** Trim oldest path points once the trail is longer than we need for the spine. */
 function trimSnakePath(path, maxArcLength) {
     if (path.length <= 2) return;
     let arc = pathArcLength(path);
-    while (path.length > 2 && arc > maxArcLength) {
+    while (path.length > 2 && (arc > maxArcLength || path.length > MAX_SNAKE_PATH_POINTS)) {
         const last = path.pop();
         const prev = path[path.length - 1];
         arc -= dist(prev.x, prev.y, last.x, last.y);
@@ -430,7 +480,8 @@ function updateSnakeBodyFromPath(snake, spacing) {
         snake.path = path;
     }
 
-    if (dist(path[0].x, path[0].y, head.x, head.y) > 0.01) {
+    const minRecord = Math.max(0.5, spacing * MIN_HEAD_PATH_DIST);
+    if (dist(path[0].x, path[0].y, head.x, head.y) > minRecord) {
         path.unshift({ x: head.x, y: head.y });
     } else {
         path[0].x = head.x;
@@ -487,6 +538,7 @@ function updateSnakeBodyFromPath(snake, spacing) {
 
 function updateSnakeMovement(snake, room = null) {
     const head = snake.segments[0];
+    rememberSnakeMouthBeforeMove(snake);
     const { dx, dy } = normalizeSnakeInput(snake);
 
     // slither.io-style turn-rate limit: heading rotates toward the cursor
@@ -637,6 +689,39 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
     return dist(px, py, ax + t * dx, ay + t * dy);
 }
 
+function snakeMouthPoint(snake) {
+    const head = snake.segments[0];
+    const r = headRadiusForBalance(snake.balance);
+    const angle = snake.angle ?? 0;
+    const fwd = r * SLITHER.foodMouthForward;
+    return {
+        x: head.x + Math.cos(angle) * fwd,
+        y: head.y + Math.sin(angle) * fwd,
+        r,
+    };
+}
+
+function rememberSnakeMouthBeforeMove(snake) {
+    const mouth = snakeMouthPoint(snake);
+    snake._prevMouthX = mouth.x;
+    snake._prevMouthY = mouth.y;
+}
+
+function foodPickupReach(snakeRadius, foodRadius) {
+    return (snakeRadius + foodRadius) * SLITHER.foodPickupReachMult + SLITHER.foodPickupReachPad;
+}
+
+function foodWithinPickup(snake, fx, fy, foodRadius, mouth = null) {
+    const pick = mouth || snakeMouthPoint(snake);
+    const reach = foodPickupReach(pick.r, foodRadius);
+    if (dist(pick.x, pick.y, fx, fy) <= reach) return true;
+
+    const px = snake._prevMouthX;
+    const py = snake._prevMouthY;
+    if (px == null || py == null) return false;
+    return distPointToSegment(fx, fy, px, py, pick.x, pick.y) <= reach;
+}
+
 function checkSelfCollision(_snake) {
     // Self-overlap is allowed — crossing your own body does not kill you.
     return false;
@@ -661,21 +746,21 @@ function checkSnakeCollisions(snake, allSnakes) {
 }
 
 function checkFoodCollisions(snake, room) {
-    const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
-    const reach = r + SLITHER.foodRadius;
-    const reach2 = reach * reach;
-    const hx = head.x;
-    const hy = head.y;
+    const mouth = snakeMouthPoint(snake);
+    const sweep = (snake._prevMouthX != null)
+        ? dist(snake._prevMouthX, snake._prevMouthY, mouth.x, mouth.y)
+        : 0;
+
     for (let i = room.slitherFood.length - 1; i >= 0; i--) {
         const f = room.slitherFood[i];
-        // Cheap axis-aligned early-out before the full distance check
-        const fdx = hx - f.x;
-        if (fdx > reach || fdx < -reach) continue;
-        const fdy = hy - f.y;
-        if (fdy > reach || fdy < -reach) continue;
-        if (fdx * fdx + fdy * fdy < reach2) {
-            snake.balance += f.balance;
+        const foodR = f.radius || SLITHER.foodRadius;
+        const reach = foodPickupReach(mouth.r, foodR) + sweep;
+        const fdx = mouth.x - f.x;
+        if (Math.abs(fdx) > reach) continue;
+        const fdy = mouth.y - f.y;
+        if (Math.abs(fdy) > reach) continue;
+        if (foodWithinPickup(snake, f.x, f.y, foodR, mouth)) {
+            applySlitherFoodPickup(snake, f, room);
             room.slitherFood.splice(i, 1);
         }
     }
@@ -683,14 +768,17 @@ function checkFoodCollisions(snake, room) {
 
 /** Drop a dead snake's mass as pick-up food along its body (slither.io style). */
 function dropSnakeAsFood(room, snake) {
-    const balance = Math.max(0, snake.balance || 0);
+    const mass = Math.max(0, snake.balance || 0);
+    const dollars = Math.max(0, snake.dollarBalance ?? snake.balance ?? 0);
     const segs = snake.segments;
-    if (balance <= 1e-9 || !segs?.length) return;
+    if (mass <= 1e-9 || !segs?.length) return;
 
-    const blob = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).foodBlobValue;
-    const maxPellets = Math.min(segs.length * 4, 150, Math.max(segs.length, Math.floor(balance / blob)));
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+    const blob = eco.foodBlobValue;
+    const maxPellets = Math.min(segs.length * 4, 150, Math.max(segs.length, Math.floor(mass / eco.massPerPellet)));
     const pelletCount = Math.max(1, maxPellets);
-    const valueEach = balance / pelletCount;
+    const massEach = mass / pelletCount;
+    const dollarEach = dollars / pelletCount;
 
     for (let i = 0; i < pelletCount; i++) {
         const seg = segs[i % segs.length];
@@ -699,7 +787,8 @@ function dropSnakeAsFood(room, snake) {
             id: randId(),
             x: seg.x + (Math.random() - 0.5) * jitter,
             y: seg.y + (Math.random() - 0.5) * jitter,
-            balance: valueEach,
+            balance: massEach,
+            dollarValue: dollarEach,
             hue: Math.floor(Math.random() * 360),
             radius: SLITHER.foodRadius + Math.random() * 1.5,
             deathDrop: true,
@@ -708,18 +797,18 @@ function dropSnakeAsFood(room, snake) {
 }
 
 function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = true, Transaction = null) {
-    const lostBalance = snake.balance;
+    const lostDollars = snake.dollarBalance ?? snake.balance ?? 0;
 
     if (killer && killer.id !== snake.id) {
         killer.kills = (killer.kills || 0) + 1;
     }
 
     // slither.io: victim mass drops as pellets; killer does not absorb balance
-    if (lostBalance > 0) {
+    if (snake.balance > 0 || lostDollars > 0) {
         if (killer || isHuman) {
             dropSnakeAsFood(room, snake);
         } else if (returnToPool) {
-            room.foodPoolBalance += lostBalance;
+            room.foodPoolBalance += lostDollars;
         }
     }
 
@@ -741,7 +830,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
             Transaction.create({
                 userId: snake.mongoId,
                 type: 'game',
-                amount: lostBalance,
+                amount: lostDollars,
                 meta: {
                     reason: 'Arena Death',
                     event: 'death',
@@ -755,10 +844,10 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
         room.slitherBots = room.slitherBots.filter(b => b.id !== snake.id);
     }
 
-    return lostBalance;
+    return lostDollars;
 }
 
-const MAX_NETWORK_SEGMENTS = 160;
+const MAX_NETWORK_SEGMENTS = 96;
 const MAX_VISIBLE_FOOD = 320;
 const SLITHER_FOOD_VIEW_EXTRA = 750;
 const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
@@ -793,6 +882,7 @@ function serializeSnake(snake, isYou) {
         isBot: !!snake.isBot,
         isYou,
         segments,
+        sct,
         angle: snake.angle || 0,
         sc,
         radius: headRadiusForBalance(snake.balance),
@@ -819,7 +909,7 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
     const densityScale = slitherFoodDensityScale();
     const goldenValueOnMap = room.slitherFood
         .filter(f => f.golden)
-        .reduce((sum, f) => sum + f.balance, 0);
+        .reduce((sum, f) => sum + slitherFoodDollarValue(f), 0);
     const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale, budget) - goldenValueOnMap);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
     const normalCount = room.slitherFood.filter(f => !f.golden && !f.deathDrop).length;
@@ -853,7 +943,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     for (const { entity: snake, isHuman } of allSnakes) {
         if (!isBR && snake.isBot) {
             const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
-            if (snake.balance > botMax) {
+            const botWealth = snake.dollarBalance ?? snake.balance;
+            if (botWealth > botMax) {
                 toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
                 continue;
             }
@@ -865,17 +956,26 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         checkFoodCollisions(snake, room);
 
         if (isHuman && !isBR) {
-            const minBal = minBalanceForSnake(snake);
-            const decay = wealthTaxDecayAmount(snake.balance, minBal);
+            const minMass = minBalanceForSnake(snake);
+            const minDollars = minDollarsForSnake(snake);
+            const currentDollars = snake.dollarBalance ?? snake.balance;
+            const decay = wealthTaxDecayAmount(currentDollars, minDollars);
             if (decay > 1e-9) {
-                const actual = Math.min(decay, snake.balance - minBal);
-                snake.balance -= actual;
+                const actual = Math.min(decay, currentDollars - minDollars);
+                if (snake.dollarBalance != null) {
+                    snake.dollarBalance -= actual;
+                } else {
+                    snake.balance -= actual;
+                }
                 room.foodPoolBalance += actual;
-                const targetCount = balanceToSegmentCount(snake.balance);
-                while (snake.segments.length > targetCount) snake.segments.pop();
             }
-            snake.balance = Math.max(minBal, snake.balance);
-            if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
+            if (snake.dollarBalance != null) {
+                snake.dollarBalance = Math.max(minDollars, snake.dollarBalance);
+            } else {
+                snake.balance = Math.max(minDollars, snake.balance);
+            }
+            snake.balance = Math.max(minMass, snake.balance);
+            if (snake.cells?.[0]) snake.cells[0].balance = snake.dollarBalance ?? snake.balance;
         }
 
         if (checkWallCollision(snake) || checkSelfCollision(snake)) {
@@ -905,8 +1005,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         .map(({ entity: s }) => ({
             id: s.id,
             name: s.username,
-            massTotal: s.balance.toFixed(2),
-            balance: s.balance.toFixed(2),
+            massTotal: (s.dollarBalance ?? s.balance).toFixed(2),
+            balance: (s.dollarBalance ?? s.balance).toFixed(2),
         }))
         .sort((a, b) => parseFloat(b.balance) - parseFloat(a.balance))
         .slice(0, 10);
@@ -1009,14 +1109,14 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 worldHalf: SLITHER.worldHalf,
                 minimap,
                 ...meta,
-                ...(meta.battleRoyale ? {} : { balance: p.balance }),
+                ...(meta.battleRoyale ? {} : { balance: p.dollarBalance ?? p.balance }),
             });
         });
 }
 
-export function createSlitherPlayer(socketId, mongoId, username, color, room, startBalance = 1.0) {
+export function createSlitherPlayer(socketId, mongoId, username, color, room, startMass = 1.0, dollarStart = 1.0) {
     const { x, y } = pickSlitherSpawn(room);
-    const balance = startBalance;
+    const balance = startMass;
     const angle = Math.random() * Math.PI * 2;
     return {
         id: socketId,
@@ -1025,6 +1125,8 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         mode: 'slither',
         kills: 0,
         balance,
+        dollarBalance: dollarStart,
+        entryFeeUsd: room.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
         startTime: Date.now(),
         spawnGraceUntil: Date.now() + 4500,
         color,
@@ -1041,7 +1143,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
             id: randId(),
             x,
             y,
-            balance,
+            balance: dollarStart,
             radius: headRadiusForBalance(balance),
             vx: 0,
             vy: 0,
@@ -1054,16 +1156,11 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
 // Snake mass (balance) and dollar balance are fully independent systems.
 
 export const COMPETITIVE_SLITHER = {
-    entryFeeUsd: 5,
-    dollarStart: 5,
     worldHalf: SLITHER.worldHalf * 0.3,
     shrinkBeforeResetMs: 2 * 60 * 1000,
-    cashoutPlayerPct: 0.965,
-    cashoutFeePct: 0.035,
     foodRadius: SLITHER.foodRadius,
     deathFoodRadius: SLITHER.foodRadius * 1.35,
     foodDensityPerHuman: 125,
-    massPerPellet: 0.01,
 };
 
 function competitiveFoodDensityScale() {
@@ -1080,8 +1177,8 @@ function randomCompetitiveSpawnCoord() {
 
 function isCompetitiveSpawnClear(room, x, y, minDist = 120) {
     for (const { entity: s } of getCompetitiveSnakes(room)) {
-        const r = headRadiusForBalance(s.balance ?? competitiveMinMass());
-        const spacing = segmentSpacingForBalance(s.balance ?? competitiveMinMass());
+        const r = headRadiusForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
+        const spacing = segmentSpacingForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
         const bodyLen = (s.segments?.length ?? 1) * spacing;
         for (let i = 0; i < (s.segments?.length ?? 0); i++) {
             const seg = s.segments[i];
@@ -1127,13 +1224,15 @@ function getCompetitiveSnakes(room) {
         .map(p => ({ entity: p, isHuman: true }));
 }
 
-function competitiveMinMass() {
-    return getEconomy(COMPETITIVE_SLITHER.entryFeeUsd).playerStartBalance;
+function competitiveMinMass(entryFeeUsd) {
+    return getCompetitiveEconomy(entryFeeUsd).playerStartBalance;
 }
 
 function updateCompetitiveSnakeMovement(snake) {
     const head = snake.segments[0];
+    rememberSnakeMouthBeforeMove(snake);
     const { dx, dy } = normalizeSnakeInput(snake);
+    const massRef = competitiveMinMass(snake.entryFeeUsd);
 
     const desired = Math.atan2(dy, dx);
     const sc = scaleForSegmentCount(snake.segments.length);
@@ -1145,12 +1244,12 @@ function updateCompetitiveSnakeMovement(snake) {
     else if (da < -maxTurn) da = -maxTurn;
     snake.angle = current + da;
 
-    const minMass = competitiveMinMass();
+    const minMass = massRef;
     const canBoost = !!snake.boost && snake.balance > minMass * 1.01;
 
     const mx = Math.cos(snake.angle);
     const my = Math.sin(snake.angle);
-    const step = speedForBalance(snake.balance, canBoost);
+    const step = speedForBalance(snake.balance, canBoost, massRef);
     head.x += mx * step;
     head.y += my * step;
 
@@ -1159,8 +1258,8 @@ function updateCompetitiveSnakeMovement(snake) {
         snake.balance -= cost;
     }
 
-    const spacing = segmentSpacingForBalance(snake.balance);
-    const targetCount = balanceToSegmentCount(snake.balance);
+    const spacing = segmentSpacingForBalance(snake.balance, massRef);
+    const targetCount = balanceToSegmentCount(snake.balance, massRef);
     growSnakeSegments(snake.segments, targetCount, spacing);
     updateSnakeBodyFromPath(snake, spacing);
 
@@ -1176,21 +1275,20 @@ function checkCompetitiveBoundary(snake, effectiveRadius) {
 }
 
 function checkCompetitiveFoodCollisions(snake, room) {
-    const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
-    const reach = r + COMPETITIVE_SLITHER.foodRadius;
-    const reach2 = reach * reach;
-    const hx = head.x;
-    const hy = head.y;
+    const mouth = snakeMouthPoint(snake);
+    const sweep = (snake._prevMouthX != null)
+        ? dist(snake._prevMouthX, snake._prevMouthY, mouth.x, mouth.y)
+        : 0;
+
     for (let i = room.slitherFood.length - 1; i >= 0; i--) {
         const f = room.slitherFood[i];
         const foodR = f.radius || COMPETITIVE_SLITHER.foodRadius;
-        const reachFood = r + foodR;
-        const fdx = hx - f.x;
-        if (fdx > reachFood || fdx < -reachFood) continue;
-        const fdy = hy - f.y;
-        if (fdy > reachFood || fdy < -reachFood) continue;
-        if (fdx * fdx + fdy * fdy < reachFood * reachFood) {
+        const reach = foodPickupReach(mouth.r, foodR) + sweep;
+        const fdx = mouth.x - f.x;
+        if (Math.abs(fdx) > reach) continue;
+        const fdy = mouth.y - f.y;
+        if (Math.abs(fdy) > reach) continue;
+        if (foodWithinPickup(snake, f.x, f.y, foodR, mouth)) {
             snake.balance += f.balance;
             if (f.dollarValue > 1e-9) {
                 snake.dollarBalance = (snake.dollarBalance || 0) + f.dollarValue;
@@ -1206,7 +1304,7 @@ function dropCompetitiveSnakeAsFood(room, snake) {
     const segs = snake.segments;
     if (mass <= 1e-9 || !segs?.length) return;
 
-    const blob = COMPETITIVE_SLITHER.massPerPellet;
+    const blob = getCompetitiveEconomy(room.entryFeeUsd).massPerPellet;
     const maxPellets = Math.min(segs.length * 4, 150, Math.max(segs.length, Math.floor(mass / blob)));
     const pelletCount = Math.max(1, maxPellets);
     const massEach = mass / pelletCount;
@@ -1238,6 +1336,17 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
     dropCompetitiveSnakeAsFood(room, snake);
 
     const socketId = snake.id;
+    const head = snake.segments?.[0];
+    if (!room.competitiveSpectators) room.competitiveSpectators = [];
+    room.competitiveSpectators = room.competitiveSpectators.filter(s => s.id !== socketId);
+    room.competitiveSpectators.push({
+        id: socketId,
+        mongoId: snake.mongoId,
+        x: head?.x ?? snake.x ?? 0,
+        y: head?.y ?? snake.y ?? 0,
+        dollarBalance: snake.dollarBalance,
+    });
+
     io.to(socketId).emit('RIP');
     room.players = room.players.filter(p => p.id !== snake.id);
     User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
@@ -1250,7 +1359,7 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
                 reason: 'Competitive Slither Death',
                 event: 'death',
                 mode: 'competitive-slither',
-                entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+                entryFeeUsd: snake.entryFeeUsd ?? room.entryFeeUsd,
             },
             status: 'confirmed',
         }).catch(err => console.error('Error logging competitive slither death:', err));
@@ -1258,13 +1367,14 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
 }
 
 export function addCompetitiveSlitherFood(room, n) {
+    const massPerPellet = getCompetitiveEconomy(room.entryFeeUsd).massPerPellet;
     for (let i = 0; i < n; i++) {
         const { x, y } = randomCompetitiveSpawnCoord();
         room.slitherFood.push({
             id: randId(),
             x,
             y,
-            balance: COMPETITIVE_SLITHER.massPerPellet,
+            balance: massPerPellet,
             hue: Math.floor(Math.random() * 360),
             radius: COMPETITIVE_SLITHER.foodRadius,
         });
@@ -1295,7 +1405,8 @@ export function syncCompetitiveSlitherFood(room, playerCount) {
 }
 
 export function createCompetitiveSlitherPlayer(socketId, mongoId, username, color, room) {
-    const startMass = competitiveMinMass();
+    const eco = getCompetitiveEconomy(room.entryFeeUsd);
+    const startMass = eco.playerStartBalance;
     const { x, y } = pickCompetitiveSpawn(room);
     const angle = Math.random() * Math.PI * 2;
     return {
@@ -1305,8 +1416,8 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
         mode: 'competitive-slither',
         kills: 0,
         balance: startMass,
-        dollarBalance: COMPETITIVE_SLITHER.dollarStart,
-        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+        dollarBalance: eco.dollarStart,
+        entryFeeUsd: eco.entryFeeUsd,
         startTime: Date.now(),
         spawnGraceUntil: Date.now() + 4500,
         color,
@@ -1323,7 +1434,8 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
 }
 
 function serializeCompetitiveSnake(snake, isYou) {
-    const sct = snake.segments.length;
+    const massRef = competitiveMinMass(snake.entryFeeUsd);
+    const sct = balanceToSegmentCount(snake.balance, massRef);
     const sc = scaleForSegmentCount(sct);
     const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
     return {
@@ -1335,9 +1447,10 @@ function serializeCompetitiveSnake(snake, isYou) {
         isBot: false,
         isYou,
         segments,
+        sct,
         angle: snake.angle || 0,
         sc,
-        radius: headRadiusForBalance(snake.balance),
+        radius: headRadiusForBalance(snake.balance, massRef),
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
     };
@@ -1389,86 +1502,110 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
     room._compSlitherBroadcastTick = (room._compSlitherBroadcastTick || 0) + 1;
     const sendFoodThisTick = room._compSlitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
 
+    const emitTickToViewer = (viewer) => {
+        const { socketId, viewX, viewY, youId, dollarBalance, spectating } = viewer;
+        const head = { x: viewX, y: viewY };
+
+        if (sendLeaderboard) {
+            io.to(socketId).emit('leaderboard', { leaderboard, competitiveSlither: true });
+        }
+
+        const visibleSnakes = allSnakes
+            .filter(({ entity: s }) => {
+                const h = s.segments[0];
+                return isInView(head.x, head.y, h.x, h.y, range);
+            })
+            .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
+
+        let visibleFood = [];
+        if (sendFoodThisTick || !room._lastCompFoodByPlayer?.[socketId]) {
+            visibleFood = room.slitherFood
+                .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
+                .map(f => ({
+                    id: f.id,
+                    x: f.x,
+                    y: f.y,
+                    hue: f.hue,
+                    radius: f.radius || COMPETITIVE_SLITHER.foodRadius,
+                    golden: !!f.golden,
+                    deathDrop: !!f.deathDrop,
+                }));
+            if (visibleFood.length > MAX_VISIBLE_FOOD) {
+                visibleFood.sort((a, b) => {
+                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                    return da - db;
+                });
+                visibleFood = visibleFood.slice(0, MAX_VISIBLE_FOOD);
+            }
+            if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
+            room._lastCompFoodByPlayer[socketId] = visibleFood;
+        } else {
+            visibleFood = room._lastCompFoodByPlayer[socketId] || [];
+        }
+
+        const minimapPlayers = allSnakes.map(({ entity: s }) => {
+            const h = s.segments[0];
+            if (!h) return null;
+            if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange * 0.65)) return null;
+            return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === youId };
+        }).filter(Boolean);
+
+        const minimapFood = room.slitherFood
+            .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange * 0.65))
+            .map(f => ({
+                x: Math.round(f.x),
+                y: Math.round(f.y),
+                g: !!f.golden,
+                h: f.hue,
+            }));
+        if (minimapFood.length > 200) {
+            minimapFood.sort((a, b) => {
+                const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                return da - db;
+            });
+            minimapFood.length = 200;
+        }
+
+        io.to(socketId).emit('slitherTick', {
+            you: youId,
+            spectating: !!spectating,
+            snakes: visibleSnakes,
+            food: visibleFood,
+            worldHalf: COMPETITIVE_SLITHER.worldHalf,
+            minimap: { players: minimapPlayers, food: minimapFood },
+            competitiveSlither: true,
+            circularMap: true,
+            zone: meta.zone,
+            dollarBalance,
+            ...meta,
+        });
+    };
+
     room.players
         .filter(p => p.mode === 'competitive-slither' && !p.disconnected)
         .forEach(p => {
             const head = p.segments?.[0];
             if (!head) return;
-
-            if (sendLeaderboard) {
-                io.to(p.id).emit('leaderboard', { leaderboard, competitiveSlither: true });
-            }
-
-            const visibleSnakes = allSnakes
-                .filter(({ entity: s }) => {
-                    const h = s.segments[0];
-                    return isInView(head.x, head.y, h.x, h.y, range);
-                })
-                .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === p.id));
-
-            let visibleFood = [];
-            if (sendFoodThisTick || !room._lastCompFoodByPlayer?.[p.id]) {
-                visibleFood = room.slitherFood
-                    .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
-                    .map(f => ({
-                        id: f.id,
-                        x: f.x,
-                        y: f.y,
-                        hue: f.hue,
-                        radius: f.radius || COMPETITIVE_SLITHER.foodRadius,
-                        golden: !!f.golden,
-                        deathDrop: !!f.deathDrop,
-                    }));
-                if (visibleFood.length > MAX_VISIBLE_FOOD) {
-                    visibleFood.sort((a, b) => {
-                        const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
-                        const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
-                        return da - db;
-                    });
-                    visibleFood = visibleFood.slice(0, MAX_VISIBLE_FOOD);
-                }
-                if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
-                room._lastCompFoodByPlayer[p.id] = visibleFood;
-            } else {
-                visibleFood = room._lastCompFoodByPlayer[p.id] || [];
-            }
-
-            const minimapPlayers = allSnakes.map(({ entity: s }) => {
-                const h = s.segments[0];
-                if (!h) return null;
-                if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange * 0.65)) return null;
-                return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === p.id };
-            }).filter(Boolean);
-
-            const minimapFood = room.slitherFood
-                .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange * 0.65))
-                .map(f => ({
-                    x: Math.round(f.x),
-                    y: Math.round(f.y),
-                    g: !!f.golden,
-                    h: f.hue,
-                }));
-            if (minimapFood.length > 200) {
-                minimapFood.sort((a, b) => {
-                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
-                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
-                    return da - db;
-                });
-                minimapFood.length = 200;
-            }
-
-            io.to(p.id).emit('slitherTick', {
-                you: p.id,
-                snakes: visibleSnakes,
-                food: visibleFood,
-                worldHalf: COMPETITIVE_SLITHER.worldHalf,
-                minimap: { players: minimapPlayers, food: minimapFood },
-                competitiveSlither: true,
-                circularMap: true,
-                zone: meta.zone,
+            emitTickToViewer({
+                socketId: p.id,
+                viewX: head.x,
+                viewY: head.y,
+                youId: p.id,
                 dollarBalance: p.dollarBalance,
-                balance: p.dollarBalance,
-                ...meta,
+                spectating: false,
             });
         });
+
+    (room.competitiveSpectators || []).forEach(spec => {
+        emitTickToViewer({
+            socketId: spec.id,
+            viewX: spec.x,
+            viewY: spec.y,
+            youId: null,
+            dollarBalance: spec.dollarBalance,
+            spectating: true,
+        });
+    });
 }

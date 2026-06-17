@@ -33,8 +33,12 @@ import {
 import {
     ALLOWED_ENTRY_FEES,
     DEFAULT_ENTRY_FEE,
+    COMPETITIVE_SLITHER_ENTRY_FEES,
+    DEFAULT_COMPETITIVE_ENTRY_FEE,
     normalizeEntryFee,
+    normalizeCompetitiveEntryFee,
     getEconomy,
+    getCompetitiveEconomy,
     getJoinPoolSplit,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
@@ -255,27 +259,59 @@ function createArenaRoom(entryFeeUsd) {
 
 const rooms = ALLOWED_ENTRY_FEES.map(fee => createArenaRoom(fee));
 
-function createCompetitiveSlitherRoom() {
+function createCompetitiveSlitherRoom(entryFeeUsd) {
     return {
-        id: 'competitive-slither',
-        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+        id: `competitive-slither-${entryFeeUsd}`,
+        entryFeeUsd,
         isCompetitiveSlither: true,
         players: [],
+        competitiveSpectators: [],
         slitherFood: [],
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
     };
 }
 
-const competitiveSlitherRoom = createCompetitiveSlitherRoom();
+const competitiveSlitherRooms = COMPETITIVE_SLITHER_ENTRY_FEES.map(fee => createCompetitiveSlitherRoom(fee));
+
+function getCompetitiveSlitherRoom(entryFeeUsd) {
+    const fee = normalizeCompetitiveEntryFee(entryFeeUsd);
+    return competitiveSlitherRooms.find(r => r.entryFeeUsd === fee)
+        ?? competitiveSlitherRooms.find(r => r.entryFeeUsd === DEFAULT_COMPETITIVE_ENTRY_FEE);
+}
+
+function removeCompetitiveSpectator(room, socketId) {
+    if (!room?.competitiveSpectators?.length) return;
+    room.competitiveSpectators = room.competitiveSpectators.filter(s => s.id !== socketId);
+}
+
+function removeCompetitiveSpectatorsForUser(room, mongoId) {
+    if (!room?.competitiveSpectators?.length || !mongoId) return;
+    const key = mongoId.toString();
+    room.competitiveSpectators = room.competitiveSpectators.filter(s => s.mongoId?.toString() !== key);
+}
+
+function findCompetitiveSlitherRoomById(roomId) {
+    return competitiveSlitherRooms.find(r => r.id === roomId) ?? null;
+}
 
 // In-memory locks and maps for idempotency / processing
 const processingCashouts = new Set(); // mongoId strings
 
+/** USD balance used for HUD, leaderboard, and cashout (mass is stored on cells / snake.balance). */
+function arenaCashoutUsd(player) {
+    if (player?.mode === 'slither' || player?.mode === 'agar' || !player?.mode) {
+        return player.dollarBalance ?? player.balance ?? 0;
+    }
+    return player?.balance ?? 0;
+}
+
 async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
-    const playerPayout = dollarBalance * COMPETITIVE_SLITHER.cashoutPlayerPct;
-    const platformFee = dollarBalance * COMPETITIVE_SLITHER.cashoutFeePct;
+    const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE;
+    const { cashoutPlayerPct, cashoutFeePct } = getCompetitiveEconomy(entryFeeUsd);
+    const playerPayout = dollarBalance * cashoutPlayerPct;
+    const platformFee = dollarBalance * cashoutFeePct;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
 
@@ -285,10 +321,11 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     const logMeta = {
         reason,
         mode: 'competitive-slither',
-        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+        entryFeeUsd,
         dollarBalance,
         playerPayout,
         platformFee,
+        cashoutFeePct,
         playerId: mongoId,
         timestamp: new Date().toISOString(),
     };
@@ -415,7 +452,7 @@ async function cashOutRoomPlayers(room) {
                 await Transaction.create({
                     userId: user._id,
                     type: 'withdraw',
-                    amount: p.balance,
+                    amount: arenaCashoutUsd(p),
                     meta: {
                         simulated: true,
                         reason: 'Auto Room Reset (Free Play)',
@@ -423,9 +460,10 @@ async function cashOutRoomPlayers(room) {
                         entryFeeUsd: room.entryFeeUsd,
                     },
                 });
-                io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: 'simulated' });
+                io.to(p.id).emit('cashOutSuccess', { amount: arenaCashoutUsd(p), reason: 'Room Reset', signature: 'simulated' });
             } else if (user.depositAddress && HOUSE_WALLET_SECRET) {
-                const solToTransfer = p.balance / SOL_PRICE_USD;
+                const cashoutUsd = arenaCashoutUsd(p);
+                const solToTransfer = cashoutUsd / SOL_PRICE_USD;
                 const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
 
                 const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -446,7 +484,7 @@ async function cashOutRoomPlayers(room) {
                 await Transaction.create({
                     userId: user._id,
                     type: 'withdraw',
-                    amount: p.balance,
+                    amount: arenaCashoutUsd(p),
                     currency: 'SOL',
                     meta: {
                         signature: sig,
@@ -456,7 +494,7 @@ async function cashOutRoomPlayers(room) {
                     },
                 });
 
-                io.to(p.id).emit('cashOutSuccess', { amount: p.balance, reason: 'Room Reset', signature: sig });
+                io.to(p.id).emit('cashOutSuccess', { amount: cashoutUsd, reason: 'Room Reset', signature: sig });
             } else {
                 console.warn(`⚠️ Reset cashout skipped for ${p.username}: no depositAddress or house wallet`);
                 await Transaction.create({
@@ -536,7 +574,7 @@ async function performGlobalArenaReset() {
     if (globalArenaResetting) return;
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
-    competitiveSlitherRoom.isResetting = true;
+    for (const room of competitiveSlitherRooms) room.isResetting = true;
 
     console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers — BR matches unaffected)');
     await Transaction.create({
@@ -550,7 +588,9 @@ async function performGlobalArenaReset() {
         for (const room of rooms) {
             await cashOutRoomPlayers(room);
         }
-        await cashOutCompetitiveRoomPlayers(competitiveSlitherRoom);
+        for (const room of competitiveSlitherRooms) {
+            await cashOutCompetitiveRoomPlayers(room);
+        }
 
         try {
             await sweepHouseWalletOnReset();
@@ -566,14 +606,19 @@ async function performGlobalArenaReset() {
         for (const room of rooms) {
             resetRoomEntities(room);
         }
-        competitiveSlitherRoom.players = [];
-        competitiveSlitherRoom.slitherFood = [];
+        for (const room of competitiveSlitherRooms) {
+            room.players = [];
+            room.slitherFood = [];
+            room.competitiveSpectators = [];
+        }
 
         GLOBAL_ARENA_START = Date.now();
         for (const room of rooms) {
             room.startTime = GLOBAL_ARENA_START;
         }
-        competitiveSlitherRoom.startTime = GLOBAL_ARENA_START;
+        for (const room of competitiveSlitherRooms) {
+            room.startTime = GLOBAL_ARENA_START;
+        }
 
         console.log('✅ GLOBAL ARENA RESET COMPLETE');
         await Transaction.create({
@@ -584,7 +629,7 @@ async function performGlobalArenaReset() {
         });
     } finally {
         for (const room of rooms) room.isResetting = false;
-        competitiveSlitherRoom.isResetting = false;
+        for (const room of competitiveSlitherRooms) room.isResetting = false;
         globalArenaResetting = false;
     }
 }
@@ -855,6 +900,8 @@ app.get('/api/config', (req, res) => {
         brDefaultEntryFee: BR.defaultEntryFee,
         brMinPlayers: BR.minPlayers,
         brMaxPlayers: BR.maxPlayers,
+        competitiveEntryFees: DEV_FREE_PLAY ? [0] : COMPETITIVE_SLITHER_ENTRY_FEES,
+        competitiveDefaultEntryFee: DEFAULT_COMPETITIVE_ENTRY_FEE,
     });
 });
 
@@ -865,7 +912,8 @@ app.get('/api/health', (req, res) => {
 // --- NYTT: Endpoint för att kolla om användaren är i ett game ---
 app.get('/api/game-status', authenticateToken, (req, res) => {
     try {
-        const arenaResetting = globalArenaResetting || rooms.some(r => r.isResetting);
+        const arenaResetting = globalArenaResetting || rooms.some(r => r.isResetting)
+            || competitiveSlitherRooms.some(r => r.isResetting);
         for (const room of rooms) {
             const player = room.players.find(
                 p => p.mongoId && p.mongoId.toString() === req.user.id
@@ -874,11 +922,30 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
                 return res.json({
                     inGame: true,
                     mode: player.mode || 'agar',
-                    balance: player.balance ?? null,
+                    balance: (player.mode === 'slither' || player.mode === 'agar' || !player.mode)
+                        ? (player.dollarBalance ?? player.balance ?? null)
+                        : (player.balance ?? null),
                     entryFeeUsd: player.entryFeeUsd ?? room.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     disconnected: player.disconnected ?? false,
                     isResetting: arenaResetting,
                     battleRoyale: !!player.isBattleRoyale,
+                });
+            }
+        }
+        for (const room of competitiveSlitherRooms) {
+            const player = room.players.find(
+                p => p.mongoId && p.mongoId.toString() === req.user.id
+            );
+            if (player) {
+                return res.json({
+                    inGame: true,
+                    mode: 'competitive-slither',
+                    balance: player.dollarBalance ?? null,
+                    entryFeeUsd: player.entryFeeUsd ?? room.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE,
+                    disconnected: player.disconnected ?? false,
+                    isResetting: arenaResetting,
+                    battleRoyale: false,
+                    competitiveSlither: true,
                 });
             }
         }
@@ -1418,6 +1485,22 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                 }
             }
         }
+        for (const room of competitiveSlitherRooms) {
+            for (const p of room.players) {
+                if (p.mongoId) {
+                    const id = p.mongoId.toString();
+                    if (!inGameUserIds.has(id)) {
+                        inGameUserIds.add(id);
+                        inGameUsernames.push({
+                            id,
+                            username: p.username,
+                            mode: 'competitive-slither',
+                            entryFeeUsd: room.entryFeeUsd,
+                        });
+                    }
+                }
+            }
+        }
 
         const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const recentMatch = await reportedTxMatch({ createdAt: { $gte: dayAgo } });
@@ -1821,6 +1904,18 @@ app.get('/api/admin/dashboard/live-feed', authenticateAdmin, async (req, res) =>
                         }
                     }
                 }
+                for (const room of competitiveSlitherRooms) {
+                    for (const p of room.players) {
+                        if (p.mongoId) {
+                            players.push({
+                                id: p.mongoId.toString(),
+                                username: p.username,
+                                mode: 'competitive-slither',
+                                entryFeeUsd: room.entryFeeUsd,
+                            });
+                        }
+                    }
+                }
                 return players;
             })(),
         ]);
@@ -2065,11 +2160,18 @@ app.post('/api/admin/set-competitive-dollar-balance', authenticateAdmin, async (
         return res.status(400).json({ message: 'userId and non-negative dollarBalance required' });
     }
     try {
-        const compPlayer = competitiveSlitherRoom.players.find(pl => pl.mongoId?.toString() === userId);
-        if (!compPlayer) {
+        let compFound = null;
+        for (const room of competitiveSlitherRooms) {
+            const compPlayer = room.players.find(pl => pl.mongoId?.toString() === userId);
+            if (compPlayer) {
+                compFound = { room, player: compPlayer };
+                break;
+            }
+        }
+        if (!compFound) {
             return res.status(404).json({ message: 'Player not active in Competitive Slither' });
         }
-        compPlayer.dollarBalance = balance;
+        compFound.player.dollarBalance = balance;
         await Transaction.create({
             type: 'game',
             amount: 0,
@@ -2098,8 +2200,8 @@ app.post('/api/admin/set-player-balance', authenticateAdmin, async (req, res) =>
         for (const room of rooms) {
             const p = room.players.find(pl => pl.mongoId.toString() === userId);
             if (p) {
+                p.dollarBalance = balance;
                 p.balance = balance;
-                p.cells.forEach(c => { c.balance = balance / p.cells.length; });
                 break;
             }
         }
@@ -2114,8 +2216,8 @@ app.post('/api/admin/set-bot-balance', authenticateAdmin, (req, res) => {
     for (const room of rooms) {
         const bot = room.bots.find(b => b.id === botId);
         if (bot) {
+            bot.dollarBalance = balance;
             bot.balance = balance;
-            bot.cells.forEach(c => { c.balance = balance / bot.cells.length; });
             return res.json({ success: true, entryFeeUsd: room.entryFeeUsd });
         }
     }
@@ -2147,6 +2249,11 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
             foodPoolBalance: room.foodPoolBalance,
             aiBudgetBalance: room.aiBudgetBalance,
             ownerBalance: room.ownerBalance,
+            isResetting: room.isResetting,
+        })),
+        competitiveSlitherRooms: competitiveSlitherRooms.map(room => ({
+            entryFeeUsd: room.entryFeeUsd,
+            playerCount: room.players.filter(p => !p.disconnected).length,
             isResetting: room.isResetting,
         })),
         battleRoyale: getBRServerStatus(),
@@ -2243,8 +2350,13 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
             if (p) { found = { room, player: p }; break; }
         }
         if (!found) {
-            const compP = competitiveSlitherRoom.players.find(pl => pl.mongoId.toString() === userId);
-            if (compP) found = { room: competitiveSlitherRoom, player: compP };
+            for (const room of competitiveSlitherRooms) {
+                const compP = room.players.find(pl => pl.mongoId.toString() === userId);
+                if (compP) {
+                    found = { room, player: compP };
+                    break;
+                }
+            }
         }
         if (!found) return res.status(404).send("Player not in arena");
 
@@ -2261,7 +2373,7 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
             }
         }
 
-        const amount = p.balance;
+        const amount = arenaCashoutUsd(p);
         if (!acquireCashoutLock(p.mongoId)) {
             return res.status(409).json({ message: 'Cashout already in progress for this player' });
         }
@@ -2474,28 +2586,29 @@ app.get('/api/stats', (req, res) => {
                         playersByModeAndFee[mode][fee] = (playersByModeAndFee[mode][fee] || 0) + 1;
                         playersByGamemode[mode] += 1;
                     }
-                    pushTop(mode === 'agar' ? agarPlayers : slitherPlayers, player.username, player.balance);
+                    pushTop(mode === 'agar' ? agarPlayers : slitherPlayers, player.username, arenaCashoutUsd(player));
                     if (!modeFilter || mode === modeFilter) {
                         filteredHumansOnline += 1;
-                        considerFilteredTop(player.username, player.balance);
+                        considerFilteredTop(player.username, arenaCashoutUsd(player));
                     }
                 }
             });
             room.bots.forEach(bot => {
-                const botBalance = bot.cells?.reduce((s, c) => s + c.balance, 0) ?? bot.balance ?? 0;
+                const botUsd = bot.dollarBalance ?? bot.balance ?? bot.cells?.reduce((s, c) => s + c.balance, 0) ?? 0;
                 playersByGamemode.agar += 1;
-                pushTop(agarPlayers, bot.username, botBalance);
+                pushTop(agarPlayers, bot.username, botUsd);
                 if (!modeFilter || modeFilter === 'agar') {
                     filteredAiOnline += 1;
-                    considerFilteredTop(bot.username, botBalance);
+                    considerFilteredTop(bot.username, botUsd);
                 }
             });
             room.slitherBots.forEach(bot => {
                 playersByGamemode.slither += 1;
-                pushTop(slitherPlayers, bot.username, bot.balance);
+                const botUsd = bot.dollarBalance ?? bot.balance;
+                pushTop(slitherPlayers, bot.username, botUsd);
                 if (!modeFilter || modeFilter === 'slither') {
                     filteredAiOnline += 1;
-                    considerFilteredTop(bot.username, bot.balance);
+                    considerFilteredTop(bot.username, botUsd);
                 }
             });
         });
@@ -2503,7 +2616,10 @@ app.get('/api/stats', (req, res) => {
         const brPlayersByFee = getBRPlayerCountsByFee();
         playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
-        playersByGamemode.competitiveSlither = competitiveSlitherRoom.players.filter(p => !p.disconnected).length;
+        playersByGamemode.competitiveSlither = competitiveSlitherRooms.reduce(
+            (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
+            0,
+        );
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
             + playersByGamemode.brAgar + playersByGamemode.brSlither
@@ -2652,8 +2768,56 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 
 // Radius beräknas via `util.massToRadius` (sqrt-baserad) för konsistens med klient och Agar.io
 
+function agarFoodDollarValue(f) {
+    if (f.dollarValue != null && f.dollarValue > 0) return f.dollarValue;
+    return f.balance;
+}
+
+function playerMassStart(player) {
+    return getEconomy(player?.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
+}
+
+function playerDollarStart(player) {
+    return getEconomy(player?.entryFeeUsd ?? DEFAULT_ENTRY_FEE).playerStartBalance;
+}
+
+function playerTotalMass(player) {
+    return player.cells.reduce((sum, cell) => sum + cell.balance, 0);
+}
+
+function applyAgarFoodPickup(cell, food, player, room) {
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+    let massGain = food.balance;
+    let dollarGain = food.dollarValue ?? 0;
+
+    if (food.dollarValue == null) {
+        dollarGain = food.balance;
+        massGain = food.golden ? eco.goldenBlobMass : eco.massPerPellet;
+    }
+
+    cell.balance += massGain;
+    if (player.dollarBalance != null) {
+        player.dollarBalance = (player.dollarBalance || 0) + dollarGain;
+    } else {
+        cell.balance += dollarGain;
+    }
+}
+
+function transferAgarDollars(victim, eater, massTaken) {
+    if (massTaken <= 1e-9 || victim.dollarBalance == null) return;
+    const victimMass = playerTotalMass(victim);
+    if (victimMass <= 1e-9) return;
+    const share = (victim.dollarBalance || 0) * (massTaken / victimMass);
+    if (share <= 1e-9) return;
+    if (eater.dollarBalance != null) {
+        eater.dollarBalance = (eater.dollarBalance || 0) + share;
+    }
+    victim.dollarBalance = Math.max(0, victim.dollarBalance - share);
+}
+
 function addFood(room, n) {
     const foodBlobValue = foodBlobValueForRoom(room);
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
     for (let i = 0; i < n; i++) {
         if (room.foodPoolBalance < foodBlobValue) break;
         room.foodPoolBalance -= foodBlobValue;
@@ -2663,7 +2827,8 @@ function addFood(room, n) {
             y: Math.random() * c.worldHeight,
             hue: Math.floor(Math.random() * 360),
             radius: 5,
-            balance: foodBlobValue
+            balance: eco.massPerPellet,
+            dollarValue: foodBlobValue,
         });
     }
 }
@@ -2677,39 +2842,49 @@ function trimNormalAgarFood(room, targetCount) {
     const normal = room.food.filter(f => !f.golden);
     while (normal.length > targetCount) {
         const removed = normal.pop();
-        room.foodPoolBalance += removed.balance;
+        room.foodPoolBalance += agarFoodDollarValue(removed);
     }
     room.food = normal.concat(golden);
 }
 
 /** One high-value blob per human join — value already deducted from food allocation. */
-function spawnGoldenAgarBlob(room, value) {
-    if (value <= 1e-9 || room.foodPoolBalance < value - 1e-9) return;
-    room.foodPoolBalance -= value;
-    const pelletValue = foodBlobValueForRoom(room);
+function spawnGoldenAgarBlob(room, dollarValue) {
+    if (dollarValue <= 1e-9 || room.foodPoolBalance < dollarValue - 1e-9) return;
+    room.foodPoolBalance -= dollarValue;
+    const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+    const pelletMass = eco.massPerPellet;
     room.food.push({
         id: Math.random().toString(36).substr(2, 9),
         x: Math.random() * c.worldWidth,
         y: Math.random() * c.worldHeight,
         hue: 48,
         golden: true,
-        radius: Math.min(13, 7 + Math.sqrt(value / pelletValue) * 1.4),
-        balance: value,
+        radius: Math.min(13, 7 + Math.sqrt(eco.goldenBlobMass / pelletMass) * 1.4),
+        balance: eco.goldenBlobMass,
+        dollarValue,
     });
 }
 
-function applyAgarWealthTax(player, room, startBalance) {
-    const total = player.cells.reduce((sum, cell) => sum + cell.balance, 0);
-    const decay = wealthTaxDecayAmount(total, startBalance);
+function applyAgarWealthTax(player, room, minDollars) {
+    const total = player.dollarBalance ?? player.balance ?? 0;
+    const decay = wealthTaxDecayAmount(total, minDollars);
     if (decay <= 1e-9) return;
-    const actual = Math.min(decay, total - startBalance);
+    const actual = Math.min(decay, total - minDollars);
     room.foodPoolBalance += actual;
-    for (const cell of player.cells) {
-        cell.balance -= actual * (cell.balance / total);
-    }
-    player.balance = player.cells.reduce((sum, cell) => sum + cell.balance, 0);
-    for (const cell of player.cells) {
-        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, startBalance);
+    if (player.dollarBalance != null) {
+        player.dollarBalance = Math.max(minDollars, player.dollarBalance - actual);
+    } else {
+        const cellTotal = playerTotalMass(player);
+        if (cellTotal <= 1e-9) return;
+        for (const cell of player.cells) {
+            cell.balance -= actual * (cell.balance / cellTotal);
+            cell.radius = calculateCellRadius(
+                cell.balance,
+                playerTotalMass(player),
+                player.cells.length,
+                playerMassStart(player),
+            );
+        }
     }
 }
 
@@ -2761,8 +2936,10 @@ function findPlayerInArena(mongoId) {
         const player = room.players.find(p => p.mongoId?.toString() === key);
         if (player) return { room, player };
     }
-    const compPlayer = competitiveSlitherRoom.players.find(p => p.mongoId?.toString() === key);
-    if (compPlayer) return { room: competitiveSlitherRoom, player: compPlayer };
+    for (const room of competitiveSlitherRooms) {
+        const player = room.players.find(p => p.mongoId?.toString() === key);
+        if (player) return { room, player };
+    }
     return null;
 }
 
@@ -2772,7 +2949,8 @@ function getRoomForEntry(entryFeeUsd) {
 }
 
 function isArenaResetting() {
-    return globalArenaResetting || rooms.some(r => r.isResetting) || competitiveSlitherRoom.isResetting;
+    return globalArenaResetting || rooms.some(r => r.isResetting)
+        || competitiveSlitherRooms.some(r => r.isResetting);
 }
 
 function capAiBudget(room) {
@@ -2820,19 +2998,31 @@ function rebuildQuadTree(room, allUsers) {
 function addBots(room, n, botStake = null) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
     const botCost = botStake ?? botStakeForRoom(room);
+    const startMass = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
     const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCost));
     for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
         const randomName = botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]";
         room.aiBudgetBalance -= botCost;
         room.bots.push({
-            id: id, username: randomName, balance: botCost, kills: 0, color: util.randomColor(), isBot: true,
-            targetX: Math.random() * c.worldWidth, targetY: Math.random() * c.worldHeight, lastTargetUpdate: 0,
+            id: id,
+            username: randomName,
+            balance: botCost,
+            dollarBalance: botCost,
+            botStake: botCost,
+            kills: 0,
+            color: util.randomColor(),
+            isBot: true,
+            targetX: Math.random() * c.worldWidth,
+            targetY: Math.random() * c.worldHeight,
+            lastTargetUpdate: 0,
             cells: [{
                 id: Math.random().toString(36).substr(2, 9),
-                x: Math.random() * c.worldWidth, y: Math.random() * c.worldHeight,
-                balance: botCost, radius: calculateCellRadius(botCost, botCost, 1, botCost)
-            }]
+                x: Math.random() * c.worldWidth,
+                y: Math.random() * c.worldHeight,
+                balance: startMass,
+                radius: calculateCellRadius(startMass, startMass, 1, startMass),
+            }],
         });
     }
 }
@@ -2850,7 +3040,7 @@ function trimAgarBots(room, targetCount) {
     const stake = botStakeForRoom(room);
     while (room.bots.length > targetCount) {
         const removed = room.bots.shift();
-        room.aiBudgetBalance += removed?.cells?.[0]?.balance ?? stake;
+        room.aiBudgetBalance += removed?.dollarBalance ?? removed?.botStake ?? removed?.cells?.[0]?.balance ?? stake;
     }
 }
 
@@ -2879,15 +3069,13 @@ function countActiveHumansByMode(room, mode) {
 
 // Helper för att beräkna radie med extra tillväxt-effekt
 function playerStartBalance(player) {
-    return getEconomy(player?.entryFeeUsd).playerStartBalance;
+    return playerDollarStart(player);
 }
 
-function calculateCellRadius(cellBalance, playerTotalBalance, cellCount, startBalance = c.playerStartBalance) {
-    // Spelet körs nu i USD-enheter internt
-    const balanceInUsd = cellBalance;
-    const startUsdPerCell = startBalance / cellCount;
-    const extraUsd = Math.max(0, balanceInUsd - startUsdPerCell);
-    const visualMass = balanceInUsd + (extraUsd * (c.growthBoost - 1));
+function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c.playerStartBalance) {
+    const startMassPerCell = massStart / cellCount;
+    const extraMass = Math.max(0, cellMass - startMassPerCell);
+    const visualMass = cellMass + (extraMass * (c.growthBoost - 1));
     return util.massToRadius(visualMass * c.sizeMult);
 }
 
@@ -2923,13 +3111,21 @@ io.on('connection', (socket) => {
             if (joiningUsers.has(userKey)) return;
             joiningUsers.add(userKey);
 
-            // ── Competitive Slither ($5 only, separate room) ──
+            // ── Competitive Slither ($2 / $5 separate pools) ──
             if (mode === 'competitive-slither') {
-                const room = competitiveSlitherRoom;
+                const entryFeeUsd = normalizeCompetitiveEntryFee(rawEntryFee);
+                const room = getCompetitiveSlitherRoom(entryFeeUsd);
+                removeCompetitiveSpectatorsForUser(room, userKey);
                 const existing = findPlayerInArena(userKey);
-                if (existing && existing.room.id !== room.id) {
-                    socket.emit('error', 'You have an active game in another mode. Finish or cash out first.');
-                    return;
+                if (existing) {
+                    if (!existing.room.isCompetitiveSlither) {
+                        socket.emit('error', 'You have an active game in another mode. Finish or cash out first.');
+                        return;
+                    }
+                    if (existing.room.entryFeeUsd !== entryFeeUsd) {
+                        socket.emit('error', `You have an active $${existing.room.entryFeeUsd} Competitive Slither game. Rejoin that stake tier first.`);
+                        return;
+                    }
                 }
 
                 const existingPlayer = existing?.player ?? null;
@@ -2956,7 +3152,7 @@ io.on('connection', (socket) => {
                         cashOutRemaining: remaining,
                         mode: 'competitive-slither',
                         rejoin: true,
-                        entryFeeUsd: COMPETITIVE_SLITHER.entryFeeUsd,
+                        entryFeeUsd: existingPlayer.entryFeeUsd ?? room.entryFeeUsd,
                         solPrice: SOL_PRICE_USD,
                         competitiveSlither: true,
                         circularMap: true,
@@ -2965,7 +3161,6 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                const entryFeeUsd = COMPETITIVE_SLITHER.entryFeeUsd;
                 const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
                 if (!DEV_FREE_PLAY) {
@@ -3198,12 +3393,20 @@ io.on('connection', (socket) => {
 
             socket.roomId = room.id;
 
-            const startBalanceUsd = economy.playerStartBalance;
+            const startMass = economy.massStartBalance;
+            const startDollars = economy.playerStartBalance;
             let newPlayer;
 
             if (gameMode === 'slither') {
-                newPlayer = createSlitherPlayer(socket.id, user._id, username || user.username, util.randomColor(), room, startBalanceUsd);
-                newPlayer.entryFeeUsd = room.entryFeeUsd;
+                newPlayer = createSlitherPlayer(
+                    socket.id,
+                    user._id,
+                    username || user.username,
+                    util.randomColor(),
+                    room,
+                    startMass,
+                    startDollars,
+                );
             } else {
                 const spawnX = Math.random() * c.worldWidth;
                 const spawnY = Math.random() * c.worldHeight;
@@ -3214,7 +3417,8 @@ io.on('connection', (socket) => {
                     mode: 'agar',
                     entryFeeUsd: room.entryFeeUsd,
                     kills: 0,
-                    balance: startBalanceUsd,
+                    balance: startDollars,
+                    dollarBalance: startDollars,
                     startTime: Date.now(),
                     color: util.randomColor(),
                     x: c.worldWidth / 2,
@@ -3227,8 +3431,8 @@ io.on('connection', (socket) => {
                         id: Math.random().toString(36).substr(2, 9),
                         x: spawnX,
                         y: spawnY,
-                        balance: startBalanceUsd,
-                        radius: calculateCellRadius(startBalanceUsd, startBalanceUsd, 1, startBalanceUsd),
+                        balance: startMass,
+                        radius: calculateCellRadius(startMass, startMass, 1, startMass),
                         vx: 0,
                         vy: 0,
                         lastSplit: Date.now()
@@ -3348,17 +3552,18 @@ io.on('connection', (socket) => {
 
         let newCells = [];
         p.cells.forEach(cell => {
-            const startBal = playerStartBalance(p);
-            if (cell.balance >= startBal * 2) {
+            const massStart = playerMassStart(p);
+            const totalMass = playerTotalMass(p);
+            if (cell.balance >= massStart * 2) {
                 cell.balance /= 2;
-                cell.radius = calculateCellRadius(cell.balance, p.balance, p.cells.length + 1, startBal);
+                cell.radius = calculateCellRadius(cell.balance, totalMass, p.cells.length + 1, massStart);
                 cell.lastSplit = Date.now(); // Starta timern även för ursprungscellen
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 newCells.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x, y: cell.y,
                     balance: cell.balance,
-                    radius: calculateCellRadius(cell.balance, p.balance, p.cells.length + 1, startBal),
+                    radius: calculateCellRadius(cell.balance, totalMass, p.cells.length + 1, massStart),
                     vx: Math.cos(angle) * 25,
                     vy: Math.sin(angle) * 25,
                     lastSplit: Date.now()
@@ -3374,10 +3579,11 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p) return;
         p.cells.forEach(cell => {
-            const startBal = playerStartBalance(p);
-            if (cell.balance >= startBal * 1.5) {
+            const massStart = playerMassStart(p);
+            const totalMass = playerTotalMass(p);
+            if (cell.balance >= massStart * 1.5) {
                 cell.balance -= c.ejectMass;
-                cell.radius = calculateCellRadius(cell.balance, p.balance, p.cells.length, startBal);
+                cell.radius = calculateCellRadius(cell.balance, totalMass, p.cells.length, massStart);
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
                 const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
@@ -3448,7 +3654,7 @@ io.on('connection', (socket) => {
             }
 
             // REMOVE RANK BONUS: Pay out only the server-side balance
-            const totalCashout = activePlayer.balance;
+            const totalCashout = arenaCashoutUsd(activePlayer);
             const mongoId = activePlayer.mongoId;
 
             try {
@@ -3573,6 +3779,9 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
+        if (room.isCompetitiveSlither) {
+            removeCompetitiveSpectator(room, socket.id);
+        }
         const p = room.players.find(pl => pl.id === socket.id);
         if (p) {
             p.disconnected = true;
@@ -3583,6 +3792,15 @@ io.on('connection', (socket) => {
                 console.log(`🗑️ Removed disconnected player ${p.username} after timeout`);
             }, 5 * 60 * 1000);
         }
+    });
+
+    socket.on('slitherSpectateCam', ({ x, y }) => {
+        const room = getArenaRoomById(socket.roomId);
+        if (!room?.isCompetitiveSlither) return;
+        const spec = room.competitiveSpectators?.find(s => s.id === socket.id);
+        if (!spec) return;
+        spec.x = Number(x) || 0;
+        spec.y = Number(y) || 0;
     });
 
     socket.on('slitherInput', ({ dx, dy, boost }) => {
@@ -3607,29 +3825,32 @@ io.on('connection', (socket) => {
 });
 
 function getArenaRoomById(roomId) {
-    if (roomId === competitiveSlitherRoom.id) return competitiveSlitherRoom;
+    const compRoom = findCompetitiveSlitherRoomById(roomId);
+    if (compRoom) return compRoom;
     return rooms.find(r => r.id === roomId);
 }
 
 function processCompetitiveSlitherTick() {
-    if (competitiveSlitherRoom.isResetting) return;
-    const resetTime = competitiveSlitherRoom.startTime + c.roomDuration;
-    const humanCount = competitiveSlitherRoom.players.filter(p => !p.disconnected).length;
-    syncCompetitiveSlitherFood(competitiveSlitherRoom, humanCount);
-    const lb = processCompetitiveSlitherRoom(
-        competitiveSlitherRoom,
-        io,
-        User,
-        Transaction,
-        resetTime,
-    );
-    broadcastCompetitiveSlitherState(competitiveSlitherRoom, io, lb, {
-        resetTime,
-        solPrice: SOL_PRICE_USD,
-        isResetting: competitiveSlitherRoom.isResetting,
-        zone: getCompetitiveZone(resetTime),
-        competitiveSlither: true,
-    });
+    for (const room of competitiveSlitherRooms) {
+        if (room.isResetting) continue;
+        const resetTime = room.startTime + c.roomDuration;
+        const humanCount = room.players.filter(p => !p.disconnected).length;
+        syncCompetitiveSlitherFood(room, humanCount);
+        const lb = processCompetitiveSlitherRoom(
+            room,
+            io,
+            User,
+            Transaction,
+            resetTime,
+        );
+        broadcastCompetitiveSlitherState(room, io, lb, {
+            resetTime,
+            solPrice: SOL_PRICE_USD,
+            isResetting: room.isResetting,
+            zone: getCompetitiveZone(resetTime),
+            competitiveSlither: true,
+        });
+    }
 }
 
 function getBattleRoyaleDeps() {
@@ -3732,20 +3953,22 @@ function processRoom(room) {
         // Slither players use server-side physics in slither-engine — skip Agar cell physics
         if (player.mode === 'slither') return;
 
-        const pStartBal = player.isBot
-            ? (player.botStake ?? player.cells[0]?.balance ?? c.botStartBalance)
-            : playerStartBalance(player);
+        const massStart = playerMassStart(player);
+        const dollarStart = player.isBot
+            ? (player.botStake ?? player.dollarBalance ?? c.botStartBalance)
+            : playerDollarStart(player);
 
         // 0. Avancerad AI-logik för bottar
         if (player.isBot) {
             const botCells = player.cells;
             if (botCells.length === 0) return;
 
-            // SJÄLVSANERING: Despawn om botten blir för stor
-            const totalBotBalance = botCells.reduce((sum, cl) => sum + cl.balance, 0);
+            // SJÄLVSANERING: Despawn om botten blir för stor (dollar, not mass)
+            const totalBotMass = playerTotalMass(player);
+            const botWealth = player.dollarBalance ?? player.balance ?? 0;
             const botMax = getEconomy(room.entryFeeUsd).botMaxBalance;
-            if (totalBotBalance > botMax) {
-                room.foodPoolBalance += totalBotBalance;
+            if (botWealth > botMax) {
+                room.foodPoolBalance += botWealth;
                 room.bots = room.bots.filter(b => b.id !== player.id);
                 if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
                 return;
@@ -3762,15 +3985,15 @@ function processRoom(room) {
                 if (u.id === player.id) return;
                 u.cells.forEach(c2 => {
                     const d = Math.hypot(c2.x - head.x, c2.y - head.y);
-                    const otherTotalBalance = u.cells.reduce((s, cl) => s + cl.balance, 0);
+                    const otherTotalMass = playerTotalMass(u);
 
                     // HOT: Om någon är 10% större (enligt tidigare önskemål)
-                    if (otherTotalBalance > totalBotBalance * 1.10 && d < minDistThreat) {
+                    if (otherTotalMass > totalBotMass * 1.10 && d < minDistThreat) {
                         minDistThreat = d;
                         threat = c2;
                     }
                     // BYTE: Om någon är liten nog att ätas
-                    else if (totalBotBalance > otherTotalBalance * 1.10 && d < minDistPrey) {
+                    else if (totalBotMass > otherTotalMass * 1.10 && d < minDistPrey) {
                         minDistPrey = d;
                         targetPrey = c2;
                     }
@@ -3778,7 +4001,7 @@ function processRoom(room) {
             });
 
             // VIRUS: Undvik om vi är stora nog att sprängas
-            if (totalBotBalance > 5.0) {
+            if (totalBotMass > 5.0) {
                 room.viruses.forEach(v => {
                     const d = Math.hypot(v.x - head.x, v.y - head.y);
                     if (d < head.radius + 150 && d < minDistThreat) {
@@ -3852,7 +4075,7 @@ function processRoom(room) {
         }
 
         if (!player.isBot) {
-            applyAgarWealthTax(player, room, pStartBal);
+            applyAgarWealthTax(player, room, dollarStart);
         }
 
         // 2. Hantera kollisioner och merging
@@ -3869,22 +4092,37 @@ function processRoom(room) {
 
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
-                        cell.balance += item.data.balance || foodBlobValueForRoom(room);
-                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
+                        applyAgarFoodPickup(cell, item.data, player, room);
+                        cell.radius = calculateCellRadius(
+                            cell.balance,
+                            playerTotalMass(player),
+                            player.cells.length,
+                            massStart,
+                        );
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance;
-                        cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
+                        cell.radius = calculateCellRadius(
+                            cell.balance,
+                            playerTotalMass(player),
+                            player.cells.length,
+                            massStart,
+                        );
                         room.ejected = room.ejected.filter(e => e.id !== item.data.id);
                     }
                 } else if (item.type === 'virus') {
-                    // Virusexplosion baserat på balans
-                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > pStartBal * 2) {
+                    // Virusexplosion baserat på massa
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > massStart * 2) {
                         if (player.cells.length < c.maxCells) {
                             cell.balance /= 2;
-                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
+                            cell.radius = calculateCellRadius(
+                                cell.balance,
+                                playerTotalMass(player),
+                                player.cells.length,
+                                massStart,
+                            );
                             player.cells.push({
                                 id: Math.random().toString(36).substr(2, 9),
                                 x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now()
@@ -3907,7 +4145,12 @@ function processRoom(room) {
                             // Om din mittpunkt är inne i den andra cellen
                             if (d < Math.max(r, r2) * 0.9) {
                                 cell.balance += otherCell.balance;
-                                cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
+                                cell.radius = calculateCellRadius(
+                                    cell.balance,
+                                    playerTotalMass(player),
+                                    player.cells.length,
+                                    massStart,
+                                );
                                 cellsToDelete.add(otherCell.id);
                             }
                             // Ingen repulsion när vi kan merga, så de kan "pressas ihop" mjukt
@@ -3922,14 +4165,20 @@ function processRoom(room) {
                         // EXTERNAL: Eat
                         // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r + r2 * 0.2)
                         if (cell.balance > otherCell.balance * 1.05 && d < (r + r2 * 0.1)) {
-                            // EKONOMI: Absorberar 100% av balansen
+                            // EKONOMI: Absorberar 100% av cellmassan + proportionell dollar-andel
                             cell.balance += otherCell.balance;
-                            cell.radius = calculateCellRadius(cell.balance, player.balance, player.cells.length, pStartBal);
                             const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
+                            if (victim) transferAgarDollars(victim, player, otherCell.balance);
+                            cell.radius = calculateCellRadius(
+                                cell.balance,
+                                playerTotalMass(player),
+                                player.cells.length,
+                                massStart,
+                            );
                             if (victim) {
                                 const willEliminate = !victim.isBot && victim.cells.length === 1 && victim.cells[0].id === otherCell.id;
                                 const balanceAtDeath = willEliminate
-                                    ? victim.cells.reduce((s, c) => s + c.balance, 0)
+                                    ? (victim.dollarBalance ?? victim.cells.reduce((s, c) => s + c.balance, 0))
                                     : 0;
 
                                 victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
@@ -3981,8 +4230,8 @@ function processRoom(room) {
             totalY += cell.y;
         });
 
-        // Balansen är summan av cellernas balans
-        player.balance = player.cells.reduce((s, cell) => s + cell.balance, 0);
+        // HUD / cashout balance is dollars; cell.balance is mass
+        player.balance = player.dollarBalance ?? player.cells.reduce((s, cell) => s + cell.balance, 0);
 
         if (player.cells.length > 0) {
             player.x = totalX / player.cells.length;
@@ -4007,7 +4256,12 @@ function processRoom(room) {
 
     // Skicka leaderboard separat för prestanda (Inkludera bottar)
     const leaderboardData = allUsers
-        .map(p => ({ id: p.id, name: p.username, massTotal: p.balance, balance: p.balance }))
+        .map(p => ({
+            id: p.id,
+            name: p.username,
+            massTotal: arenaCashoutUsd(p),
+            balance: arenaCashoutUsd(p),
+        }))
         .sort((a, b) => b.balance - a.balance)
         .slice(0, 10);
 
