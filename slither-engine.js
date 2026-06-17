@@ -7,7 +7,7 @@ export const SLITHER = {
     slitherGameRadius: 21600,
     spawnSegments: 12,
     maxSegments: 500,
-    segmentsPerCent: 0.2,
+    segmentsPerCent: 0.055,
     maxScale: 6,
     scaleDivisor: 106,
     baseRadius: 6.2,
@@ -142,6 +142,14 @@ export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
 export function headRadiusForBalance(balance, referenceBalance = 1.0) {
     const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
     return SLITHER.baseRadius * sc;
+}
+
+export function segmentSpacingForSegmentCount(sct) {
+    return SLITHER.segmentSepFactor * scaleForSegmentCount(sct);
+}
+
+export function headRadiusForSegmentCount(sct) {
+    return SLITHER.baseRadius * scaleForSegmentCount(sct);
 }
 
 export function segmentSpacingForBalance(balance, referenceBalance = 1.0) {
@@ -298,6 +306,7 @@ export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
         targetX: x,
         targetY: y,
         angle,
+        fam: 0,
     };
 }
 
@@ -381,6 +390,35 @@ function applySlitherFoodPickup(snake, food, room) {
         snake.dollarBalance = (snake.dollarBalance || 0) + dollarGain;
     } else {
         snake.balance += dollarGain;
+    }
+    snake.fam = (snake.fam || 0) + massGain / famVolumeForSegment(snake.segments.length);
+    applyFamGrowth(snake);
+}
+
+/** Slither.io-style gradual length growth via fam fullness before adding a segment. */
+function famVolumeForSegment(sct) {
+    const sc = scaleForSegmentCount(sct);
+    return 0.018 + sc * 0.0042 + sct * 0.00035;
+}
+
+function applyFamGrowth(snake) {
+    if (snake.fam == null) snake.fam = 0;
+    while (snake.fam >= 1 && snake.segments.length < SLITHER.maxSegments) {
+        snake.fam -= 1;
+        const spacing = segmentSpacingForSegmentCount(snake.segments.length);
+        growSnakeSegments(snake.segments, snake.segments.length + 1, spacing);
+    }
+}
+
+function applyFamShrink(snake, massLost) {
+    if (snake.fam == null) snake.fam = 0;
+    const sct = snake.segments.length;
+    const vol = famVolumeForSegment(sct);
+    snake.fam -= massLost / vol;
+    while (snake.fam < 0 && snake.segments.length > SLITHER.spawnSegments) {
+        snake.fam += 1;
+        const spacing = segmentSpacingForSegmentCount(snake.segments.length);
+        growSnakeSegments(snake.segments, snake.segments.length - 1, spacing);
     }
 }
 
@@ -567,11 +605,10 @@ function updateSnakeMovement(snake, room = null) {
         const cost = Math.min(SLITHER.boostCostPerTick, snake.balance - minBal);
         snake.balance -= cost;
         room.foodPoolBalance += cost;
+        applyFamShrink(snake, cost);
     }
 
-    const spacing = segmentSpacingForBalance(snake.balance);
-    const targetCount = balanceToSegmentCount(snake.balance);
-    growSnakeSegments(snake.segments, targetCount, spacing);
+    const spacing = segmentSpacingForSegmentCount(snake.segments.length);
     updateSnakeBodyFromPath(snake, spacing);
 
     if (snake.x !== undefined) {
@@ -885,7 +922,7 @@ function serializeSnake(snake, isYou) {
         sct,
         angle: snake.angle || 0,
         sc,
-        radius: headRadiusForBalance(snake.balance),
+        radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
     };
@@ -968,6 +1005,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                     snake.balance -= actual;
                 }
                 room.foodPoolBalance += actual;
+                applyFamShrink(snake, actual);
             }
             if (snake.dollarBalance != null) {
                 snake.dollarBalance = Math.max(minDollars, snake.dollarBalance);
@@ -1136,6 +1174,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         inputDy: Math.sin(angle),
         boost: false,
         angle,
+        fam: 0,
         segments: createSegments(x, y, balance, angle),
         screenWidth: 1920,
         screenHeight: 1080,
@@ -1256,11 +1295,10 @@ function updateCompetitiveSnakeMovement(snake) {
     if (canBoost) {
         const cost = Math.min(SLITHER.boostCostPerTick, snake.balance - minMass);
         snake.balance -= cost;
+        applyFamShrink(snake, cost);
     }
 
-    const spacing = segmentSpacingForBalance(snake.balance, massRef);
-    const targetCount = balanceToSegmentCount(snake.balance, massRef);
-    growSnakeSegments(snake.segments, targetCount, spacing);
+    const spacing = segmentSpacingForSegmentCount(snake.segments.length);
     updateSnakeBodyFromPath(snake, spacing);
 
     snake.x = head.x;
@@ -1289,10 +1327,13 @@ function checkCompetitiveFoodCollisions(snake, room) {
         const fdy = mouth.y - f.y;
         if (Math.abs(fdy) > reach) continue;
         if (foodWithinPickup(snake, f.x, f.y, foodR, mouth)) {
-            snake.balance += f.balance;
+            const gain = f.balance;
+            snake.balance += gain;
             if (f.dollarValue > 1e-9) {
                 snake.dollarBalance = (snake.dollarBalance || 0) + f.dollarValue;
             }
+            snake.fam = (snake.fam || 0) + gain / famVolumeForSegment(snake.segments.length);
+            applyFamGrowth(snake);
             room.slitherFood.splice(i, 1);
         }
     }
@@ -1430,6 +1471,7 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
         inputDy: Math.sin(angle),
         boost: false,
         angle,
+        fam: 0,
         segments: createSegments(x, y, startMass, angle),
         screenWidth: 1920,
         screenHeight: 1080,
@@ -1437,8 +1479,7 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
 }
 
 function serializeCompetitiveSnake(snake, isYou) {
-    const massRef = competitiveMinMass(snake.entryFeeUsd);
-    const sct = balanceToSegmentCount(snake.balance, massRef);
+    const sct = snake.segments.length;
     const sc = scaleForSegmentCount(sct);
     const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
     return {
@@ -1453,7 +1494,7 @@ function serializeCompetitiveSnake(snake, isYou) {
         sct,
         angle: snake.angle || 0,
         sc,
-        radius: headRadiusForBalance(snake.balance, massRef),
+        radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
     };
