@@ -398,7 +398,8 @@ function applySlitherFoodPickup(snake, food, room) {
 /** Slither.io-style gradual length growth via fam fullness before adding a segment. */
 function famVolumeForSegment(sct) {
     const sc = scaleForSegmentCount(sct);
-    return 0.018 + sc * 0.0042 + sct * 0.00035;
+    // Higher volume = slower segment adds per pellet (subtle, gradual growth).
+    return 0.09 + sc * 0.022 + sct * 0.0016;
 }
 
 function applyFamGrowth(snake) {
@@ -922,6 +923,7 @@ function serializeSnake(snake, isYou) {
         sct,
         angle: snake.angle || 0,
         sc,
+        fam: snake.fam ?? 0,
         radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
@@ -1494,6 +1496,7 @@ function serializeCompetitiveSnake(snake, isYou) {
         sct,
         angle: snake.angle || 0,
         sc,
+        fam: snake.fam ?? 0,
         radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
