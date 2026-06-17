@@ -1346,6 +1346,9 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
         y: head?.y ?? snake.y ?? 0,
         dollarBalance: snake.dollarBalance,
     });
+    if (room._lastCompFoodByPlayer) {
+        delete room._lastCompFoodByPlayer[socketId];
+    }
 
     io.to(socketId).emit('RIP');
     room.players = room.players.filter(p => p.id !== snake.id);
@@ -1518,7 +1521,10 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
 
         let visibleFood = [];
-        if (sendFoodThisTick || !room._lastCompFoodByPlayer?.[socketId]) {
+        const refreshFood = spectating
+            || sendFoodThisTick
+            || !room._lastCompFoodByPlayer?.[socketId];
+        if (refreshFood) {
             visibleFood = room.slitherFood
                 .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
                 .map(f => ({
@@ -1538,8 +1544,10 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 });
                 visibleFood = visibleFood.slice(0, MAX_VISIBLE_FOOD);
             }
-            if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
-            room._lastCompFoodByPlayer[socketId] = visibleFood;
+            if (!spectating) {
+                if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
+                room._lastCompFoodByPlayer[socketId] = visibleFood;
+            }
         } else {
             visibleFood = room._lastCompFoodByPlayer[socketId] || [];
         }
