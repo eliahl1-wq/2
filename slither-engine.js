@@ -393,7 +393,7 @@ function pathArcLength(path) {
 }
 
 const MAX_SNAKE_PATH_POINTS = 420;
-const MIN_HEAD_PATH_DIST = 0.35;
+const MIN_HEAD_PATH_DIST = 0.14;
 
 /** Trim oldest path points once the trail is longer than we need for the spine. */
 function trimSnakePath(path, maxArcLength) {
@@ -480,7 +480,7 @@ function updateSnakeBodyFromPath(snake, spacing) {
         snake.path = path;
     }
 
-    const minRecord = Math.max(0.5, spacing * MIN_HEAD_PATH_DIST);
+    const minRecord = Math.max(0.22, spacing * MIN_HEAD_PATH_DIST);
     if (dist(path[0].x, path[0].y, head.x, head.y) > minRecord) {
         path.unshift({ x: head.x, y: head.y });
     } else {
@@ -847,7 +847,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
     return lostDollars;
 }
 
-const MAX_NETWORK_SEGMENTS = 96;
+const MAX_NETWORK_SEGMENTS = 120;
 const MAX_VISIBLE_FOOD = 320;
 const SLITHER_FOOD_VIEW_EXTRA = 750;
 const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
