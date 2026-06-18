@@ -822,6 +822,11 @@ function snakeMouthPoint(snake) {
 }
 
 function rememberSnakeMouthBeforeMove(snake) {
+    const head = snake.segments?.[0];
+    if (head) {
+        snake._prevHeadX = head.x;
+        snake._prevHeadY = head.y;
+    }
     const mouth = snakeMouthPoint(snake);
     snake._prevMouthX = mouth.x;
     snake._prevMouthY = mouth.y;
@@ -850,16 +855,38 @@ function checkSelfCollision(_snake) {
 function checkSnakeCollisions(snake, allSnakes) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return null;
     const head = snake.segments[0];
+    if (!head) return null;
     const r = headRadiusForBalance(snake.balance);
+    const headReach = r * 0.72;
+    const px = snake._prevHeadX;
+    const py = snake._prevHeadY;
+    const hasSweep = px != null && py != null;
+
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
         if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) continue;
-        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 3)) {
-            const seg = other.segments[i];
-            const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
-            if (dist(head.x, head.y, seg.x, seg.y) < r * 0.65 + segR * 0.45) {
-                return other;
-            }
+        const segs = other.segments;
+        if (!segs?.length) continue;
+
+        const otherR = headRadiusForBalance(other.balance);
+        const bodyR = otherR * 0.72;
+        const spacing = segmentSpacingForBalance(other.balance);
+        const bodyReach = segs.length * spacing + otherR + headReach + 40;
+        if (dist(head.x, head.y, segs[0].x, segs[0].y) > bodyReach) continue;
+
+        for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            const segR = i === 0 ? otherR * 0.82 : bodyR;
+            const pointHit = headReach + segR * 0.52;
+
+            if (dist(head.x, head.y, seg.x, seg.y) < pointHit) return other;
+            if (hasSweep && distPointToSegment(seg.x, seg.y, px, py, head.x, head.y) < pointHit) return other;
+
+            if (i === 0) continue;
+            const prev = segs[i - 1];
+            const lineHit = headReach + bodyR * 0.48;
+            if (distPointToSegment(head.x, head.y, prev.x, prev.y, seg.x, seg.y) < lineHit) return other;
+            if (hasSweep && distPointToSegment(px, py, prev.x, prev.y, seg.x, seg.y) < lineHit) return other;
         }
     }
     return null;
@@ -1127,6 +1154,7 @@ function serializeSnake(snake, isYou) {
         id: snake.id,
         name: snake.username,
         balance: snake.balance,
+        dollarBalance: snake.dollarBalance ?? snake.balance,
         color: snake.color,
         isBot: !!snake.isBot,
         isYou,
