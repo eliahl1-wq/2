@@ -3851,8 +3851,11 @@ function getSandboxRoomById(roomId) {
 function processCompetitiveSlitherTick() {
     for (const room of competitiveSlitherRooms) {
         if (room.isResetting) continue;
-        const resetTime = room.startTime + c.roomDuration;
         const humanCount = room.players.filter(p => !p.disconnected).length;
+        const spectatorCount = room.competitiveSpectators?.length ?? 0;
+        if (humanCount === 0 && spectatorCount === 0) continue;
+
+        const resetTime = room.startTime + c.roomDuration;
         syncCompetitiveSlitherFood(room, humanCount);
         const lb = processCompetitiveSlitherRoom(
             room,

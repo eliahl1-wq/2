@@ -608,6 +608,15 @@ export function setupSandbox(io, deps) {
             if (!socket.sandboxMode) return;
             const room = getSandboxRoom(socket.sandboxMode);
             room.players = room.players.filter(p => p.id !== socket.id);
+            if (room.players.length === 0) {
+                room.slitherBots = [];
+                room.bots = [];
+                room.slitherFood = [];
+                room.food = [];
+                room.sandboxStaticWorms = [];
+                room.ejected = [];
+                room.sandboxPaused = false;
+            }
         });
     });
 
