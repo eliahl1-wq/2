@@ -56,6 +56,7 @@ import {
     BR,
 } from './battle-royale.js';
 import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
+import { validateBRWalletsOnStartup } from './br-wallets.js';
 
 // --- SOLANA KONFIGURATION ---
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
@@ -144,6 +145,8 @@ const corsOptions = {
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma', 'X-Presence-Id'],
 };
+
+const app = express();
 
 // Always answer preflight + attach ACAO even if a route throws (e.g. during Railway restarts)
 app.use((req, res, next) => {
@@ -3928,11 +3931,11 @@ function processRoom(room) {
     if (room.isResetting) return; // Pause during global reset
 
     const isSandbox = room.isSandbox === true;
+    const agarHumans = countActiveHumansByMode(room, 'agar');
+    const slitherHumans = countActiveHumansByMode(room, 'slither');
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     if (!isSandbox || room.sandboxAutoBots) {
-    const agarHumans = countActiveHumansByMode(room, 'agar');
-    const slitherHumans = countActiveHumansByMode(room, 'slither');
     const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
     const slitherHumansInArena = effectiveHumanCountForBots(room, 'slither');
 
