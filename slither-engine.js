@@ -957,6 +957,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 
 const MAX_NETWORK_SEGMENTS = 120;
 const MAX_VISIBLE_FOOD = 320;
+const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
 const SLITHER_FOOD_VIEW_EXTRA = 750;
 const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
 
@@ -1146,6 +1147,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
     room._slitherBroadcastTick = (room._slitherBroadcastTick || 0) + 1;
     const sendFoodThisTick = room._slitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
+    const sendMinimapThisTick = room._slitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
     room.players
         .filter(p => p.mode === 'slither' && !p.disconnected)
@@ -1164,7 +1166,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 })
                 .map(({ entity: s }) => serializeSnake(s, s.id === p.id));
 
-            let visibleFood = [];
+            let visibleFood = null;
             if (sendFoodThisTick || !room._lastSlitherFoodByPlayer?.[p.id]) {
                 visibleFood = room.slitherFood
                     .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
@@ -1187,52 +1189,57 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 }
                 if (!room._lastSlitherFoodByPlayer) room._lastSlitherFoodByPlayer = {};
                 room._lastSlitherFoodByPlayer[p.id] = visibleFood;
-            } else {
-                visibleFood = room._lastSlitherFoodByPlayer[p.id] || [];
             }
 
-            const minimapPlayers = allSnakes.map(({ entity: s }) => {
-                const h = s.segments[0];
-                if (!h) return null;
-                if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange)) return null;
-                return {
-                    x: Math.round(h.x),
-                    y: Math.round(h.y),
-                    you: s.id === p.id,
+            let minimap = null;
+            if (sendMinimapThisTick || !room._lastSlitherMinimapByPlayer?.[p.id]) {
+                const minimapPlayers = allSnakes.map(({ entity: s }) => {
+                    const h = s.segments[0];
+                    if (!h) return null;
+                    if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange)) return null;
+                    return {
+                        x: Math.round(h.x),
+                        y: Math.round(h.y),
+                        you: s.id === p.id,
+                    };
+                }).filter(Boolean);
+
+                const minimapFood = room.slitherFood
+                    .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange))
+                    .map(f => ({
+                        x: Math.round(f.x),
+                        y: Math.round(f.y),
+                        g: !!f.golden,
+                        h: f.hue,
+                    }));
+                if (minimapFood.length > 200) {
+                    minimapFood.sort((a, b) => {
+                        const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                        const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                        return da - db;
+                    });
+                    minimapFood.length = 200;
+                }
+
+                minimap = {
+                    players: minimapPlayers,
+                    food: minimapFood,
                 };
-            }).filter(Boolean);
-
-            const minimapFood = room.slitherFood
-                .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange))
-                .map(f => ({
-                    x: Math.round(f.x),
-                    y: Math.round(f.y),
-                    g: !!f.golden,
-                    h: f.hue,
-                }));
-            if (minimapFood.length > 200) {
-                minimapFood.sort((a, b) => {
-                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
-                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
-                    return da - db;
-                });
-                minimapFood.length = 200;
+                if (!room._lastSlitherMinimapByPlayer) room._lastSlitherMinimapByPlayer = {};
+                room._lastSlitherMinimapByPlayer[p.id] = minimap;
             }
 
-            const minimap = {
-                players: minimapPlayers,
-                food: minimapFood,
-            };
-
-            io.to(p.id).emit('slitherTick', {
+            const tickPayload = {
                 you: p.id,
                 snakes: visibleSnakes,
-                food: visibleFood,
                 worldHalf: room.sandboxWorldHalf ?? SLITHER.worldHalf,
-                minimap,
                 ...meta,
                 ...(meta.battleRoyale ? {} : { balance: p.dollarBalance ?? p.balance }),
-            });
+            };
+            if (visibleFood) tickPayload.food = visibleFood;
+            if (minimap) tickPayload.minimap = minimap;
+
+            io.to(p.id).emit('slitherTick', tickPayload);
         });
 }
 
@@ -1631,6 +1638,7 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
 
     room._compSlitherBroadcastTick = (room._compSlitherBroadcastTick || 0) + 1;
     const sendFoodThisTick = room._compSlitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
+    const sendMinimapThisTick = room._compSlitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
     const emitTickToViewer = (viewer) => {
         const { socketId, viewX, viewY, youId, dollarBalance, spectating } = viewer;
@@ -1647,7 +1655,7 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             })
             .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
 
-        let visibleFood = [];
+        let visibleFood = null;
         const refreshFood = spectating
             || sendFoodThisTick
             || !room._lastCompFoodByPlayer?.[socketId];
@@ -1675,47 +1683,53 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
                 room._lastCompFoodByPlayer[socketId] = visibleFood;
             }
-        } else {
-            visibleFood = room._lastCompFoodByPlayer[socketId] || [];
         }
 
-        const minimapPlayers = allSnakes.map(({ entity: s }) => {
-            const h = s.segments[0];
-            if (!h) return null;
-            if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange * 0.65)) return null;
-            return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === youId };
-        }).filter(Boolean);
+        let minimap = null;
+        if (sendMinimapThisTick || spectating || !room._lastCompMinimapByPlayer?.[socketId]) {
+            const minimapPlayers = allSnakes.map(({ entity: s }) => {
+                const h = s.segments[0];
+                if (!h) return null;
+                if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange * 0.65)) return null;
+                return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === youId };
+            }).filter(Boolean);
 
-        const minimapFood = room.slitherFood
-            .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange * 0.65))
-            .map(f => ({
-                x: Math.round(f.x),
-                y: Math.round(f.y),
-                g: !!f.golden,
-                h: f.hue,
-            }));
-        if (minimapFood.length > 200) {
-            minimapFood.sort((a, b) => {
-                const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
-                const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
-                return da - db;
-            });
-            minimapFood.length = 200;
+            const minimapFood = room.slitherFood
+                .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange * 0.65))
+                .map(f => ({
+                    x: Math.round(f.x),
+                    y: Math.round(f.y),
+                    g: !!f.golden,
+                    h: f.hue,
+                }));
+            if (minimapFood.length > 200) {
+                minimapFood.sort((a, b) => {
+                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                    return da - db;
+                });
+                minimapFood.length = 200;
+            }
+
+            minimap = { players: minimapPlayers, food: minimapFood };
+            if (!room._lastCompMinimapByPlayer) room._lastCompMinimapByPlayer = {};
+            room._lastCompMinimapByPlayer[socketId] = minimap;
         }
 
-        io.to(socketId).emit('slitherTick', {
+        const tickPayload = {
             you: youId,
             spectating: !!spectating,
             snakes: visibleSnakes,
-            food: visibleFood,
             worldHalf: COMPETITIVE_SLITHER.worldHalf,
-            minimap: { players: minimapPlayers, food: minimapFood },
             competitiveSlither: true,
             circularMap: true,
-            zone: meta.zone,
             dollarBalance,
             ...meta,
-        });
+        };
+        if (visibleFood) tickPayload.food = visibleFood;
+        if (minimap) tickPayload.minimap = minimap;
+
+        io.to(socketId).emit('slitherTick', tickPayload);
     };
 
     room.players
