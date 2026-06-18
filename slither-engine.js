@@ -402,12 +402,14 @@ function famVolumeForSegment(sct) {
     return 0.09 + sc * 0.022 + sct * 0.0016;
 }
 
-function applyFamGrowth(snake) {
+function applyFamGrowth(snake, maxAdd = 1) {
     if (snake.fam == null) snake.fam = 0;
-    while (snake.fam >= 1 && snake.segments.length < SLITHER.maxSegments) {
+    let added = 0;
+    while (snake.fam >= 1 && snake.segments.length < SLITHER.maxSegments && added < maxAdd) {
         snake.fam -= 1;
         const spacing = segmentSpacingForSegmentCount(snake.segments.length);
         growSnakeSegments(snake.segments, snake.segments.length + 1, spacing);
+        added++;
     }
 }
 
