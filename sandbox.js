@@ -12,11 +12,17 @@ import {
     createSlitherBot,
     processSlitherRoom,
     broadcastSlitherState,
+    trimSlitherFood,
 } from './slither-engine.js';
 import { DEFAULT_ENTRY_FEE, getEconomy } from './economy.js';
 import * as util from './utils.js';
 
 const SANDBOX_POOL = 1_000_000;
+const MAX_SANDBOX_FOOD = 400;
+const MAX_SANDBOX_BOTS = 12;
+const MAX_SANDBOX_BOTS_PER_SPAWN = 8;
+const MAX_SANDBOX_STATIC_WORMS = 10;
+const SANDBOX_PAUSED_BROADCAST_INTERVAL = 4;
 
 function defaultZone(worldHalf) {
     return {
@@ -263,14 +269,17 @@ export function applySandboxAction(mode, action, params = {}) {
             return { zone: getSandboxZone(room) };
 
         case 'spawnBots': {
-            const count = Math.max(1, Math.min(30, Number(params.count) || 3));
+            const count = Math.max(1, Math.min(MAX_SANDBOX_BOTS_PER_SPAWN, Number(params.count) || 3));
             const stake = Number(params.balance) || 5;
             if (room.mode === 'slither') {
-                for (let i = 0; i < count; i++) {
+                const roomCap = Math.max(0, MAX_SANDBOX_BOTS - room.slitherBots.length);
+                const spawnCount = Math.min(count, roomCap);
+                for (let i = 0; i < spawnCount; i++) {
                     const bot = createSlitherBot(room, stake);
                     if (params.balance) setSnakeBalance(bot, stake);
                     room.slitherBots.push(bot);
                 }
+                return { spawned: spawnCount, mode: room.mode, capped: spawnCount < count };
             } else {
                 room.aiBudgetBalance = SANDBOX_POOL;
                 // addBots is injected via deps in setup — use direct spawn
@@ -298,6 +307,7 @@ export function applySandboxAction(mode, action, params = {}) {
                         dollarValue: eco.foodBlobValue,
                     });
                 }
+                trimSlitherFood(room, MAX_SANDBOX_FOOD);
             } else {
                 for (let i = 0; i < count; i++) {
                     const w = room.sandboxWorldHalf * 2;
@@ -316,6 +326,9 @@ export function applySandboxAction(mode, action, params = {}) {
         }
 
         case 'addStaticWorm': {
+            if ((room.sandboxStaticWorms?.length ?? 0) >= MAX_SANDBOX_STATIC_WORMS) {
+                return { error: `Max ${MAX_SANDBOX_STATIC_WORMS} static worms` };
+            }
             const spawnParams = { ...params };
             const human = room.players.find(p => !p.disconnected && p.segments?.[0]);
             if (human && params.useCustomPosition !== true) {
@@ -552,11 +565,12 @@ export function setupSandbox(io, deps) {
                 const room = getSandboxRoom(gameMode);
 
                 if (action === 'spawnBots') {
-                    const count = Math.max(1, Math.min(30, Number(params?.count) || 3));
+                    const count = Math.max(1, Math.min(MAX_SANDBOX_BOTS_PER_SPAWN, Number(params?.count) || 3));
                     const stake = Number(params?.balance) || 5;
                     if (gameMode === 'slither') {
                         room.aiBudgetBalance = SANDBOX_POOL;
-                        addSlitherBots(room, count, stake);
+                        const roomCap = Math.max(0, MAX_SANDBOX_BOTS - room.slitherBots.length);
+                        addSlitherBots(room, Math.min(count, roomCap), stake);
                     } else {
                         room.aiBudgetBalance = SANDBOX_POOL;
                         addBots(room, count, stake);
@@ -598,24 +612,26 @@ export function setupSandbox(io, deps) {
     });
 
     // Sandbox tick — runs alongside main loop
+    let sandboxTickCounter = 0;
     setInterval(() => {
+        sandboxTickCounter += 1;
         for (const key of ['agar', 'slither']) {
             const room = sandboxRooms[key];
             if (!room || room.players.length === 0) continue;
-
-            const zone = getSandboxZone(room);
 
             if (key === 'slither') {
                 let lb = buildStaticLeaderboard(room);
                 if (!room.sandboxPaused) {
                     lb = processSlitherRoom(room, io, User, null);
+                } else if (sandboxTickCounter % SANDBOX_PAUSED_BROADCAST_INTERVAL !== 0) {
+                    continue;
                 }
                 broadcastSlitherState(room, io, lb, buildSlitherMeta(room));
             } else {
                 getSandboxZone(room);
                 if (!room.sandboxPaused) {
                     processRoom(room);
-                } else {
+                } else if (sandboxTickCounter % SANDBOX_PAUSED_BROADCAST_INTERVAL === 0) {
                     broadcastSandboxAgar(room, io, deps);
                 }
             }

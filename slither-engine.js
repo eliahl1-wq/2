@@ -83,7 +83,7 @@ function clearSlitherFood(room) {
     room.slitherFood.length = 0;
 }
 
-function trimSlitherFood(room, targetCount) {
+export function trimSlitherFood(room, targetCount) {
     const protectedFood = room.slitherFood.filter(f => f.golden || f.deathDrop);
     let normal = room.slitherFood.filter(f => !f.golden && !f.deathDrop);
 
@@ -810,24 +810,65 @@ function checkSnakeCollisions(snake, allSnakes) {
     return null;
 }
 
-function checkFoodCollisions(snake, room) {
+const SLITHER_FOOD_CELL = 64;
+
+function buildSlitherFoodGrid(food) {
+    const grid = new Map();
+    for (const f of food) {
+        const cx = Math.floor(f.x / SLITHER_FOOD_CELL);
+        const cy = Math.floor(f.y / SLITHER_FOOD_CELL);
+        const key = `${cx},${cy}`;
+        let bucket = grid.get(key);
+        if (!bucket) {
+            bucket = [];
+            grid.set(key, bucket);
+        }
+        bucket.push(f);
+    }
+    return grid;
+}
+
+function checkFoodCollisions(snake, room, foodGrid = null) {
     const mouth = snakeMouthPoint(snake);
     const sweep = (snake._prevMouthX != null)
         ? dist(snake._prevMouthX, snake._prevMouthY, mouth.x, mouth.y)
         : 0;
+    const maxReach = foodPickupReach(mouth.r, SLITHER.foodRadius) + sweep + 8;
 
-    for (let i = room.slitherFood.length - 1; i >= 0; i--) {
-        const f = room.slitherFood[i];
+    const tryPickup = (f) => {
+        const idx = room.slitherFood.indexOf(f);
+        if (idx < 0) return false;
         const foodR = f.radius || SLITHER.foodRadius;
         const reach = foodPickupReach(mouth.r, foodR) + sweep;
         const fdx = mouth.x - f.x;
-        if (Math.abs(fdx) > reach) continue;
+        if (Math.abs(fdx) > reach) return false;
         const fdy = mouth.y - f.y;
-        if (Math.abs(fdy) > reach) continue;
-        if (foodWithinPickup(snake, f.x, f.y, foodR, mouth)) {
-            applySlitherFoodPickup(snake, f, room);
-            room.slitherFood.splice(i, 1);
+        if (Math.abs(fdy) > reach) return false;
+        if (!foodWithinPickup(snake, f.x, f.y, foodR, mouth)) return false;
+        applySlitherFoodPickup(snake, f, room);
+        room.slitherFood.splice(idx, 1);
+        return true;
+    };
+
+    if (foodGrid) {
+        const minCx = Math.floor((mouth.x - maxReach) / SLITHER_FOOD_CELL);
+        const maxCx = Math.floor((mouth.x + maxReach) / SLITHER_FOOD_CELL);
+        const minCy = Math.floor((mouth.y - maxReach) / SLITHER_FOOD_CELL);
+        const maxCy = Math.floor((mouth.y + maxReach) / SLITHER_FOOD_CELL);
+        for (let cx = minCx; cx <= maxCx; cx++) {
+            for (let cy = minCy; cy <= maxCy; cy++) {
+                const bucket = foodGrid.get(`${cx},${cy}`);
+                if (!bucket) continue;
+                for (let i = bucket.length - 1; i >= 0; i--) {
+                    tryPickup(bucket[i]);
+                }
+            }
         }
+        return;
+    }
+
+    for (let i = room.slitherFood.length - 1; i >= 0; i--) {
+        tryPickup(room.slitherFood[i]);
     }
 }
 
@@ -1008,6 +1049,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 
     const allSnakes = getAllSlitherSnakes(room);
     const toRemove = [];
+    const sandboxSkipDeathCollisions = room.isSandbox && room.sandboxInvincible;
+    const sandboxSkipFoodCollisions = sandboxSkipDeathCollisions && !room.sandboxBotAi;
+    const foodGrid = room.slitherFood.length > 80 ? buildSlitherFoodGrid(room.slitherFood) : null;
 
     for (const { entity: snake, isHuman } of allSnakes) {
         if (snake.frozen || snake.isStatic) continue;
@@ -1026,7 +1070,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
         updateSnakeMovement(snake, room);
-        checkFoodCollisions(snake, room);
+        if (!sandboxSkipFoodCollisions) {
+            checkFoodCollisions(snake, room, foodGrid);
+        }
 
         if (isHuman && !isBR && !room.isSandbox) {
             const minMass = minBalanceForSnake(snake);
@@ -1052,20 +1098,14 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             if (snake.cells?.[0]) snake.cells[0].balance = snake.dollarBalance ?? snake.balance;
         }
 
-        if (checkWallCollision(snake) || checkSelfCollision(snake)) {
-            if (room.isSandbox && room.sandboxInvincible) {
-                // No elimination in sandbox invincible mode
-            } else {
+        if (!sandboxSkipDeathCollisions) {
+            if (checkWallCollision(snake) || checkSelfCollision(snake)) {
                 toRemove.push({ snake, isHuman, killer: null });
                 continue;
             }
-        }
 
-        const hit = checkSnakeCollisions(snake, allSnakes);
-        if (hit) {
-            if (room.isSandbox && room.sandboxInvincible) {
-                // No elimination in sandbox invincible mode
-            } else {
+            const hit = checkSnakeCollisions(snake, allSnakes);
+            if (hit) {
                 toRemove.push({ snake, isHuman, killer: hit });
             }
         }
