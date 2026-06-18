@@ -135,6 +135,12 @@ export function scaleForSegmentCount(sct) {
     return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
 }
 
+/** Slither.io angular speed scale — thick snakes turn much slower. */
+export function scangForSegmentCount(sct) {
+    const sc = scaleForSegmentCount(sct);
+    return 0.13 + 0.87 * Math.pow((7 - sc) / 6, 2);
+}
+
 export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
     return segmentCountForBalance(balance, referenceBalance);
 }
@@ -521,7 +527,7 @@ function updateSnakeBodyFromPath(snake, spacing) {
         snake.path = path;
     }
 
-    const minRecord = Math.max(0.22, spacing * MIN_HEAD_PATH_DIST);
+    const minRecord = Math.max(0.12, spacing * MIN_HEAD_PATH_DIST * 0.55);
     if (dist(path[0].x, path[0].y, head.x, head.y) > minRecord) {
         path.unshift({ x: head.x, y: head.y });
     } else {
@@ -585,8 +591,8 @@ function updateSnakeMovement(snake, room = null) {
     // slither.io-style turn-rate limit: heading rotates toward the cursor
     // instead of snapping. Bigger snakes turn slower.
     const desired = Math.atan2(dy, dx);
-    const sc = scaleForSegmentCount(snake.segments.length);
-    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
+    const scang = scangForSegmentCount(snake.segments.length);
+    const maxTurn = (SLITHER.turnRate * scang) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
     let da = desired - current;
     da = Math.atan2(Math.sin(da), Math.cos(da));
@@ -1278,8 +1284,8 @@ function updateCompetitiveSnakeMovement(snake) {
     const massRef = competitiveMinMass(snake.entryFeeUsd);
 
     const desired = Math.atan2(dy, dx);
-    const sc = scaleForSegmentCount(snake.segments.length);
-    const maxTurn = (SLITHER.turnRate / (0.7 + 0.3 * sc)) / SLITHER.serverTickRate;
+    const scang = scangForSegmentCount(snake.segments.length);
+    const maxTurn = (SLITHER.turnRate * scang) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
     let da = desired - current;
     da = Math.atan2(Math.sin(da), Math.cos(da));
