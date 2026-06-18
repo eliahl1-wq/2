@@ -3211,7 +3211,7 @@ io.on('connection', (socket) => {
                     socket.id,
                     user._id,
                     username || user.username,
-                    util.randomColor(),
+                    util.randomSlitherColor(),
                     room,
                 );
 
@@ -3402,7 +3402,7 @@ io.on('connection', (socket) => {
                     socket.id,
                     user._id,
                     username || user.username,
-                    util.randomColor(),
+                    util.randomSlitherColor(),
                     room,
                     startMass,
                     startDollars,

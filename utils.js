@@ -86,6 +86,8 @@ export const findIndex = function (arr, id) {
     return -1;
 };
 
+export { randomSlitherColor } from './slither-colors.js';
+
 export const randomColor = function () {
     var color = '#' + ('00000' + (Math.random() * (1 << 24) | 0).toString(16)).slice(-6);
     var c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(color);

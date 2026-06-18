@@ -303,7 +303,7 @@ export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
         dollarBalance: botBalance,
         botStake: botBalance,
         kills: 0,
-        color: util.randomColor(),
+        color: util.randomSlitherColor(),
         segments: createSegments(x, y, startMass, angle),
         inputDx: Math.cos(angle),
         inputDy: Math.sin(angle),
