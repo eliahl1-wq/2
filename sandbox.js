@@ -5,6 +5,7 @@
 import jwt from 'jsonwebtoken';
 import {
     SLITHER,
+    COMPETITIVE_SLITHER,
     createSlitherPlayer,
     createSegments,
     addSlitherBots,
@@ -31,7 +32,8 @@ function defaultZone(worldHalf) {
 }
 
 function createSandboxRoom(mode) {
-    const worldHalf = mode === 'slither' ? SLITHER.worldHalf : 3000;
+    // Match competitive arena size — smaller map, less render/broadcast cost than full Slither.
+    const worldHalf = mode === 'slither' ? COMPETITIVE_SLITHER.worldHalf : 3000;
     return {
         id: `sandbox-${mode}`,
         mode,
@@ -314,9 +316,26 @@ export function applySandboxAction(mode, action, params = {}) {
         }
 
         case 'addStaticWorm': {
-            const worm = createStaticWorm(room, params);
+            const spawnParams = { ...params };
+            const human = room.players.find(p => !p.disconnected && p.segments?.[0]);
+            if (human && params.useCustomPosition !== true) {
+                const head = human.segments[0];
+                const a = params.angle != null ? Number(params.angle) : (human.angle ?? 0);
+                const dist = 55 + (Number(params.balance) || 5) * 4;
+                spawnParams.x = head.x + Math.cos(a + Math.PI / 2) * dist;
+                spawnParams.y = head.y + Math.sin(a + Math.PI / 2) * dist;
+                spawnParams.angle = a;
+            }
+            const worm = createStaticWorm(room, spawnParams);
             room.sandboxStaticWorms.push(worm);
-            return { id: worm.id, staticWorms: room.sandboxStaticWorms.length };
+            const wHead = worm.segments[0];
+            return {
+                id: worm.id,
+                staticWorms: room.sandboxStaticWorms.length,
+                x: wHead?.x,
+                y: wHead?.y,
+                angle: worm.angle,
+            };
         }
 
         case 'moveStaticWorm': {
