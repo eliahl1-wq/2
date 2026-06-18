@@ -100,6 +100,39 @@ function randId() {
     return Math.random().toString(36).substr(2, 9);
 }
 
+const BR_DEV_BOT_NAMES = [
+    'Sirius', 'Gota', 'Blobby', 'Wojak', 'Pepe', 'Doge', 'Sanic', 'Solo King',
+    'AgarioMaster', 'ProPlayer', 'Legit', 'Team Me', 'Spooderman', 'U Mad?',
+];
+
+/** DEV_FREE_PLAY only — pad queue to minPlayers so solo dev can test BR. */
+function fillBRQueueWithDevBots(variant, entryFeeUsd) {
+    const fee = normalizeBREntryFee(entryFeeUsd);
+    const q = getQueue(variant, fee);
+    const needed = Math.max(0, BR.minPlayers - q.length);
+    for (let i = 0; i < needed; i++) {
+        q.push({
+            socketId: `br_dev_bot_${variant}_${fee}_${randId()}`,
+            mongoId: null,
+            username: `${BR_DEV_BOT_NAMES[i % BR_DEV_BOT_NAMES.length]} [AI]`,
+            entryFeeUsd: fee,
+            joinedAt: Date.now(),
+            socket: null,
+            isBot: true,
+        });
+    }
+    if (needed > 0) {
+        console.log(`🤖 [DEV_FREE_PLAY] BR ${variant} $${fee}: added ${needed} AI (${q.length} in queue)`);
+    }
+}
+
+function clearBRDevBotsFromQueue(variant, entryFeeUsd) {
+    const q = getQueue(variant, entryFeeUsd);
+    for (let i = q.length - 1; i >= 0; i--) {
+        if (q[i].isBot) q.splice(i, 1);
+    }
+}
+
 function variantMode(variant) {
     return variant === 'slither' ? 'br-slither' : 'br-agar';
 }
@@ -240,6 +273,12 @@ function tryStartMatch(variant, entryFeeUsd, io, deps) {
         return;
     }
 
+    // Solo dev testing — skip grace wait once min players (incl. AI) are queued
+    if (deps?.DEV_FREE_PLAY && q.length >= BR.minPlayers) {
+        launchMatch(variant, entryFeeUsd, io, deps);
+        return;
+    }
+
     scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps);
     emitQueueStatus(io, variant, entryFeeUsd, deps);
 }
@@ -274,6 +313,9 @@ export function processBRQueues(io, deps) {
         if (!q.length) continue;
         const [variant, feeStr] = key.split(':');
         const entryFeeUsd = Number(feeStr);
+        if (deps?.DEV_FREE_PLAY && q.some(e => !e.isBot) && q.length < BR.minPlayers) {
+            fillBRQueueWithDevBots(variant, entryFeeUsd);
+        }
         if (q.length >= BR.maxPlayers) {
             tryStartMatch(variant, entryFeeUsd, io, deps);
             continue;
@@ -375,9 +417,11 @@ function processQueueTimeouts(io, deps) {
         const entryFeeUsd = Number(feeStr);
         for (let i = q.length - 1; i >= 0; i--) {
             const entry = q[i];
+            if (entry.isBot) continue;
             if (now - entry.joinedAt <= BR.queueTimeoutMs) continue;
             q.splice(i, 1);
             if (q.length < BR.minPlayers) clearQueueGrace(key);
+            if (deps.DEV_FREE_PLAY) clearBRDevBotsFromQueue(variant, entryFeeUsd);
             refundBREntryFee(entry, variant, entryFeeUsd, deps, 'queue_timeout').catch(err => {
                 console.error('Queue timeout refund failed:', err.message);
             });
@@ -536,10 +580,17 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
 
 function tryDeclareBRWinner(room, io, deps) {
     if (room.status !== 'active') return;
-    const connected = room.players.filter(p => !p.disconnected && socketToMatch.has(p.id));
+    const connected = room.players.filter(p =>
+        !p.disconnected && (p.isBot || socketToMatch.has(p.id)),
+    );
 
     if (connected.length === 1) {
-        finishMatch(room, connected[0], io, deps);
+        const winner = connected[0];
+        if (winner.isBot || !winner.mongoId) {
+            endMatchNoWinner(room, io);
+            return;
+        }
+        finishMatch(room, winner, io, deps);
     } else if (room.players.length === 0) {
         endMatchNoWinner(room, io);
     } else if (connected.length === 0) {
@@ -755,6 +806,57 @@ function playerTotalMass(player) {
     return player.cells.reduce((s, cl) => s + cellBalance(cl), 0);
 }
 
+function runBRAgarBotAI(player, allUsers, room) {
+    const head = player.cells[0];
+    if (!head) return;
+    const totalMass = playerTotalMass(player);
+    let threat = null;
+    let prey = null;
+    let threatDist = 500;
+    let preyDist = 400;
+
+    for (const other of allUsers) {
+        if (other.id === player.id) continue;
+        const oh = other.cells[0];
+        if (!oh) continue;
+        const d = Math.hypot(oh.x - head.x, oh.y - head.y);
+        const otherMass = playerTotalMass(other);
+        if (otherMass > totalMass * 1.1 && d < threatDist) {
+            threatDist = d;
+            threat = oh;
+        } else if (totalMass > otherMass * 1.1 && d < preyDist) {
+            preyDist = d;
+            prey = oh;
+        }
+    }
+
+    if (threat) {
+        player.mouseX = head.x + (head.x - threat.x) * 3;
+        player.mouseY = head.y + (head.y - threat.y) * 3;
+    } else if (prey) {
+        player.mouseX = prey.x;
+        player.mouseY = prey.y;
+    } else if (room.food.length) {
+        let nearest = null;
+        let nearestD = Infinity;
+        for (const f of room.food) {
+            const d = Math.hypot(f.x - head.x, f.y - head.y);
+            if (d < nearestD) {
+                nearestD = d;
+                nearest = f;
+            }
+        }
+        if (nearest) {
+            player.mouseX = nearest.x;
+            player.mouseY = nearest.y;
+        }
+    } else {
+        const { cx, cy } = room.zone;
+        player.mouseX = cx + (Math.random() - 0.5) * room.zone.radius;
+        player.mouseY = cy + (Math.random() - 0.5) * room.zone.radius;
+    }
+}
+
 function processBRAgarMatch(room, io, deps) {
     const { c, calculateCellRadius } = deps;
     const startBal = c.playerStartBalance;
@@ -764,6 +866,9 @@ function processBRAgarMatch(room, io, deps) {
     rebuildBRQuadTree(room, allUsers);
 
     allUsers.forEach(player => {
+        if (player.isBot) {
+            runBRAgarBotAI(player, allUsers, room);
+        }
         for (const cell of player.cells) {
             const bal = cellBalance(cell);
             const speed = (6 / Math.pow(Math.max(bal, 1), 0.449)) * c.speedMult;
@@ -926,6 +1031,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
     const room = createMatchRoom(variant, prizePool, fee);
     room.playerCount = queuedPlayers.length;
     matches.set(room.id, room);
+    const countdownMs = deps.DEV_FREE_PLAY ? 3000 : BR.countdownMs;
 
     queuedPlayers.forEach(entry => {
         removeFromQueue(entry.socketId);
@@ -936,17 +1042,20 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
         } else {
             player = createBRAgarPlayer(entry.socketId, entry.mongoId, entry.username, color, room, deps);
         }
+        if (entry.isBot) player.isBot = true;
         room.players.push(player);
-        socketToMatch.set(entry.socketId, room.id);
-        mongoToMatch.set(entry.mongoId, room.id);
-        entry.socket.brMatchId = room.id;
-        entry.socket.join(`br:${room.id}`);
+        if (!entry.isBot && entry.socket) {
+            socketToMatch.set(entry.socketId, room.id);
+            mongoToMatch.set(entry.mongoId, room.id);
+            entry.socket.brMatchId = room.id;
+            entry.socket.join(`br:${room.id}`);
+        }
     });
 
-    room.players.forEach(p => {
+    room.players.filter(p => !p.isBot).forEach(p => {
         io.to(p.id).emit('brMatchCountdown', {
             matchId: room.id,
-            seconds: BR.countdownMs / 1000,
+            seconds: countdownMs / 1000,
             prizePool: room.prizePool,
             playerCount: room.players.length,
             variant,
@@ -962,7 +1071,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
             addBRAgarFood(room, Math.max(BR.agarFoodMin, room.players.length * BR.agarFoodPerPlayer));
             rebuildBRQuadTree(room, room.players);
         }
-        room.players.forEach(p => {
+        room.players.filter(p => !p.isBot).forEach(p => {
             const meta = {
                 width: variant === 'slither' ? SLITHER.worldHalf * 2 : BR.agarWorld,
                 height: variant === 'slither' ? SLITHER.worldHalf * 2 : BR.agarWorld,
@@ -986,7 +1095,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
                 zone: room.zone,
             });
         });
-    }, BR.countdownMs);
+    }, countdownMs);
 }
 
 async function chargeEntryFee(user, deps, variant, entryFeeUsd) {
@@ -1158,6 +1267,9 @@ export function setupBattleRoyale(io, deps) {
                 });
                 socket.brQueueVariant = variant;
                 socket.brQueueEntryFee = entryFeeUsd;
+                if (deps.DEV_FREE_PLAY) {
+                    fillBRQueueWithDevBots(variant, entryFeeUsd);
+                }
                 tryStartMatch(variant, entryFeeUsd, io, deps);
                 emitQueueStatus(io, variant, entryFeeUsd, deps);
             } catch (err) {
@@ -1170,6 +1282,7 @@ export function setupBattleRoyale(io, deps) {
             const found = findQueueEntryBySocket(socket.id);
             if (!found) return;
             removeFromQueue(socket.id);
+            if (deps.DEV_FREE_PLAY) clearBRDevBotsFromQueue(found.variant, found.entryFeeUsd);
             await refundBREntryFee(found.entry, found.variant, found.entryFeeUsd, deps, 'queue_leave');
             emitQueueStatus(io, found.variant, found.entryFeeUsd, deps);
         });
@@ -1220,6 +1333,7 @@ export function setupBattleRoyale(io, deps) {
             const found = findQueueEntryBySocket(socket.id);
             if (found) {
                 removeFromQueue(socket.id);
+                if (deps.DEV_FREE_PLAY) clearBRDevBotsFromQueue(found.variant, found.entryFeeUsd);
                 refundBREntryFee(found.entry, found.variant, found.entryFeeUsd, deps, 'queue_disconnect').catch(() => {});
                 emitQueueStatus(io, found.variant, found.entryFeeUsd, deps);
             }

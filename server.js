@@ -56,7 +56,7 @@ import {
     BR,
 } from './battle-royale.js';
 import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
-import { validateBRWalletsOnStartup } from './br-wallets.js';
+import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
 
 // --- SOLANA KONFIGURATION ---
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;

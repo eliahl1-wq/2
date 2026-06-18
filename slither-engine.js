@@ -890,7 +890,9 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
         }
         io.to(socketId).emit('RIP');
         room.players = room.players.filter(p => p.id !== snake.id);
-        User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
+        if (snake.mongoId) {
+            User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
+        }
         if (Transaction && snake.mongoId) {
             Transaction.create({
                 userId: snake.mongoId,
@@ -1010,19 +1012,16 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     for (const { entity: snake, isHuman } of allSnakes) {
         if (snake.frozen || snake.isStatic) continue;
 
-        if (!isBR && snake.isBot) {
-            const runAi = !room.isSandbox || room.sandboxBotAi;
-            if (runAi) {
-                if (!room.isSandbox) {
-                    const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
-                    const botWealth = snake.dollarBalance ?? snake.balance;
-                    if (botWealth > botMax) {
-                        toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
-                        continue;
-                    }
+        if (snake.isBot && (isBR || !room.isSandbox || room.sandboxBotAi)) {
+            if (!isBR && !room.isSandbox) {
+                const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
+                const botWealth = snake.dollarBalance ?? snake.balance;
+                if (botWealth > botMax) {
+                    toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
+                    continue;
                 }
-                runSlitherBotAI(snake, allSnakes, room.slitherFood);
             }
+            runSlitherBotAI(snake, allSnakes, room.slitherFood);
         }
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout

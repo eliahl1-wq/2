@@ -73,6 +73,37 @@ export function getSandboxRoom(mode) {
     return sandboxRooms[key];
 }
 
+function initAgarSandboxRoom(room, deps) {
+    const { QuadTree, Rectangle, c, addViruses } = deps;
+    room.qt = new QuadTree(
+        new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2),
+        4,
+    );
+    addViruses(room, c.virusCount);
+}
+
+/** Wipe both sandbox rooms, kick all connected sandbox clients, recreate fresh state. */
+export function abortAllSandbox(io, deps) {
+    for (const key of ['agar', 'slither']) {
+        const room = sandboxRooms[key];
+        if (room?.players?.length) {
+            for (const p of room.players) {
+                io.to(p.id).emit('sandboxAborted');
+                const s = io.sockets.sockets.get(p.id);
+                if (s) {
+                    s.sandboxMode = null;
+                    s.roomId = null;
+                }
+            }
+        }
+        sandboxRooms[key] = createSandboxRoom(key);
+        if (key === 'agar' && deps) {
+            initAgarSandboxRoom(sandboxRooms[key], deps);
+        }
+    }
+    return { aborted: true };
+}
+
 function getSandboxZone(room) {
     const zone = room.sandboxZone;
     if (!zone) return null;
@@ -390,11 +421,7 @@ export function setupSandbox(io, deps) {
 
     // Init quadtree for agar sandbox
     const agarRoom = getSandboxRoom('agar');
-    agarRoom.qt = new QuadTree(
-        new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2),
-        4,
-    );
-    addViruses(agarRoom, c.virusCount);
+    initAgarSandboxRoom(agarRoom, { QuadTree, Rectangle, c, addViruses });
 
     io.on('connection', (socket) => {
         socket.on('sandboxJoin', async ({ token, mode, username }) => {
@@ -516,6 +543,15 @@ export function setupSandbox(io, deps) {
                         addBots(room, count, stake);
                     }
                     socket.emit('sandboxState', { ...getSandboxStatus()[gameMode], lastAction: 'spawnBots' });
+                    return;
+                }
+
+                if (action === 'abort') {
+                    abortAllSandbox(io, { QuadTree, Rectangle, c, addViruses });
+                    socket.sandboxMode = null;
+                    socket.roomId = null;
+                    socket.emit('sandboxAborted');
+                    socket.emit('sandboxState', { ...getSandboxStatus()[gameMode], lastAction: 'abort' });
                     return;
                 }
 
