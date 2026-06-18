@@ -8,6 +8,7 @@ import {
     COMPETITIVE_SLITHER,
     createSlitherPlayer,
     createSegments,
+    randomCoordInRoom,
     addSlitherBots,
     createSlitherBot,
     processSlitherRoom,
@@ -146,7 +147,19 @@ export function getSandboxStatus() {
             players: room.players.length,
             bots: key === 'slither' ? room.slitherBots.length : room.bots.length,
             staticWorms: room.sandboxStaticWorms?.length ?? 0,
-            staticWormIds: (room.sandboxStaticWorms || []).map(w => ({ id: w.id, name: w.username, balance: w.balance })),
+            staticWormIds: (room.sandboxStaticWorms || []).map(w => {
+                const head = w.segments?.[0];
+                return {
+                    id: w.id,
+                    name: w.username,
+                    balance: w.balance,
+                    x: head?.x,
+                    y: head?.y,
+                    angle: w.angle ?? 0,
+                    bend: w.bend ?? 0,
+                };
+            }),
+            controllableEntities: key === 'slither' ? buildControllableEntities(room) : [],
             food: key === 'slither' ? room.slitherFood.length : room.food.length,
         };
     }
@@ -161,15 +174,82 @@ async function verifyAdminToken(token, User, jwtSecret) {
     return user;
 }
 
-function setSnakeBalance(snake, balance, angle = snake.angle ?? 0) {
+function setSnakeBalance(snake, balance, angle = snake.angle ?? 0, bend = snake.bend ?? 0) {
     const head = snake.segments?.[0];
     const x = head?.x ?? 0;
     const y = head?.y ?? 0;
     snake.balance = Math.max(0.5, balance);
-    snake.segments = createSegments(x, y, snake.balance, angle);
+    snake.segments = createSegments(x, y, snake.balance, angle, bend);
     snake.angle = angle;
+    snake.bend = bend;
     snake.fam = 0;
     if (snake.dollarBalance != null) snake.dollarBalance = snake.balance;
+}
+
+function copySnakeBodyTo(target, source) {
+    target.segments = (source.segments || []).map(s => ({ x: s.x, y: s.y }));
+    target.balance = source.balance;
+    target.dollarBalance = source.dollarBalance ?? source.balance;
+    if (source.color) target.color = source.color;
+    target.angle = source.angle ?? 0;
+    target.bend = source.bend ?? 0;
+    target.fam = source.fam ?? 0;
+    target.inputDx = Math.cos(target.angle);
+    target.inputDy = Math.sin(target.angle);
+    target.boost = false;
+    const head = target.segments[0];
+    if (head) {
+        target.x = head.x;
+        target.y = head.y;
+    }
+    if (target.cells?.[0] && head) {
+        target.cells[0].x = head.x;
+        target.cells[0].y = head.y;
+        target.cells[0].balance = target.balance;
+    }
+}
+
+function playerToStaticWorm(player) {
+    const head = player.segments?.[0];
+    return createStaticWorm(null, {
+        x: head?.x ?? 0,
+        y: head?.y ?? 0,
+        balance: player.dollarBalance ?? player.balance,
+        angle: player.angle ?? 0,
+        bend: player.bend ?? 0,
+        color: player.color,
+        name: `${player.username} (parked)`,
+    });
+}
+
+function buildControllableEntities(room) {
+    const statics = (room.sandboxStaticWorms || []).map(w => {
+        const head = w.segments?.[0];
+        return {
+            id: w.id,
+            name: w.username,
+            balance: w.balance,
+            type: 'static',
+            x: head?.x,
+            y: head?.y,
+            angle: w.angle ?? 0,
+            bend: w.bend ?? 0,
+        };
+    });
+    const bots = (room.slitherBots || []).map(b => {
+        const head = b.segments?.[0];
+        return {
+            id: b.id,
+            name: b.username,
+            balance: b.dollarBalance ?? b.balance,
+            type: 'bot',
+            x: head?.x,
+            y: head?.y,
+            angle: b.angle ?? 0,
+            bend: b.bend ?? 0,
+        };
+    });
+    return [...statics, ...bots];
 }
 
 function createStaticWorm(room, opts = {}) {
@@ -177,6 +257,7 @@ function createStaticWorm(room, opts = {}) {
     const y = opts.y ?? 0;
     const balance = opts.balance ?? 5;
     const angle = opts.angle ?? 0;
+    const bend = opts.bend ?? 0;
     const color = opts.color ?? util.randomSlitherColor();
     return {
         id: 'static_' + Math.random().toString(36).slice(2, 8),
@@ -188,8 +269,9 @@ function createStaticWorm(room, opts = {}) {
         dollarBalance: balance,
         color,
         angle,
+        bend,
         fam: 0,
-        segments: createSegments(x, y, balance, angle),
+        segments: createSegments(x, y, balance, angle, bend),
         boost: false,
     };
 }
@@ -296,11 +378,11 @@ export function applySandboxAction(mode, action, params = {}) {
             if (room.mode === 'slither') {
                 room.foodPoolBalance = SANDBOX_POOL;
                 for (let i = 0; i < count; i++) {
-                    const h = room.sandboxWorldHalf * 0.9;
+                    const { x, y } = randomCoordInRoom(room);
                     room.slitherFood.push({
                         id: Math.random().toString(36).slice(2, 9),
-                        x: (Math.random() - 0.5) * 2 * h,
-                        y: (Math.random() - 0.5) * 2 * h,
+                        x,
+                        y,
                         hue: Math.floor(Math.random() * 360),
                         radius: SLITHER.foodRadius,
                         balance: eco.massPerPellet,
@@ -309,12 +391,25 @@ export function applySandboxAction(mode, action, params = {}) {
                 }
                 trimSlitherFood(room, MAX_SANDBOX_FOOD);
             } else {
+                const zone = room.sandboxZone;
                 for (let i = 0; i < count; i++) {
-                    const w = room.sandboxWorldHalf * 2;
+                    let x;
+                    let y;
+                    if (zone?.radius) {
+                        const maxR = zone.radius * 0.82;
+                        const ang = Math.random() * Math.PI * 2;
+                        const r = Math.sqrt(Math.random()) * maxR;
+                        x = (zone.cx ?? 0) + Math.cos(ang) * r;
+                        y = (zone.cy ?? 0) + Math.sin(ang) * r;
+                    } else {
+                        const w = room.sandboxWorldHalf * 2;
+                        x = Math.random() * w;
+                        y = Math.random() * w;
+                    }
                     room.food.push({
                         id: Math.random().toString(36).slice(2, 9),
-                        x: Math.random() * w,
-                        y: Math.random() * w,
+                        x,
+                        y,
                         hue: Math.floor(Math.random() * 360),
                         radius: 5,
                         balance: eco.massPerPellet,
@@ -330,6 +425,7 @@ export function applySandboxAction(mode, action, params = {}) {
                 return { error: `Max ${MAX_SANDBOX_STATIC_WORMS} static worms` };
             }
             const spawnParams = { ...params };
+            if (params.bend != null) spawnParams.bend = Number(params.bend);
             const human = room.players.find(p => !p.disconnected && p.segments?.[0]);
             if (human && params.useCustomPosition !== true) {
                 const head = human.segments[0];
@@ -348,6 +444,7 @@ export function applySandboxAction(mode, action, params = {}) {
                 x: wHead?.x,
                 y: wHead?.y,
                 angle: worm.angle,
+                bend: worm.bend ?? 0,
             };
         }
 
@@ -363,10 +460,45 @@ export function applySandboxAction(mode, action, params = {}) {
                     seg.y += dy;
                 }
             }
-            if (params.angle != null) {
-                setSnakeBalance(worm, worm.balance, params.angle);
+            if (params.angle != null || params.bend != null || params.balance != null) {
+                const angle = params.angle != null ? Number(params.angle) : (worm.angle ?? 0);
+                const bend = params.bend != null ? Number(params.bend) : (worm.bend ?? 0);
+                const balance = params.balance != null ? Number(params.balance) : worm.balance;
+                setSnakeBalance(worm, balance, angle, bend);
             }
             return { id: worm.id };
+        }
+
+        case 'possessEntity': {
+            if (room.mode !== 'slither') return { error: 'Slither only' };
+            const socketId = params.socketId;
+            const player = room.players.find(p => p.id === socketId && !p.disconnected);
+            if (!player) return { error: 'Player not found' };
+            const target = findSandboxEntity(room, params.id);
+            if (!target || target.id === player.id) return { error: 'Invalid target' };
+
+            let parkedId = null;
+            if (params.leaveBody !== false) {
+                const parked = playerToStaticWorm(player);
+                room.sandboxStaticWorms.push(parked);
+                parkedId = parked.id;
+            }
+
+            room.sandboxStaticWorms = room.sandboxStaticWorms.filter(w => w.id !== target.id);
+            room.slitherBots = room.slitherBots.filter(b => b.id !== target.id);
+
+            copySnakeBodyTo(player, target);
+            player.frozen = false;
+            player.isStatic = false;
+            player.isBot = false;
+
+            return { possessedId: params.id, parkedId, playerId: player.id };
+        }
+
+        case 'removeStaticWorm': {
+            const id = params.id;
+            room.sandboxStaticWorms = room.sandboxStaticWorms.filter(w => w.id !== id);
+            return { removed: id };
         }
 
         case 'setEntitySize': {
@@ -377,7 +509,7 @@ export function applySandboxAction(mode, action, params = {}) {
             if (!entity) return { error: 'Entity not found' };
             const size = Math.max(0.5, Number(params.balance) || 5);
             if (room.mode === 'slither' && entity.segments) {
-                setSnakeBalance(entity, size, params.angle ?? entity.angle);
+                setSnakeBalance(entity, size, params.angle ?? entity.angle, params.bend ?? entity.bend ?? 0);
             } else if (entity.cells?.[0]) {
                 entity.balance = size;
                 entity.dollarBalance = size;
@@ -573,7 +705,49 @@ export function setupSandbox(io, deps) {
                         addSlitherBots(room, Math.min(count, roomCap), stake);
                     } else {
                         room.aiBudgetBalance = SANDBOX_POOL;
-                        addBots(room, count, stake);
+                        const botNames = ['Sirius', 'Gota', 'AgarioMaster', 'ProPlayer', 'Legit', 'Sanic'];
+                        const eco = getEconomy(entryFee);
+                        const startMass = eco.massStartBalance;
+                        const spawnCount = Math.min(count, Math.floor(room.aiBudgetBalance / stake));
+                        for (let i = 0; i < spawnCount; i++) {
+                            const zone = room.sandboxZone;
+                            let x;
+                            let y;
+                            if (zone?.radius) {
+                                const maxR = zone.radius * 0.82;
+                                const ang = Math.random() * Math.PI * 2;
+                                const r = Math.sqrt(Math.random()) * maxR;
+                                x = (zone.cx ?? 0) + Math.cos(ang) * r;
+                                y = (zone.cy ?? 0) + Math.sin(ang) * r;
+                            } else {
+                                x = Math.random() * c.worldWidth;
+                                y = Math.random() * c.worldHeight;
+                            }
+                            room.aiBudgetBalance -= stake;
+                            room.bots.push({
+                                id: 'bot_' + Math.random().toString(36).slice(2, 7),
+                                username: botNames[Math.floor(Math.random() * botNames.length)] + ' [' + utilDeps.randomInRange(10, 99) + ']',
+                                balance: stake,
+                                dollarBalance: stake,
+                                botStake: stake,
+                                kills: 0,
+                                color: utilDeps.randomColor(),
+                                isBot: true,
+                                targetX: x,
+                                targetY: y,
+                                lastTargetUpdate: 0,
+                                cells: [{
+                                    id: Math.random().toString(36).slice(2, 9),
+                                    x,
+                                    y,
+                                    balance: startMass,
+                                    radius: calculateCellRadius(startMass, startMass, 1, startMass),
+                                    vx: 0,
+                                    vy: 0,
+                                    lastSplit: Date.now(),
+                                }],
+                            });
+                        }
                     }
                     socket.emit('sandboxState', { ...getSandboxStatus()[gameMode], lastAction: 'spawnBots' });
                     return;
@@ -588,7 +762,10 @@ export function setupSandbox(io, deps) {
                     return;
                 }
 
-                const result = applySandboxAction(gameMode, action, params);
+                const result = applySandboxAction(gameMode, action, {
+                    ...params,
+                    ...(action === 'possessEntity' ? { socketId: socket.id } : {}),
+                });
                 socket.emit('sandboxState', { ...getSandboxStatus()[gameMode], lastAction: action, result });
             } catch (err) {
                 socket.emit('error', err.message || 'Sandbox control failed');

@@ -173,17 +173,39 @@ export function speedForBalance(balance, boosting = false, referenceBalance = 1.
     return (ourUnitsPerSec / SLITHER.serverTickRate) * SLITHER.speedMultiplier;
 }
 
-export function createSegments(x, y, balance, angle = 0) {
+export function createSegments(x, y, balance, angle = 0, bend = 0) {
     const count = balanceToSegmentCount(balance);
     const spacing = segmentSpacingForBalance(balance);
-    const segs = [];
-    for (let i = 0; i < count; i++) {
+    const segs = [{ x, y }];
+    for (let i = 1; i < count; i++) {
+        const segAngle = angle + bend * (i - 1);
+        const prev = segs[i - 1];
         segs.push({
-            x: x - Math.cos(angle) * i * spacing,
-            y: y - Math.sin(angle) * i * spacing,
+            x: prev.x - Math.cos(segAngle) * spacing,
+            y: prev.y - Math.sin(segAngle) * spacing,
         });
     }
     return segs;
+}
+
+/** Random point inside the active play area (sandbox zone, sandbox world, or default arena). */
+export function randomCoordInRoom(room) {
+    if (room?.isSandbox && room.sandboxZone) {
+        const z = room.sandboxZone;
+        const maxR = Math.max(40, z.radius * 0.82);
+        const ang = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random()) * maxR;
+        return {
+            x: (z.cx ?? 0) + Math.cos(ang) * r,
+            y: (z.cy ?? 0) + Math.sin(ang) * r,
+        };
+    }
+    const half = room?.sandboxWorldHalf ?? SLITHER.worldHalf;
+    const h = half * 0.85;
+    return {
+        x: (Math.random() - 0.5) * 2 * h,
+        y: (Math.random() - 0.5) * 2 * h,
+    };
 }
 
 function isSpawnClear(room, x, y, minDist = 200) {
@@ -203,16 +225,14 @@ function isSpawnClear(room, x, y, minDist = 200) {
 
 function pickSlitherSpawn(room) {
     for (let i = 0; i < 80; i++) {
-        const x = randomSpawnCoord();
-        const y = randomSpawnCoord();
+        const { x, y } = randomCoordInRoom(room);
         if (isSpawnClear(room, x, y, 180)) return { x, y };
     }
     for (let i = 0; i < 40; i++) {
-        const x = randomSpawnCoord();
-        const y = randomSpawnCoord();
+        const { x, y } = randomCoordInRoom(room);
         if (isSpawnClear(room, x, y, 120)) return { x, y };
     }
-    return { x: randomSpawnCoord(), y: randomSpawnCoord() };
+    return randomCoordInRoom(room);
 }
 
 function clampInput(dx, dy) {
@@ -238,10 +258,11 @@ export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity
         if (room.foodPoolBalance < foodBlobValue) break;
         room.foodPoolBalance -= foodBlobValue;
         currentValue += foodBlobValue;
+        const { x, y } = randomCoordInRoom(room);
         room.slitherFood.push({
             id: randId(),
-            x: randomSpawnCoord(),
-            y: randomSpawnCoord(),
+            x,
+            y,
             balance: massPerPellet,
             dollarValue: foodBlobValue,
             hue: Math.floor(Math.random() * 360),
@@ -271,10 +292,11 @@ export function spawnGoldenSlitherBlob(room, dollarValue) {
 /** BR-only pellets: growth mass only, not tied to prize pool or house wallet. */
 export function addBRSlitherFood(room, n, massPerPellet = 0.012) {
     for (let i = 0; i < n; i++) {
+        const { x, y } = randomCoordInRoom(room);
         room.slitherFood.push({
             id: randId(),
-            x: randomSpawnCoord(),
-            y: randomSpawnCoord(),
+            x,
+            y,
             balance: massPerPellet,
             hue: Math.floor(Math.random() * 360),
             radius: SLITHER.foodRadius,
