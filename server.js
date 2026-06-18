@@ -226,7 +226,7 @@ const c = {
     sizeMult: 18,
     growthBoost: 2,
     foodValuePerPlayer: 6.0,
-    foodBlobValue: 0.04, // legacy doc; use foodBlobValueForRoom(room) per arena tier
+    foodBlobValue: 0.02, // legacy doc; use foodBlobValueForRoom(room) per arena tier
     roomDuration: process.env.DEV_ROOM_DURATION_MS
         ? parseInt(process.env.DEV_ROOM_DURATION_MS, 10)
         : 3 * 60 * 60 * 1000,

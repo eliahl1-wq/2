@@ -23,8 +23,8 @@ const BASE = {
     foodDensityPerHuman: 250.0,
     /** Snake mass gained per normal pellet at $10 entry ($5→0.01, $10→0.02, $20→0.04). Decoupled from dollar value. */
     massPerPellet: 0.02,
-    /** Pellet dollar value at $10 entry ($5→$0.02, $10→$0.04, $20→$0.08). Half the blob count, same total food pool $. */
-    foodBlobValue: 0.04,
+    /** Pellet dollar value at $10 entry ($5→$0.01, $10→$0.02, $20→$0.04). Scales with density so blob count stays constant. */
+    foodBlobValue: 0.02,
 };
 
 export function normalizeEntryFee(fee) {
