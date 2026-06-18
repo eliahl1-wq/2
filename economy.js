@@ -21,8 +21,10 @@ const BASE = {
     botStart: 1.0,
     botMax: 500.0,
     foodDensityPerHuman: 250.0,
-    /** Pellet value at $10 entry ($5→$0.01, $10→$0.02, $20→$0.04). Scales with density so blob count stays constant. */
-    foodBlobValue: 0.02,
+    /** Snake mass gained per normal pellet at $10 entry ($5→0.01, $10→0.02, $20→0.04). Decoupled from dollar value. */
+    massPerPellet: 0.02,
+    /** Pellet dollar value at $10 entry ($5→$0.02, $10→$0.04, $20→$0.08). Half the blob count, same total food pool $. */
+    foodBlobValue: 0.04,
 };
 
 export function normalizeEntryFee(fee) {
@@ -44,7 +46,7 @@ export function getEconomy(entryFeeUsd) {
         playerStartBalance: BASE.playerStart * s,
         /** Snake mass / visual size — fixed baseline, not tied to entry tier. */
         massStartBalance: BASE.playerStart,
-        massPerPellet: BASE.foodBlobValue,
+        massPerPellet: BASE.massPerPellet * s,
         goldenBlobMass: getGoldenBlobValue(DEFAULT_ENTRY_FEE),
         ownerCut: BASE.ownerCut * s,
         foodLow: BASE.foodLow * s,
@@ -128,7 +130,7 @@ export function getCompetitiveEconomy(entryFeeUsd) {
         dollarStart: entry,
         // Snake mass uses the same baseline as $10 normal slither — size is not tied to entry tier or dollars.
         playerStartBalance: BASE.playerStart,
-        massPerPellet: BASE.foodBlobValue,
+        massPerPellet: BASE.massPerPellet,
         cashoutFeePct,
         cashoutPlayerPct: 1 - cashoutFeePct,
     };

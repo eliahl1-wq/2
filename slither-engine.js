@@ -30,7 +30,7 @@ export const SLITHER = {
     segmentSpacing: 6,
     baseSegments: 12,
     segmentsPerCentLegacy: 0.1,
-    foodBlobValue: 0.02, // baseline at $10; use getEconomy(entryFee).foodBlobValue per room
+    foodBlobValue: 0.04, // legacy doc; use getEconomy(entryFee).foodBlobValue per room
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
     viewRange: 520,
@@ -115,6 +115,18 @@ export function trimSlitherFood(room, targetCount) {
         room.foodPoolBalance += slitherFoodDollarValue(removed);
     }
     room.slitherFood = normal.concat(protectedFood);
+}
+
+/** Trim only pool-spawned pellets when total count is high — never removes deathDrop or golden loot. */
+export function enforceSlitherFoodCap(room, maxTotal = MAX_SLITHER_FOOD_TOTAL) {
+    if (!room.slitherFood?.length || room.slitherFood.length <= maxTotal) return;
+
+    const protectedCount = room.slitherFood.filter(f => f.golden || f.deathDrop).length;
+    const maxNormal = Math.max(0, maxTotal - protectedCount);
+    const normalCount = room.slitherFood.filter(f => !f.golden && !f.deathDrop).length;
+    if (normalCount > maxNormal) {
+        trimSlitherFood(room, maxNormal);
+    }
 }
 
 function randId() {
@@ -691,7 +703,41 @@ function applyWallAvoidance(snake) {
 }
 
 /** Bot AI aligned with agar mode: flee → chase → food → wander, plus wall avoidance. */
-function runSlitherBotAI(snake, allSnakes, food) {
+function findNearestFoodForBot(head, food, foodGrid, minDistFood) {
+    let nearestFood = null;
+    let nearestFoodDist2 = minDistFood * minDistFood;
+
+    const tryFood = (f) => {
+        const fdx = head.x - f.x;
+        if (fdx > minDistFood || fdx < -minDistFood) return;
+        const fdy = head.y - f.y;
+        if (fdy > minDistFood || fdy < -minDistFood) return;
+        const d2 = fdx * fdx + fdy * fdy;
+        if (d2 < nearestFoodDist2) {
+            nearestFoodDist2 = d2;
+            nearestFood = f;
+        }
+    };
+
+    if (foodGrid) {
+        const minCx = Math.floor((head.x - minDistFood) / SLITHER_FOOD_CELL);
+        const maxCx = Math.floor((head.x + minDistFood) / SLITHER_FOOD_CELL);
+        const minCy = Math.floor((head.y - minDistFood) / SLITHER_FOOD_CELL);
+        const maxCy = Math.floor((head.y + minDistFood) / SLITHER_FOOD_CELL);
+        for (let cx = minCx; cx <= maxCx; cx++) {
+            for (let cy = minCy; cy <= maxCy; cy++) {
+                const bucket = foodGrid.get(`${cx},${cy}`);
+                if (!bucket) continue;
+                for (const f of bucket) tryFood(f);
+            }
+        }
+    } else {
+        for (const f of food) tryFood(f);
+    }
+    return nearestFood;
+}
+
+function runSlitherBotAI(snake, allSnakes, food, foodGrid = null) {
     const head = snake.segments[0];
     const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
@@ -727,20 +773,7 @@ function runSlitherBotAI(snake, allSnakes, food) {
         snake.targetY = targetPrey.y;
         snake.boost = nearestPreyDist < fleeDistance * 0.25;
     } else if (Date.now() - (snake.lastTargetUpdate || 0) > AGAR_BOT_TARGET_INTERVAL_MS) {
-        let nearestFood = null;
-        let nearestFoodDist2 = minDistFood * minDistFood;
-
-        for (const f of food) {
-            const fdx = head.x - f.x;
-            if (fdx > minDistFood || fdx < -minDistFood) continue;
-            const fdy = head.y - f.y;
-            if (fdy > minDistFood || fdy < -minDistFood) continue;
-            const d2 = fdx * fdx + fdy * fdy;
-            if (d2 < nearestFoodDist2) {
-                nearestFoodDist2 = d2;
-                nearestFood = f;
-            }
-        }
+        const nearestFood = findNearestFoodForBot(head, food, foodGrid, minDistFood);
 
         if (nearestFood) {
             snake.targetX = nearestFood.x;
@@ -979,6 +1012,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 
 const MAX_NETWORK_SEGMENTS = 120;
 const MAX_VISIBLE_FOOD = 320;
+const MAX_SLITHER_FOOD_TOTAL = 700;
 const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
 const SLITHER_FOOD_VIEW_EXTRA = 750;
 const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
@@ -1060,6 +1094,7 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
     } else if (normalCount > trimThreshold) {
         trimSlitherFood(room, targetFoodCount);
     }
+    enforceSlitherFoodCap(room);
 }
 
 /**
@@ -1088,7 +1123,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                     continue;
                 }
             }
-            runSlitherBotAI(snake, allSnakes, room.slitherFood);
+            runSlitherBotAI(snake, allSnakes, room.slitherFood, foodGrid);
         }
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
@@ -1155,6 +1190,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         }))
         .sort((a, b) => parseFloat(b.balance) - parseFloat(a.balance))
         .slice(0, 10);
+
+    enforceSlitherFoodCap(room);
 
     return slitherLeaderboard;
 }
