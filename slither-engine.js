@@ -883,6 +883,59 @@ function buildSlitherFoodGrid(food) {
     return grid;
 }
 
+function serializeVisibleSlitherFood(f, radius = SLITHER.foodRadius) {
+    return {
+        id: f.id,
+        x: f.x,
+        y: f.y,
+        hue: f.hue,
+        radius: f.radius || radius,
+        golden: !!f.golden,
+        deathDrop: !!f.deathDrop,
+    };
+}
+
+/** Spatial query for network culling — avoids scanning all pellets per player. */
+function collectSlitherFoodInView(food, foodGrid, hx, hy, range, maxCount, radius = SLITHER.foodRadius) {
+    const inRange = [];
+    if (foodGrid) {
+        const minCx = Math.floor((hx - range) / SLITHER_FOOD_CELL);
+        const maxCx = Math.floor((hx + range) / SLITHER_FOOD_CELL);
+        const minCy = Math.floor((hy - range) / SLITHER_FOOD_CELL);
+        const maxCy = Math.floor((hy + range) / SLITHER_FOOD_CELL);
+        for (let cx = minCx; cx <= maxCx; cx++) {
+            for (let cy = minCy; cy <= maxCy; cy++) {
+                const bucket = foodGrid.get(`${cx},${cy}`);
+                if (!bucket) continue;
+                for (let i = 0; i < bucket.length; i++) {
+                    const f = bucket[i];
+                    const dx = f.x - hx;
+                    if (Math.abs(dx) > range) continue;
+                    const dy = f.y - hy;
+                    if (Math.abs(dy) > range) continue;
+                    inRange.push(f);
+                }
+            }
+        }
+    } else {
+        for (let i = 0; i < food.length; i++) {
+            const f = food[i];
+            if (isInView(hx, hy, f.x, f.y, range)) inRange.push(f);
+        }
+    }
+
+    if (inRange.length <= maxCount) {
+        return inRange.map(f => serializeVisibleSlitherFood(f, radius));
+    }
+    inRange.sort((a, b) => {
+        const da = (a.x - hx) ** 2 + (a.y - hy) ** 2;
+        const db = (b.x - hx) ** 2 + (b.y - hy) ** 2;
+        return da - db;
+    });
+    inRange.length = maxCount;
+    return inRange.map(f => serializeVisibleSlitherFood(f, radius));
+}
+
 function checkFoodCollisions(snake, room, foodGrid = null) {
     const mouth = snakeMouthPoint(snake);
     const sweep = (snake._prevMouthX != null)
@@ -1011,10 +1064,11 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 }
 
 const MAX_NETWORK_SEGMENTS = 120;
-const MAX_VISIBLE_FOOD = 320;
+const MAX_VISIBLE_FOOD = 240;
 const MAX_SLITHER_FOOD_TOTAL = 700;
 const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
-const SLITHER_FOOD_VIEW_EXTRA = 750;
+/** Extra beyond snake viewRange — tuned to client viewport (~W/2/zoom + margin), not whole arena. */
+const SLITHER_FOOD_VIEW_EXTRA = 200;
 const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
@@ -1074,12 +1128,14 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
     room._lastSlitherFoodSync = now;
 
     const densityScale = slitherFoodDensityScale();
-    const goldenValueOnMap = room.slitherFood
-        .filter(f => f.golden)
-        .reduce((sum, f) => sum + slitherFoodDollarValue(f), 0);
+    let goldenValueOnMap = 0;
+    let normalCount = 0;
+    for (const f of room.slitherFood) {
+        if (f.golden) goldenValueOnMap += slitherFoodDollarValue(f);
+        else if (!f.deathDrop) normalCount++;
+    }
     const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale, budget) - goldenValueOnMap);
     const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
-    const normalCount = room.slitherFood.filter(f => !f.golden && !f.deathDrop).length;
 
     const addThreshold = Math.floor(targetFoodCount * 0.94);
     const trimThreshold = Math.ceil(targetFoodCount * 1.12);
@@ -1208,9 +1264,13 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const sendFoodThisTick = room._slitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
     const sendMinimapThisTick = room._slitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
-    room.players
-        .filter(p => p.mode === 'slither' && !p.disconnected)
-        .forEach(p => {
+    const slitherPlayers = room.players.filter(p => p.mode === 'slither' && !p.disconnected);
+    const needsFoodRefresh = sendFoodThisTick || slitherPlayers.some(p => !room._lastSlitherFoodByPlayer?.[p.id]);
+    const broadcastFoodGrid = needsFoodRefresh && room.slitherFood.length > 80
+        ? buildSlitherFoodGrid(room.slitherFood)
+        : null;
+
+    slitherPlayers.forEach(p => {
             const head = p.segments?.[0];
             if (!head) return;
 
@@ -1227,25 +1287,14 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
             let visibleFood = null;
             if (sendFoodThisTick || !room._lastSlitherFoodByPlayer?.[p.id]) {
-                visibleFood = room.slitherFood
-                    .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
-                    .map(f => ({
-                        id: f.id,
-                        x: f.x,
-                        y: f.y,
-                        hue: f.hue,
-                        radius: f.radius || SLITHER.foodRadius,
-                        golden: !!f.golden,
-                        deathDrop: !!f.deathDrop,
-                    }));
-                if (visibleFood.length > MAX_VISIBLE_FOOD) {
-                    visibleFood.sort((a, b) => {
-                        const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
-                        const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
-                        return da - db;
-                    });
-                    visibleFood = visibleFood.slice(0, MAX_VISIBLE_FOOD);
-                }
+                visibleFood = collectSlitherFoodInView(
+                    room.slitherFood,
+                    broadcastFoodGrid,
+                    head.x,
+                    head.y,
+                    foodRange,
+                    MAX_VISIBLE_FOOD,
+                );
                 if (!room._lastSlitherFoodByPlayer) room._lastSlitherFoodByPlayer = {};
                 room._lastSlitherFoodByPlayer[p.id] = visibleFood;
             }
@@ -1699,6 +1748,15 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
     const sendFoodThisTick = room._compSlitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
     const sendMinimapThisTick = room._compSlitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
+    const compPlayers = room.players.filter(p => p.mode === 'competitive-slither' && !p.disconnected);
+    const compSpecs = room.competitiveSpectators || [];
+    const needsCompFoodRefresh = sendFoodThisTick
+        || compPlayers.some(p => !room._lastCompFoodByPlayer?.[p.id])
+        || compSpecs.length > 0;
+    const compFoodGrid = needsCompFoodRefresh && room.slitherFood.length > 80
+        ? buildSlitherFoodGrid(room.slitherFood)
+        : null;
+
     const emitTickToViewer = (viewer) => {
         const { socketId, viewX, viewY, youId, dollarBalance, spectating } = viewer;
         const head = { x: viewX, y: viewY };
@@ -1719,25 +1777,15 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             || sendFoodThisTick
             || !room._lastCompFoodByPlayer?.[socketId];
         if (refreshFood) {
-            visibleFood = room.slitherFood
-                .filter(f => isInView(head.x, head.y, f.x, f.y, foodRange))
-                .map(f => ({
-                    id: f.id,
-                    x: f.x,
-                    y: f.y,
-                    hue: f.hue,
-                    radius: f.radius || COMPETITIVE_SLITHER.foodRadius,
-                    golden: !!f.golden,
-                    deathDrop: !!f.deathDrop,
-                }));
-            if (visibleFood.length > MAX_VISIBLE_FOOD) {
-                visibleFood.sort((a, b) => {
-                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
-                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
-                    return da - db;
-                });
-                visibleFood = visibleFood.slice(0, MAX_VISIBLE_FOOD);
-            }
+            visibleFood = collectSlitherFoodInView(
+                room.slitherFood,
+                compFoodGrid,
+                head.x,
+                head.y,
+                foodRange,
+                MAX_VISIBLE_FOOD,
+                COMPETITIVE_SLITHER.foodRadius,
+            );
             if (!spectating) {
                 if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
                 room._lastCompFoodByPlayer[socketId] = visibleFood;
@@ -1791,22 +1839,20 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         io.to(socketId).emit('slitherTick', tickPayload);
     };
 
-    room.players
-        .filter(p => p.mode === 'competitive-slither' && !p.disconnected)
-        .forEach(p => {
-            const head = p.segments?.[0];
-            if (!head) return;
-            emitTickToViewer({
-                socketId: p.id,
-                viewX: head.x,
-                viewY: head.y,
-                youId: p.id,
-                dollarBalance: p.dollarBalance,
-                spectating: false,
-            });
+    compPlayers.forEach(p => {
+        const head = p.segments?.[0];
+        if (!head) return;
+        emitTickToViewer({
+            socketId: p.id,
+            viewX: head.x,
+            viewY: head.y,
+            youId: p.id,
+            dollarBalance: p.dollarBalance,
+            spectating: false,
         });
+    });
 
-    (room.competitiveSpectators || []).forEach(spec => {
+    compSpecs.forEach(spec => {
         emitTickToViewer({
             socketId: spec.id,
             viewX: spec.x,
