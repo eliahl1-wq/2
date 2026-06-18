@@ -55,9 +55,7 @@ import {
     getBRServerStatus,
     BR,
 } from './battle-royale.js';
-import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
-
-const app = express();
+import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
 
 // --- SOLANA KONFIGURATION ---
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
@@ -3352,10 +3350,10 @@ io.on('connection', (socket) => {
                 status: 'confirmed'
             });
 
-            // DYNAMIC ECONOMY SPLIT (scaled to entry tier)
+            // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population)
             const gameMode = mode === 'slither' ? 'slither' : 'agar';
-            const activeHumansCount = room.players.filter(p => !p.disconnected).length + 1;
-            const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, activeHumansCount);
+            const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
+            const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
             const foodToPool = Math.max(0, foodAlloc - goldenBlobValue);
 
@@ -3372,7 +3370,6 @@ io.on('connection', (socket) => {
             room.ownerBalance += economy.ownerCut;
 
             // DYNAMIC BOT SCALING (mode-specific)
-            const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
             const targetBots = gameMode === 'slither'
                 ? getSlitherTargetBots(modeHumansAfterJoin)
                 : getTargetBots(modeHumansAfterJoin);
@@ -3530,7 +3527,7 @@ io.on('connection', (socket) => {
             }
             return;
         }
-        const room = rooms.find(r => r.id === socket.roomId);
+        const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (p) {
             p.mouseX = data.x;
@@ -3587,8 +3584,14 @@ io.on('connection', (socket) => {
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
                 const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
-                // Recycle the spread (ejectMass − ejectMassGain) into the food pool so no money is lost
-                room.foodPoolBalance += Math.max(0, c.ejectMass - c.ejectMassGain);
+                // Recycle the spread (ejectMass − ejectMassGain) from player dollars into the food pool
+                const spread = Math.max(0, c.ejectMass - c.ejectMassGain);
+                const dollarStart = playerDollarStart(p);
+                const dollarDrain = Math.min(spread, Math.max(0, (p.dollarBalance ?? 0) - dollarStart));
+                if (dollarDrain > 1e-9) {
+                    room.foodPoolBalance += dollarDrain;
+                    p.dollarBalance = (p.dollarBalance ?? 0) - dollarDrain;
+                }
                 room.ejected.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x + dirX * (cell.radius + 20),
@@ -3827,7 +3830,19 @@ io.on('connection', (socket) => {
 function getArenaRoomById(roomId) {
     const compRoom = findCompetitiveSlitherRoomById(roomId);
     if (compRoom) return compRoom;
+    const sandboxRoom = getSandboxRoomById(roomId);
+    if (sandboxRoom) return sandboxRoom;
     return rooms.find(r => r.id === roomId);
+}
+
+function getSandboxRoomById(roomId) {
+    if (!roomId?.startsWith('sandbox-')) return null;
+    const mode = roomId.replace('sandbox-', '');
+    try {
+        return getSandboxRoom(mode);
+    } catch {
+        return null;
+    }
 }
 
 function processCompetitiveSlitherTick() {
@@ -3873,6 +3888,23 @@ function getBattleRoyaleDeps() {
 
 setupBattleRoyale(io, getBattleRoyaleDeps());
 
+setupSandbox(io, {
+    User,
+    Transaction,
+    c,
+    util,
+    QuadTree,
+    Rectangle,
+    Point,
+    calculateCellRadius,
+    addBots,
+    addViruses,
+    rebuildQuadTree,
+    processRoom,
+    DEFAULT_ENTRY_FEE,
+    JWT_SECRET: process.env.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig',
+});
+
 setInterval(() => {
     processBRQueues(io, getBattleRoyaleDeps());
 }, 1000);
@@ -3895,7 +3927,10 @@ setInterval(() => {
 function processRoom(room) {
     if (room.isResetting) return; // Pause during global reset
 
+    const isSandbox = room.isSandbox === true;
+
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
+    if (!isSandbox || room.sandboxAutoBots) {
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
     const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
@@ -3918,8 +3953,10 @@ function processRoom(room) {
     }
 
     capAiBudget(room);
+    }
 
     // Food spawn — funded from pool (entry fees on join), same rules for agar + slither
+    if (!isSandbox || room.sandboxAutoFood) {
     const agarInArena = countHumansInMode(room, 'agar');
     const slitherInArena = countHumansInMode(room, 'slither');
     const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
@@ -3940,6 +3977,7 @@ function processRoom(room) {
     syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+    }
 
     const allUsers = [
         ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected),
@@ -4055,7 +4093,7 @@ function processRoom(room) {
             const cell = player.cells[i];
             // PHYSICS: Movement & Friction
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
-            const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult;
+            const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult * (isSandbox ? (room.sandboxSpeedMultiplier ?? 1) : 1);
             const angle = Math.atan2(player.mouseY, player.mouseX);
             const distToMouse = Math.hypot(player.mouseX, player.mouseY);
 
@@ -4162,6 +4200,7 @@ function processRoom(room) {
                             cell.vy += Math.sin(pushAngle) * force;
                         }
                     } else if (item.type === 'player' || item.type === 'bot') {
+                        if (isSandbox && room.sandboxInvincible) continue;
                         // EXTERNAL: Eat
                         // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r + r2 * 0.2)
                         if (cell.balance > otherCell.balance * 1.05 && d < (r + r2 * 0.1)) {
@@ -4279,7 +4318,7 @@ function processRoom(room) {
 
         // Spatial filtering — food range is wider than entity range to reduce edge pop-in.
         const pad = 500;
-        const foodPad = 720;
+        const foodPad = 960;
         const rangeX = (p.screenWidth || 1920) / 2 + pad;
         const rangeY = (p.screenHeight || 1080) / 2 + pad;
         const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
@@ -4351,9 +4390,33 @@ function processRoom(room) {
             resetTime: room.startTime + c.roomDuration,
             solPrice: SOL_PRICE_USD,
             minimap,
+            ...(isSandbox ? { sandbox: true, zone: room.sandboxZone ? {
+                cx: room.sandboxZone.cx,
+                cy: room.sandboxZone.cy,
+                radius: room.sandboxZone.radius,
+                shrinking: room.sandboxZone.shrinking,
+            } : null } : {}),
         });
     });
 }
+
+app.get('/api/admin/sandbox/status', authenticateAdmin, (req, res) => {
+    res.json(getSandboxStatus());
+});
+
+app.post('/api/admin/sandbox/action', authenticateAdmin, (req, res) => {
+    const { mode, action, params } = req.body;
+    const gameMode = mode === 'slither' ? 'slither' : 'agar';
+    const result = applySandboxAction(gameMode, action, params ?? {});
+    if (result?.needsAgarDeps && action === 'spawnBots') {
+        const room = getSandboxRoom(gameMode);
+        const count = Math.max(1, Math.min(30, Number(params?.count) || 3));
+        const stake = Number(params?.balance) || 5;
+        room.aiBudgetBalance = 1_000_000;
+        addBots(room, count, stake);
+    }
+    res.json({ status: getSandboxStatus(), result });
+});
 
 const PORT = process.env.PORT || 5000;
 

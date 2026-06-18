@@ -344,7 +344,8 @@ function getAllSlitherSnakes(room) {
         .filter(p => p.mode === 'slither' && !p.disconnected && p.segments?.length)
         .map(p => ({ entity: p, isHuman: true }));
     const bots = room.slitherBots.map(b => ({ entity: b, isHuman: false }));
-    return [...humans, ...bots];
+    const statics = (room.sandboxStaticWorms || []).map(s => ({ entity: s, isHuman: false }));
+    return [...humans, ...bots, ...statics];
 }
 
 function normalizeSnakeInput(snake) {
@@ -372,6 +373,11 @@ function minDollarsForSnake(snake) {
         return snake.botStake ?? getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance;
     }
     return getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE).playerStartBalance;
+}
+
+/** Normal slither: HUD dollars and snake mass move together. Arena / BR keep them separate. */
+function isCoupledSlitherRoom(room) {
+    return !!room && !room.isBattleRoyale && !room.isCompetitiveSlither && !room.isSandbox;
 }
 
 function applySlitherFoodPickup(snake, food, room) {
@@ -606,15 +612,28 @@ function updateSnakeMovement(snake, room = null) {
 
     const mx = Math.cos(snake.angle);
     const my = Math.sin(snake.angle);
-    const step = speedForBalance(snake.balance, canBoost);
+    const speedMult = room?.sandboxSpeedMultiplier ?? 1;
+    const step = speedForBalance(snake.balance, canBoost) * speedMult;
     head.x += mx * step;
     head.y += my * step;
 
     if (canBoost && room) {
         const cost = Math.min(SLITHER.boostCostPerTick, snake.balance - minBal);
         snake.balance -= cost;
-        room.foodPoolBalance += cost;
         applyFamShrink(snake, cost);
+
+        let poolCredit = cost;
+        // Normal mode: boost spends HUD balance too (size and dollars stay linked).
+        if (isCoupledSlitherRoom(room) && snake.dollarBalance != null) {
+            const dollarFloor = minDollarsForSnake(snake);
+            const dollarCost = Math.min(cost, Math.max(0, snake.dollarBalance - dollarFloor));
+            if (dollarCost > 1e-9) {
+                snake.dollarBalance -= dollarCost;
+            }
+            poolCredit = dollarCost;
+            if (snake.cells?.[0]) snake.cells[0].balance = snake.dollarBalance;
+        }
+        room.foodPoolBalance += poolCredit;
     }
 
     const spacing = segmentSpacingForSegmentCount(snake.segments.length);
@@ -989,21 +1008,28 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const toRemove = [];
 
     for (const { entity: snake, isHuman } of allSnakes) {
+        if (snake.frozen || snake.isStatic) continue;
+
         if (!isBR && snake.isBot) {
-            const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
-            const botWealth = snake.dollarBalance ?? snake.balance;
-            if (botWealth > botMax) {
-                toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
-                continue;
+            const runAi = !room.isSandbox || room.sandboxBotAi;
+            if (runAi) {
+                if (!room.isSandbox) {
+                    const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
+                    const botWealth = snake.dollarBalance ?? snake.balance;
+                    if (botWealth > botMax) {
+                        toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
+                        continue;
+                    }
+                }
+                runSlitherBotAI(snake, allSnakes, room.slitherFood);
             }
-            runSlitherBotAI(snake, allSnakes, room.slitherFood);
         }
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
         updateSnakeMovement(snake, room);
         checkFoodCollisions(snake, room);
 
-        if (isHuman && !isBR) {
+        if (isHuman && !isBR && !room.isSandbox) {
             const minMass = minBalanceForSnake(snake);
             const minDollars = minDollarsForSnake(snake);
             const currentDollars = snake.dollarBalance ?? snake.balance;
@@ -1028,13 +1054,21 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         }
 
         if (checkWallCollision(snake) || checkSelfCollision(snake)) {
-            toRemove.push({ snake, isHuman, killer: null });
-            continue;
+            if (room.isSandbox && room.sandboxInvincible) {
+                // No elimination in sandbox invincible mode
+            } else {
+                toRemove.push({ snake, isHuman, killer: null });
+                continue;
+            }
         }
 
         const hit = checkSnakeCollisions(snake, allSnakes);
         if (hit) {
-            toRemove.push({ snake, isHuman, killer: hit });
+            if (room.isSandbox && room.sandboxInvincible) {
+                // No elimination in sandbox invincible mode
+            } else {
+                toRemove.push({ snake, isHuman, killer: hit });
+            }
         }
     }
 
@@ -1155,7 +1189,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 you: p.id,
                 snakes: visibleSnakes,
                 food: visibleFood,
-                worldHalf: SLITHER.worldHalf,
+                worldHalf: room.sandboxWorldHalf ?? SLITHER.worldHalf,
                 minimap,
                 ...meta,
                 ...(meta.battleRoyale ? {} : { balance: p.dollarBalance ?? p.balance }),
