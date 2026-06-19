@@ -3058,10 +3058,7 @@ function countHumansInMode(room, mode) {
 
 /** Keep bots alive while humans are disconnected or after death until arena reset. */
 function effectiveHumanCountForBots(room, mode) {
-    const humans = room.players.filter(p => p.mode === mode || (mode === 'agar' && !p.mode));
-    if (humans.length > 0) return humans.length;
-    const botCount = mode === 'slither' ? room.slitherBots.length : room.bots.length;
-    return botCount > 0 ? 1 : 0;
+    return countActiveHumansByMode(room, mode);
 }
 
 function countActiveHumansByMode(room, mode) {
@@ -3939,26 +3936,33 @@ function processRoom(room) {
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     if (!isSandbox || room.sandboxAutoBots) {
-    const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
-    const slitherHumansInArena = effectiveHumanCountForBots(room, 'slither');
+        const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
+        const slitherHumansInArena = effectiveHumanCountForBots(room, 'slither');
 
-    const agarTargetBots = getTargetBots(agarHumansInArena);
-    const agarBotStake = botStakeForRoom(room);
-    const slitherBotStake = botStakeForRoom(room);
-    if (room.bots.length < agarTargetBots) {
-        addBots(room, agarTargetBots - room.bots.length, agarBotStake);
-    } else if (room.bots.length > agarTargetBots) {
-        trimAgarBots(room, agarTargetBots);
-    }
+        let agarTargetBots = getTargetBots(agarHumansInArena);
+        if (agarHumansInArena > 0) room.savedAgarTarget = agarTargetBots;
+        else agarTargetBots = room.savedAgarTarget || 0;
 
-    const slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
-    if (room.slitherBots.length < slitherTargetBots) {
-        addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
-    } else if (room.slitherBots.length > slitherTargetBots) {
-        trimSlitherBots(room, slitherTargetBots);
-    }
+        const agarBotStake = botStakeForRoom(room);
+        const slitherBotStake = botStakeForRoom(room);
+        
+        if (room.bots.length < agarTargetBots) {
+            addBots(room, agarTargetBots - room.bots.length, agarBotStake);
+        } else if (room.bots.length > agarTargetBots) {
+            trimAgarBots(room, agarTargetBots);
+        }
 
-    capAiBudget(room);
+        let slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
+        if (slitherHumansInArena > 0) room.savedSlitherTarget = slitherTargetBots;
+        else slitherTargetBots = room.savedSlitherTarget || 0;
+
+        if (room.slitherBots.length < slitherTargetBots) {
+            addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
+        } else if (room.slitherBots.length > slitherTargetBots) {
+            trimSlitherBots(room, slitherTargetBots);
+        }
+
+        capAiBudget(room);
     }
 
     // Food spawn — funded from pool (entry fees on join), same rules for agar + slither

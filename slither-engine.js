@@ -134,7 +134,9 @@ function randId() {
 }
 
 function dist(x1, y1, x2, y2) {
-    return Math.hypot(x1 - x2, y1 - y2);
+    const dx = x1 - x2;
+    const dy = y1 - y2;
+    return Math.sqrt(dx * dx + dy * dy);
 }
 
 export function segmentCountForBalance(balance, referenceBalance = 1.0) {
@@ -726,7 +728,8 @@ function findNearestFoodForBot(head, food, foodGrid, minDistFood) {
         const maxCy = Math.floor((head.y + minDistFood) / SLITHER_FOOD_CELL);
         for (let cx = minCx; cx <= maxCx; cx++) {
             for (let cy = minCy; cy <= maxCy; cy++) {
-                const bucket = foodGrid.get(`${cx},${cy}`);
+                const key = (cx + 2000) + (cy + 2000) * 10000;
+                const bucket = foodGrid.get(key);
                 if (!bucket) continue;
                 for (const f of bucket) tryFood(f);
             }
@@ -854,10 +857,13 @@ function checkSnakeCollisions(snake, allSnakes) {
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
         if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) continue;
-        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 3)) {
+        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 4)) {
             const seg = other.segments[i];
             const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
-            if (dist(head.x, head.y, seg.x, seg.y) < r * 0.65 + segR * 0.45) {
+            const dx = head.x - seg.x;
+            const dy = head.y - seg.y;
+            const threshold = r * 0.65 + segR * 0.45;
+            if (dx * dx + dy * dy < threshold * threshold) {
                 return other;
             }
         }
@@ -869,10 +875,11 @@ const SLITHER_FOOD_CELL = 64;
 
 function buildSlitherFoodGrid(food) {
     const grid = new Map();
-    for (const f of food) {
+    for (let i = 0; i < food.length; i++) {
+        const f = food[i];
         const cx = Math.floor(f.x / SLITHER_FOOD_CELL);
         const cy = Math.floor(f.y / SLITHER_FOOD_CELL);
-        const key = `${cx},${cy}`;
+        const key = (cx + 2000) + (cy + 2000) * 10000;
         let bucket = grid.get(key);
         if (!bucket) {
             bucket = [];
@@ -905,7 +912,8 @@ function collectSlitherFoodInView(food, foodGrid, hx, hy, range, maxCount, radiu
         const maxCy = Math.floor((hy + range) / SLITHER_FOOD_CELL);
         for (let cx = minCx; cx <= maxCx; cx++) {
             for (let cy = minCy; cy <= maxCy; cy++) {
-                const bucket = foodGrid.get(`${cx},${cy}`);
+                const key = (cx + 2000) + (cy + 2000) * 10000;
+                const bucket = foodGrid.get(key);
                 if (!bucket) continue;
                 for (let i = 0; i < bucket.length; i++) {
                     const f = bucket[i];
@@ -965,7 +973,8 @@ function checkFoodCollisions(snake, room, foodGrid = null) {
         const maxCy = Math.floor((mouth.y + maxReach) / SLITHER_FOOD_CELL);
         for (let cx = minCx; cx <= maxCx; cx++) {
             for (let cy = minCy; cy <= maxCy; cy++) {
-                const bucket = foodGrid.get(`${cx},${cy}`);
+                const key = (cx + 2000) + (cy + 2000) * 10000;
+                const bucket = foodGrid.get(key);
                 if (!bucket) continue;
                 for (let i = bucket.length - 1; i >= 0; i--) {
                     tryPickup(bucket[i]);
