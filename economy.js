@@ -46,7 +46,7 @@ export function getEconomy(entryFeeUsd) {
         playerStartBalance: BASE.playerStart * s,
         /** Snake mass / visual size — fixed baseline, not tied to entry tier. */
         massStartBalance: BASE.playerStart,
-        massPerPellet: BASE.massPerPellet * s,
+        massPerPellet: BASE.massPerPellet,
         goldenBlobMass: getGoldenBlobValue(DEFAULT_ENTRY_FEE),
         ownerCut: BASE.ownerCut * s,
         foodLow: BASE.foodLow * s,

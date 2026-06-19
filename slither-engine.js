@@ -669,8 +669,12 @@ function updateSnakeMovement(snake, room = null) {
         let poolCredit = cost;
         // Normal mode: boost spends HUD balance too (size and dollars stay linked).
         if (isCoupledSlitherRoom(room) && snake.dollarBalance != null) {
+            const eco = getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+            const conversionRatio = eco.foodBlobValue / eco.massPerPellet;
+            const targetDollarCost = cost * conversionRatio;
+
             const dollarFloor = minDollarsForSnake(snake);
-            const dollarCost = Math.min(cost, Math.max(0, snake.dollarBalance - dollarFloor));
+            const dollarCost = Math.min(targetDollarCost, Math.max(0, snake.dollarBalance - dollarFloor));
             if (dollarCost > 1e-9) {
                 snake.dollarBalance -= dollarCost;
             }
