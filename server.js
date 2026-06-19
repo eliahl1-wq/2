@@ -3670,27 +3670,45 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('adminSpawnBotNearMe', async ({ token }) => {
+    socket.on('adminSpawnBotNearMe', async ({ token, mode }) => {
+        console.log(`[Admin Spawn] Received request. Mode parameter: ${mode}, Socket ID: ${socket.id}, Room ID: ${socket.roomId}`);
         try {
-            const decoded = jwt.verify(token, process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193");
+            const secret = process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193";
+            const decoded = jwt.verify(token, secret);
             const user = await User.findById(decoded.id);
-            if (!user || !user.isAdmin) return;
+            if (!user) {
+                console.log(`[Admin Spawn] Rejected: User not found for ID ${decoded.id}`);
+                return;
+            }
+            if (!user.isAdmin) {
+                console.log(`[Admin Spawn] Rejected: User ${user.username} is not an admin`);
+                return;
+            }
 
             const room = getArenaRoomById(socket.roomId);
-            if (!room || !DEV_FREE_PLAY) return;
-            const p = room.players.find(pl => pl.id === socket.id);
-            if (!p) return;
+            if (!room) {
+                console.log(`[Admin Spawn] Rejected: Room ${socket.roomId} not found`);
+                return;
+            }
+            if (!DEV_FREE_PLAY && !room.isSandbox) {
+                console.log(`[Admin Spawn] Rejected: DEV_FREE_PLAY is false and room is not sandbox`);
+                return;
+            }
 
-            const isSlither = p.mode === 'slither';
+            const p = room.players.find(pl => pl.id === socket.id);
+            const isSlither = mode === 'slither' || (p && p.mode === 'slither') || room.id.includes('slither') || room.isCompetitiveSlither;
             const stake = botStakeForRoom(room);
             const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
             const startMass = getEconomy(room.entryFeeUsd ?? 0.10).massStartBalance;
-            const spawnX = (isSlither ? p.x : p.cells?.[0]?.x) || 0;
-            const spawnY = (isSlither ? p.y : p.cells?.[0]?.y) || 0;
+            
+            const spawnX = p ? ((isSlither ? p.x : p.cells?.[0]?.x) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : c.worldWidth));
+            const spawnY = p ? ((isSlither ? p.y : p.cells?.[0]?.y) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : c.worldHeight));
 
-            const offsetX = (Math.random() - 0.5) * 600;
-            const offsetY = (Math.random() - 0.5) * 600;
+            const offsetX = p ? (Math.random() - 0.5) * 600 : 0;
+            const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
 
+            console.log(`[Admin Spawn] Spawning ${isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
+            
             if (isSlither) {
                 const dollarStart = getEconomy(room.entryFeeUsd ?? 0.10).botStartBalance;
                 const angle = Math.random() * Math.PI * 2;
@@ -3743,7 +3761,7 @@ io.on('connection', (socket) => {
                 });
             }
         } catch (err) {
-            console.error('adminSpawnBot error:', err);
+            console.error('[Admin Spawn] Error:', err);
         }
     });
 
