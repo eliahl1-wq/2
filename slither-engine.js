@@ -873,8 +873,13 @@ function checkSnakeCollisions(snake, allSnakes) {
 
 const SLITHER_FOOD_CELL = 64;
 
-function buildSlitherFoodGrid(food) {
-    const grid = new Map();
+function buildSlitherFoodGrid(food, existingGrid) {
+    const grid = existingGrid || new Map();
+    if (existingGrid) {
+        for (const bucket of grid.values()) {
+            bucket.length = 0;
+        }
+    }
     for (let i = 0; i < food.length; i++) {
         const f = food[i];
         const cx = Math.floor(f.x / SLITHER_FOOD_CELL);
@@ -1082,18 +1087,18 @@ const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
     if (segments.length <= maxPoints) {
-        return segments.map(s => ({ x: Math.round(s.x), y: Math.round(s.y) }));
+        return segments.map(s => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 }));
     }
     const step = Math.ceil(segments.length / maxPoints);
     const slim = [];
     for (let i = 0; i < segments.length; i += step) {
         const s = segments[i];
-        slim.push({ x: Math.round(s.x), y: Math.round(s.y) });
+        slim.push({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 });
     }
     const last = segments[segments.length - 1];
     const tail = slim[slim.length - 1];
-    if (!tail || tail.x !== Math.round(last.x) || tail.y !== Math.round(last.y)) {
-        slim.push({ x: Math.round(last.x), y: Math.round(last.y) });
+    if (!tail || tail.x !== Math.round(last.x * 10) / 10 || tail.y !== Math.round(last.y * 10) / 10) {
+        slim.push({ x: Math.round(last.x * 10) / 10, y: Math.round(last.y * 10) / 10 });
     }
     return slim;
 }
@@ -1174,7 +1179,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const toRemove = [];
     const sandboxSkipDeathCollisions = room.isSandbox && room.sandboxInvincible;
     const sandboxSkipFoodCollisions = sandboxSkipDeathCollisions && !room.sandboxBotAi;
-    const foodGrid = room.slitherFood.length > 80 ? buildSlitherFoodGrid(room.slitherFood) : null;
+    room._sharedFoodGrid = room.slitherFood.length > 80 ? buildSlitherFoodGrid(room.slitherFood, room._sharedFoodGrid) : null;
+    const foodGrid = room._sharedFoodGrid;
 
     for (const { entity: snake, isHuman } of allSnakes) {
         if (snake.frozen || snake.isStatic) continue;
@@ -1286,7 +1292,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
     const needsFoodRefresh = sendFoodThisTick || slitherPlayers.some(p => !room._lastSlitherFoodByPlayer?.[p.id]);
     const broadcastFoodGrid = needsFoodRefresh && room.slitherFood.length > 80
-        ? buildSlitherFoodGrid(room.slitherFood)
+        ? buildSlitherFoodGrid(room.slitherFood, room._sharedFoodGrid)
         : null;
 
     slitherPlayers.forEach(p => {
@@ -1773,8 +1779,9 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         || compPlayers.some(p => !room._lastCompFoodByPlayer?.[p.id])
         || compSpecs.length > 0;
     const compFoodGrid = needsCompFoodRefresh && room.slitherFood.length > 80
-        ? buildSlitherFoodGrid(room.slitherFood)
+        ? buildSlitherFoodGrid(room.slitherFood, room._sharedCompFoodGrid)
         : null;
+    if (compFoodGrid) room._sharedCompFoodGrid = compFoodGrid;
 
     const emitTickToViewer = (viewer) => {
         const { socketId, viewX, viewY, youId, dollarBalance, spectating } = viewer;
