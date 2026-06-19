@@ -29,6 +29,8 @@ import {
     syncCompetitiveSlitherFood,
     spawnGoldenSlitherBlob,
     getCompetitiveZone,
+    addSlitherFood,
+    createSegments,
 } from './slither-engine.js';
 import {
     ALLOWED_ENTRY_FEES,
@@ -3566,7 +3568,7 @@ io.on('connection', (socket) => {
             if (!user || !user.isAdmin) return;
 
             const room = getArenaRoomById(socket.roomId);
-            if (!room) return;
+            if (!room || !DEV_FREE_PLAY) return;
             const p = room.players.find(pl => pl.id === socket.id);
             if (!p) return;
 
@@ -3602,10 +3604,11 @@ io.on('connection', (socket) => {
                     boost: false,
                     angle,
                     fam: 0,
-                    segments: [],
+                    segments: createSegments(spawnX + offsetX, spawnY + offsetY, startMass, angle),
                     screenWidth: 1920,
                     screenHeight: 1080,
                     isBot: true,
+                    adminSpawned: true,
                 });
             } else {
                 room.bots.push({
@@ -3617,6 +3620,7 @@ io.on('connection', (socket) => {
                     kills: 0,
                     color: util.randomColor(),
                     isBot: true,
+                    adminSpawned: true,
                     targetX: spawnX + offsetX,
                     targetY: spawnY + offsetY,
                     lastTargetUpdate: Date.now(),
@@ -4063,6 +4067,7 @@ function processRoom(room) {
         let agarTargetBots = getTargetBots(agarHumansInArena);
         if (agarHumansInArena > 0) room.savedAgarTarget = agarTargetBots;
         else agarTargetBots = room.savedAgarTarget || 0;
+        agarTargetBots += room.bots.filter(b => b.adminSpawned).length;
 
         const agarBotStake = botStakeForRoom(room);
         const slitherBotStake = botStakeForRoom(room);
@@ -4076,6 +4081,7 @@ function processRoom(room) {
         let slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
         if (slitherHumansInArena > 0) room.savedSlitherTarget = slitherTargetBots;
         else slitherTargetBots = room.savedSlitherTarget || 0;
+        slitherTargetBots += room.slitherBots.filter(b => b.adminSpawned).length;
 
         if (room.slitherBots.length < slitherTargetBots) {
             addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
