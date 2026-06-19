@@ -3670,7 +3670,7 @@ io.on('connection', (socket) => {
 
     socket.on('adminSpawnBotNearMe', async ({ token }) => {
         try {
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
             const user = await User.findById(decoded.id);
             if (!user || !user.isAdmin) return;
 
