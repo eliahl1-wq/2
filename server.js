@@ -7,6 +7,14 @@ import { Server } from 'socket.io';
 import { createServer } from 'http';
 import 'dotenv/config';
 import * as util from './utils.js';
+import {
+    PRESENCE_TTL_MS,
+    touchSitePresenceFromRequest,
+    touchSitePresenceFromSocket,
+    getSiteUsersOnline,
+    getSitePresenceList,
+    formatPresenceLocation,
+} from './site-presence.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import passport from 'passport';
@@ -2294,6 +2302,34 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
     });
 });
 
+app.get('/api/admin/dashboard/site-presence', authenticateAdmin, (req, res) => {
+    const visitors = getSitePresenceList().map((rec) => ({
+        id: rec.key.length > 12 ? `${rec.key.slice(0, 8)}…` : rec.key,
+        key: rec.key,
+        username: rec.username,
+        page: rec.page,
+        gamemode: rec.gamemode,
+        inGame: rec.inGame,
+        gameMode: rec.gameMode,
+        country: rec.country,
+        city: rec.city,
+        timezone: rec.timezone,
+        locale: rec.locale,
+        location: formatPresenceLocation(rec),
+        ip: rec.ipDisplay,
+        source: rec.source,
+        seenAt: rec.seenAt,
+        firstSeenAt: rec.firstSeenAt,
+        sessionMs: Math.max(0, (rec.seenAt || 0) - (rec.firstSeenAt || 0)),
+    }));
+    res.json({
+        count: visitors.length,
+        ttlMs: PRESENCE_TTL_MS,
+        serverTime: Date.now(),
+        visitors,
+    });
+});
+
 app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
     if (globalArenaResetting || rooms.some(r => r.isResetting)) {
         return res.status(409).json({ message: 'Arena reset already in progress' });
@@ -2552,28 +2588,27 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Site-wide presence (pregame + any page polling /api/stats with X-Presence-Id)
-const sitePresence = new Map();
-const PRESENCE_TTL_MS = 90_000;
-
-function touchSitePresence(key) {
-    if (!key) return;
-    sitePresence.set(String(key), Date.now());
-}
-
-function getSiteUsersOnline() {
-    const cutoff = Date.now() - PRESENCE_TTL_MS;
-    for (const [key, seenAt] of sitePresence) {
-        if (seenAt < cutoff) sitePresence.delete(key);
+app.post('/api/presence/ping', (req, res) => {
+    try {
+        touchSitePresenceFromRequest(req, {
+            page: req.body?.page || null,
+            gamemode: req.body?.gamemode || null,
+            username: req.body?.username || null,
+            inGame: !!req.body?.inGame,
+            gameMode: req.body?.gameMode || null,
+            source: 'ping',
+        });
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('Presence ping error:', err);
+        res.status(500).json({ error: 'Presence ping failed' });
     }
-    return sitePresence.size;
-}
+});
 
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
-        const presenceKey = req.headers['x-presence-id'] || req.ip;
-        touchSitePresence(presenceKey);
+        touchSitePresenceFromRequest(req, { source: 'stats' });
 
         const modeFilter = req.query.mode === 'slither' ? 'slither' : req.query.mode === 'agar' ? 'agar' : null;
         let filteredHumansOnline = 0;
@@ -3129,8 +3164,17 @@ function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c
     return util.massToRadius(visualMass * c.sizeMult);
 }
 
+function markPresenceInGame(socket, username, gameMode) {
+    touchSitePresenceFromSocket(socket, {
+        username: username || null,
+        inGame: true,
+        gameMode: gameMode || null,
+        page: String(gameMode || '').includes('slither') ? '/slither-game' : '/game',
+    });
+}
+
 io.on('connection', (socket) => {
-    touchSitePresence(socket.id);
+    touchSitePresenceFromSocket(socket, { source: 'socket' });
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
         let userKey = null;
@@ -3208,6 +3252,7 @@ io.on('connection', (socket) => {
                         circularMap: true,
                         zone: getCompetitiveZone(room.startTime + c.roomDuration),
                     });
+                    markPresenceInGame(socket, user.username, 'competitive-slither');
                     return;
                 }
 
@@ -3280,6 +3325,7 @@ io.on('connection', (socket) => {
                         circularMap: true,
                         zone: getCompetitiveZone(room.startTime + c.roomDuration),
                     });
+                    markPresenceInGame(socket, user.username, 'competitive-slither');
                     return;
                 }
 
@@ -3297,6 +3343,7 @@ io.on('connection', (socket) => {
                     circularMap: true,
                     zone: getCompetitiveZone(room.startTime + c.roomDuration),
                 });
+                markPresenceInGame(socket, user.username, 'competitive-slither');
                 return;
             }
 
@@ -3348,6 +3395,7 @@ io.on('connection', (socket) => {
                     entryFeeUsd: existingPlayer.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
+                markPresenceInGame(socket, user.username, rejoinMode);
                 return;
             }
 
@@ -3502,6 +3550,7 @@ io.on('connection', (socket) => {
                     entryFeeUsd: raced.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
+                markPresenceInGame(socket, user.username, racedMode);
                 return;
             }
 
@@ -3545,6 +3594,7 @@ io.on('connection', (socket) => {
                 entryFeeUsd,
                 solPrice: SOL_PRICE_USD,
             });
+            markPresenceInGame(socket, user.username, gameMode);
         } catch (err) {
             console.error('joinGame error:', err.message);
             if (err.name === 'TokenExpiredError') {
@@ -3826,6 +3876,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
+        touchSitePresenceFromSocket(socket, { inGame: false });
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
         if (room.isCompetitiveSlither) {

@@ -1159,15 +1159,16 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 }
 
 const MAX_NETWORK_SEGMENTS = 120;
-const MAX_VISIBLE_FOOD = 240;
+const MAX_VISIBLE_FOOD = 130;
 const MAX_SLITHER_FOOD_TOTAL = 700;
-const MAX_MINIMAP_FOOD = 200;
-const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
+const MAX_MINIMAP_FOOD = 40;
+const MAX_COMP_MINIMAP_FOOD = 28;
+const SLITHER_MINIMAP_BROADCAST_INTERVAL = 5;
 /** Extra beyond snake viewRange — tuned to client viewport (~W/2/zoom + margin), not whole arena. */
 const SLITHER_FOOD_VIEW_EXTRA = 200;
-const SLITHER_FOOD_BROADCAST_INTERVAL = 4;
-/** Physics at 40Hz; network state at ~13Hz — client interpolates between ticks. */
-const SLITHER_STATE_BROADCAST_INTERVAL = 3;
+const SLITHER_FOOD_BROADCAST_INTERVAL = 5;
+/** Physics at 40Hz; network state at ~10Hz — client interpolates between ticks. */
+const SLITHER_STATE_BROADCAST_INTERVAL = 4;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
     if (segments.length <= maxPoints) {
@@ -1190,7 +1191,7 @@ function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS
 function serializeSnake(snake, isYou) {
     const sct = snake.segments.length;
     const sc = scaleForSegmentCount(sct);
-    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
+    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 40);
     return {
         id: snake.id,
         name: snake.username,
@@ -1796,7 +1797,7 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
 function serializeCompetitiveSnake(snake, isYou) {
     const sct = snake.segments.length;
     const sc = scaleForSegmentCount(sct);
-    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
+    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 40);
     return {
         id: snake.id,
         name: snake.username,
@@ -1927,13 +1928,13 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             }).filter(Boolean);
 
             const minimapFood = collectMinimapFood(
-                room.slitherFood,
-                compFoodGrid ?? getSlitherFoodGridForRoom(room),
-                head.x,
-                head.y,
-                SLITHER.minimapRange * 0.65,
-                MAX_MINIMAP_FOOD,
-            );
+                    room.slitherFood,
+                    broadcastFoodGrid ?? getSlitherFoodGridForRoom(room),
+                    head.x,
+                    head.y,
+                    SLITHER.minimapRange * 0.65,
+                    MAX_COMP_MINIMAP_FOOD,
+                );
 
             minimap = { players: minimapPlayers, food: minimapFood };
             if (!room._lastCompMinimapByPlayer) room._lastCompMinimapByPlayer = {};
