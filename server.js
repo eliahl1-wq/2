@@ -3680,7 +3680,8 @@ io.on('connection', (socket) => {
                 console.log(`[Admin Spawn] Rejected: User not found for ID ${decoded.id}`);
                 return;
             }
-            if (!user.isAdmin) {
+            const isAdmin = user.isAdmin || (process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+            if (!isAdmin) {
                 console.log(`[Admin Spawn] Rejected: User ${user.username} is not an admin`);
                 return;
             }
@@ -3700,7 +3701,7 @@ io.on('connection', (socket) => {
             const stake = botStakeForRoom(room);
             const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
             const startMass = getEconomy(room.entryFeeUsd ?? 0.10).massStartBalance;
-            
+
             const spawnX = p ? ((isSlither ? p.x : p.cells?.[0]?.x) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : c.worldWidth));
             const spawnY = p ? ((isSlither ? p.y : p.cells?.[0]?.y) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : c.worldHeight));
 
@@ -3708,7 +3709,7 @@ io.on('connection', (socket) => {
             const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
 
             console.log(`[Admin Spawn] Spawning ${isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
-            
+
             if (isSlither) {
                 const dollarStart = getEconomy(room.entryFeeUsd ?? 0.10).botStartBalance;
                 const angle = Math.random() * Math.PI * 2;
