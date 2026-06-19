@@ -1082,18 +1082,18 @@ const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
     if (segments.length <= maxPoints) {
-        return segments.map(s => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 }));
+        return segments.map(s => ({ x: Math.round(s.x), y: Math.round(s.y) }));
     }
     const step = Math.ceil(segments.length / maxPoints);
     const slim = [];
     for (let i = 0; i < segments.length; i += step) {
         const s = segments[i];
-        slim.push({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 });
+        slim.push({ x: Math.round(s.x), y: Math.round(s.y) });
     }
     const last = segments[segments.length - 1];
     const tail = slim[slim.length - 1];
-    if (!tail || tail.x !== Math.round(last.x * 10) / 10 || tail.y !== Math.round(last.y * 10) / 10) {
-        slim.push({ x: Math.round(last.x * 10) / 10, y: Math.round(last.y * 10) / 10 });
+    if (!tail || tail.x !== Math.round(last.x) || tail.y !== Math.round(last.y)) {
+        slim.push({ x: Math.round(last.x), y: Math.round(last.y) });
     }
     return slim;
 }
@@ -1274,6 +1274,16 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const sendMinimapThisTick = room._slitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
     const slitherPlayers = room.players.filter(p => p.mode === 'slither' && !p.disconnected);
+
+    const serializedSnakesNotYou = new Map();
+    for (const { entity: s } of allSnakes) {
+        serializedSnakesNotYou.set(s.id, serializeSnake(s, false));
+    }
+    const serializedSnakesYou = new Map();
+    for (const p of slitherPlayers) {
+        serializedSnakesYou.set(p.id, serializeSnake(p, true));
+    }
+
     const needsFoodRefresh = sendFoodThisTick || slitherPlayers.some(p => !room._lastSlitherFoodByPlayer?.[p.id]);
     const broadcastFoodGrid = needsFoodRefresh && room.slitherFood.length > 80
         ? buildSlitherFoodGrid(room.slitherFood)
@@ -1292,7 +1302,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                     const h = s.segments[0];
                     return isInView(head.x, head.y, h.x, h.y, range);
                 })
-                .map(({ entity: s }) => serializeSnake(s, s.id === p.id));
+                .map(({ entity: s }) => s.id === p.id ? serializedSnakesYou.get(s.id) : serializedSnakesNotYou.get(s.id));
 
             let visibleFood = null;
             if (sendFoodThisTick || !room._lastSlitherFoodByPlayer?.[p.id]) {

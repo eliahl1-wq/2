@@ -2556,6 +2556,7 @@ app.get('/api/stats', (req, res) => {
             slither: { 5: 0, 10: 0, 20: 0 },
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
+        let totalBotsOnline = 0;
 
         const pushTop = (list, name, balance) => {
             if (name && balance > 0) list.push({ username: name, balance });
@@ -2595,6 +2596,7 @@ app.get('/api/stats', (req, res) => {
                 }
             });
             room.bots.forEach(bot => {
+                totalBotsOnline += 1;
                 const botUsd = bot.dollarBalance ?? bot.balance ?? bot.cells?.reduce((s, c) => s + c.balance, 0) ?? 0;
                 playersByGamemode.agar += 1;
                 pushTop(agarPlayers, bot.username, botUsd);
@@ -2604,6 +2606,7 @@ app.get('/api/stats', (req, res) => {
                 }
             });
             room.slitherBots.forEach(bot => {
+                totalBotsOnline += 1;
                 playersByGamemode.slither += 1;
                 const botUsd = bot.dollarBalance ?? bot.balance;
                 pushTop(slitherPlayers, bot.username, botUsd);
@@ -2643,6 +2646,7 @@ app.get('/api/stats', (req, res) => {
             playersOnline: filteredHumansOnline + filteredAiOnline,
             totalPlayersOnline,
             siteUsersOnline: getSiteUsersOnline(),
+            totalBotsOnline,
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
             topBalance: Number(topBalance.toFixed(2)),
