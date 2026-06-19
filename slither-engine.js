@@ -1320,8 +1320,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     for (const { snake, isHuman, killer, respawnBot, returnToPool = true } of toRemove) {
         eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
         if (!isBR && respawnBot) {
-            const activeHumans = room.players.filter(p => p.mode === 'slither' && !p.disconnected).length;
-            syncSlitherBots(room, activeHumans, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
+            const humansInArena = room.players.filter(p => p.mode === 'slither').length;
+            const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
+            syncSlitherBots(room, effectiveHumans, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
         }
     }
 
