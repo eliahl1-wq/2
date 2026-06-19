@@ -18,9 +18,8 @@ import {
     COMPETITIVE_SLITHER,
     createSlitherPlayer,
     createCompetitiveSlitherPlayer,
-    addSlitherBots,
+    syncSlitherBots,
     getSlitherTargetBots,
-    trimSlitherBots,
     processSlitherRoom,
     processCompetitiveSlitherRoom,
     broadcastSlitherState,
@@ -3056,16 +3055,21 @@ function countHumansInMode(room, mode) {
     return room.players.filter(p => p.mode === mode || (mode === 'agar' && !p.mode)).length;
 }
 
-/** Keep bots alive while humans are disconnected or after death until arena reset. */
+/** Active humans for bot scaling — bots never count as humans. */
 function effectiveHumanCountForBots(room, mode) {
+    const active = countActiveHumansByMode(room, mode);
+    if (active > 0) return active;
+    if (mode === 'slither') return 0;
+    // Agar: keep bots alive while humans are disconnected until arena reset.
     const humans = room.players.filter(p => p.mode === mode || (mode === 'agar' && !p.mode));
     if (humans.length > 0) return humans.length;
-    const botCount = mode === 'slither' ? room.slitherBots.length : room.bots.length;
-    return botCount > 0 ? 1 : 0;
+    return room.bots.length > 0 ? 1 : 0;
 }
 
 function countActiveHumansByMode(room, mode) {
-    return room.players.filter(p => !p.disconnected && (p.mode === mode || (mode === 'agar' && !p.mode))).length;
+    return room.players.filter(p =>
+        !p.disconnected && !p.isBot && (p.mode === mode || (mode === 'agar' && !p.mode))
+    ).length;
 }
 
 // Helper för att beräkna radie med extra tillväxt-effekt
@@ -3355,14 +3359,14 @@ io.on('connection', (socket) => {
 
             // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population)
             const gameMode = mode === 'slither' ? 'slither' : 'agar';
-            const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
+            const modeHumansAfterJoin = countActiveHumansByMode(room, gameMode) + 1;
             const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
             const foodToPool = Math.max(0, foodAlloc - goldenBlobValue);
 
             // Only fund bots up to the cap for current population; surplus → food pool
-            const agarAfter = countHumansInMode(room, 'agar') + (gameMode === 'agar' ? 1 : 0);
-            const slitherAfter = countHumansInMode(room, 'slither') + (gameMode === 'slither' ? 1 : 0);
+            const agarAfter = countActiveHumansByMode(room, 'agar') + (gameMode === 'agar' ? 1 : 0);
+            const slitherAfter = countActiveHumansByMode(room, 'slither') + (gameMode === 'slither' ? 1 : 0);
             const joinBotStake = economy.botStartBalance;
             const maxAi = getTargetBots(agarAfter) * joinBotStake + getSlitherTargetBots(slitherAfter) * joinBotStake;
             const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
@@ -3373,17 +3377,11 @@ io.on('connection', (socket) => {
             room.ownerBalance += economy.ownerCut;
 
             // DYNAMIC BOT SCALING (mode-specific)
-            const targetBots = gameMode === 'slither'
-                ? getSlitherTargetBots(modeHumansAfterJoin)
-                : getTargetBots(modeHumansAfterJoin);
-
             if (gameMode === 'slither') {
-                if (room.slitherBots.length < targetBots) {
-                    addSlitherBots(room, targetBots - room.slitherBots.length, joinBotStake);
-                } else if (room.slitherBots.length > targetBots) {
-                    trimSlitherBots(room, targetBots);
-                }
+                const botsFromEntry = Math.floor(aiToAdd / joinBotStake);
+                syncSlitherBots(room, modeHumansAfterJoin, joinBotStake, botsFromEntry);
             } else {
+                const targetBots = getTargetBots(modeHumansAfterJoin);
                 if (room.bots.length < targetBots) {
                     addBots(room, targetBots - room.bots.length, joinBotStake);
                 } else if (room.bots.length > targetBots) {
@@ -3951,12 +3949,7 @@ function processRoom(room) {
         trimAgarBots(room, agarTargetBots);
     }
 
-    const slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
-    if (room.slitherBots.length < slitherTargetBots) {
-        addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
-    } else if (room.slitherBots.length > slitherTargetBots) {
-        trimSlitherBots(room, slitherTargetBots);
-    }
+    syncSlitherBots(room, slitherHumansInArena, slitherBotStake);
 
     capAiBudget(room);
     }

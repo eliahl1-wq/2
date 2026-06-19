@@ -1,5 +1,5 @@
 import * as util from './utils.js';
-import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy } from './economy.js';
+import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy, getJoinPoolSplit } from './economy.js';
 
 export const SLITHER = {
     worldHalf: 3000,
@@ -366,11 +366,44 @@ export function trimSlitherBots(room, targetCount) {
     }
 }
 
+/**
+ * Max slither bots for active human count. Bots never count as humans.
+ * Matches entry-fee tiers: 2 bots/entry (<3 humans), 1 bot/entry (3–8), none (9+).
+ * 1→2, 2→4, 3→5, 4→6, … 8→10
+ */
 export function getSlitherTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
-    if (humanCount >= 8) return 0;
-    if (humanCount < 3) return humanCount * 2; // 1 human → 2 bots, 2 humans → 4 bots
-    return Math.min(humanCount * 2, 12);
+    if (humanCount > 8) return 0;
+    if (humanCount < 3) return humanCount * 2;
+    return Math.min(humanCount, 2) * 2 + Math.max(0, humanCount - 2);
+}
+
+/** Bots this entry fee funds (20% slice at $10 = $2 or $1 per tier). */
+export function slitherBotsFundedPerEntry(entryFeeUsd, activeHumansAfterJoin, botStake) {
+    const { ai } = getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin);
+    return Math.floor(ai / botStake);
+}
+
+/** How many bots may spawn this tick — throttles when the arena is already bot-heavy. */
+export function slitherBotsToSpawn(room, targetBots) {
+    const current = room.slitherBots.length;
+    if (current >= 7) return 0;
+    const needed = Math.max(0, targetBots - current);
+    if (needed <= 0) return 0;
+    if (current >= 4) return Math.min(needed, 1);
+    return needed;
+}
+
+/** Spawn slither bots up to the population target; never despawn live bots when humans leave or die. */
+export function syncSlitherBots(room, humanCount, botStake = SLITHER.botStartBalance, maxSpawn = Infinity) {
+    const target = getSlitherTargetBots(humanCount);
+    let toSpawn = slitherBotsToSpawn(room, target);
+    if (Number.isFinite(maxSpawn)) {
+        toSpawn = Math.min(toSpawn, maxSpawn);
+    }
+    if (toSpawn > 0) {
+        addSlitherBots(room, toSpawn, botStake);
+    }
 }
 
 function getAllSlitherSnakes(room) {
@@ -1287,12 +1320,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     for (const { snake, isHuman, killer, respawnBot, returnToPool = true } of toRemove) {
         eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
         if (!isBR && respawnBot) {
-            const humansInArena = room.players.filter(p => p.mode === 'slither').length;
-            const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
-            const targetBots = getSlitherTargetBots(effectiveHumans);
-            if (room.slitherBots.length < targetBots) {
-                addSlitherBots(room, 1, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
-            }
+            const activeHumans = room.players.filter(p => p.mode === 'slither' && !p.disconnected).length;
+            syncSlitherBots(room, activeHumans, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
         }
     }
 
