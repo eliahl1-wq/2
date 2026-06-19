@@ -3152,7 +3152,7 @@ function addBots(room, n, botStake = null) {
     const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCost));
     for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
-        const randomName = botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]";
+        const randomName = botNames[Math.floor(Math.random() * botNames.length)];
         room.aiBudgetBalance -= botCost;
         room.bots.push({
             id: id,
@@ -3720,7 +3720,7 @@ io.on('connection', (socket) => {
                 room.players.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
                     mongoId: null,
-                    username: botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]",
+                    username: botNames[Math.floor(Math.random() * botNames.length)],
                     mode: 'competitive-slither',
                     kills: 0,
                     balance: startMass,
@@ -3748,7 +3748,7 @@ io.on('connection', (socket) => {
                 const angle = Math.random() * Math.PI * 2;
                 room.slitherBots.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
-                    username: botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]",
+                    username: botNames[Math.floor(Math.random() * botNames.length)],
                     mode: 'slither',
                     kills: 0,
                     balance: startMass,
@@ -3774,7 +3774,7 @@ io.on('connection', (socket) => {
             } else {
                 room.bots.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
-                    username: botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]",
+                    username: botNames[Math.floor(Math.random() * botNames.length)],
                     balance: stake,
                     dollarBalance: stake,
                     botStake: stake,

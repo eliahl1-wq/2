@@ -333,7 +333,7 @@ export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
     const angle = Math.random() * Math.PI * 2;
     return {
         id: 'slither_bot_' + randId(),
-        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)] + ' [' + util.randomInRange(10, 99) + ']',
+        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
         isBot: true,
         balance: startMass,
         dollarBalance: botBalance,
