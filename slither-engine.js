@@ -1,5 +1,5 @@
 import * as util from './utils.js';
-import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy, getJoinPoolSplit } from './economy.js';
+import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy } from './economy.js';
 
 export const SLITHER = {
     worldHalf: 3000,
@@ -30,7 +30,7 @@ export const SLITHER = {
     segmentSpacing: 6,
     baseSegments: 12,
     segmentsPerCentLegacy: 0.1,
-    foodBlobValue: 0.02, // baseline at $10; use getEconomy(entryFee).foodBlobValue per room
+    foodBlobValue: 0.04, // legacy doc; use getEconomy(entryFee).foodBlobValue per room
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
     viewRange: 520,
@@ -366,44 +366,11 @@ export function trimSlitherBots(room, targetCount) {
     }
 }
 
-/**
- * Max slither bots for active human count. Bots never count as humans.
- * Matches entry-fee tiers: 2 bots/entry (<3 humans), 1 bot/entry (3–8), none (9+).
- * 1→2, 2→4, 3→5, 4→6, … 8→10
- */
 export function getSlitherTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
-    if (humanCount > 8) return 0;
-    if (humanCount < 3) return humanCount * 2;
-    return Math.min(humanCount, 2) * 2 + Math.max(0, humanCount - 2);
-}
-
-/** Bots this entry fee funds (20% slice at $10 = $2 or $1 per tier). */
-export function slitherBotsFundedPerEntry(entryFeeUsd, activeHumansAfterJoin, botStake) {
-    const { ai } = getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin);
-    return Math.floor(ai / botStake);
-}
-
-/** How many bots may spawn this tick — throttles when the arena is already bot-heavy. */
-export function slitherBotsToSpawn(room, targetBots) {
-    const current = room.slitherBots.length;
-    if (current >= 7) return 0;
-    const needed = Math.max(0, targetBots - current);
-    if (needed <= 0) return 0;
-    if (current >= 4) return Math.min(needed, 1);
-    return needed;
-}
-
-/** Spawn slither bots up to the population target; never despawn live bots when humans leave or die. */
-export function syncSlitherBots(room, humanCount, botStake = SLITHER.botStartBalance, maxSpawn = Infinity) {
-    const target = getSlitherTargetBots(humanCount);
-    let toSpawn = slitherBotsToSpawn(room, target);
-    if (Number.isFinite(maxSpawn)) {
-        toSpawn = Math.min(toSpawn, maxSpawn);
-    }
-    if (toSpawn > 0) {
-        addSlitherBots(room, toSpawn, botStake);
-    }
+    if (humanCount >= 8) return 0;
+    if (humanCount < 3) return humanCount * 2; // 1 human → 2 bots, 2 humans → 4 bots
+    return Math.min(humanCount * 2, 12);
 }
 
 function getAllSlitherSnakes(room) {
@@ -855,11 +822,6 @@ function snakeMouthPoint(snake) {
 }
 
 function rememberSnakeMouthBeforeMove(snake) {
-    const head = snake.segments?.[0];
-    if (head) {
-        snake._prevHeadX = head.x;
-        snake._prevHeadY = head.y;
-    }
     const mouth = snakeMouthPoint(snake);
     snake._prevMouthX = mouth.x;
     snake._prevMouthY = mouth.y;
@@ -888,46 +850,16 @@ function checkSelfCollision(_snake) {
 function checkSnakeCollisions(snake, allSnakes) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return null;
     const head = snake.segments[0];
-    if (!head) return null;
     const r = headRadiusForBalance(snake.balance);
-    const headReach = r * 0.72;
-    const px = snake._prevHeadX;
-    const py = snake._prevHeadY;
-    const hasSweep = px != null && py != null;
-
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
         if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) continue;
-        const segs = other.segments;
-        if (!segs?.length) continue;
-
-        const otherR = headRadiusForBalance(other.balance);
-        const bodyR = otherR * 0.72;
-        const spacing = segmentSpacingForBalance(other.balance);
-        const bodyReach = segs.length * spacing + otherR + headReach + 40;
-        if (dist(head.x, head.y, segs[0].x, segs[0].y) > bodyReach) continue;
-
-        const pointHitHead = headReach + otherR * 0.82 * 0.52;
-        const pointHitBody = headReach + bodyR * 0.52;
-        const lineHit = headReach + bodyR * 0.48;
-        const pointStride = segs.length > 80 ? 2 : 1;
-
-        for (let i = 0; i < segs.length; i += pointStride) {
-            const seg = segs[i];
-            const hit = i === 0 ? pointHitHead : pointHitBody;
-            if (dist(head.x, head.y, seg.x, seg.y) < hit) return other;
-            if (hasSweep && distPointToSegment(seg.x, seg.y, px, py, head.x, head.y) < hit) return other;
-        }
-
-        const lineStride = segs.length > 120 ? 2 : 1;
-        for (let i = 1; i < segs.length; i += lineStride) {
-            const prev = segs[i - 1];
-            const seg = segs[i];
-            const mx = (prev.x + seg.x) * 0.5;
-            const my = (prev.y + seg.y) * 0.5;
-            if (dist(head.x, head.y, mx, my) > lineHit + spacing * lineStride) continue;
-            if (distPointToSegment(head.x, head.y, prev.x, prev.y, seg.x, seg.y) < lineHit) return other;
-            if (hasSweep && distPointToSegment(px, py, prev.x, prev.y, seg.x, seg.y) < lineHit) return other;
+        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 3)) {
+            const seg = other.segments[i];
+            const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
+            if (dist(head.x, head.y, seg.x, seg.y) < r * 0.65 + segR * 0.45) {
+                return other;
+            }
         }
     }
     return null;
@@ -949,18 +881,6 @@ function buildSlitherFoodGrid(food) {
         bucket.push(f);
     }
     return grid;
-}
-
-/** Reuse one spatial grid per physics tick — avoids rebuilding in process + broadcast. */
-function getSlitherFoodGridForRoom(room) {
-    if (!room.slitherFood?.length || room.slitherFood.length <= 80) return null;
-    const tick = room._slitherPhysicsTick ?? 0;
-    if (room._slitherFoodGrid && room._slitherFoodGridTick === tick) {
-        return room._slitherFoodGrid;
-    }
-    room._slitherFoodGrid = buildSlitherFoodGrid(room.slitherFood);
-    room._slitherFoodGridTick = tick;
-    return room._slitherFoodGrid;
 }
 
 function serializeVisibleSlitherFood(f, radius = SLITHER.foodRadius) {
@@ -1014,21 +934,6 @@ function collectSlitherFoodInView(food, foodGrid, hx, hy, range, maxCount, radiu
     });
     inRange.length = maxCount;
     return inRange.map(f => serializeVisibleSlitherFood(f, radius));
-}
-
-function collectMinimapFood(food, foodGrid, hx, hy, range, maxCount) {
-    const visible = collectSlitherFoodInView(food, foodGrid, hx, hy, range, maxCount);
-    const out = new Array(visible.length);
-    for (let i = 0; i < visible.length; i++) {
-        const f = visible[i];
-        out[i] = {
-            x: Math.round(f.x),
-            y: Math.round(f.y),
-            g: !!f.golden,
-            h: f.hue,
-        };
-    }
-    return out;
 }
 
 function checkFoodCollisions(snake, room, foodGrid = null) {
@@ -1159,16 +1064,12 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 }
 
 const MAX_NETWORK_SEGMENTS = 120;
-const MAX_VISIBLE_FOOD = 130;
+const MAX_VISIBLE_FOOD = 240;
 const MAX_SLITHER_FOOD_TOTAL = 700;
-const MAX_MINIMAP_FOOD = 40;
-const MAX_COMP_MINIMAP_FOOD = 28;
-const SLITHER_MINIMAP_BROADCAST_INTERVAL = 5;
+const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
 /** Extra beyond snake viewRange — tuned to client viewport (~W/2/zoom + margin), not whole arena. */
 const SLITHER_FOOD_VIEW_EXTRA = 200;
-const SLITHER_FOOD_BROADCAST_INTERVAL = 5;
-/** Physics at 40Hz; network state at ~10Hz — client interpolates between ticks. */
-const SLITHER_STATE_BROADCAST_INTERVAL = 4;
+const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
     if (segments.length <= maxPoints) {
@@ -1191,12 +1092,11 @@ function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS
 function serializeSnake(snake, isYou) {
     const sct = snake.segments.length;
     const sc = scaleForSegmentCount(sct);
-    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 40);
+    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
     return {
         id: snake.id,
         name: snake.username,
         balance: snake.balance,
-        dollarBalance: snake.dollarBalance ?? snake.balance,
         color: snake.color,
         isBot: !!snake.isBot,
         isYou,
@@ -1257,7 +1157,6 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
  * Run one slither physics tick. Returns leaderboard entries for slither mode.
  */
 export function processSlitherRoom(room, io, User, Transaction = null) {
-    room._slitherPhysicsTick = (room._slitherPhysicsTick ?? 0) + 1;
     const isBR = room.isBattleRoyale === true;
     const slitherHumans = room.players.filter(p => !p.disconnected && p.mode === 'slither');
     const humanCount = slitherHumans.length;
@@ -1266,7 +1165,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const toRemove = [];
     const sandboxSkipDeathCollisions = room.isSandbox && room.sandboxInvincible;
     const sandboxSkipFoodCollisions = sandboxSkipDeathCollisions && !room.sandboxBotAi;
-    const foodGrid = getSlitherFoodGridForRoom(room);
+    const foodGrid = room.slitherFood.length > 80 ? buildSlitherFoodGrid(room.slitherFood) : null;
 
     for (const { entity: snake, isHuman } of allSnakes) {
         if (snake.frozen || snake.isStatic) continue;
@@ -1331,7 +1230,10 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         if (!isBR && respawnBot) {
             const humansInArena = room.players.filter(p => p.mode === 'slither').length;
             const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
-            syncSlitherBots(room, effectiveHumans, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
+            const targetBots = getSlitherTargetBots(effectiveHumans);
+            if (room.slitherBots.length < targetBots) {
+                addSlitherBots(room, 1, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
+            }
         }
     }
 
@@ -1359,31 +1261,14 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     if (sendLeaderboard) room._lastLbAt = now;
 
     room._slitherBroadcastTick = (room._slitherBroadcastTick || 0) + 1;
-    const sendStateThisTick = room._slitherBroadcastTick % SLITHER_STATE_BROADCAST_INTERVAL === 0;
     const sendFoodThisTick = room._slitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
     const sendMinimapThisTick = room._slitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
     const slitherPlayers = room.players.filter(p => p.mode === 'slither' && !p.disconnected);
-    if (!slitherPlayers.length) return;
-
-    const needsImmediateTick = slitherPlayers.some(p => !room._lastSlitherStateAt?.[p.id]);
-    if (!sendStateThisTick && !needsImmediateTick) return;
-
     const needsFoodRefresh = sendFoodThisTick || slitherPlayers.some(p => !room._lastSlitherFoodByPlayer?.[p.id]);
-    const broadcastFoodGrid = needsFoodRefresh ? getSlitherFoodGridForRoom(room) : null;
-
-    const physicsTick = room._slitherPhysicsTick ?? 0;
-    if (room._slitherSerializeTick !== physicsTick) {
-        room._slitherSerializeTick = physicsTick;
-        room._slitherSerializedOther = new Map();
-        room._slitherSerializedYou = new Map();
-        for (const { entity: s } of allSnakes) {
-            room._slitherSerializedOther.set(s.id, serializeSnake(s, false));
-            room._slitherSerializedYou.set(s.id, serializeSnake(s, true));
-        }
-    }
-    const serializedOther = room._slitherSerializedOther;
-    const serializedYou = room._slitherSerializedYou;
+    const broadcastFoodGrid = needsFoodRefresh && room.slitherFood.length > 80
+        ? buildSlitherFoodGrid(room.slitherFood)
+        : null;
 
     slitherPlayers.forEach(p => {
             const head = p.segments?.[0];
@@ -1398,10 +1283,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                     const h = s.segments[0];
                     return isInView(head.x, head.y, h.x, h.y, range);
                 })
-                .map(({ entity: s }) => (
-                    s.id === p.id ? serializedYou.get(s.id) : serializedOther.get(s.id)
-                ))
-                .filter(Boolean);
+                .map(({ entity: s }) => serializeSnake(s, s.id === p.id));
 
             let visibleFood = null;
             if (sendFoodThisTick || !room._lastSlitherFoodByPlayer?.[p.id]) {
@@ -1415,8 +1297,6 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 );
                 if (!room._lastSlitherFoodByPlayer) room._lastSlitherFoodByPlayer = {};
                 room._lastSlitherFoodByPlayer[p.id] = visibleFood;
-            } else {
-                visibleFood = room._lastSlitherFoodByPlayer[p.id];
             }
 
             let minimap = null;
@@ -1432,14 +1312,22 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                     };
                 }).filter(Boolean);
 
-                const minimapFood = collectMinimapFood(
-                    room.slitherFood,
-                    broadcastFoodGrid ?? getSlitherFoodGridForRoom(room),
-                    head.x,
-                    head.y,
-                    SLITHER.minimapRange,
-                    MAX_MINIMAP_FOOD,
-                );
+                const minimapFood = room.slitherFood
+                    .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange))
+                    .map(f => ({
+                        x: Math.round(f.x),
+                        y: Math.round(f.y),
+                        g: !!f.golden,
+                        h: f.hue,
+                    }));
+                if (minimapFood.length > 200) {
+                    minimapFood.sort((a, b) => {
+                        const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                        const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                        return da - db;
+                    });
+                    minimapFood.length = 200;
+                }
 
                 minimap = {
                     players: minimapPlayers,
@@ -1447,8 +1335,6 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 };
                 if (!room._lastSlitherMinimapByPlayer) room._lastSlitherMinimapByPlayer = {};
                 room._lastSlitherMinimapByPlayer[p.id] = minimap;
-            } else {
-                minimap = room._lastSlitherMinimapByPlayer[p.id];
             }
 
             const tickPayload = {
@@ -1460,9 +1346,6 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
             };
             if (visibleFood) tickPayload.food = visibleFood;
             if (minimap) tickPayload.minimap = minimap;
-
-            if (!room._lastSlitherStateAt) room._lastSlitherStateAt = {};
-            room._lastSlitherStateAt[p.id] = now;
 
             io.to(p.id).emit('slitherTick', tickPayload);
         });
@@ -1797,7 +1680,7 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
 function serializeCompetitiveSnake(snake, isYou) {
     const sct = snake.segments.length;
     const sc = scaleForSegmentCount(sct);
-    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 40);
+    const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
     return {
         id: snake.id,
         name: snake.username,
@@ -1819,7 +1702,6 @@ function serializeCompetitiveSnake(snake, isYou) {
 }
 
 export function processCompetitiveSlitherRoom(room, io, User, Transaction, resetTime) {
-    room._slitherPhysicsTick = (room._slitherPhysicsTick ?? 0) + 1;
     const effectiveRadius = getCompetitiveEffectiveRadius(resetTime);
     const allSnakes = getCompetitiveSnakes(room);
     const toRemove = [];
@@ -1863,23 +1745,17 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
     if (sendLeaderboard) room._lastCompLbAt = now;
 
     room._compSlitherBroadcastTick = (room._compSlitherBroadcastTick || 0) + 1;
-    const sendStateThisTick = room._compSlitherBroadcastTick % SLITHER_STATE_BROADCAST_INTERVAL === 0;
     const sendFoodThisTick = room._compSlitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
     const sendMinimapThisTick = room._compSlitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
     const compPlayers = room.players.filter(p => p.mode === 'competitive-slither' && !p.disconnected);
     const compSpecs = room.competitiveSpectators || [];
-    const allViewers = [
-        ...compPlayers.map(p => p.id),
-        ...compSpecs.map(s => s.id),
-    ];
-    const needsImmediateTick = allViewers.some(id => !room._lastCompStateAt?.[id]);
-    if (!sendStateThisTick && !needsImmediateTick) return;
-
     const needsCompFoodRefresh = sendFoodThisTick
         || compPlayers.some(p => !room._lastCompFoodByPlayer?.[p.id])
         || compSpecs.length > 0;
-    const compFoodGrid = needsCompFoodRefresh ? getSlitherFoodGridForRoom(room) : null;
+    const compFoodGrid = needsCompFoodRefresh && room.slitherFood.length > 80
+        ? buildSlitherFoodGrid(room.slitherFood)
+        : null;
 
     const emitTickToViewer = (viewer) => {
         const { socketId, viewX, viewY, youId, dollarBalance, spectating } = viewer;
@@ -1914,8 +1790,6 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
                 room._lastCompFoodByPlayer[socketId] = visibleFood;
             }
-        } else if (!spectating) {
-            visibleFood = room._lastCompFoodByPlayer?.[socketId];
         }
 
         let minimap = null;
@@ -1927,20 +1801,26 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === youId };
             }).filter(Boolean);
 
-            const minimapFood = collectMinimapFood(
-                    room.slitherFood,
-                    broadcastFoodGrid ?? getSlitherFoodGridForRoom(room),
-                    head.x,
-                    head.y,
-                    SLITHER.minimapRange * 0.65,
-                    MAX_COMP_MINIMAP_FOOD,
-                );
+            const minimapFood = room.slitherFood
+                .filter(f => isInView(head.x, head.y, f.x, f.y, SLITHER.minimapRange * 0.65))
+                .map(f => ({
+                    x: Math.round(f.x),
+                    y: Math.round(f.y),
+                    g: !!f.golden,
+                    h: f.hue,
+                }));
+            if (minimapFood.length > 200) {
+                minimapFood.sort((a, b) => {
+                    const da = (a.x - head.x) ** 2 + (a.y - head.y) ** 2;
+                    const db = (b.x - head.x) ** 2 + (b.y - head.y) ** 2;
+                    return da - db;
+                });
+                minimapFood.length = 200;
+            }
 
             minimap = { players: minimapPlayers, food: minimapFood };
             if (!room._lastCompMinimapByPlayer) room._lastCompMinimapByPlayer = {};
             room._lastCompMinimapByPlayer[socketId] = minimap;
-        } else {
-            minimap = room._lastCompMinimapByPlayer?.[socketId];
         }
 
         const tickPayload = {
@@ -1955,9 +1835,6 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         };
         if (visibleFood) tickPayload.food = visibleFood;
         if (minimap) tickPayload.minimap = minimap;
-
-        if (!room._lastCompStateAt) room._lastCompStateAt = {};
-        room._lastCompStateAt[socketId] = now;
 
         io.to(socketId).emit('slitherTick', tickPayload);
     };

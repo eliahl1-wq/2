@@ -7,14 +7,6 @@ import { Server } from 'socket.io';
 import { createServer } from 'http';
 import 'dotenv/config';
 import * as util from './utils.js';
-import {
-    PRESENCE_TTL_MS,
-    touchSitePresenceFromRequest,
-    touchSitePresenceFromSocket,
-    getSiteUsersOnline,
-    getSitePresenceList,
-    formatPresenceLocation,
-} from './site-presence.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import passport from 'passport';
@@ -26,8 +18,9 @@ import {
     COMPETITIVE_SLITHER,
     createSlitherPlayer,
     createCompetitiveSlitherPlayer,
-    syncSlitherBots,
+    addSlitherBots,
     getSlitherTargetBots,
+    trimSlitherBots,
     processSlitherRoom,
     processCompetitiveSlitherRoom,
     broadcastSlitherState,
@@ -233,7 +226,7 @@ const c = {
     sizeMult: 18,
     growthBoost: 2,
     foodValuePerPlayer: 6.0,
-    foodBlobValue: 0.02, // legacy doc; use foodBlobValueForRoom(room) per arena tier
+    foodBlobValue: 0.04, // legacy doc; use foodBlobValueForRoom(room) per arena tier
     roomDuration: process.env.DEV_ROOM_DURATION_MS
         ? parseInt(process.env.DEV_ROOM_DURATION_MS, 10)
         : 3 * 60 * 60 * 1000,
@@ -2238,39 +2231,6 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
     const msUntilReset = Math.max(0, resetAt - now);
     const resetting = isArenaResetting();
 
-    const arenaRoomDetail = rooms.map(room => {
-        const humans = room.players.filter(p => !p.disconnected && !p.isBot);
-        const agarHumans = humans.filter(p => p.mode !== 'slither');
-        const slitherHumans = humans.filter(p => p.mode === 'slither');
-        return {
-            entryFeeUsd: room.entryFeeUsd,
-            playerCount: humans.length,
-            agarHumans: agarHumans.length,
-            slitherHumans: slitherHumans.length,
-            agarBots: room.bots.length,
-            slitherBots: room.slitherBots.length,
-            foodPoolBalance: room.foodPoolBalance,
-            aiBudgetBalance: room.aiBudgetBalance,
-            ownerBalance: room.ownerBalance,
-            isResetting: room.isResetting,
-            inGame: humans.map(p => ({
-                username: p.username,
-                mode: p.mode || 'agar',
-                balanceUsd: arenaCashoutUsd(p),
-            })),
-        };
-    });
-
-    let totalHumansInGame = 0;
-    let totalBotsInGame = 0;
-    for (const room of arenaRoomDetail) {
-        totalHumansInGame += room.playerCount;
-        totalBotsInGame += room.agarBots + room.slitherBots;
-    }
-    for (const room of competitiveSlitherRooms) {
-        totalHumansInGame += room.players.filter(p => !p.disconnected).length;
-    }
-
     res.json({
         serverTime: now,
         arenaStartedAt: GLOBAL_ARENA_START,
@@ -2284,49 +2244,20 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
         brUntouchedOnArenaReset: true,
         mainHouseWallet: HOUSE_WALLET_ADDRESS || null,
         ownerVault: OWNER_VAULT_ADDRESS || null,
-        siteUsersOnline: getSiteUsersOnline(),
-        presenceTtlMs: PRESENCE_TTL_MS,
-        totalHumansInGame,
-        totalBotsInGame,
-        arenaRooms: arenaRoomDetail,
+        arenaRooms: rooms.map(room => ({
+            entryFeeUsd: room.entryFeeUsd,
+            playerCount: room.players.filter(p => !p.isBot).length,
+            foodPoolBalance: room.foodPoolBalance,
+            aiBudgetBalance: room.aiBudgetBalance,
+            ownerBalance: room.ownerBalance,
+            isResetting: room.isResetting,
+        })),
         competitiveSlitherRooms: competitiveSlitherRooms.map(room => ({
             entryFeeUsd: room.entryFeeUsd,
             playerCount: room.players.filter(p => !p.disconnected).length,
             isResetting: room.isResetting,
-            inGame: room.players.filter(p => !p.disconnected).map(p => ({
-                username: p.username,
-                balanceUsd: p.dollarBalance ?? p.balance,
-            })),
         })),
         battleRoyale: getBRServerStatus(),
-    });
-});
-
-app.get('/api/admin/dashboard/site-presence', authenticateAdmin, (req, res) => {
-    const visitors = getSitePresenceList().map((rec) => ({
-        id: rec.key.length > 12 ? `${rec.key.slice(0, 8)}…` : rec.key,
-        key: rec.key,
-        username: rec.username,
-        page: rec.page,
-        gamemode: rec.gamemode,
-        inGame: rec.inGame,
-        gameMode: rec.gameMode,
-        country: rec.country,
-        city: rec.city,
-        timezone: rec.timezone,
-        locale: rec.locale,
-        location: formatPresenceLocation(rec),
-        ip: rec.ipDisplay,
-        source: rec.source,
-        seenAt: rec.seenAt,
-        firstSeenAt: rec.firstSeenAt,
-        sessionMs: Math.max(0, (rec.seenAt || 0) - (rec.firstSeenAt || 0)),
-    }));
-    res.json({
-        count: visitors.length,
-        ttlMs: PRESENCE_TTL_MS,
-        serverTime: Date.now(),
-        visitors,
     });
 });
 
@@ -2588,27 +2519,28 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-app.post('/api/presence/ping', (req, res) => {
-    try {
-        touchSitePresenceFromRequest(req, {
-            page: req.body?.page || null,
-            gamemode: req.body?.gamemode || null,
-            username: req.body?.username || null,
-            inGame: !!req.body?.inGame,
-            gameMode: req.body?.gameMode || null,
-            source: 'ping',
-        });
-        res.json({ ok: true });
-    } catch (err) {
-        console.error('Presence ping error:', err);
-        res.status(500).json({ error: 'Presence ping failed' });
+// Site-wide presence (pregame + any page polling /api/stats with X-Presence-Id)
+const sitePresence = new Map();
+const PRESENCE_TTL_MS = 90_000;
+
+function touchSitePresence(key) {
+    if (!key) return;
+    sitePresence.set(String(key), Date.now());
+}
+
+function getSiteUsersOnline() {
+    const cutoff = Date.now() - PRESENCE_TTL_MS;
+    for (const [key, seenAt] of sitePresence) {
+        if (seenAt < cutoff) sitePresence.delete(key);
     }
-});
+    return sitePresence.size;
+}
 
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
-        touchSitePresenceFromRequest(req, { source: 'stats' });
+        const presenceKey = req.headers['x-presence-id'] || req.ip;
+        touchSitePresence(presenceKey);
 
         const modeFilter = req.query.mode === 'slither' ? 'slither' : req.query.mode === 'agar' ? 'agar' : null;
         let filteredHumansOnline = 0;
@@ -2624,8 +2556,6 @@ app.get('/api/stats', (req, res) => {
             slither: { 5: 0, 10: 0, 20: 0 },
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
-        const playersByGamemodeHumans = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
-        const playersByGamemodeBots = { agar: 0, slither: 0 };
 
         const pushTop = (list, name, balance) => {
             if (name && balance > 0) list.push({ username: name, balance });
@@ -2656,7 +2586,6 @@ app.get('/api/stats', (req, res) => {
                     if (playersByModeAndFee[mode]) {
                         playersByModeAndFee[mode][fee] = (playersByModeAndFee[mode][fee] || 0) + 1;
                         playersByGamemode[mode] += 1;
-                        playersByGamemodeHumans[mode] += 1;
                     }
                     pushTop(mode === 'agar' ? agarPlayers : slitherPlayers, player.username, arenaCashoutUsd(player));
                     if (!modeFilter || mode === modeFilter) {
@@ -2668,7 +2597,6 @@ app.get('/api/stats', (req, res) => {
             room.bots.forEach(bot => {
                 const botUsd = bot.dollarBalance ?? bot.balance ?? bot.cells?.reduce((s, c) => s + c.balance, 0) ?? 0;
                 playersByGamemode.agar += 1;
-                playersByGamemodeBots.agar += 1;
                 pushTop(agarPlayers, bot.username, botUsd);
                 if (!modeFilter || modeFilter === 'agar') {
                     filteredAiOnline += 1;
@@ -2677,7 +2605,6 @@ app.get('/api/stats', (req, res) => {
             });
             room.slitherBots.forEach(bot => {
                 playersByGamemode.slither += 1;
-                playersByGamemodeBots.slither += 1;
                 const botUsd = bot.dollarBalance ?? bot.balance;
                 pushTop(slitherPlayers, bot.username, botUsd);
                 if (!modeFilter || modeFilter === 'slither') {
@@ -2694,17 +2621,10 @@ app.get('/api/stats', (req, res) => {
             (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
             0,
         );
-        playersByGamemodeHumans.competitiveSlither = playersByGamemode.competitiveSlither;
-        playersByGamemodeHumans.brAgar = playersByGamemode.brAgar;
-        playersByGamemodeHumans.brSlither = playersByGamemode.brSlither;
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
             + playersByGamemode.brAgar + playersByGamemode.brSlither
             + playersByGamemode.competitiveSlither;
-        const totalHumansInGame = playersByGamemodeHumans.agar + playersByGamemodeHumans.slither
-            + playersByGamemodeHumans.brAgar + playersByGamemodeHumans.brSlither
-            + playersByGamemodeHumans.competitiveSlither;
-        const totalBotsInGame = playersByGamemodeBots.agar + playersByGamemodeBots.slither;
 
         if (modeFilter === 'agar') {
             filteredHumansOnline += countBRForMode('agar');
@@ -2722,8 +2642,6 @@ app.get('/api/stats', (req, res) => {
         res.json({
             playersOnline: filteredHumansOnline + filteredAiOnline,
             totalPlayersOnline,
-            totalHumansInGame,
-            totalBotsInGame,
             siteUsersOnline: getSiteUsersOnline(),
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
@@ -2735,8 +2653,6 @@ app.get('/api/stats', (req, res) => {
             playersByEntryFee,
             playersByModeAndFee,
             playersByGamemode,
-            playersByGamemodeHumans,
-            playersByGamemodeBots,
             brPlayersByFee,
             globalPlayerEarningsSol,
             globalPlayerEarningsUsd,
@@ -3164,17 +3080,8 @@ function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c
     return util.massToRadius(visualMass * c.sizeMult);
 }
 
-function markPresenceInGame(socket, username, gameMode) {
-    touchSitePresenceFromSocket(socket, {
-        username: username || null,
-        inGame: true,
-        gameMode: gameMode || null,
-        page: String(gameMode || '').includes('slither') ? '/slither-game' : '/game',
-    });
-}
-
 io.on('connection', (socket) => {
-    touchSitePresenceFromSocket(socket, { source: 'socket' });
+    touchSitePresence(socket.id);
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
         let userKey = null;
@@ -3252,7 +3159,6 @@ io.on('connection', (socket) => {
                         circularMap: true,
                         zone: getCompetitiveZone(room.startTime + c.roomDuration),
                     });
-                    markPresenceInGame(socket, user.username, 'competitive-slither');
                     return;
                 }
 
@@ -3325,7 +3231,6 @@ io.on('connection', (socket) => {
                         circularMap: true,
                         zone: getCompetitiveZone(room.startTime + c.roomDuration),
                     });
-                    markPresenceInGame(socket, user.username, 'competitive-slither');
                     return;
                 }
 
@@ -3343,7 +3248,6 @@ io.on('connection', (socket) => {
                     circularMap: true,
                     zone: getCompetitiveZone(room.startTime + c.roomDuration),
                 });
-                markPresenceInGame(socket, user.username, 'competitive-slither');
                 return;
             }
 
@@ -3395,7 +3299,6 @@ io.on('connection', (socket) => {
                     entryFeeUsd: existingPlayer.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
-                markPresenceInGame(socket, user.username, rejoinMode);
                 return;
             }
 
@@ -3470,11 +3373,17 @@ io.on('connection', (socket) => {
             room.ownerBalance += economy.ownerCut;
 
             // DYNAMIC BOT SCALING (mode-specific)
+            const targetBots = gameMode === 'slither'
+                ? getSlitherTargetBots(modeHumansAfterJoin)
+                : getTargetBots(modeHumansAfterJoin);
+
             if (gameMode === 'slither') {
-                const botsFromEntry = Math.floor(aiToAdd / joinBotStake);
-                syncSlitherBots(room, modeHumansAfterJoin, joinBotStake, botsFromEntry);
+                if (room.slitherBots.length < targetBots) {
+                    addSlitherBots(room, targetBots - room.slitherBots.length, joinBotStake);
+                } else if (room.slitherBots.length > targetBots) {
+                    trimSlitherBots(room, targetBots);
+                }
             } else {
-                const targetBots = getTargetBots(modeHumansAfterJoin);
                 if (room.bots.length < targetBots) {
                     addBots(room, targetBots - room.bots.length, joinBotStake);
                 } else if (room.bots.length > targetBots) {
@@ -3550,7 +3459,6 @@ io.on('connection', (socket) => {
                     entryFeeUsd: raced.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
-                markPresenceInGame(socket, user.username, racedMode);
                 return;
             }
 
@@ -3594,7 +3502,6 @@ io.on('connection', (socket) => {
                 entryFeeUsd,
                 solPrice: SOL_PRICE_USD,
             });
-            markPresenceInGame(socket, user.username, gameMode);
         } catch (err) {
             console.error('joinGame error:', err.message);
             if (err.name === 'TokenExpiredError') {
@@ -3876,7 +3783,6 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        touchSitePresenceFromSocket(socket, { inGame: false });
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
         if (room.isCompetitiveSlither) {
@@ -4028,13 +3934,8 @@ function processRoom(room) {
     if (room.isResetting) return; // Pause during global reset
 
     const isSandbox = room.isSandbox === true;
-    const activePlayers = room.players.filter(p => !p.disconnected);
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
-    const hasAgarActivity = agarHumans > 0 || room.bots.length > 0;
-    const hasSlitherActivity = slitherHumans > 0 || room.slitherBots.length > 0;
-
-    if (!hasAgarActivity && !hasSlitherActivity) return;
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     if (!isSandbox || room.sandboxAutoBots) {
@@ -4050,13 +3951,18 @@ function processRoom(room) {
         trimAgarBots(room, agarTargetBots);
     }
 
-    syncSlitherBots(room, slitherHumansInArena, slitherBotStake);
+    const slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
+    if (room.slitherBots.length < slitherTargetBots) {
+        addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
+    } else if (room.slitherBots.length > slitherTargetBots) {
+        trimSlitherBots(room, slitherTargetBots);
+    }
 
     capAiBudget(room);
     }
 
     // Food spawn — funded from pool (entry fees on join), same rules for agar + slither
-    if ((!isSandbox || room.sandboxAutoFood) && (hasAgarActivity || hasSlitherActivity)) {
+    if (!isSandbox || room.sandboxAutoFood) {
     const agarInArena = countHumansInMode(room, 'agar');
     const slitherInArena = countHumansInMode(room, 'slither');
     const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
@@ -4077,19 +3983,6 @@ function processRoom(room) {
     syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
-    }
-
-    if (!hasAgarActivity) {
-        if (hasSlitherActivity) {
-            const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
-            broadcastSlitherState(room, io, slitherLeaderboard, {
-                resetTime: room.startTime + c.roomDuration,
-                solPrice: SOL_PRICE_USD,
-                isResetting: room.isResetting,
-                battleRoyale: room.isBattleRoyale === true,
-            });
-        }
-        return;
     }
 
     const allUsers = [
@@ -4395,17 +4288,16 @@ function processRoom(room) {
 
     rebuildQuadTree(room, allUsers);
 
-    // Slither server-side physics tick (40Hz) — network broadcast throttled in slither-engine
-    if (hasSlitherActivity) {
-        const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
-        const slitherMeta = {
-            resetTime: room.startTime + c.roomDuration,
-            solPrice: SOL_PRICE_USD,
-            isResetting: room.isResetting,
-            battleRoyale: room.isBattleRoyale === true,
-        };
-        broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
-    }
+    // Slither server-side physics tick (40Hz) — network broadcast at 40Hz
+    const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
+
+    const slitherMeta = {
+        resetTime: room.startTime + c.roomDuration,
+        solPrice: SOL_PRICE_USD,
+        isResetting: room.isResetting,
+        battleRoyale: room.isBattleRoyale === true,
+    };
+    broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
 
     // Skicka leaderboard separat för prestanda (Inkludera bottar)
     const leaderboardData = allUsers
