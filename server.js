@@ -3697,7 +3697,8 @@ io.on('connection', (socket) => {
             }
 
             const p = room.players.find(pl => pl.id === socket.id);
-            const isSlither = mode === 'slither' || (p && p.mode === 'slither') || room.id.includes('slither') || room.isCompetitiveSlither;
+            const isCompSlither = room.isCompetitiveSlither;
+            const isSlither = isCompSlither || mode === 'slither' || (p && p.mode === 'slither') || room.id.includes('slither');
             const stake = botStakeForRoom(room);
             const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
             const startMass = getEconomy(room.entryFeeUsd ?? 0.10).massStartBalance;
@@ -3708,9 +3709,41 @@ io.on('connection', (socket) => {
             const offsetX = p ? (Math.random() - 0.5) * 600 : 0;
             const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
 
-            console.log(`[Admin Spawn] Spawning ${isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
+            console.log(`[Admin Spawn] Spawning ${isCompSlither ? 'CompetitiveSlither' : isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
 
-            if (isSlither) {
+            if (isCompSlither) {
+                // Competitive slither: bots live in room.players (no slitherBots array)
+                const eco = getEconomy(room.entryFeeUsd ?? 2);
+                const angle = Math.random() * Math.PI * 2;
+                const bx = spawnX + offsetX;
+                const by = spawnY + offsetY;
+                room.players.push({
+                    id: 'bot_' + Math.random().toString(36).substr(2, 5),
+                    mongoId: null,
+                    username: botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]",
+                    mode: 'competitive-slither',
+                    kills: 0,
+                    balance: startMass,
+                    dollarBalance: eco.botStartBalance ?? stake,
+                    entryFeeUsd: room.entryFeeUsd,
+                    botStake: stake,
+                    startTime: Date.now(),
+                    spawnGraceUntil: Date.now() + 4500,
+                    color: util.randomSlitherColor(),
+                    x: bx,
+                    y: by,
+                    inputDx: Math.cos(angle),
+                    inputDy: Math.sin(angle),
+                    boost: false,
+                    angle,
+                    fam: 0,
+                    segments: createSegments(bx, by, startMass, angle),
+                    screenWidth: 1920,
+                    screenHeight: 1080,
+                    isBot: true,
+                    adminSpawned: true,
+                });
+            } else if (isSlither) {
                 const dollarStart = getEconomy(room.entryFeeUsd ?? 0.10).botStartBalance;
                 const angle = Math.random() * Math.PI * 2;
                 room.slitherBots.push({
@@ -3763,6 +3796,32 @@ io.on('connection', (socket) => {
             }
         } catch (err) {
             console.error('[Admin Spawn] Error:', err);
+        }
+    });
+
+    socket.on('adminClearBots', async ({ token }) => {
+        try {
+            const secret = process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193";
+            const decoded = jwt.verify(token, secret);
+            const user = await User.findById(decoded.id);
+            if (!user) return;
+            const isAdmin = user.isAdmin || (process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+            if (!isAdmin) return;
+
+            const room = getArenaRoomById(socket.roomId);
+            if (!room) return;
+            if (!DEV_FREE_PLAY && !room.isSandbox) return;
+
+            if (room.isCompetitiveSlither) {
+                room.players = room.players.filter(pl => !pl.isBot);
+            } else {
+                room.bots = [];
+                room.slitherBots = [];
+            }
+            console.log(`[Admin Clear] All bots removed from room ${room.id} by ${user.username}`);
+            socket.emit('adminClearBotsOk');
+        } catch (err) {
+            console.error('[Admin Clear] Error:', err);
         }
     });
 
