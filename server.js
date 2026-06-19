@@ -2671,6 +2671,15 @@ function getSiteUsersOnline() {
     return sitePresence.size;
 }
 
+app.post('/api/presence/ping', (req, res) => {
+    try {
+        touchSitePresence(req);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
