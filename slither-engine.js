@@ -675,7 +675,7 @@ function updateSnakeMovement(snake, room = null) {
                 snake.dollarBalance -= dollarCost;
             }
             poolCredit = dollarCost;
-            if (snake.cells?.[0]) snake.cells[0].balance = snake.dollarBalance;
+            if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
         }
         room.foodPoolBalance += poolCredit;
     }
@@ -1222,7 +1222,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 snake.balance = Math.max(minDollars, snake.balance);
             }
             snake.balance = Math.max(minMass, snake.balance);
-            if (snake.cells?.[0]) snake.cells[0].balance = snake.dollarBalance ?? snake.balance;
+            if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
         }
 
         if (!sandboxSkipDeathCollisions) {
@@ -1384,7 +1384,8 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         username,
         mode: 'slither',
         kills: 0,
-        balance: dollarStart,
+        balance: startMass,
+        dollarBalance: dollarStart,
         entryFeeUsd: room.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
         startTime: Date.now(),
         spawnGraceUntil: Date.now() + 4500,
@@ -1403,8 +1404,8 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
             id: randId(),
             x,
             y,
-            balance: dollarStart,
-            radius: headRadiusForBalance(dollarStart),
+            balance: startMass,
+            radius: headRadiusForBalance(startMass),
             vx: 0,
             vy: 0,
             lastSplit: Date.now(),

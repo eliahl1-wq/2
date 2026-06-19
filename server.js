@@ -3559,6 +3559,81 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('adminSpawnBotNearMe', async ({ token }) => {
+        try {
+            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            const user = await User.findById(decoded.id);
+            if (!user || !user.isAdmin) return;
+
+            const room = getArenaRoomById(socket.roomId);
+            if (!room) return;
+            const p = room.players.find(pl => pl.id === socket.id);
+            if (!p) return;
+
+            const isSlither = p.mode === 'slither';
+            const stake = botStakeForRoom(room);
+            const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
+            const startMass = getEconomy(room.entryFeeUsd ?? 0.10).massStartBalance;
+            const spawnX = (isSlither ? p.x : p.cells?.[0]?.x) || 0;
+            const spawnY = (isSlither ? p.y : p.cells?.[0]?.y) || 0;
+
+            const offsetX = (Math.random() - 0.5) * 600;
+            const offsetY = (Math.random() - 0.5) * 600;
+
+            if (isSlither) {
+                const dollarStart = getEconomy(room.entryFeeUsd ?? 0.10).botStartBalance;
+                const angle = Math.random() * Math.PI * 2;
+                room.slitherBots.push({
+                    id: 'bot_' + Math.random().toString(36).substr(2, 5),
+                    username: botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]",
+                    mode: 'slither',
+                    kills: 0,
+                    balance: startMass,
+                    dollarBalance: dollarStart,
+                    botStake: stake,
+                    entryFeeUsd: room.entryFeeUsd,
+                    startTime: Date.now(),
+                    spawnGraceUntil: Date.now() + 4500,
+                    color: util.randomSlitherColor(),
+                    x: spawnX + offsetX,
+                    y: spawnY + offsetY,
+                    inputDx: Math.cos(angle),
+                    inputDy: Math.sin(angle),
+                    boost: false,
+                    angle,
+                    fam: 0,
+                    segments: [],
+                    screenWidth: 1920,
+                    screenHeight: 1080,
+                    isBot: true,
+                });
+            } else {
+                room.bots.push({
+                    id: 'bot_' + Math.random().toString(36).substr(2, 5),
+                    username: botNames[Math.floor(Math.random() * botNames.length)] + " [" + util.randomInRange(10, 99) + "]",
+                    balance: stake,
+                    dollarBalance: stake,
+                    botStake: stake,
+                    kills: 0,
+                    color: util.randomColor(),
+                    isBot: true,
+                    targetX: spawnX + offsetX,
+                    targetY: spawnY + offsetY,
+                    lastTargetUpdate: Date.now(),
+                    cells: [{
+                        id: Math.random().toString(36).substr(2, 9),
+                        x: spawnX + offsetX,
+                        y: spawnY + offsetY,
+                        balance: startMass,
+                        radius: util.massToRadius(startMass),
+                    }],
+                });
+            }
+        } catch (err) {
+            console.error('adminSpawnBot error:', err);
+        }
+    });
+
     // Protokoll-matchning: 0 = rörelse
     socket.on('0', (data) => {
         const br = findBRPlayerBySocket(socket.id);
