@@ -2230,6 +2230,39 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
     const msUntilReset = Math.max(0, resetAt - now);
     const resetting = isArenaResetting();
 
+    const arenaRoomDetail = rooms.map(room => {
+        const humans = room.players.filter(p => !p.disconnected && !p.isBot);
+        const agarHumans = humans.filter(p => p.mode !== 'slither');
+        const slitherHumans = humans.filter(p => p.mode === 'slither');
+        return {
+            entryFeeUsd: room.entryFeeUsd,
+            playerCount: humans.length,
+            agarHumans: agarHumans.length,
+            slitherHumans: slitherHumans.length,
+            agarBots: room.bots.length,
+            slitherBots: room.slitherBots.length,
+            foodPoolBalance: room.foodPoolBalance,
+            aiBudgetBalance: room.aiBudgetBalance,
+            ownerBalance: room.ownerBalance,
+            isResetting: room.isResetting,
+            inGame: humans.map(p => ({
+                username: p.username,
+                mode: p.mode || 'agar',
+                balanceUsd: arenaCashoutUsd(p),
+            })),
+        };
+    });
+
+    let totalHumansInGame = 0;
+    let totalBotsInGame = 0;
+    for (const room of arenaRoomDetail) {
+        totalHumansInGame += room.playerCount;
+        totalBotsInGame += room.agarBots + room.slitherBots;
+    }
+    for (const room of competitiveSlitherRooms) {
+        totalHumansInGame += room.players.filter(p => !p.disconnected).length;
+    }
+
     res.json({
         serverTime: now,
         arenaStartedAt: GLOBAL_ARENA_START,
@@ -2243,18 +2276,19 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
         brUntouchedOnArenaReset: true,
         mainHouseWallet: HOUSE_WALLET_ADDRESS || null,
         ownerVault: OWNER_VAULT_ADDRESS || null,
-        arenaRooms: rooms.map(room => ({
-            entryFeeUsd: room.entryFeeUsd,
-            playerCount: room.players.filter(p => !p.isBot).length,
-            foodPoolBalance: room.foodPoolBalance,
-            aiBudgetBalance: room.aiBudgetBalance,
-            ownerBalance: room.ownerBalance,
-            isResetting: room.isResetting,
-        })),
+        siteUsersOnline: getSiteUsersOnline(),
+        presenceTtlMs: PRESENCE_TTL_MS,
+        totalHumansInGame,
+        totalBotsInGame,
+        arenaRooms: arenaRoomDetail,
         competitiveSlitherRooms: competitiveSlitherRooms.map(room => ({
             entryFeeUsd: room.entryFeeUsd,
             playerCount: room.players.filter(p => !p.disconnected).length,
             isResetting: room.isResetting,
+            inGame: room.players.filter(p => !p.disconnected).map(p => ({
+                username: p.username,
+                balanceUsd: p.dollarBalance ?? p.balance,
+            })),
         })),
         battleRoyale: getBRServerStatus(),
     });
@@ -2555,6 +2589,8 @@ app.get('/api/stats', (req, res) => {
             slither: { 5: 0, 10: 0, 20: 0 },
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
+        const playersByGamemodeHumans = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
+        const playersByGamemodeBots = { agar: 0, slither: 0 };
 
         const pushTop = (list, name, balance) => {
             if (name && balance > 0) list.push({ username: name, balance });
@@ -2585,6 +2621,7 @@ app.get('/api/stats', (req, res) => {
                     if (playersByModeAndFee[mode]) {
                         playersByModeAndFee[mode][fee] = (playersByModeAndFee[mode][fee] || 0) + 1;
                         playersByGamemode[mode] += 1;
+                        playersByGamemodeHumans[mode] += 1;
                     }
                     pushTop(mode === 'agar' ? agarPlayers : slitherPlayers, player.username, arenaCashoutUsd(player));
                     if (!modeFilter || mode === modeFilter) {
@@ -2596,6 +2633,7 @@ app.get('/api/stats', (req, res) => {
             room.bots.forEach(bot => {
                 const botUsd = bot.dollarBalance ?? bot.balance ?? bot.cells?.reduce((s, c) => s + c.balance, 0) ?? 0;
                 playersByGamemode.agar += 1;
+                playersByGamemodeBots.agar += 1;
                 pushTop(agarPlayers, bot.username, botUsd);
                 if (!modeFilter || modeFilter === 'agar') {
                     filteredAiOnline += 1;
@@ -2604,6 +2642,7 @@ app.get('/api/stats', (req, res) => {
             });
             room.slitherBots.forEach(bot => {
                 playersByGamemode.slither += 1;
+                playersByGamemodeBots.slither += 1;
                 const botUsd = bot.dollarBalance ?? bot.balance;
                 pushTop(slitherPlayers, bot.username, botUsd);
                 if (!modeFilter || modeFilter === 'slither') {
@@ -2620,10 +2659,17 @@ app.get('/api/stats', (req, res) => {
             (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
             0,
         );
+        playersByGamemodeHumans.competitiveSlither = playersByGamemode.competitiveSlither;
+        playersByGamemodeHumans.brAgar = playersByGamemode.brAgar;
+        playersByGamemodeHumans.brSlither = playersByGamemode.brSlither;
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
             + playersByGamemode.brAgar + playersByGamemode.brSlither
             + playersByGamemode.competitiveSlither;
+        const totalHumansInGame = playersByGamemodeHumans.agar + playersByGamemodeHumans.slither
+            + playersByGamemodeHumans.brAgar + playersByGamemodeHumans.brSlither
+            + playersByGamemodeHumans.competitiveSlither;
+        const totalBotsInGame = playersByGamemodeBots.agar + playersByGamemodeBots.slither;
 
         if (modeFilter === 'agar') {
             filteredHumansOnline += countBRForMode('agar');
@@ -2641,6 +2687,8 @@ app.get('/api/stats', (req, res) => {
         res.json({
             playersOnline: filteredHumansOnline + filteredAiOnline,
             totalPlayersOnline,
+            totalHumansInGame,
+            totalBotsInGame,
             siteUsersOnline: getSiteUsersOnline(),
             biggestPayout: Number(topBalance.toFixed(2)),
             topPlayer,
@@ -2652,6 +2700,8 @@ app.get('/api/stats', (req, res) => {
             playersByEntryFee,
             playersByModeAndFee,
             playersByGamemode,
+            playersByGamemodeHumans,
+            playersByGamemodeBots,
             brPlayersByFee,
             globalPlayerEarningsSol,
             globalPlayerEarningsUsd,

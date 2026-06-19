@@ -1414,6 +1414,8 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 );
                 if (!room._lastSlitherFoodByPlayer) room._lastSlitherFoodByPlayer = {};
                 room._lastSlitherFoodByPlayer[p.id] = visibleFood;
+            } else {
+                visibleFood = room._lastSlitherFoodByPlayer[p.id];
             }
 
             let minimap = null;
@@ -1444,6 +1446,8 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                 };
                 if (!room._lastSlitherMinimapByPlayer) room._lastSlitherMinimapByPlayer = {};
                 room._lastSlitherMinimapByPlayer[p.id] = minimap;
+            } else {
+                minimap = room._lastSlitherMinimapByPlayer[p.id];
             }
 
             const tickPayload = {
@@ -1909,6 +1913,8 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
                 room._lastCompFoodByPlayer[socketId] = visibleFood;
             }
+        } else if (!spectating) {
+            visibleFood = room._lastCompFoodByPlayer?.[socketId];
         }
 
         let minimap = null;
@@ -1932,6 +1938,8 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             minimap = { players: minimapPlayers, food: minimapFood };
             if (!room._lastCompMinimapByPlayer) room._lastCompMinimapByPlayer = {};
             room._lastCompMinimapByPlayer[socketId] = minimap;
+        } else {
+            minimap = room._lastCompMinimapByPlayer?.[socketId];
         }
 
         const tickPayload = {
