@@ -885,7 +885,7 @@ function checkSelfCollision(_snake) {
     return false;
 }
 
-function checkSnakeCollisions(snake, allSnakes) {
+function checkSnakeCollisions(snake, allSnakes, collisionGrid = null) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return null;
     const head = snake.segments[0];
     if (!head) return null;
@@ -894,6 +894,47 @@ function checkSnakeCollisions(snake, allSnakes) {
     const px = snake._prevHeadX;
     const py = snake._prevHeadY;
     const hasSweep = px != null && py != null;
+
+    const tryHit = (other, sample) => {
+        if (other.id === snake.id) return false;
+        if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) return false;
+
+        const { headR, bodyR } = sample;
+        if (sample.kind === 'point') {
+            const segR = sample.index === 0 ? headR * 0.82 : bodyR;
+            const pointHit = headReach + segR * 0.52;
+            if (dist(head.x, head.y, sample.x, sample.y) < pointHit) return true;
+            if (hasSweep && distPointToSegment(sample.x, sample.y, px, py, head.x, head.y) < pointHit) return true;
+            return false;
+        }
+
+        const lineHit = headReach + bodyR * 0.48;
+        const { prev, seg } = sample;
+        if (!prev || !seg) return false;
+        if (distPointToSegment(head.x, head.y, prev.x, prev.y, seg.x, seg.y) < lineHit) return true;
+        if (hasSweep && distPointToSegment(px, py, prev.x, prev.y, seg.x, seg.y) < lineHit) return true;
+        return false;
+    };
+
+    if (collisionGrid) {
+        const queryR = headReach + 140;
+        const minCx = Math.floor((head.x - queryR) / SLITHER_COLLISION_CELL);
+        const maxCx = Math.floor((head.x + queryR) / SLITHER_COLLISION_CELL);
+        const minCy = Math.floor((head.y - queryR) / SLITHER_COLLISION_CELL);
+        const maxCy = Math.floor((head.y + queryR) / SLITHER_COLLISION_CELL);
+
+        for (let gx = minCx; gx <= maxCx; gx++) {
+            for (let gy = minCy; gy <= maxCy; gy++) {
+                const bucket = collisionGrid.get(`${gx},${gy}`);
+                if (!bucket) continue;
+                for (let i = 0; i < bucket.length; i++) {
+                    const sample = bucket[i];
+                    if (tryHit(sample.snake, sample)) return sample.snake;
+                }
+            }
+        }
+        return null;
+    }
 
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
@@ -926,6 +967,65 @@ function checkSnakeCollisions(snake, allSnakes) {
 }
 
 const SLITHER_FOOD_CELL = 64;
+const SLITHER_COLLISION_CELL = 96;
+
+function buildSnakeCollisionGrid(allSnakes) {
+    const grid = new Map();
+    for (const { entity: snake } of allSnakes) {
+        const segs = snake.segments;
+        if (!segs?.length) continue;
+        const headR = headRadiusForBalance(snake.balance);
+        const bodyR = headR * 0.72;
+
+        for (let i = 1; i < segs.length; i++) {
+            const prev = segs[i - 1];
+            const seg = segs[i];
+            const mx = (prev.x + seg.x) * 0.5;
+            const my = (prev.y + seg.y) * 0.5;
+            pushCollisionSample(grid, snake, mx, my, {
+                kind: 'line',
+                headR,
+                bodyR,
+                prev,
+                seg,
+            });
+        }
+
+        const pointStride = segs.length > 100 ? 2 : 1;
+        for (let i = 0; i < segs.length; i += pointStride) {
+            const seg = segs[i];
+            pushCollisionSample(grid, snake, seg.x, seg.y, {
+                kind: 'point',
+                headR,
+                bodyR,
+                index: i,
+            });
+        }
+    }
+    return grid;
+}
+
+function pushCollisionSample(grid, snake, x, y, sample) {
+    const cx = Math.floor(x / SLITHER_COLLISION_CELL);
+    const cy = Math.floor(y / SLITHER_COLLISION_CELL);
+    const key = `${cx},${cy}`;
+    let bucket = grid.get(key);
+    if (!bucket) {
+        bucket = [];
+        grid.set(key, bucket);
+    }
+    bucket.push({ snake, x, y, ...sample });
+}
+
+function getSnakeCollisionGridForRoom(room, allSnakes) {
+    const tick = room._slitherPhysicsTick ?? 0;
+    if (room._slitherCollisionGrid && room._slitherCollisionGridTick === tick) {
+        return room._slitherCollisionGrid;
+    }
+    room._slitherCollisionGrid = buildSnakeCollisionGrid(allSnakes);
+    room._slitherCollisionGridTick = tick;
+    return room._slitherCollisionGrid;
+}
 
 function buildSlitherFoodGrid(food) {
     const grid = new Map();
@@ -1157,9 +1257,9 @@ const MAX_MINIMAP_FOOD = 200;
 const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
 /** Extra beyond snake viewRange — tuned to client viewport (~W/2/zoom + margin), not whole arena. */
 const SLITHER_FOOD_VIEW_EXTRA = 200;
-const SLITHER_FOOD_BROADCAST_INTERVAL = 3;
-/** Physics at 40Hz; network state at 20Hz — client interpolates between ticks. */
-const SLITHER_STATE_BROADCAST_INTERVAL = 2;
+const SLITHER_FOOD_BROADCAST_INTERVAL = 4;
+/** Physics at 40Hz; network state at ~13Hz — client interpolates between ticks. */
+const SLITHER_STATE_BROADCAST_INTERVAL = 3;
 
 function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS) {
     if (segments.length <= maxPoints) {
@@ -1258,6 +1358,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const sandboxSkipDeathCollisions = room.isSandbox && room.sandboxInvincible;
     const sandboxSkipFoodCollisions = sandboxSkipDeathCollisions && !room.sandboxBotAi;
     const foodGrid = getSlitherFoodGridForRoom(room);
+    const collisionGrid = getSnakeCollisionGridForRoom(room, allSnakes);
 
     for (const { entity: snake, isHuman } of allSnakes) {
         if (snake.frozen || snake.isStatic) continue;
@@ -1310,7 +1411,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 continue;
             }
 
-            const hit = checkSnakeCollisions(snake, allSnakes);
+            const hit = checkSnakeCollisions(snake, allSnakes, collisionGrid);
             if (hit) {
                 toRemove.push({ snake, isHuman, killer: hit });
             }
@@ -1363,6 +1464,19 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const needsFoodRefresh = sendFoodThisTick || slitherPlayers.some(p => !room._lastSlitherFoodByPlayer?.[p.id]);
     const broadcastFoodGrid = needsFoodRefresh ? getSlitherFoodGridForRoom(room) : null;
 
+    const physicsTick = room._slitherPhysicsTick ?? 0;
+    if (room._slitherSerializeTick !== physicsTick) {
+        room._slitherSerializeTick = physicsTick;
+        room._slitherSerializedOther = new Map();
+        room._slitherSerializedYou = new Map();
+        for (const { entity: s } of allSnakes) {
+            room._slitherSerializedOther.set(s.id, serializeSnake(s, false));
+            room._slitherSerializedYou.set(s.id, serializeSnake(s, true));
+        }
+    }
+    const serializedOther = room._slitherSerializedOther;
+    const serializedYou = room._slitherSerializedYou;
+
     slitherPlayers.forEach(p => {
             const head = p.segments?.[0];
             if (!head) return;
@@ -1376,7 +1490,10 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
                     const h = s.segments[0];
                     return isInView(head.x, head.y, h.x, h.y, range);
                 })
-                .map(({ entity: s }) => serializeSnake(s, s.id === p.id));
+                .map(({ entity: s }) => (
+                    s.id === p.id ? serializedYou.get(s.id) : serializedOther.get(s.id)
+                ))
+                .filter(Boolean);
 
             let visibleFood = null;
             if (sendFoodThisTick || !room._lastSlitherFoodByPlayer?.[p.id]) {

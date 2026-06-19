@@ -3927,8 +3927,13 @@ function processRoom(room) {
     if (room.isResetting) return; // Pause during global reset
 
     const isSandbox = room.isSandbox === true;
+    const activePlayers = room.players.filter(p => !p.disconnected);
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
+    const hasAgarActivity = agarHumans > 0 || room.bots.length > 0;
+    const hasSlitherActivity = slitherHumans > 0 || room.slitherBots.length > 0;
+
+    if (!hasAgarActivity && !hasSlitherActivity) return;
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     if (!isSandbox || room.sandboxAutoBots) {
@@ -3950,7 +3955,7 @@ function processRoom(room) {
     }
 
     // Food spawn — funded from pool (entry fees on join), same rules for agar + slither
-    if (!isSandbox || room.sandboxAutoFood) {
+    if ((!isSandbox || room.sandboxAutoFood) && (hasAgarActivity || hasSlitherActivity)) {
     const agarInArena = countHumansInMode(room, 'agar');
     const slitherInArena = countHumansInMode(room, 'slither');
     const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
@@ -3971,6 +3976,19 @@ function processRoom(room) {
     syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
     if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+    }
+
+    if (!hasAgarActivity) {
+        if (hasSlitherActivity) {
+            const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
+            broadcastSlitherState(room, io, slitherLeaderboard, {
+                resetTime: room.startTime + c.roomDuration,
+                solPrice: SOL_PRICE_USD,
+                isResetting: room.isResetting,
+                battleRoyale: room.isBattleRoyale === true,
+            });
+        }
+        return;
     }
 
     const allUsers = [
@@ -4276,16 +4294,17 @@ function processRoom(room) {
 
     rebuildQuadTree(room, allUsers);
 
-    // Slither server-side physics tick (40Hz) — network broadcast at 40Hz
-    const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
-
-    const slitherMeta = {
-        resetTime: room.startTime + c.roomDuration,
-        solPrice: SOL_PRICE_USD,
-        isResetting: room.isResetting,
-        battleRoyale: room.isBattleRoyale === true,
-    };
-    broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
+    // Slither server-side physics tick (40Hz) — network broadcast throttled in slither-engine
+    if (hasSlitherActivity) {
+        const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
+        const slitherMeta = {
+            resetTime: room.startTime + c.roomDuration,
+            solPrice: SOL_PRICE_USD,
+            isResetting: room.isResetting,
+            battleRoyale: room.isBattleRoyale === true,
+        };
+        broadcastSlitherState(room, io, slitherLeaderboard, slitherMeta);
+    }
 
     // Skicka leaderboard separat för prestanda (Inkludera bottar)
     const leaderboardData = allUsers
