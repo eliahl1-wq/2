@@ -369,9 +369,13 @@ export function trimSlitherBots(room, targetCount) {
 
 export function getSlitherTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
-    if (humanCount >= 8) return 0;
-    if (humanCount < 3) return humanCount * 2; // 1 human → 2 bots, 2 humans → 4 bots
-    return Math.min(humanCount * 2, 12);
+    
+    // Target a lively arena with a mix of players and bots.
+    // The fewer humans, the more bots we spawn to fill the room up to a target size.
+    const targetEntities = 12;
+    if (humanCount >= targetEntities) return 0;
+    
+    return targetEntities - humanCount;
 }
 
 function getAllSlitherSnakes(room) {
@@ -1210,18 +1214,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         if (isHuman && !isBR && !room.isSandbox) {
             const minMass = minBalanceForSnake(snake);
             const minDollars = minDollarsForSnake(snake);
-            const currentDollars = snake.dollarBalance ?? snake.balance;
-            const decay = wealthTaxDecayAmount(currentDollars, minDollars);
-            if (decay > 1e-9) {
-                const actual = Math.min(decay, currentDollars - minDollars);
-                if (snake.dollarBalance != null) {
-                    snake.dollarBalance -= actual;
-                } else {
-                    snake.balance -= actual;
-                }
-                room.foodPoolBalance += actual;
-                applyFamShrink(snake, actual);
-            }
+            // wealthTaxDecayAmount removed here so you don't lose size and balance over time
+
             if (snake.dollarBalance != null) {
                 snake.dollarBalance = Math.max(minDollars, snake.dollarBalance);
             } else {

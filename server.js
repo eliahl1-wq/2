@@ -1507,10 +1507,24 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
         const recentMatch = await reportedTxMatch({ createdAt: { $gte: dayAgo } });
         const recentUserIds = await Transaction.distinct('userId', recentMatch);
 
+        const presenceData = Array.from(sitePresence.entries())
+            .filter(([_, data]) => Date.now() - (data.lastSeen || data) < PRESENCE_TTL_MS)
+            .map(([k, data]) => ({
+                id: k,
+                ip: data.ip || 'Unknown',
+                country: data.country || 'Unknown',
+                page: data.page || 'unknown',
+                gamemode: data.gamemode || 'none',
+                userAgent: data.userAgent || 'Unknown',
+                lastSeen: data.lastSeen || data
+            }))
+            .sort((a, b) => b.lastSeen - a.lastSeen);
+
         res.json({
             currentlyInGame: inGameUserIds.size,
             activeLast24h: recentUserIds.length,
             inGamePlayers: inGameUsernames,
+            sitePresence: presenceData,
         });
     } catch (err) {
         console.error('Admin active-users error:', err);
@@ -2523,14 +2537,39 @@ app.post('/api/login', async (req, res) => {
 const sitePresence = new Map();
 const PRESENCE_TTL_MS = 90_000;
 
-function touchSitePresence(key) {
+function touchSitePresence(req, customKey = null) {
+    const key = customKey || (req && req.headers ? req.headers['x-presence-id'] : null) || (req ? req.ip : 'unknown');
     if (!key) return;
-    sitePresence.set(String(key), Date.now());
+
+    const existing = sitePresence.get(String(key)) || {};
+    let ip = existing.ip;
+    let country = existing.country || 'Unknown';
+    let userAgent = existing.userAgent || 'Unknown';
+    let page = existing.page || 'unknown';
+    let gamemode = existing.gamemode || 'none';
+
+    if (req && req.headers) {
+        ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || ip;
+        country = req.headers['cf-ipcountry'] || country;
+        userAgent = req.headers['user-agent'] || userAgent;
+        page = req.headers['x-presence-page'] || page;
+        gamemode = req.headers['x-presence-gamemode'] || gamemode;
+    }
+
+    sitePresence.set(String(key), {
+        lastSeen: Date.now(),
+        ip,
+        country,
+        userAgent,
+        page,
+        gamemode
+    });
 }
 
 function getSiteUsersOnline() {
     const cutoff = Date.now() - PRESENCE_TTL_MS;
-    for (const [key, seenAt] of sitePresence) {
+    for (const [key, data] of sitePresence) {
+        const seenAt = typeof data === 'number' ? data : data.lastSeen;
         if (seenAt < cutoff) sitePresence.delete(key);
     }
     return sitePresence.size;
@@ -2539,8 +2578,7 @@ function getSiteUsersOnline() {
 // 6. Exponera live stats för lobby och pre-game
 app.get('/api/stats', (req, res) => {
     try {
-        const presenceKey = req.headers['x-presence-id'] || req.ip;
-        touchSitePresence(presenceKey);
+        touchSitePresence(req);
 
         const modeFilter = req.query.mode === 'slither' ? 'slither' : req.query.mode === 'agar' ? 'agar' : null;
         let filteredHumansOnline = 0;
@@ -3051,9 +3089,13 @@ function trimAgarBots(room, targetCount) {
 
 function getTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
-    if (humanCount >= 8) return 0;
-    if (humanCount < 3) return humanCount * 2; // 1 human → 2 bots, 2 humans → 4 bots
-    return Math.min(humanCount * 2, 12);
+    
+    // Target a lively arena with a mix of players and bots.
+    // The fewer humans, the more bots we spawn to fill the room up to a target size.
+    const targetEntities = 12;
+    if (humanCount >= targetEntities) return 0;
+    
+    return targetEntities - humanCount;
 }
 
 function countHumansInMode(room, mode) {
@@ -3082,7 +3124,7 @@ function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c
 }
 
 io.on('connection', (socket) => {
-    touchSitePresence(socket.id);
+    touchSitePresence(socket.request, socket.id);
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
         let userKey = null;
