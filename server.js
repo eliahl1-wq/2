@@ -143,7 +143,7 @@ const corsOptions = {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma', 'X-Presence-Id'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma', 'X-Presence-Id', 'X-Presence-Timezone', 'X-Presence-Page', 'X-Presence-Gamemode'],
 };
 
 const app = express();
@@ -153,7 +153,7 @@ app.use((req, res, next) => {
     applyCorsHeaders(req, res);
     if (req.method === 'OPTIONS') {
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma, X-Presence-Id');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma, X-Presence-Id, X-Presence-Timezone, X-Presence-Page, X-Presence-Gamemode');
         return res.sendStatus(204);
     }
     next();
@@ -1211,7 +1211,7 @@ function txAmountUsd(tx) {
 }
 
 async function sumGameCashoutUsd(extra = {}) {
-    const match = await reportedTxMatch({ ...buildGameCashoutTxFilter(), ...extra });
+    const match = await reportedTxMatch({ ...buildGameCashoutTxFilter(), ...extra }, { skipUserExclusion: true });
     const txs = await Transaction.find(match).select('amount currency meta').lean();
     let totalUsd = 0;
     for (const tx of txs) {

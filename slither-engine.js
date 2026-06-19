@@ -335,8 +335,7 @@ export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
         id: 'slither_bot_' + randId(),
         username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)] + ' [' + util.randomInRange(10, 99) + ']',
         isBot: true,
-        balance: startMass,
-        dollarBalance: botBalance,
+        balance: botBalance,
         botStake: botBalance,
         kills: 0,
         color: util.randomSlitherColor(),
@@ -433,13 +432,18 @@ function applySlitherFoodPickup(snake, food, room) {
         }
     }
 
-    snake.balance += massGain;
     if (snake.dollarBalance != null) {
+        snake.balance += massGain;
         snake.dollarBalance = (snake.dollarBalance || 0) + dollarGain;
     } else {
-        snake.balance += dollarGain;
+        if (room.isBattleRoyale) {
+            snake.balance += massGain;
+        } else {
+            snake.balance += dollarGain;
+        }
     }
-    snake.fam = (snake.fam || 0) + massGain / famVolumeForSegment(snake.segments.length);
+    
+    snake.fam = (snake.fam || 0) + (room.isBattleRoyale ? massGain : dollarGain) / famVolumeForSegment(snake.segments.length);
     applyFamGrowth(snake);
 }
 
@@ -1386,8 +1390,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         username,
         mode: 'slither',
         kills: 0,
-        balance,
-        dollarBalance: dollarStart,
+        balance: dollarStart,
         entryFeeUsd: room.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
         startTime: Date.now(),
         spawnGraceUntil: Date.now() + 4500,
@@ -1407,7 +1410,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
             x,
             y,
             balance: dollarStart,
-            radius: headRadiusForBalance(balance),
+            radius: headRadiusForBalance(dollarStart),
             vx: 0,
             vy: 0,
             lastSplit: Date.now(),
