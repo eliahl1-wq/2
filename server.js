@@ -56,6 +56,7 @@ import {
     getRecentBRVictories,
     getBRServerStatus,
     BR,
+    getActiveBRMatchesRaw,
 } from './battle-royale.js';
 import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
@@ -257,6 +258,7 @@ function createArenaRoom(entryFeeUsd) {
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
         qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4),
+        lastHumanTime: Date.now(),
     };
 }
 
@@ -1477,20 +1479,68 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
     try {
         const inGameUserIds = new Set();
         const inGameUsernames = [];
+        let botCount = 0;
+        const botList = [];
+
+        // Normal rooms (agar/slither)
         for (const room of rooms) {
             for (const p of room.players) {
-                if (!p.isBot && p.mongoId) {
+                if (p.isBot) {
+                    botCount++;
+                    botList.push({
+                        id: p.id || `bot_${Math.random()}`,
+                        username: p.username,
+                        mode: room.mode || 'agar',
+                        entryFeeUsd: room.entryFeeUsd,
+                        isBot: true,
+                    });
+                } else if (p.mongoId) {
                     const id = p.mongoId.toString();
                     if (!inGameUserIds.has(id)) {
                         inGameUserIds.add(id);
-                        inGameUsernames.push({ id, username: p.username, mode: p.mode || 'agar', entryFeeUsd: room.entryFeeUsd });
+                        inGameUsernames.push({ id, username: p.username, mode: room.mode || 'agar', entryFeeUsd: room.entryFeeUsd, isBot: false });
                     }
                 }
             }
+            if (room.slitherBots) {
+                for (const b of room.slitherBots) {
+                    botCount++;
+                    botList.push({
+                        id: b.id,
+                        username: b.username,
+                        mode: 'slither',
+                        entryFeeUsd: room.entryFeeUsd,
+                        isBot: true,
+                    });
+                }
+            }
+            if (room.sandboxStaticWorms) {
+                for (const b of room.sandboxStaticWorms) {
+                    botCount++;
+                    botList.push({
+                        id: b.id,
+                        username: b.username,
+                        mode: 'slither',
+                        entryFeeUsd: room.entryFeeUsd,
+                        isBot: true,
+                    });
+                }
+            }
         }
+
+        // Competitive slither rooms
         for (const room of competitiveSlitherRooms) {
             for (const p of room.players) {
-                if (p.mongoId) {
+                if (p.isBot) {
+                    botCount++;
+                    botList.push({
+                        id: p.id || `bot_${Math.random()}`,
+                        username: p.username,
+                        mode: 'competitive-slither',
+                        entryFeeUsd: room.entryFeeUsd,
+                        isBot: true,
+                    });
+                } else if (p.mongoId) {
                     const id = p.mongoId.toString();
                     if (!inGameUserIds.has(id)) {
                         inGameUserIds.add(id);
@@ -1499,6 +1549,48 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                             username: p.username,
                             mode: 'competitive-slither',
                             entryFeeUsd: room.entryFeeUsd,
+                            isBot: false,
+                        });
+                    }
+                }
+            }
+            if (room.slitherBots) {
+                for (const b of room.slitherBots) {
+                    botCount++;
+                    botList.push({
+                        id: b.id,
+                        username: b.username,
+                        mode: 'competitive-slither',
+                        entryFeeUsd: room.entryFeeUsd,
+                        isBot: true,
+                    });
+                }
+            }
+        }
+
+        // Battle Royale matches
+        const brMatches = typeof getActiveBRMatchesRaw === 'function' ? getActiveBRMatchesRaw() : [];
+        for (const room of brMatches) {
+            for (const p of room.players) {
+                if (p.isBot) {
+                    botCount++;
+                    botList.push({
+                        id: p.id || `bot_${Math.random()}`,
+                        username: p.username,
+                        mode: room.variant === 'slither' ? 'br-slither' : 'br-agar',
+                        entryFeeUsd: room.entryFeeUsd,
+                        isBot: true,
+                    });
+                } else if (p.mongoId) {
+                    const id = p.mongoId.toString();
+                    if (!inGameUserIds.has(id)) {
+                        inGameUserIds.add(id);
+                        inGameUsernames.push({
+                            id,
+                            username: p.username,
+                            mode: room.variant === 'slither' ? 'br-slither' : 'br-agar',
+                            entryFeeUsd: room.entryFeeUsd,
+                            isBot: false,
                         });
                     }
                 }
@@ -1524,8 +1616,10 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
 
         res.json({
             currentlyInGame: inGameUserIds.size,
+            currentlyBots: botCount,
             activeLast24h: recentUserIds.length,
             inGamePlayers: inGameUsernames,
+            inGameBots: botList,
             sitePresence: presenceData,
         });
     } catch (err) {
@@ -3084,7 +3178,9 @@ rooms.forEach(room => {
 function trimAgarBots(room, targetCount) {
     const stake = botStakeForRoom(room);
     while (room.bots.length > targetCount) {
-        const removed = room.bots.shift();
+        const index = room.bots.findIndex(b => !b.adminSpawned);
+        if (index === -1) break; // Only admin-spawned bots left
+        const [removed] = room.bots.splice(index, 1);
         room.aiBudgetBalance += removed?.dollarBalance ?? removed?.botStake ?? removed?.cells?.[0]?.balance ?? stake;
     }
 }
@@ -3097,7 +3193,7 @@ function getTargetBots(humanCount) {
     const targetEntities = 12;
     if (humanCount >= targetEntities) return 0;
     
-    return targetEntities - humanCount;
+    return Math.min(8, targetEntities - humanCount);
 }
 
 function countHumansInMode(room, mode) {
@@ -3418,17 +3514,19 @@ io.on('connection', (socket) => {
             room.ownerBalance += economy.ownerCut;
 
             // DYNAMIC BOT SCALING (mode-specific)
-            const targetBots = gameMode === 'slither'
+            let targetBots = gameMode === 'slither'
                 ? getSlitherTargetBots(modeHumansAfterJoin)
                 : getTargetBots(modeHumansAfterJoin);
 
             if (gameMode === 'slither') {
+                targetBots += room.slitherBots.filter(b => b.adminSpawned).length;
                 if (room.slitherBots.length < targetBots) {
                     addSlitherBots(room, targetBots - room.slitherBots.length, joinBotStake);
                 } else if (room.slitherBots.length > targetBots) {
                     trimSlitherBots(room, targetBots);
                 }
             } else {
+                targetBots += room.bots.filter(b => b.adminSpawned).length;
                 if (room.bots.length < targetBots) {
                     addBots(room, targetBots - room.bots.length, joinBotStake);
                 } else if (room.bots.length > targetBots) {
@@ -4059,6 +4157,40 @@ function processRoom(room) {
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
 
+    // IDLE ROOM CLEANUP (Despawn bots after 10 min of no human players, reclaim money to ownerBalance)
+    const activeHumans = agarHumans + slitherHumans;
+    if (activeHumans > 0) {
+        room.lastHumanTime = Date.now();
+    } else {
+        if (!room.lastHumanTime) {
+            room.lastHumanTime = Date.now();
+        }
+        if (Date.now() - room.lastHumanTime >= 10 * 60 * 1000) {
+            const botsCount = room.bots.length + room.slitherBots.length;
+            if (botsCount > 0 || room.aiBudgetBalance > 0) {
+                console.log(`⏳ Room ${room.id} has been empty of humans for 10 minutes. Despawning bots and reclaiming balances.`);
+                let totalReclaimed = room.aiBudgetBalance;
+                
+                room.bots.forEach(b => {
+                    totalReclaimed += b.dollarBalance ?? b.botStake ?? b.balance ?? 0;
+                });
+                
+                room.slitherBots.forEach(b => {
+                    totalReclaimed += b.dollarBalance ?? b.botStake ?? 0;
+                });
+                
+                room.bots = [];
+                room.slitherBots = [];
+                room.aiBudgetBalance = 0;
+                room.savedAgarTarget = 0;
+                room.savedSlitherTarget = 0;
+                
+                room.ownerBalance += totalReclaimed;
+                console.log(`💰 Reclaimed $${totalReclaimed.toFixed(2)} from idle room bots/budget to ownerBalance.`);
+            }
+        }
+    }
+
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     if (!isSandbox || room.sandboxAutoBots) {
         const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
@@ -4145,7 +4277,9 @@ function processRoom(room) {
             if (botWealth > botMax) {
                 room.foodPoolBalance += botWealth;
                 room.bots = room.bots.filter(b => b.id !== player.id);
-                if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
+                const currentHumans = effectiveHumanCountForBots(room, 'agar');
+                const autoBotsCount = room.bots.filter(b => !b.adminSpawned).length;
+                if (autoBotsCount < getTargetBots(currentHumans)) addBots(room, 1);
                 return;
             }
 
@@ -4384,9 +4518,10 @@ function processRoom(room) {
                                         room.players = room.players.filter(p => p.id !== victim.id);
                                     } else {
                                         // Ta bort botten och spawna en ny direkt
-                                        // Kill rewards är borttagna, så ingen ökning av kills
                                         room.bots = room.bots.filter(b => b.id !== victim.id);
-                                        if (room.players.length + room.bots.length < c.targetPopulation) addBots(room, 1);
+                                        const currentHumans = effectiveHumanCountForBots(room, 'agar');
+                                        const autoBotsCount = room.bots.filter(b => !b.adminSpawned).length;
+                                        if (autoBotsCount < getTargetBots(currentHumans)) addBots(room, 1);
                                     }
                                 }
                             }

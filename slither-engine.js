@@ -363,7 +363,9 @@ export function addSlitherBots(room, n, botStake = SLITHER.botStartBalance) {
 /** Remove excess bots from the front and return their stake to the AI budget (matches agar economy). */
 export function trimSlitherBots(room, targetCount) {
     while (room.slitherBots.length > targetCount) {
-        const removed = room.slitherBots.shift();
+        const index = room.slitherBots.findIndex(b => !b.adminSpawned);
+        if (index === -1) break; // Only admin-spawned bots left
+        const [removed] = room.slitherBots.splice(index, 1);
         room.aiBudgetBalance += removed?.botStake ?? SLITHER.botStartBalance;
     }
 }
@@ -376,7 +378,7 @@ export function getSlitherTargetBots(humanCount) {
     const targetEntities = 12;
     if (humanCount >= targetEntities) return 0;
     
-    return targetEntities - humanCount;
+    return Math.min(8, targetEntities - humanCount);
 }
 
 function getAllSlitherSnakes(room) {

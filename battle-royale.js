@@ -308,6 +308,10 @@ export function getBRServerStatus() {
     };
 }
 
+export function getActiveBRMatchesRaw() {
+    return Array.from(matches.values()).filter(room => room.status !== 'ended');
+}
+
 export function processBRQueues(io, deps) {
     for (const [key, q] of queues.entries()) {
         if (!q.length) continue;
