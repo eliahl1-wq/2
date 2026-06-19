@@ -1037,7 +1037,7 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
     } catch (err) {
         console.error("Withdraw Error:", err.message);
         if (typeof solToWithdraw === 'number' && Number.isFinite(solToWithdraw)) {
-            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } }).catch(() => {});
+            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } }).catch(() => { });
         }
         res.status(500).json({ error: "Blockchain transaction failed" });
     }
@@ -2100,14 +2100,16 @@ app.get('/api/admin/dashboard/transactions', authenticateAdmin, async (req, res)
 app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 200, 500);
-        const eventFilter = { $or: [
-            { type: 'game', 'meta.event': 'join' },
-            { type: 'game', 'meta.event': 'br_join' },
-            { type: 'game', 'meta.reason': 'Arena Death' },
-            { type: 'game', 'meta.reason': 'BR Eliminated' },
-            { type: 'game', 'meta.event': 'br_refund' },
-            { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
-        ]};
+        const eventFilter = {
+            $or: [
+                { type: 'game', 'meta.event': 'join' },
+                { type: 'game', 'meta.event': 'br_join' },
+                { type: 'game', 'meta.reason': 'Arena Death' },
+                { type: 'game', 'meta.reason': 'BR Eliminated' },
+                { type: 'game', 'meta.event': 'br_refund' },
+                { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
+            ]
+        };
         const skipUserExclusion = !!req.query.userId;
         const reported = await reportedTxMatch({}, { skipUserExclusion });
         const andClauses = [eventFilter, reported];
@@ -3196,12 +3198,12 @@ function trimAgarBots(room, targetCount) {
 
 function getTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
-    
+
     // Target a lively arena with a mix of players and bots.
     // The fewer humans, the more bots we spawn to fill the room up to a target size.
     const targetEntities = 12;
     if (humanCount >= targetEntities) return 0;
-    
+
     return Math.min(8, targetEntities - humanCount);
 }
 
@@ -3456,34 +3458,34 @@ io.on('connection', (socket) => {
             const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
             if (!DEV_FREE_PLAY) {
-            // 1. Kontrollera on-chain balans direkt innan start
-            const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-            const currentLamports = await connection.getBalance(userPubKey);
-            const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
+                // 1. Kontrollera on-chain balans direkt innan start
+                const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                const currentLamports = await connection.getBalance(userPubKey);
+                const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
 
-            if (currentLamports < (feeLamports + 5000)) { // +5000 för gas
-                socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
-                return;
-            }
+                if (currentLamports < (feeLamports + 5000)) { // +5000 för gas
+                    socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
+                    return;
+                }
 
-            // 2. Utför on-chain transfer: Deposit Address -> House Wallet
-            try {
-                const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
-                const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                const joinTx = new solanaWeb3.Transaction().add(
-                    solanaWeb3.SystemProgram.transfer({
-                        fromPubkey: userPubKey,
-                        toPubkey: housePubKey,
-                        lamports: feeLamports,
-                    })
-                );
-                const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
-                console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
-            } catch (txErr) {
-                console.error("Join transaction failed:", txErr.message);
-                socket.emit('error', 'Blockchain transfer failed. Please try again.');
-                return;
-            }
+                // 2. Utför on-chain transfer: Deposit Address -> House Wallet
+                try {
+                    const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                    const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                    const joinTx = new solanaWeb3.Transaction().add(
+                        solanaWeb3.SystemProgram.transfer({
+                            fromPubkey: userPubKey,
+                            toPubkey: housePubKey,
+                            lamports: feeLamports,
+                        })
+                    );
+                    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
+                    console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
+                } catch (txErr) {
+                    console.error("Join transaction failed:", txErr.message);
+                    socket.emit('error', 'Blockchain transfer failed. Please try again.');
+                    return;
+                }
             } else {
                 console.log(`🎮 [FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
             }
@@ -3670,7 +3672,7 @@ io.on('connection', (socket) => {
 
     socket.on('adminSpawnBotNearMe', async ({ token }) => {
         try {
-            const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
+            const decoded = jwt.verify(token, process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193");
             const user = await User.findById(decoded.id);
             if (!user || !user.isAdmin) return;
 
@@ -4179,21 +4181,21 @@ function processRoom(room) {
             if (botsCount > 0 || room.aiBudgetBalance > 0) {
                 console.log(`⏳ Room ${room.id} has been empty of humans for 10 minutes. Despawning bots and reclaiming balances.`);
                 let totalReclaimed = room.aiBudgetBalance;
-                
+
                 room.bots.forEach(b => {
                     totalReclaimed += b.dollarBalance ?? b.botStake ?? b.balance ?? 0;
                 });
-                
+
                 room.slitherBots.forEach(b => {
                     totalReclaimed += b.dollarBalance ?? b.botStake ?? 0;
                 });
-                
+
                 room.bots = [];
                 room.slitherBots = [];
                 room.aiBudgetBalance = 0;
                 room.savedAgarTarget = 0;
                 room.savedSlitherTarget = 0;
-                
+
                 room.ownerBalance += totalReclaimed;
                 console.log(`💰 Reclaimed $${totalReclaimed.toFixed(2)} from idle room bots/budget to ownerBalance.`);
             }
@@ -4212,7 +4214,7 @@ function processRoom(room) {
 
         const agarBotStake = botStakeForRoom(room);
         const slitherBotStake = botStakeForRoom(room);
-        
+
         if (room.bots.length < agarTargetBots) {
             addBots(room, agarTargetBots - room.bots.length, agarBotStake);
         } else if (room.bots.length > agarTargetBots) {
@@ -4235,26 +4237,26 @@ function processRoom(room) {
 
     // Food spawn — funded from pool (entry fees on join), same rules for agar + slither
     if (!isSandbox || room.sandboxAutoFood) {
-    const agarInArena = countHumansInMode(room, 'agar');
-    const slitherInArena = countHumansInMode(room, 'slither');
-    const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
+        const agarInArena = countHumansInMode(room, 'agar');
+        const slitherInArena = countHumansInMode(room, 'slither');
+        const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
 
-    const pelletValue = foodBlobValueForRoom(room);
-    const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
-    const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
-    if (agarInArena <= 0) {
-        room.food.length = 0;
-    } else {
-        const normalCount = countNormalAgarFood(room);
-        if (normalCount < agarTargetFoodCount) {
-            addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
-        } else if (normalCount > agarTargetFoodCount + 25) {
-            trimNormalAgarFood(room, agarTargetFoodCount);
+        const pelletValue = foodBlobValueForRoom(room);
+        const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
+        const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
+        if (agarInArena <= 0) {
+            room.food.length = 0;
+        } else {
+            const normalCount = countNormalAgarFood(room);
+            if (normalCount < agarTargetFoodCount) {
+                addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
+            } else if (normalCount > agarTargetFoodCount + 25) {
+                trimNormalAgarFood(room, agarTargetFoodCount);
+            }
         }
-    }
-    syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
+        syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
 
-    if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
+        if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
     }
 
     const allUsers = [
@@ -4671,12 +4673,14 @@ function processRoom(room) {
             resetTime: room.startTime + c.roomDuration,
             solPrice: SOL_PRICE_USD,
             minimap,
-            ...(isSandbox ? { sandbox: true, zone: room.sandboxZone ? {
-                cx: room.sandboxZone.cx,
-                cy: room.sandboxZone.cy,
-                radius: room.sandboxZone.radius,
-                shrinking: room.sandboxZone.shrinking,
-            } : null } : {}),
+            ...(isSandbox ? {
+                sandbox: true, zone: room.sandboxZone ? {
+                    cx: room.sandboxZone.cx,
+                    cy: room.sandboxZone.cy,
+                    radius: room.sandboxZone.radius,
+                    shrinking: room.sandboxZone.shrinking,
+                } : null
+            } : {}),
         });
     });
 }
