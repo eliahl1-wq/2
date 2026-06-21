@@ -3320,21 +3320,30 @@ io.on('connection', (socket) => {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    if (currentLamports < (feeLamports + 5000)) {
+                    if (currentLamports < (feeLamports + 15000)) { // +15000 lamports for tx fee buffer
                         socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
                         return;
                     }
                     try {
                         const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                        const joinTx = new solanaWeb3.Transaction().add(
+                        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                        const joinTx = new solanaWeb3.Transaction({
+                            recentBlockhash: blockhash,
+                            feePayer: userPubKey,
+                        }).add(
                             solanaWeb3.SystemProgram.transfer({
                                 fromPubkey: userPubKey,
                                 toPubkey: housePubKey,
                                 lamports: feeLamports,
                             })
                         );
-                        const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
+                        const sig = await solanaWeb3.sendAndConfirmTransaction(
+                            connection,
+                            joinTx,
+                            [userKeypair],
+                            { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
+                        );
                         console.log(`🎟️ Competitive Slither Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
                         console.error('Competitive join transaction failed:', txErr.message);
@@ -3463,7 +3472,7 @@ io.on('connection', (socket) => {
                 const currentLamports = await connection.getBalance(userPubKey);
                 const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
 
-                if (currentLamports < (feeLamports + 5000)) { // +5000 för gas
+                if (currentLamports < (feeLamports + 15000)) { // +15000 lamports for tx fee buffer
                     socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
                     return;
                 }
@@ -3472,14 +3481,23 @@ io.on('connection', (socket) => {
                 try {
                     const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
                     const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                    const joinTx = new solanaWeb3.Transaction().add(
+                    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                    const joinTx = new solanaWeb3.Transaction({
+                        recentBlockhash: blockhash,
+                        feePayer: userPubKey,
+                    }).add(
                         solanaWeb3.SystemProgram.transfer({
                             fromPubkey: userPubKey,
                             toPubkey: housePubKey,
                             lamports: feeLamports,
                         })
                     );
-                    const sig = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
+                    const sig = await solanaWeb3.sendAndConfirmTransaction(
+                        connection,
+                        joinTx,
+                        [userKeypair],
+                        { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
+                    );
                     console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                 } catch (txErr) {
                     console.error("Join transaction failed:", txErr.message);
