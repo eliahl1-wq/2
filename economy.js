@@ -12,15 +12,15 @@ export const ECONOMY_TICKS_PER_SECOND = 40;
 const BASE = {
     playerStart: 1.0,
     ownerCut: 1.0,
-    foodLow: 6.0,   // 1–2 humans
-    foodMid: 7.0,   // 3–7 humans
-    foodHigh: 8.0,  // 8+ humans
+    foodLow: 12.0,   // 1–2 humans
+    foodMid: 16.0,   // 3–7 humans
+    foodHigh: 20.0,  // 8+ humans
     aiLow: 2.0,   // per join: fund 2 bots; 2 joins → 4 bots max at botStart stake
     aiMid: 1.0,
     aiHigh: 0.0,
     botStart: 1.0,
     botMax: 500.0,
-    foodDensityPerHuman: 250.0,
+    foodDensityPerHuman: 500.0,
     /** Snake mass gained per normal pellet at $10 entry ($5→0.01, $10→0.02, $20→0.04). Decoupled from dollar value. */
     massPerPellet: 0.02,
     /** Pellet dollar value at $10 entry ($5→$0.02, $10→$0.04, $20→$0.08). Half the blob count, same total food pool $. */

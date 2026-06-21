@@ -490,10 +490,11 @@ async function cashOutRoomPlayers(room) {
                     userId: user._id,
                     type: 'withdraw',
                     amount: arenaCashoutUsd(p),
-                    currency: 'SOL',
+                    currency: 'USD',
                     meta: {
                         signature: sig,
                         reason: 'Auto Room Reset to Account Address',
+                        destination: user.depositAddress,
                         roomId: room.id,
                         entryFeeUsd: room.entryFeeUsd,
                     },
@@ -1029,7 +1030,7 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
             type: 'withdraw',
             amount: solToWithdraw,
             currency: 'SOL',
-            meta: { signature, destination: destinationAddress, solAmount: solToWithdraw },
+            meta: { signature, destination: destinationAddress, solAmount: solToWithdraw, amountUsd: amountUSD },
             status: 'confirmed'
         });
 
@@ -1086,7 +1087,7 @@ app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
             type: 'deposit',
             amount: solReceived,
             currency: 'SOL',
-            meta: { signature, solAmount: solReceived, verifiedOnChain: true },
+            meta: { signature, solAmount: solReceived, amountUsd: solReceived * SOL_PRICE_USD, verifiedOnChain: true },
             status: 'confirmed',
         });
 
@@ -3332,6 +3333,7 @@ io.on('connection', (socket) => {
                             recentBlockhash: blockhash,
                             feePayer: userPubKey,
                         }).add(
+                            solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000000 }),
                             solanaWeb3.SystemProgram.transfer({
                                 fromPubkey: userPubKey,
                                 toPubkey: housePubKey,
@@ -3486,6 +3488,7 @@ io.on('connection', (socket) => {
                         recentBlockhash: blockhash,
                         feePayer: userPubKey,
                     }).add(
+                        solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000000 }),
                         solanaWeb3.SystemProgram.transfer({
                             fromPubkey: userPubKey,
                             toPubkey: housePubKey,
