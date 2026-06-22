@@ -1039,11 +1039,12 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
 
     queuedPlayers.forEach(entry => {
         removeFromQueue(entry.socketId);
-        const color = deps.util.randomColor();
         let player;
         if (variant === 'slither') {
+            const color = entry.skinColor || deps.util.randomSlitherColor();
             player = createBRSlitherPlayer(entry.socketId, entry.mongoId, entry.username, color, room);
         } else {
+            const color = deps.util.randomColor();
             player = createBRAgarPlayer(entry.socketId, entry.mongoId, entry.username, color, room, deps);
         }
         if (entry.isBot) player.isBot = true;
@@ -1222,7 +1223,7 @@ export function findBRPlayerByMongo(mongoId) {
 
 export function setupBattleRoyale(io, deps) {
     io.on('connection', (socket) => {
-        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee }) => {
+        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor }) => {
             try {
                 if (variant !== 'agar' && variant !== 'slither') {
                     socket.emit('error', 'Invalid battle royale variant.');
@@ -1260,6 +1261,11 @@ export function setupBattleRoyale(io, deps) {
                     return;
                 }
 
+                let validatedSkinColor = null;
+                if (skinColor && typeof skinColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(skinColor)) {
+                    validatedSkinColor = skinColor;
+                }
+
                 removeFromQueue(socket.id);
                 getQueue(variant, entryFeeUsd).push({
                     socketId: socket.id,
@@ -1268,6 +1274,7 @@ export function setupBattleRoyale(io, deps) {
                     entryFeeUsd,
                     joinedAt: Date.now(),
                     socket,
+                    skinColor: validatedSkinColor,
                 });
                 socket.brQueueVariant = variant;
                 socket.brQueueEntryFee = entryFeeUsd;

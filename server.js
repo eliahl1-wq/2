@@ -3237,12 +3237,16 @@ io.on('connection', (socket) => {
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
 
-    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
+    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor }) => {
         let userKey = null;
         try {
             if (mode === 'br-agar' || mode === 'br-slither') {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
                 return;
+            }
+            let validatedSkinColor = null;
+            if (skinColor && typeof skinColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(skinColor)) {
+                validatedSkinColor = skinColor;
             }
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193");
             let user = await User.findById(decoded.id);
@@ -3376,7 +3380,7 @@ io.on('connection', (socket) => {
                     socket.id,
                     user._id,
                     username || user.username,
-                    util.randomSlitherColor(),
+                    validatedSkinColor || util.randomSlitherColor(),
                     room,
                 );
 
@@ -3578,7 +3582,7 @@ io.on('connection', (socket) => {
                     socket.id,
                     user._id,
                     username || user.username,
-                    util.randomSlitherColor(),
+                    validatedSkinColor || util.randomSlitherColor(),
                     room,
                     startMass,
                     startDollars,
