@@ -3234,7 +3234,8 @@ function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c
 }
 
 io.on('connection', (socket) => {
-    touchSitePresence(socket.request, socket.id);
+    const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
+    touchSitePresence(socket.request, presenceId);
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee }) => {
         let userKey = null;
@@ -3243,7 +3244,7 @@ io.on('connection', (socket) => {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
                 return;
             }
-            const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig");
+            const decoded = jwt.verify(token, process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193");
             let user = await User.findById(decoded.id);
             if (!user) {
                 socket.emit('error', 'Account not found — please log in again.');
