@@ -3965,14 +3965,16 @@ io.on('connection', (socket) => {
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
                 const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
+                
+                // Deduct the ejected mass value directly from the player's dollar balance
+                if (p.dollarBalance != null) {
+                    p.dollarBalance = Math.max(0, p.dollarBalance - c.ejectMass);
+                }
+                
                 // Recycle the spread (ejectMass − ejectMassGain) from player dollars into the food pool
                 const spread = Math.max(0, c.ejectMass - c.ejectMassGain);
-                const dollarStart = playerDollarStart(p);
-                const dollarDrain = Math.min(spread, Math.max(0, (p.dollarBalance ?? 0) - dollarStart));
-                if (dollarDrain > 1e-9) {
-                    room.foodPoolBalance += dollarDrain;
-                    p.dollarBalance = (p.dollarBalance ?? 0) - dollarDrain;
-                }
+                room.foodPoolBalance += spread;
+
                 room.ejected.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x + dirX * (cell.radius + 20),
@@ -4571,6 +4573,9 @@ function processRoom(room) {
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance;
+                        if (player.dollarBalance != null) {
+                            player.dollarBalance = (player.dollarBalance || 0) + item.data.balance;
+                        }
                         cell.radius = calculateCellRadius(
                             cell.balance,
                             playerTotalMass(player),
