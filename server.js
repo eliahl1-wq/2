@@ -221,7 +221,7 @@ const c = {
     ejectMassGain: 0.04,
     massLossRate: 1.0,
     mergeTimer: 30,
-    speedMult: 1.1,
+    speedMult: 1.45,
     houseFee: 0.0,
     targetPopulation: 30,
     botStartBalance: 1.0,
@@ -3990,6 +3990,7 @@ io.on('connection', (socket) => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p) return;
+        const s = playerDollarStart(p);
         p.cells.forEach(cell => {
             const massStart = playerMassStart(p);
             const totalMass = playerTotalMass(p);
@@ -4000,13 +4001,13 @@ io.on('connection', (socket) => {
                 const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
                 const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
                 
-                // Deduct the ejected mass value directly from the player's dollar balance
+                // Deduct the ejected mass value directly from the player's dollar balance, scaled by the arena tier factor s
                 if (p.dollarBalance != null) {
-                    p.dollarBalance = Math.max(0, p.dollarBalance - c.ejectMass);
+                    p.dollarBalance = Math.max(0, p.dollarBalance - (c.ejectMass * s));
                 }
                 
                 // Recycle the spread (ejectMass − ejectMassGain) from player dollars into the food pool
-                const spread = Math.max(0, c.ejectMass - c.ejectMassGain);
+                const spread = Math.max(0, (c.ejectMass - c.ejectMassGain) * s);
                 room.foodPoolBalance += spread;
 
                 room.ejected.push({
@@ -4018,7 +4019,8 @@ io.on('connection', (socket) => {
                     vy: dirY * 22,
                     hue: Math.floor(Math.random() * 360),
                     color: p.color,
-                    balance: c.ejectMassGain
+                    balance: c.ejectMassGain,
+                    dollarValue: c.ejectMassGain * s
                 });
             }
         });
@@ -4558,14 +4560,22 @@ function processRoom(room) {
         let totalY = 0;
         const cellsToDelete = new Set();
 
+        // Calculate absolute target position in the world
+        const targetWorldX = player.isBot ? player.targetX : (player.x + (player.mouseX || 0));
+        const targetWorldY = player.isBot ? player.targetY : (player.y + (player.mouseY || 0));
+
         // 1. Beräkna rörelse för alla celler
         for (let i = 0; i < player.cells.length; i++) {
             const cell = player.cells[i];
             // PHYSICS: Movement & Friction
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
             const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult * (isSandbox ? (room.sandboxSpeedMultiplier ?? 1) : 1);
-            const angle = Math.atan2(player.mouseY, player.mouseX);
-            const distToMouse = Math.hypot(player.mouseX, player.mouseY);
+            
+            // Calculate movement angle from individual cell to absolute mouse position
+            const cellMouseX = targetWorldX - cell.x;
+            const cellMouseY = targetWorldY - cell.y;
+            const angle = Math.atan2(cellMouseY, cellMouseX);
+            const distToMouse = Math.hypot(cellMouseX, cellMouseY);
 
             const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
             const velX = (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
@@ -4612,8 +4622,10 @@ function processRoom(room) {
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
                         cell.balance += item.data.balance;
+                        const s = playerDollarStart(player);
+                        const dollarGain = item.data.dollarValue ?? (item.data.balance * s);
                         if (player.dollarBalance != null) {
-                            player.dollarBalance = (player.dollarBalance || 0) + item.data.balance;
+                            player.dollarBalance = (player.dollarBalance || 0) + dollarGain;
                         }
                         cell.radius = calculateCellRadius(
                             cell.balance,
@@ -4653,8 +4665,8 @@ function processRoom(room) {
 
                         if (canMerge) {
                             // INTERNAL sammanslagning: Ingen 5% regel.
-                            // Om din mittpunkt är inne i den andra cellen
-                            if (d < Math.max(r, r2) * 0.9) {
+                            // Om din mittpunkt är inne i den andra cellen (ökat till hela radien för mjukare merge)
+                            if (d < Math.max(r, r2)) {
                                 cell.balance += otherCell.balance;
                                 cell.radius = calculateCellRadius(
                                     cell.balance,
@@ -4664,19 +4676,19 @@ function processRoom(room) {
                                 );
                                 cellsToDelete.add(otherCell.id);
                             }
-                            // Ingen repulsion när vi kan merga, så de kan "pressas ihop" mjukt
+                            // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Om vi INTE kan merga än: Knuffa bort dem mjukare (delat med 25 istället för 10)
+                            // Om vi INTE kan merga än: Knuffa bort dem mjukare (delat med 45 istället för 25 för mer överlappning)
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
-                            const force = (r + r2 - d) / 25;
+                            const force = (r + r2 - d) / 45;
                             cell.vx += Math.cos(pushAngle) * force;
                             cell.vy += Math.sin(pushAngle) * force;
                         }
-                    } else if (item.type === 'player' || item.type === 'bot') {
+                    } else {
                         if (isSandbox && room.sandboxInvincible) continue;
                         // EXTERNAL: Eat
-                        // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r + r2 * 0.2)
-                        if (cell.balance > otherCell.balance * 1.05 && d < (r + r2 * 0.1)) {
+                        // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r för en mjukare känsla där man äter lättare)
+                        if (cell.balance > otherCell.balance * 1.05 && d < r) {
                             // EKONOMI: Absorberar 100% av cellmassan + proportionell dollar-andel
                             cell.balance += otherCell.balance;
                             const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
