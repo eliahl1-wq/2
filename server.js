@@ -1602,17 +1602,29 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
         const recentMatch = await reportedTxMatch({ createdAt: { $gte: dayAgo } });
         const recentUserIds = await Transaction.distinct('userId', recentMatch);
 
-        const presenceData = Array.from(sitePresence.entries())
-            .filter(([_, data]) => Date.now() - (data.lastSeen || data) < PRESENCE_TTL_MS)
-            .map(([k, data]) => ({
-                id: k,
-                ip: data.ip || 'Unknown',
-                country: data.country || 'Unknown',
-                page: data.page || 'unknown',
-                gamemode: data.gamemode || 'none',
-                userAgent: data.userAgent || 'Unknown',
-                lastSeen: data.lastSeen || data
-            }))
+                const uniquePresence = new Map();
+        for (const [k, data] of sitePresence) {
+            if (Date.now() - (data.lastSeen || data) >= PRESENCE_TTL_MS) continue;
+            
+            let ip = data.ip || 'Unknown';
+            if (ip.includes(',')) ip = ip.split(',')[0].trim();
+            if (ip === '::1' || ip === '::ffff:127.0.0.1') ip = '127.0.0.1';
+            
+            const existing = uniquePresence.get(ip);
+            const seenAt = data.lastSeen || data;
+            if (!existing || seenAt > existing.lastSeen) {
+                uniquePresence.set(ip, {
+                    id: k,
+                    ip: ip,
+                    country: data.country || 'Unknown',
+                    page: data.page || 'unknown',
+                    gamemode: data.gamemode || 'none',
+                    userAgent: data.userAgent || 'Unknown',
+                    lastSeen: seenAt
+                });
+            }
+        }
+        const presenceData = Array.from(uniquePresence.values())
             .sort((a, b) => b.lastSeen - a.lastSeen);
 
         res.json({
@@ -2639,7 +2651,14 @@ const PRESENCE_TTL_MS = 90_000;
 function touchSitePresence(req, customKey = null) {
     let ip = 'unknown';
     if (req) {
-        ip = (req.headers ? (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) : null) || req.ip || 'unknown';
+        let rawIp = (req.headers ? (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) : null) || req.ip;
+        if (rawIp) {
+            if (rawIp.includes(',')) {
+                ip = rawIp.split(',')[0].trim();
+            } else {
+                ip = rawIp.trim();
+            }
+        }
     }
     if (ip === '::1' || ip === '::ffff:127.0.0.1') {
         ip = '127.0.0.1';
@@ -2687,11 +2706,24 @@ function touchSitePresence(req, customKey = null) {
 
 function getSiteUsersOnline() {
     const cutoff = Date.now() - PRESENCE_TTL_MS;
+    const uniqueIps = new Set();
     for (const [key, data] of sitePresence) {
         const seenAt = typeof data === 'number' ? data : data.lastSeen;
-        if (seenAt < cutoff) sitePresence.delete(key);
+        if (seenAt < cutoff) {
+            sitePresence.delete(key);
+        } else {
+            let ip = data.ip || 'unknown';
+            if (ip.includes(',')) ip = ip.split(',')[0].trim();
+            if (ip === '::1' || ip === '::ffff:127.0.0.1') ip = '127.0.0.1';
+            
+            if (ip && ip !== 'unknown') {
+                uniqueIps.add(ip);
+            } else {
+                uniqueIps.add(key);
+            }
+        }
     }
-    return sitePresence.size;
+    return Math.max(1, uniqueIps.size);
 }
 
 app.post('/api/presence/ping', (req, res) => {
