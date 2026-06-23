@@ -4662,11 +4662,12 @@ function processRoom(room) {
                     if (item.socketId === player.id || item.botId === player.id) {
                         // INTERNAL: Merge or Push
                         const canMerge = (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
+                        const forceMerge = d < Math.max(r, r2) * 0.65; // Tvinga sammanslagning om mittpunkterna är tillräckligt nära varandra (t.ex. mot en vägg)
 
-                        if (canMerge) {
+                        if (canMerge || forceMerge) {
                             // INTERNAL sammanslagning: Ingen 5% regel.
-                            // Mycket mer förlåtande sammanslagning (räcker med 80% av radiesumman för direkt merge)
-                            if (d < r + r2 * 0.8) {
+                            // Merge om timern är klar (d < r+r2*0.8) ELLER om de trycks in i varandra djupt (forceMerge)
+                            if (d < r + r2 * 0.8 || forceMerge) {
                                 cell.balance += otherCell.balance;
                                 cell.radius = calculateCellRadius(
                                     cell.balance,
