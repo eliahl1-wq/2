@@ -4662,8 +4662,8 @@ function processRoom(room) {
                     if (item.socketId === player.id || item.botId === player.id) {
                         // INTERNAL: Merge or Push
                         const canMerge = (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
-                        // Tvinga sammanslagning efter 3.5 sekunder om mittpunkterna är tillräckligt nära varandra (t.ex. om man sitter fast i en vägg)
-                        const forceMerge = (d < Math.max(r, r2) * 0.65) && (Date.now() - cell.lastSplit > 3500) && (Date.now() - otherCell.lastSplit > 3500);
+                        // Tvinga sammanslagning efter 2 sekunder om mittpunkterna är tillräckligt nära varandra (85% av summan av radierna)
+                        const forceMerge = (d < (r + r2) * 0.85) && (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
 
                         if (canMerge || forceMerge) {
                             // INTERNAL sammanslagning: Ingen 5% regel.
@@ -4680,11 +4680,13 @@ function processRoom(room) {
                             }
                             // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Mycket mjukare glidning (sänkt korrigering från 0.15 till 0.08 för djupare överlappning)
+                            // Mycket mjukare glidning. Om cellerna har varit delade i >2s, försvaga repulsionen avsevärt (0.01) så de glider ihop smidigt.
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
                             const overlap = (r + r2 - d);
-                            cell.x += Math.cos(pushAngle) * overlap * 0.08;
-                            cell.y += Math.sin(pushAngle) * overlap * 0.08;
+                            const isReadyToMerge = (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
+                            const pushStrength = isReadyToMerge ? 0.01 : 0.08;
+                            cell.x += Math.cos(pushAngle) * overlap * pushStrength;
+                            cell.y += Math.sin(pushAngle) * overlap * pushStrength;
                         }
                     } else {
                         if (isSandbox && room.sandboxInvincible) continue;
