@@ -4665,8 +4665,8 @@ function processRoom(room) {
 
                         if (canMerge) {
                             // INTERNAL sammanslagning: Ingen 5% regel.
-                            // Om din mittpunkt är inne i den andra cellen (ökat till hela radien för mjukare merge)
-                            if (d < Math.max(r, r2)) {
+                            // Mycket mer förlåtande sammanslagning (räcker med 80% av radiesumman för direkt merge)
+                            if (d < r + r2 * 0.8) {
                                 cell.balance += otherCell.balance;
                                 cell.radius = calculateCellRadius(
                                     cell.balance,
@@ -4678,11 +4678,11 @@ function processRoom(room) {
                             }
                             // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Positional correction instead of velocity addition to prevent bouncing, making cells soft and squishy
+                            // Mycket mjukare glidning (sänkt korrigering från 0.15 till 0.08 för djupare överlappning)
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
                             const overlap = (r + r2 - d);
-                            cell.x += Math.cos(pushAngle) * overlap * 0.15;
-                            cell.y += Math.sin(pushAngle) * overlap * 0.15;
+                            cell.x += Math.cos(pushAngle) * overlap * 0.08;
+                            cell.y += Math.sin(pushAngle) * overlap * 0.08;
                         }
                     } else {
                         if (isSandbox && room.sandboxInvincible) continue;
