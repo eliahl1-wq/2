@@ -1044,7 +1044,21 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
             const color = entry.skinColor || deps.util.randomSlitherColor();
             player = createBRSlitherPlayer(entry.socketId, entry.mongoId, entry.username, color, room);
         } else {
-            const color = deps.util.randomColor();
+            const color = (() => {
+                if (entry.skinColor && entry.skinColor !== 'random') {
+                    const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(entry.skinColor);
+                    if (c) {
+                        const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;
+                        const g = (parseInt(c[2], 16) - 32) > 0 ? (parseInt(c[2], 16) - 32) : 0;
+                        const b = (parseInt(c[3], 16) - 32) > 0 ? (parseInt(c[3], 16) - 32) : 0;
+                        return {
+                            fill: entry.skinColor,
+                            border: '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)
+                        };
+                    }
+                }
+                return deps.util.randomColor();
+            })();
             player = createBRAgarPlayer(entry.socketId, entry.mongoId, entry.username, color, room, deps);
         }
         if (entry.isBot) player.isBot = true;

@@ -3600,7 +3600,21 @@ io.on('connection', (socket) => {
                     balance: startDollars,
                     dollarBalance: startDollars,
                     startTime: Date.now(),
-                    color: util.randomColor(),
+                    color: (() => {
+                        if (validatedSkinColor && validatedSkinColor !== 'random') {
+                            const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(validatedSkinColor);
+                            if (c) {
+                                const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;
+                                const g = (parseInt(c[2], 16) - 32) > 0 ? (parseInt(c[2], 16) - 32) : 0;
+                                const b = (parseInt(c[3], 16) - 32) > 0 ? (parseInt(c[3], 16) - 32) : 0;
+                                return {
+                                    fill: validatedSkinColor,
+                                    border: '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)
+                                };
+                            }
+                        }
+                        return util.randomColor();
+                    })(),
                     x: c.worldWidth / 2,
                     y: c.worldHeight / 2,
                     mouseX: 0,
