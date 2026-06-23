@@ -2637,18 +2637,38 @@ const sitePresence = new Map();
 const PRESENCE_TTL_MS = 90_000;
 
 function touchSitePresence(req, customKey = null) {
-    const key = customKey || (req && req.headers ? req.headers['x-presence-id'] : null) || (req ? req.ip : 'unknown');
-    if (!key) return;
+    let ip = 'unknown';
+    if (req) {
+        ip = (req.headers ? (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']) : null) || req.ip || 'unknown';
+    }
+    if (ip === '::1' || ip === '::ffff:127.0.0.1') {
+        ip = '127.0.0.1';
+    }
+
+    // Retrieve presence ID from headers if available
+    let presenceId = req && req.headers ? req.headers['x-presence-id'] : null;
+    
+    // If customKey looks like a valid presence ID (UUID) or is not a socket.id, use it
+    if (customKey && !presenceId) {
+        if (customKey.includes('-') || customKey.startsWith('p-')) {
+            presenceId = customKey;
+        }
+    }
+
+    // Final key is either the stable presence ID or the IP address. If both are missing, fall back to customKey/unknown.
+    const key = presenceId || (ip && ip !== 'unknown' ? ip : (customKey || 'unknown'));
+    if (!key || key === 'unknown' || (typeof key === 'string' && key.length === 20 && !key.includes('-'))) {
+        // Skip transient socket IDs (alphanumeric, length 20, no hyphens)
+        return;
+    }
 
     const existing = sitePresence.get(String(key)) || {};
-    let ip = existing.ip;
     let country = existing.country || 'Unknown';
     let userAgent = existing.userAgent || 'Unknown';
     let page = existing.page || 'unknown';
     let gamemode = existing.gamemode || 'none';
 
     if (req && req.headers) {
-        ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.ip || ip;
         country = req.headers['cf-ipcountry'] || country;
         userAgent = req.headers['user-agent'] || userAgent;
         page = req.headers['x-presence-page'] || page;
