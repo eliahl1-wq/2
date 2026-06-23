@@ -6,8 +6,8 @@ export const SLITHER = {
     // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
     slitherGameRadius: 21600,
     spawnSegments: 12,
-    maxSegments: 500,
-    segmentsPerCent: 0.055,
+    maxSegments: 1200,
+    segmentsPerCent: 0.125,
     maxScale: 6,
     scaleDivisor: 106,
     baseRadius: 6.2,
@@ -152,7 +152,8 @@ export function scaleForSegmentCount(sct) {
 /** Slither.io angular speed scale — thick snakes turn much slower. */
 export function scangForSegmentCount(sct) {
     const sc = scaleForSegmentCount(sct);
-    return 0.13 + 0.87 * Math.pow((7 - sc) / 6, 2);
+    // Large snakes steer in wider, slower arcs so they do not fold into themselves weirdly.
+    return Math.max(0.025, (0.13 + 0.87 * Math.pow((7 - sc) / 6, 2)) * (1.0 / Math.pow(sc, 0.45)));
 }
 
 export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
@@ -1197,6 +1198,55 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const sandboxSkipFoodCollisions = sandboxSkipDeathCollisions && !room.sandboxBotAi;
     room._sharedFoodGrid = room.slitherFood.length > 80 ? buildSlitherFoodGrid(room.slitherFood, room._sharedFoodGrid) : null;
     const foodGrid = room._sharedFoodGrid;
+
+    // Update golden food blobs movement: float gently and flee from nearby snakes
+    const nowTicks = room._slitherBroadcastTick || 0;
+    for (const f of room.slitherFood) {
+        if (!f.golden) continue;
+        
+        // Float logic: drift using a wave motion
+        if (f.vx === undefined) {
+            f.vx = (Math.random() - 0.5) * 0.4;
+            f.vy = (Math.random() - 0.5) * 0.4;
+            f.floatAngle = Math.random() * Math.PI * 2;
+        }
+        
+        f.floatAngle += 0.04;
+        let driftX = Math.cos(f.floatAngle) * 0.16 + f.vx;
+        let driftY = Math.sin(f.floatAngle) * 0.16 + f.vy;
+        
+        // Flee logic: check if any snake head is nearby and flee from it
+        let nearestSnake = null;
+        let minDist2 = 14400; // 120 units reach
+        for (const { entity: snake } of allSnakes) {
+            const head = snake.segments?.[0];
+            if (!head) continue;
+            const dx = f.x - head.x;
+            const dy = f.y - head.y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < minDist2) {
+                minDist2 = d2;
+                nearestSnake = head;
+            }
+        }
+        
+        if (nearestSnake) {
+            // Run away: calculate flee angle and add to speed
+            const fleeAngle = Math.atan2(f.y - nearestSnake.y, f.x - nearestSnake.x);
+            // Move speed matches the non-boosting speed (~1.3 units per tick at 40Hz)
+            const fleeSpeed = 1.25;
+            driftX = Math.cos(fleeAngle) * fleeSpeed;
+            driftY = Math.sin(fleeAngle) * fleeSpeed;
+        }
+        
+        f.x += driftX;
+        f.y += driftY;
+        
+        // Keep inside arena boundaries
+        const limit = SLITHER.worldHalf - 40;
+        f.x = Math.max(-limit, Math.min(limit, f.x));
+        f.y = Math.max(-limit, Math.min(limit, f.y));
+    }
 
     for (const { entity: snake, isHuman } of allSnakes) {
         if (snake.frozen || snake.isStatic) continue;

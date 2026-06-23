@@ -3043,26 +3043,8 @@ function spawnGoldenAgarBlob(room, dollarValue) {
 }
 
 function applyAgarWealthTax(player, room, minDollars) {
-    const total = player.dollarBalance ?? player.balance ?? 0;
-    const decay = wealthTaxDecayAmount(total, minDollars);
-    if (decay <= 1e-9) return;
-    const actual = Math.min(decay, total - minDollars);
-    room.foodPoolBalance += actual;
-    if (player.dollarBalance != null) {
-        player.dollarBalance = Math.max(minDollars, player.dollarBalance - actual);
-    } else {
-        const cellTotal = playerTotalMass(player);
-        if (cellTotal <= 1e-9) return;
-        for (const cell of player.cells) {
-            cell.balance -= actual * (cell.balance / cellTotal);
-            cell.radius = calculateCellRadius(
-                cell.balance,
-                playerTotalMass(player),
-                player.cells.length,
-                playerMassStart(player),
-            );
-        }
-    }
+    // Wealth tax decay completely disabled so players do not lose size/balance over time
+    return;
 }
 
 function addViruses(room, n) {
