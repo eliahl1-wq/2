@@ -218,7 +218,7 @@ const c = {
     minMassSplit: 2.0,
     minMassEject: 1.5,
     ejectMass: 0.05,
-    ejectMassGain: 0.04,
+    ejectMassGain: 0.05,
     massLossRate: 1.0,
     mergeTimer: 30,
     speedMult: 1.45,
@@ -4755,8 +4755,13 @@ function processRoom(room) {
             totalY += cell.y;
         });
 
-        // HUD / cashout balance is dollars; cell.balance is mass
-        player.balance = player.dollarBalance ?? player.cells.reduce((s, cell) => s + cell.balance, 0);
+        // HUD / cashout balance is dollars; cell.balance is mass. Coupled directly via tier scale factor.
+        const s = player.isBot
+            ? (player.botStake ?? player.dollarBalance ?? c.botStartBalance)
+            : playerDollarStart(player);
+
+        player.dollarBalance = playerTotalMass(player) * s;
+        player.balance = player.dollarBalance;
 
         if (player.cells.length > 0) {
             player.x = totalX / player.cells.length;
