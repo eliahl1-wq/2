@@ -4567,6 +4567,8 @@ function processRoom(room) {
         // 1. Beräkna rörelse för alla celler
         for (let i = 0; i < player.cells.length; i++) {
             const cell = player.cells[i];
+            cell.isCollidingWithOwn = false; // Återställ kollisionsflagga för denna tick
+            
             // PHYSICS: Movement & Friction
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
             const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult * (isSandbox ? (room.sandboxSpeedMultiplier ?? 1) : 1);
@@ -4577,7 +4579,11 @@ function processRoom(room) {
             const angle = Math.atan2(cellMouseY, cellMouseX);
             const distToMouse = Math.hypot(cellMouseX, cellMouseY);
 
-            const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
+            // Om spelaren har flera celler som är redo att merga, gör rörelsen lite segare (70% hastighet) för lättare kontroll
+            const isReadyToMerge = cell.lastSplit && (Date.now() - cell.lastSplit > 2000);
+            const speedMultiplier = (player.cells.length > 1 && isReadyToMerge) ? 0.70 : 1.0;
+            const moveSpeed = (distToMouse < 50 ? (speed * distToMouse / 50) : speed) * speedMultiplier;
+            
             const velX = (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
             const velY = (Math.sin(angle) * moveSpeed) + (cell.vy || 0);
             cell.x += velX;
@@ -4660,33 +4666,45 @@ function processRoom(room) {
                     const r2 = otherCell.radius;
 
                     if (item.socketId === player.id || item.botId === player.id) {
+                        cell.isCollidingWithOwn = true;
                         // INTERNAL: Merge or Push
-                        const canMerge = (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
-                        // Tvinga sammanslagning efter 2 sekunder om mittpunkterna är tillräckligt nära varandra (85% av summan av radierna)
-                        const forceMerge = (d < (r + r2) * 0.85) && (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
+                        const canMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
+                        // Tvinga sammanslagning efter 2 sekunder om mittpunkterna är tillräckligt nära varandra (90% av summan av radierna)
+                        const forceMerge = cell.lastSplit && otherCell.lastSplit && (d < (r + r2) * 0.90) && (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
 
                         if (canMerge || forceMerge) {
                             // INTERNAL sammanslagning: Ingen 5% regel.
                             // Merge om timern är klar (d < r+r2*0.8) ELLER om de trycks in i varandra djupt (forceMerge)
                             if (d < r + r2 * 0.8 || forceMerge) {
-                                cell.balance += otherCell.balance;
-                                cell.radius = calculateCellRadius(
-                                    cell.balance,
-                                    playerTotalMass(player),
-                                    player.cells.length,
-                                    massStart,
-                                );
-                                cellsToDelete.add(otherCell.id);
+                                cell.mergeTicks = (cell.mergeTicks || 0) + 1;
+                                if (cell.mergeTicks >= 12) { // Kräver ~300ms av kontinuerlig överlappning för att slås ihop (segare/kontrollerat)
+                                    cell.balance += otherCell.balance;
+                                    cell.radius = calculateCellRadius(
+                                        cell.balance,
+                                        playerTotalMass(player),
+                                        player.cells.length,
+                                        massStart,
+                                    );
+                                    cellsToDelete.add(otherCell.id);
+                                } else {
+                                    // Trög/seg sammanslagning: Sug in dem mot varandra långsamt
+                                    const pullAngle = Math.atan2(otherCell.y - cell.y, otherCell.x - cell.x);
+                                    cell.x += Math.cos(pullAngle) * 0.5;
+                                    cell.y += Math.sin(pullAngle) * 0.5;
+                                }
+                            } else {
+                                cell.mergeTicks = 0;
                             }
                             // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Mycket mjukare glidning. Om cellerna har varit delade i >2s, försvaga repulsionen avsevärt (0.01) så de glider ihop smidigt.
+                            // Mycket mjukare glidning. Om cellerna har varit delade i >2s, försvaga repulsionen avsevärt (0.005) så de glider ihop smidigt.
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
                             const overlap = (r + r2 - d);
-                            const isReadyToMerge = (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
-                            const pushStrength = isReadyToMerge ? 0.01 : 0.08;
+                            const isReadyToMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
+                            const pushStrength = isReadyToMerge ? 0.005 : 0.08;
                             cell.x += Math.cos(pushAngle) * overlap * pushStrength;
                             cell.y += Math.sin(pushAngle) * overlap * pushStrength;
+                            cell.mergeTicks = 0;
                         }
                     } else {
                         if (isSandbox && room.sandboxInvincible) continue;
@@ -4755,6 +4773,9 @@ function processRoom(room) {
         }
 
         player.cells.forEach(cell => {
+            if (!cell.isCollidingWithOwn) {
+                cell.mergeTicks = 0;
+            }
             totalX += cell.x;
             totalY += cell.y;
         });
