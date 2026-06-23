@@ -1045,7 +1045,10 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
             player = createBRSlitherPlayer(entry.socketId, entry.mongoId, entry.username, color, room);
         } else {
             const color = (() => {
-                if (entry.skinColor && entry.skinColor !== 'random') {
+                if (entry.skinColor === 'random') {
+                    return { fill: 'rainbow', border: 'rainbow' };
+                }
+                if (entry.skinColor) {
                     const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(entry.skinColor);
                     if (c) {
                         const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;

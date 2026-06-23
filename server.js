@@ -2909,7 +2909,33 @@ app.get('/api/leaderboard-live', async (req, res) => {
 // Hämta användartransaktioner (deposits, withdrawals, game tx)
 app.get('/api/transactions', authenticateToken, async (req, res) => {
     try {
-        const txs = await Transaction.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(200);
+        const { filter } = req.query;
+        let query = { userId: req.user.id };
+
+        if (filter === 'external') {
+            const brAddresses = listBRHouseWallets().map(w => w.address);
+            const houseWallets = [
+                HOUSE_WALLET_ADDRESS,
+                OWNER_VAULT_ADDRESS,
+                ...brAddresses
+            ].filter(Boolean).map(a => a.trim());
+
+            query.$or = [
+                {
+                    type: 'deposit',
+                    'meta.entryFor': { $ne: 'arena-entry' },
+                    'meta.isEntryPayment': { $ne: true }
+                },
+                {
+                    type: 'withdraw',
+                    'meta.destination': { $exists: true, $nin: houseWallets },
+                    'meta.reason': { $not: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory|BR Refund/i },
+                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] }
+                }
+            ];
+        }
+
+        const txs = await Transaction.find(query).sort({ createdAt: -1 }).limit(200);
         res.json(txs);
     } catch (err) {
         console.error('Error fetching transactions:', err);
@@ -3601,7 +3627,10 @@ io.on('connection', (socket) => {
                     dollarBalance: startDollars,
                     startTime: Date.now(),
                     color: (() => {
-                        if (validatedSkinColor && validatedSkinColor !== 'random') {
+                        if (validatedSkinColor === 'random') {
+                            return { fill: 'rainbow', border: 'rainbow' };
+                        }
+                        if (validatedSkinColor) {
                             const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(validatedSkinColor);
                             if (c) {
                                 const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;
