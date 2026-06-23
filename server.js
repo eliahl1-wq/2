@@ -3245,7 +3245,7 @@ io.on('connection', (socket) => {
                 return;
             }
             let validatedSkinColor = null;
-            if (skinColor && typeof skinColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(skinColor)) {
+            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
             const decoded = jwt.verify(token, process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193");

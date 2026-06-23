@@ -1262,7 +1262,7 @@ export function setupBattleRoyale(io, deps) {
                 }
 
                 let validatedSkinColor = null;
-                if (skinColor && typeof skinColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(skinColor)) {
+                if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                     validatedSkinColor = skinColor;
                 }
 
