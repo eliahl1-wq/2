@@ -4378,11 +4378,16 @@ function processRoom(room) {
         if (agarInArena <= 0) {
             room.food.length = 0;
         } else {
-            const normalCount = countNormalAgarFood(room);
-            if (normalCount < agarTargetFoodCount) {
-                addFood(room, Math.min(50, agarTargetFoodCount - normalCount));
-            } else if (normalCount > agarTargetFoodCount + 25) {
-                trimNormalAgarFood(room, agarTargetFoodCount);
+            const now = Date.now();
+            if (!room._lastAgarFoodSync) room._lastAgarFoodSync = 0;
+            if (now - room._lastAgarFoodSync >= 750) {
+                room._lastAgarFoodSync = now;
+                const normalCount = countNormalAgarFood(room);
+                if (normalCount < agarTargetFoodCount) {
+                    addFood(room, Math.min(30, agarTargetFoodCount - normalCount));
+                } else if (normalCount > agarTargetFoodCount + 25) {
+                    trimNormalAgarFood(room, agarTargetFoodCount);
+                }
             }
         }
         syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
