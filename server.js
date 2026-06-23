@@ -4678,11 +4678,11 @@ function processRoom(room) {
                             }
                             // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Om vi INTE kan merga än: Knuffa bort dem mjukare (delat med 45 istället för 25 för mer överlappning)
+                            // Positional correction instead of velocity addition to prevent bouncing, making cells soft and squishy
                             const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
-                            const force = (r + r2 - d) / 45;
-                            cell.vx += Math.cos(pushAngle) * force;
-                            cell.vy += Math.sin(pushAngle) * force;
+                            const overlap = (r + r2 - d);
+                            cell.x += Math.cos(pushAngle) * overlap * 0.15;
+                            cell.y += Math.sin(pushAngle) * overlap * 0.15;
                         }
                     } else {
                         if (isSandbox && room.sandboxInvincible) continue;
