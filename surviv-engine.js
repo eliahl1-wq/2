@@ -423,6 +423,138 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
     }
 }
 
+function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1600, 1400, { collidable: false, variant: 'industrial' });
+    addWall(obstacles, x, y - 690, 1600, 20, 'stone');
+    addWall(obstacles, x - 790, y, 20, 1400, 'stone');
+    addWall(obstacles, x + 790, y, 20, 1400, 'stone');
+    addWall(obstacles, x - 400, y + 690, 800, 20, 'stone');
+    addWall(obstacles, x + 500, y + 690, 600, 20, 'stone');
+
+    // Central Warehouse
+    addHouse(obstacles, loot, spawnPoints, x, y, 600, 450, { variant: 'warehouse', tier: 'military', hue: 205, wall: 16 });
+    
+    // Tents and barracks
+    for (let i = 0; i < 4; i++) {
+        addObstacle(obstacles, 'tent', x - 550 + i * 160, y - 450, 120, 80, { hue: 80, rotation: 0, variant: 'camp' });
+        loot.push(makeChest(x - 550 + i * 160, y - 450, 'military'));
+    }
+    
+    // Containers
+    for (let i = 0; i < 8; i++) {
+        addObstacle(obstacles, 'container', x + 550, y - 400 + i * 110, 125, 54, { hue: 195, rotation: Math.PI / 2, variant: 'blue' });
+    }
+    
+    // Sandbags and defensive positions
+    for (let i = 0; i < 6; i++) {
+        addObstacle(obstacles, 'sandbag', x - 200 + i * 80, y + 550, 60, 30, { rotation: 0 });
+    }
+    
+    spawnPoints.push({ x: x, y: y + 800 });
+}
+
+function addGasStation(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'road', x, y, 1200, 800, { collidable: false, variant: 'asphalt' });
+    
+    // Store
+    addHouse(obstacles, loot, spawnPoints, x, y - 200, 450, 250, { variant: 'warehouse', tier: 'rare', hue: 10, wall: 12 });
+    
+    // Pumps Canopy
+    addObstacle(obstacles, 'field', x, y + 150, 500, 200, { collidable: false, variant: 'industrial' });
+    
+    // Fuel pumps
+    for (let i = 0; i < 4; i++) {
+        addObstacle(obstacles, 'barrel', x - 150 + i * 100, y + 150, 36, 36, { hue: 15, variant: 'fuel' });
+    }
+    
+    // Cars (colored containers)
+    addObstacle(obstacles, 'container', x - 400, y + 250, 110, 50, { hue: 0, rotation: 0.2, variant: 'red' });
+    addObstacle(obstacles, 'container', x + 350, y + 100, 110, 50, { hue: 200, rotation: -0.1, variant: 'blue' });
+
+    loot.push(makeChest(x - 100, y + 150, 'common'));
+    loot.push(makeChest(x + 100, y + 150, 'common'));
+}
+
+function addPrison(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1800, 1800, { collidable: false, variant: 'quarry' });
+    
+    // High walls
+    addWall(obstacles, x, y - 890, 1800, 24, 'stone');
+    addWall(obstacles, x, y + 890, 1800, 24, 'stone');
+    addWall(obstacles, x - 890, y, 24, 1800, 'stone');
+    addWall(obstacles, x + 890, y, 24, 1800, 'stone');
+
+    // Central Yard
+    addObstacle(obstacles, 'field', x, y, 600, 600, { collidable: false, variant: 'estate' });
+    for (let i = 0; i < 6; i++) {
+        addObstacle(obstacles, 'barrel', x - 200 + Math.random() * 400, y - 200 + Math.random() * 400, 30, 30, { hue: 20, variant: 'water' });
+    }
+
+    // Cell blocks
+    addHouse(obstacles, loot, spawnPoints, x - 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+    addHouse(obstacles, loot, spawnPoints, x + 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+    addHouse(obstacles, loot, spawnPoints, x - 500, y + 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+    addHouse(obstacles, loot, spawnPoints, x + 500, y + 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+
+    // Guard towers (stone boxes)
+    addObstacle(obstacles, 'wall', x - 800, y - 800, 100, 100, 'stone');
+    addObstacle(obstacles, 'wall', x + 800, y - 800, 100, 100, 'stone');
+    addObstacle(obstacles, 'wall', x - 800, y + 800, 100, 100, 'stone');
+    addObstacle(obstacles, 'wall', x + 800, y + 800, 100, 100, 'stone');
+
+    for (let i = 0; i < 5; i++) loot.push(makeChest(x - 200 + i * 100, y, 'military'));
+}
+
+function addHospital(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1400, 1000, { collidable: false, variant: 'estate' });
+    
+    // Main building
+    addObstacle(obstacles, 'houseFloor', x, y, 1000, 800, { collidable: false, hue: 0, variant: 'mansion' });
+    addWall(obstacles, x, y - 400 + 8, 1000, 16, 'plaster');
+    addWall(obstacles, x, y + 400 - 8, 1000, 16, 'plaster');
+    addWall(obstacles, x - 500 + 8, y, 16, 800, 'plaster');
+    addWall(obstacles, x + 500 - 8, y, 16, 800, 'plaster');
+    
+    // Corridors & Rooms
+    addInteriorWall(obstacles, x - 200, y, 16, 800, 'plaster');
+    addInteriorWall(obstacles, x + 200, y, 16, 800, 'plaster');
+    
+    addInteriorWall(obstacles, x - 350, y, 300, 16, 'plaster');
+    addInteriorWall(obstacles, x + 350, y, 300, 16, 'plaster');
+
+    // Beds everywhere
+    for (let i = 0; i < 4; i++) {
+        addObstacle(obstacles, 'furniture', x - 400, y - 250 + i * 80, 36, 28, { collidable: false, variant: 'bed' });
+        addObstacle(obstacles, 'furniture', x + 400, y - 250 + i * 80, 36, 28, { collidable: false, variant: 'bed' });
+    }
+
+    // Lots of loot
+    for (let i = 0; i < 12; i++) {
+        loot.push(makeChest(x - 450 + Math.random() * 900, y - 350 + Math.random() * 700, Math.random() > 0.5 ? 'rare' : 'common'));
+    }
+}
+
+function addRadioTower(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 800, 800, { collidable: false, variant: 'industrial' });
+    
+    // Fence
+    addWall(obstacles, x, y - 390, 800, 10, 'stone');
+    addWall(obstacles, x, y + 390, 800, 10, 'stone');
+    addWall(obstacles, x - 390, y, 10, 800, 'stone');
+    addWall(obstacles, x + 390, y, 10, 800, 'stone');
+
+    // Tower Base
+    addObstacle(obstacles, 'wall', x, y, 150, 150, 'warehouse');
+    addInteriorWall(obstacles, x, y, 250, 20, 'warehouse');
+    addInteriorWall(obstacles, x, y, 20, 250, 'warehouse');
+
+    // Control building
+    addHouse(obstacles, loot, spawnPoints, x - 200, y - 200, 150, 150, { variant: 'warehouse', tier: 'rare', hue: 200 });
+    
+    loot.push(makeChest(x + 100, y + 100, 'military'));
+    loot.push(makeChest(x - 100, y + 100, 'military'));
+}
+
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
     const loot = [];
@@ -440,6 +572,11 @@ export function generateSurvivMap(worldHalf) {
         { name: 'East Depot', x: 31000, y: -4500, type: 'yard' },
         { name: 'River Camp', x: 8500, y: 25500, type: 'camp' },
         { name: 'South Bunker', x: -4200, y: 31500, type: 'bunker' },
+        { name: 'Military Base', x: -25000, y: -25000, type: 'military' },
+        { name: 'Crossroads Gas', x: 12000, y: 12000, type: 'gas' },
+        { name: 'State Prison', x: 28000, y: -25000, type: 'prison' },
+        { name: 'Central Hospital', x: -15000, y: 28000, type: 'hospital' },
+        { name: 'Radio Tower', x: 28000, y: 28000, type: 'tower' },
     ];
 
     for (const poi of pois) {
@@ -467,6 +604,16 @@ export function generateSurvivMap(worldHalf) {
             addObstacle(obstacles, 'field', poi.x, poi.y, 1200, 820, { collidable: false, variant: 'ruins' });
             addHouse(obstacles, loot, spawnPoints, poi.x, poi.y, 520, 360, { variant: 'warehouse', tier: 'military', hue: 205, wall: 18 });
             for (let i = 0; i < 10; i++) loot.push(makeChest(poi.x - 340 + i * 78, poi.y - 130 + (i % 3) * 120, i % 2 ? 'rare' : 'military'));
+        } else if (poi.type === 'hospital') {
+            addHospital(obstacles, loot, spawnPoints, poi.x, poi.y);
+        } else if (poi.type === 'prison') {
+            addPrison(obstacles, loot, spawnPoints, poi.x, poi.y);
+        } else if (poi.type === 'military') {
+            addMilitaryBase(obstacles, loot, spawnPoints, poi.x, poi.y);
+        } else if (poi.type === 'gas') {
+            addGasStation(obstacles, loot, spawnPoints, poi.x, poi.y);
+        } else if (poi.type === 'tower') {
+            addRadioTower(obstacles, loot, spawnPoints, poi.x, poi.y);
         } else {
             addSettlement(obstacles, loot, spawnPoints, poi.x, poi.y, 8, 'town');
         }
@@ -498,6 +645,8 @@ export function generateSurvivMap(worldHalf) {
             const biome = y < -22000 ? 'snow' : x < -18000 && y > 8500 ? 'dry' : x > 14500 && y > 9500 ? 'pine' : 'grass';
             const roll = Math.random();
             if (roll < 0.36) addMicroSite(obstacles, loot, spawnPoints, x, y, biome);
+            else if (roll < 0.40) addGasStation(obstacles, loot, spawnPoints, x, y);
+            else if (roll < 0.44) addRadioTower(obstacles, loot, spawnPoints, x, y);
             else if (roll < 0.74) addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: biome === 'snow' ? 'snow-woods' : biome === 'dry' ? 'scrub' : 'woods' });
         }
     }
