@@ -1084,8 +1084,7 @@ function dropSnakeAsFood(room, snake) {
 
     const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
     const blob = eco.foodBlobValue;
-    const maxPellets = Math.min(segs.length * 4, 150, Math.max(segs.length, Math.floor(mass / eco.massPerPellet)));
-    const pelletCount = Math.max(1, maxPellets);
+    const pelletCount = Math.max(1, segs.length); // One pellet per segment for exact shape
     const massEach = mass / pelletCount;
     const dollarEach = dollars / pelletCount;
 
@@ -1096,8 +1095,8 @@ function dropSnakeAsFood(room, snake) {
     const snakeHue = cIdx >= 0 ? hueMap[cIdx] : 0;
 
     for (let i = 0; i < pelletCount; i++) {
-        const seg = segs[i % segs.length];
-        const jitter = 40;
+        const seg = segs[i];
+        const jitter = 4; // Very small jitter to retain snake shape
         room.slitherFood.push({
             id: randId(),
             x: seg.x + (Math.random() - 0.5) * jitter,
@@ -1105,7 +1104,7 @@ function dropSnakeAsFood(room, snake) {
             balance: massEach,
             dollarValue: dollarEach,
             hue: snakeHue,
-            radius: SLITHER.foodRadius + 3.0,
+            radius: SLITHER.foodRadius + 1.5,
             deathDrop: true,
         });
     }
