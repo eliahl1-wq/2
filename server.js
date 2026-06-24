@@ -265,6 +265,7 @@ function createArenaRoom(entryFeeUsd) {
         slitherBots: [],
         food: [],
         slitherFood: [],
+        spectators: [],
         viruses: [],
         ejected: [],
         foodPoolBalance: 0,
@@ -4022,6 +4023,9 @@ io.on('connection', (socket) => {
             }
 
             socket.roomId = room.id;
+            if (room.spectators) {
+                room.spectators = room.spectators.filter(s => s.id !== socket.id);
+            }
 
             const startMass = economy.massStartBalance;
             const startDollars = economy.playerStartBalance;
@@ -4497,6 +4501,9 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
+        if (room.spectators) {
+            room.spectators = room.spectators.filter(s => s.id !== socket.id);
+        }
         if (room.isCompetitiveSlither) {
             removeCompetitiveSpectator(room, socket.id);
         }
@@ -4517,11 +4524,24 @@ io.on('connection', (socket) => {
 
     socket.on('slitherSpectateCam', ({ x, y }) => {
         const room = getArenaRoomById(socket.roomId);
-        if (!room?.isCompetitiveSlither) return;
-        const spec = room.competitiveSpectators?.find(s => s.id === socket.id);
-        if (!spec) return;
-        spec.x = Number(x) || 0;
-        spec.y = Number(y) || 0;
+        if (!room) return;
+        if (room.isCompetitiveSlither) {
+            const spec = room.competitiveSpectators?.find(s => s.id === socket.id);
+            if (spec) {
+                spec.x = Number(x) || 0;
+                spec.y = Number(y) || 0;
+            }
+        } else {
+            if (!room.spectators) room.spectators = [];
+            let spec = room.spectators.find(s => s.id === socket.id);
+            if (!spec) {
+                spec = { id: socket.id, x: Number(x) || 0, y: Number(y) || 0 };
+                room.spectators.push(spec);
+            } else {
+                spec.x = Number(x) || 0;
+                spec.y = Number(y) || 0;
+            }
+        }
     });
 
     socket.on('slitherInput', ({ dx, dy, boost }) => {
