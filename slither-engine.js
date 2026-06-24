@@ -1090,7 +1090,10 @@ function dropSnakeAsFood(room, snake) {
     const dollarEach = dollars / pelletCount;
 
     const hueMap = [20, 45, 110, 150, 200, 240, 280, 320, 350];
-    const snakeHue = hueMap[(snake.color || 0) % hueMap.length] || 0;
+    const defaultColors = ['#c080ff', '#9099ff', '#80d0d0', '#80ff80', '#eeee70', '#ffa060', '#ff9050', '#ff4040', '#e030e0'];
+    let cIdx = defaultColors.indexOf(snake.color);
+    if (cIdx === -1 && typeof snake.color === 'number') cIdx = snake.color % hueMap.length;
+    const snakeHue = cIdx >= 0 ? hueMap[cIdx] : 0;
 
     for (let i = 0; i < pelletCount; i++) {
         const seg = segs[i % segs.length];
@@ -1102,7 +1105,7 @@ function dropSnakeAsFood(room, snake) {
             balance: massEach,
             dollarValue: dollarEach,
             hue: snakeHue,
-            radius: SLITHER.foodRadius + 2.5,
+            radius: SLITHER.foodRadius + 3.0,
             deathDrop: true,
         });
     }
