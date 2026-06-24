@@ -1097,7 +1097,7 @@ function dropSnakeAsFood(room, snake) {
 
     for (let i = 0; i < pelletCount; i++) {
         const seg = segs[i % segs.length];
-        const jitter = 14;
+        const jitter = 40;
         room.slitherFood.push({
             id: randId(),
             x: seg.x + (Math.random() - 0.5) * jitter,
