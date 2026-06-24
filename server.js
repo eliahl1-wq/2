@@ -37,14 +37,27 @@ import {
     DEFAULT_ENTRY_FEE,
     COMPETITIVE_SLITHER_ENTRY_FEES,
     DEFAULT_COMPETITIVE_ENTRY_FEE,
+    SURVIV_ENTRY_FEES,
+    DEFAULT_SURVIV_ENTRY_FEE,
     normalizeEntryFee,
     normalizeCompetitiveEntryFee,
+    normalizeSurvivEntryFee,
     getEconomy,
     getCompetitiveEconomy,
+    getSurvivEconomy,
     getJoinPoolSplit,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
 } from './economy.js';
+import {
+    SURVIV,
+    createSurvivPlayer,
+    generateSurvivObstacles,
+    getSurvivZone,
+    processSurvivRoom,
+    broadcastSurvivState,
+    spawnLootFromPool,
+} from './surviv-engine.js';
 import {
     setupBattleRoyale,
     processBattleRoyaleMatches,
@@ -279,6 +292,40 @@ function createCompetitiveSlitherRoom(entryFeeUsd) {
 
 const competitiveSlitherRooms = COMPETITIVE_SLITHER_ENTRY_FEES.map(fee => createCompetitiveSlitherRoom(fee));
 
+function createSurvivRoom(entryFeeUsd) {
+    return {
+        id: `surviv-${entryFeeUsd}`,
+        entryFeeUsd,
+        isSurviv: true,
+        players: [],
+        bots: [],
+        bullets: [],
+        loot: [],
+        obstacles: generateSurvivObstacles(SURVIV.worldHalf),
+        lootPoolBalance: 0,
+        spectators: [],
+        startTime: GLOBAL_ARENA_START,
+        isResetting: false,
+    };
+}
+
+const survivRooms = SURVIV_ENTRY_FEES.map(fee => createSurvivRoom(fee));
+
+function getSurvivRoom(entryFeeUsd) {
+    const fee = normalizeSurvivEntryFee(entryFeeUsd);
+    return survivRooms.find(r => r.entryFeeUsd === fee)
+        ?? survivRooms.find(r => r.entryFeeUsd === DEFAULT_SURVIV_ENTRY_FEE);
+}
+
+function findSurvivRoomById(roomId) {
+    return survivRooms.find(r => r.id === roomId) ?? null;
+}
+
+function removeSurvivSpectator(room, socketId) {
+    if (!room?.spectators?.length) return;
+    room.spectators = room.spectators.filter(s => s.id !== socketId);
+}
+
 function getCompetitiveSlitherRoom(entryFeeUsd) {
     const fee = normalizeCompetitiveEntryFee(entryFeeUsd);
     return competitiveSlitherRooms.find(r => r.entryFeeUsd === fee)
@@ -412,6 +459,107 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     return { playerPayout, platformFee, signature };
 }
 
+async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
+    const dollarBalance = Number(player.dollarBalance) || 0;
+    const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_SURVIV_ENTRY_FEE;
+    const { cashoutPlayerPct, cashoutFeePct } = getSurvivEconomy(entryFeeUsd);
+    const playerPayout = dollarBalance * cashoutPlayerPct;
+    const platformFee = dollarBalance * cashoutFeePct;
+    const mongoId = player.mongoId?.toString();
+    const playerId = player.id;
+
+    let user = await User.findById(mongoId);
+    if (!user) throw new Error('Account not found');
+
+    const logMeta = {
+        reason,
+        mode: 'surviv',
+        entryFeeUsd,
+        dollarBalance,
+        playerPayout,
+        platformFee,
+        cashoutFeePct,
+        playerId: mongoId,
+        timestamp: new Date().toISOString(),
+    };
+
+    if (DEV_FREE_PLAY) {
+        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        user.playtime += (Date.now() - player.startTime);
+        await user.save();
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            meta: { ...logMeta, simulated: true, signature: 'simulated' },
+            status: 'confirmed',
+        });
+        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
+        return { playerPayout, platformFee, signature: 'simulated' };
+    }
+
+    user = await ensureUserDepositWallet(user);
+    if (!user.depositAddress) throw new Error('No deposit address');
+
+    const solPayout = playerPayout / SOL_PRICE_USD;
+    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+
+    if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+    );
+    const housePubKey = houseKeypair.publicKey;
+
+    const totalLamports = await connection.getBalance(housePubKey);
+    const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+    if (totalLamports < payoutLamports + feeLamports + feeBuffer) {
+        throw new Error('House wallet lacks liquidity');
+    }
+
+    const transaction = new solanaWeb3.Transaction();
+    transaction.add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: housePubKey,
+            toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
+            lamports: payoutLamports,
+        })
+    );
+    if (feeLamports > 0 && OWNER_VAULT_ADDRESS) {
+        transaction.add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: housePubKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: feeLamports,
+            })
+        );
+    }
+
+    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+
+    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+    user.playtime += (Date.now() - player.startTime);
+    await user.save();
+
+    await Transaction.create({
+        userId: user._id,
+        type: 'withdraw',
+        amount: playerPayout,
+        meta: {
+            ...logMeta,
+            signature,
+            solAmount: solPayout,
+            feeSolAmount: feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            feeDestination: OWNER_VAULT_ADDRESS || null,
+        },
+        status: 'confirmed',
+    });
+
+    console.log(`💰 SURVIV CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
+    io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature });
+    return { playerPayout, platformFee, signature };
+}
+
 async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     const dollarBalance = arenaCashoutUsd(player);
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
@@ -541,6 +689,37 @@ async function cashOutCompetitiveRoomPlayers(room) {
     room.players = [];
 }
 
+async function cashOutSurvivRoomPlayers(room) {
+    const playersToProcess = [...room.players];
+    for (const p of playersToProcess) {
+        if (p.isCashingOut) continue;
+        const mongoId = p.mongoId?.toString();
+        if (!acquireCashoutLock(mongoId)) continue;
+        try {
+            await executeSurvivCashout(p, room, 'Auto Room Reset');
+        } catch (err) {
+            console.error(`Surviv reset cashout failed for ${p.username}:`, err.message);
+            await Transaction.create({
+                type: 'game',
+                amount: 0,
+                meta: {
+                    event: 'failure',
+                    reason: 'surviv_auto_cashout_failed',
+                    userId: mongoId,
+                    error: err.message,
+                },
+            });
+        } finally {
+            releaseCashoutLock(mongoId);
+        }
+    }
+    room.players = [];
+    room.bots = [];
+    room.bullets = [];
+    room.loot = [];
+    room.spectators = [];
+}
+
 // --- RESET FLOW LOGIC ---
 async function cashOutRoomPlayers(room) {
     const playersToProcess = [...room.players];
@@ -638,6 +817,7 @@ async function performGlobalArenaReset() {
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
     for (const room of competitiveSlitherRooms) room.isResetting = true;
+    for (const room of survivRooms) room.isResetting = true;
 
     console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers — BR matches unaffected)');
     await Transaction.create({
@@ -653,6 +833,9 @@ async function performGlobalArenaReset() {
         }
         for (const room of competitiveSlitherRooms) {
             await cashOutCompetitiveRoomPlayers(room);
+        }
+        for (const room of survivRooms) {
+            await cashOutSurvivRoomPlayers(room);
         }
 
         try {
@@ -674,12 +857,23 @@ async function performGlobalArenaReset() {
             room.slitherFood = [];
             room.competitiveSpectators = [];
         }
+        for (const room of survivRooms) {
+            room.players = [];
+            room.bots = [];
+            room.bullets = [];
+            room.loot = [];
+            room.spectators = [];
+            room.obstacles = generateSurvivObstacles(SURVIV.worldHalf);
+        }
 
         GLOBAL_ARENA_START = Date.now();
         for (const room of rooms) {
             room.startTime = GLOBAL_ARENA_START;
         }
         for (const room of competitiveSlitherRooms) {
+            room.startTime = GLOBAL_ARENA_START;
+        }
+        for (const room of survivRooms) {
             room.startTime = GLOBAL_ARENA_START;
         }
 
@@ -693,6 +887,7 @@ async function performGlobalArenaReset() {
     } finally {
         for (const room of rooms) room.isResetting = false;
         for (const room of competitiveSlitherRooms) room.isResetting = false;
+        for (const room of survivRooms) room.isResetting = false;
         globalArenaResetting = false;
     }
 }
@@ -976,7 +1171,8 @@ app.get('/api/health', (req, res) => {
 app.get('/api/game-status', authenticateToken, (req, res) => {
     try {
         const arenaResetting = globalArenaResetting || rooms.some(r => r.isResetting)
-            || competitiveSlitherRooms.some(r => r.isResetting);
+            || competitiveSlitherRooms.some(r => r.isResetting)
+            || survivRooms.some(r => r.isResetting);
         for (const room of rooms) {
             const player = room.players.find(
                 p => p.mongoId && p.mongoId.toString() === req.user.id
@@ -1009,6 +1205,23 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
                     isResetting: arenaResetting,
                     battleRoyale: false,
                     competitiveSlither: true,
+                });
+            }
+        }
+        for (const room of survivRooms) {
+            const player = room.players.find(
+                p => p.mongoId && p.mongoId.toString() === req.user.id
+            );
+            if (player) {
+                return res.json({
+                    inGame: true,
+                    mode: 'surviv',
+                    balance: player.dollarBalance ?? null,
+                    entryFeeUsd: player.entryFeeUsd ?? room.entryFeeUsd ?? DEFAULT_SURVIV_ENTRY_FEE,
+                    disconnected: player.disconnected ?? false,
+                    isResetting: arenaResetting,
+                    battleRoyale: false,
+                    surviv: true,
                 });
             }
         }
@@ -2768,7 +2981,7 @@ app.get('/api/stats', (req, res) => {
             agar: { 5: 0, 10: 0, 20: 0 },
             slither: { 5: 0, 10: 0, 20: 0 },
         };
-        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0 };
+        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0, surviv: 0 };
         let totalBotsOnline = 0;
 
         const pushTop = (list, name, balance) => {
@@ -2837,10 +3050,14 @@ app.get('/api/stats', (req, res) => {
             (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
             0,
         );
+        playersByGamemode.surviv = survivRooms.reduce(
+            (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
+            0,
+        );
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
             + playersByGamemode.brAgar + playersByGamemode.brSlither
-            + playersByGamemode.competitiveSlither;
+            + playersByGamemode.competitiveSlither + playersByGamemode.surviv;
 
         if (modeFilter === 'agar') {
             filteredHumansOnline += countBRForMode('agar');
@@ -3166,6 +3383,10 @@ function findPlayerInArena(mongoId) {
         const player = room.players.find(p => p.mongoId?.toString() === key);
         if (player) return { room, player };
     }
+    for (const room of survivRooms) {
+        const player = room.players.find(p => p.mongoId?.toString() === key);
+        if (player) return { room, player };
+    }
     return null;
 }
 
@@ -3176,7 +3397,8 @@ function getRoomForEntry(entryFeeUsd) {
 
 function isArenaResetting() {
     return globalArenaResetting || rooms.some(r => r.isResetting)
-        || competitiveSlitherRooms.some(r => r.isResetting);
+        || competitiveSlitherRooms.some(r => r.isResetting)
+        || survivRooms.some(r => r.isResetting);
 }
 
 function capAiBudget(room) {
@@ -3494,12 +3716,159 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            // ── Surviv ($5 pool) ──
+            if (mode === 'surviv') {
+                const entryFeeUsd = normalizeSurvivEntryFee(rawEntryFee);
+                const room = getSurvivRoom(entryFeeUsd);
+                removeSurvivSpectator(room, socket.id);
+                const existing = findPlayerInArena(userKey);
+                if (existing) {
+                    if (!existing.room.isSurviv) {
+                        socket.emit('error', 'You have an active game in another mode. Finish or cash out first.');
+                        return;
+                    }
+                }
+
+                const existingPlayer = existing?.player ?? null;
+                if (existingPlayer) {
+                    const oldSocketId = existingPlayer.id;
+                    const oldSocket = io.sockets.sockets.get(oldSocketId);
+                    if (oldSocket?.connected && oldSocket.id !== socket.id) {
+                        oldSocket.emit('forcedDisconnect');
+                    }
+                    if (existingPlayer.removeTimeout) {
+                        clearTimeout(existingPlayer.removeTimeout);
+                        delete existingPlayer.removeTimeout;
+                    }
+                    existingPlayer.id = socket.id;
+                    existingPlayer.disconnected = false;
+                    socket.roomId = room.id;
+                    let remaining = 0;
+                    if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
+                        remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
+                    }
+                    socket.emit('welcome', existingPlayer, {
+                        width: SURVIV.worldHalf * 2,
+                        height: SURVIV.worldHalf * 2,
+                        cashOutRemaining: remaining,
+                        mode: 'surviv',
+                        rejoin: true,
+                        entryFeeUsd: existingPlayer.entryFeeUsd ?? room.entryFeeUsd,
+                        solPrice: SOL_PRICE_USD,
+                        surviv: true,
+                        zone: getSurvivZone(room.startTime + c.roomDuration),
+                    });
+                    return;
+                }
+
+                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+
+                if (!DEV_FREE_PLAY) {
+                    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                    const currentLamports = await connection.getBalance(userPubKey);
+                    const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
+                    if (currentLamports < (feeLamports + 15000)) {
+                        socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
+                        return;
+                    }
+                    try {
+                        const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                        const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
+                        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                        const joinTx = new solanaWeb3.Transaction({
+                            recentBlockhash: blockhash,
+                            feePayer: userPubKey,
+                        }).add(
+                            solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000000 }),
+                            solanaWeb3.SystemProgram.transfer({
+                                fromPubkey: userPubKey,
+                                toPubkey: housePubKey,
+                                lamports: feeLamports,
+                            })
+                        );
+                        const sig = await solanaWeb3.sendAndConfirmTransaction(
+                            connection,
+                            joinTx,
+                            [userKeypair],
+                            { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
+                        );
+                        console.log(`🎟️ Surviv Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
+                    } catch (txErr) {
+                        console.error('Surviv join transaction failed:', txErr.message);
+                        socket.emit('error', 'Blockchain transfer failed. Please try again.');
+                        return;
+                    }
+                } else {
+                    console.log(`🎮 [FREE PLAY] ${user.username} joined Surviv (simulated $${entryFeeUsd} entry)`);
+                }
+
+                await Transaction.create({
+                    userId: user._id,
+                    type: 'game',
+                    amount: entryFeeInSol,
+                    meta: {
+                        event: 'join',
+                        roomId: room.id,
+                        entryFeeUsd,
+                        mode: 'surviv',
+                        ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                    },
+                    status: 'confirmed',
+                });
+
+                socket.roomId = room.id;
+                const newPlayer = createSurvivPlayer(
+                    socket.id,
+                    user._id,
+                    username || user.username,
+                    validatedSkinColor || util.randomSlitherColor(),
+                    room,
+                );
+
+                const raced = room.players.find(p => p.mongoId?.toString() === userKey);
+                if (raced) {
+                    raced.id = socket.id;
+                    raced.disconnected = false;
+                    socket.emit('welcome', raced, {
+                        width: SURVIV.worldHalf * 2,
+                        height: SURVIV.worldHalf * 2,
+                        mode: 'surviv',
+                        rejoin: true,
+                        entryFeeUsd,
+                        solPrice: SOL_PRICE_USD,
+                        surviv: true,
+                        zone: getSurvivZone(room.startTime + c.roomDuration),
+                    });
+                    return;
+                }
+
+                const eco = getSurvivEconomy(entryFeeUsd);
+                spawnLootFromPool(room, eco.lootPoolOnJoin);
+                room.players.push(newPlayer);
+
+                socket.emit('welcome', newPlayer, {
+                    width: SURVIV.worldHalf * 2,
+                    height: SURVIV.worldHalf * 2,
+                    mode: 'surviv',
+                    rejoin: false,
+                    entryFeeUsd,
+                    solPrice: SOL_PRICE_USD,
+                    surviv: true,
+                    zone: getSurvivZone(room.startTime + c.roomDuration),
+                });
+                return;
+            }
+
             const entryFeeUsd = normalizeEntryFee(rawEntryFee);
             const economy = getEconomy(entryFeeUsd);
 
             const existing = findPlayerInArena(userKey);
             if (existing && existing.room.isCompetitiveSlither) {
                 socket.emit('error', 'You have an active Competitive Slither game. Rejoin or cash out first.');
+                return;
+            }
+            if (existing && existing.room.isSurviv) {
+                socket.emit('error', 'You have an active Surviv game. Rejoin or cash out first.');
                 return;
             }
             if (existing && existing.room.entryFeeUsd !== entryFeeUsd) {
@@ -4061,6 +4430,7 @@ io.on('connection', (socket) => {
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
         const isCompetitive = p.mode === 'competitive-slither';
+        const isSurviv = p.mode === 'surviv';
 
         // Meddela klienten att timern har börjat
         socket.emit('cashOutStarting', { seconds: duration / 1000 });
@@ -4072,6 +4442,19 @@ io.on('connection', (socket) => {
             if (!activePlayer || !activePlayer.isCashingOut) {
                 console.log(`❌ Cashout cancelled (died or invalid state)`);
                 releaseCashoutLock(playerMongoId);
+                return;
+            }
+
+            if (isSurviv || activePlayer.mode === 'surviv') {
+                try {
+                    await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
+                } catch (err) {
+                    console.error('❌ Surviv cashout error:', err.message);
+                    io.to(activePlayer.id).emit('error', err.message || 'Transfer failed.');
+                    activePlayer.isCashingOut = false;
+                } finally {
+                    releaseCashoutLock(playerMongoId);
+                }
                 return;
             }
 
@@ -4105,6 +4488,9 @@ io.on('connection', (socket) => {
         if (!room) return;
         if (room.isCompetitiveSlither) {
             removeCompetitiveSpectator(room, socket.id);
+        }
+        if (room.isSurviv) {
+            removeSurvivSpectator(room, socket.id);
         }
         const p = room.players.find(pl => pl.id === socket.id);
         if (p) {
@@ -4146,9 +4532,36 @@ io.on('connection', (socket) => {
         p.inputDy = Number(dy) || 0;
         p.boost = p.isCashingOut ? false : !!boost;
     });
+
+    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload }) => {
+        const room = getArenaRoomById(socket.roomId);
+        const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
+        if (!p || p.isCashingOut) return;
+        p.inputDx = Number(dx) || 0;
+        p.inputDy = Number(dy) || 0;
+        if (Number.isFinite(aimAngle)) p.aimAngle = aimAngle;
+        p.shooting = p.isCashingOut ? false : !!shooting;
+        if (reload && p.weapon && !p.weapon.reloading) {
+            const wDef = { pistol: { reloadMs: 1400, clipSize: 15 }, smg: { reloadMs: 1800, clipSize: 30 }, shotgun: { reloadMs: 2200, clipSize: 6 }, assault: { reloadMs: 2000, clipSize: 22 } };
+            const def = wDef[p.weapon.type] || wDef.pistol;
+            p.weapon.reloading = true;
+            p.weapon.reloadEndAt = Date.now() + def.reloadMs;
+        }
+    });
+
+    socket.on('survivSpectateCam', ({ x, y }) => {
+        const room = getArenaRoomById(socket.roomId);
+        if (!room?.isSurviv) return;
+        const spec = room.spectators?.find(s => s.id === socket.id);
+        if (!spec) return;
+        spec.x = Number(x) || 0;
+        spec.y = Number(y) || 0;
+    });
 });
 
 function getArenaRoomById(roomId) {
+    const survivRoom = findSurvivRoomById(roomId);
+    if (survivRoom) return survivRoom;
     const compRoom = findCompetitiveSlitherRoomById(roomId);
     if (compRoom) return compRoom;
     const sandboxRoom = getSandboxRoomById(roomId);
@@ -4188,6 +4601,24 @@ function processCompetitiveSlitherTick() {
             isResetting: room.isResetting,
             zone: getCompetitiveZone(resetTime),
             competitiveSlither: true,
+        });
+    }
+}
+
+function processSurvivTick() {
+    for (const room of survivRooms) {
+        if (room.isResetting) continue;
+        const humanCount = room.players.filter(p => !p.disconnected).length;
+        const spectatorCount = room.spectators?.length ?? 0;
+        if (humanCount === 0 && spectatorCount === 0) continue;
+
+        const resetTime = room.startTime + c.roomDuration;
+        const lbData = processSurvivRoom(room, io, resetTime);
+        broadcastSurvivState(room, io, lbData, {
+            resetTime,
+            solPrice: SOL_PRICE_USD,
+            isResetting: room.isResetting,
+            surviv: true,
         });
     }
 }
@@ -4245,6 +4676,7 @@ setInterval(() => {
         processRoom(room);
     });
     processCompetitiveSlitherTick();
+    processSurvivTick();
     processBattleRoyaleMatches(io, getBattleRoyaleDeps());
 }, 1000 / 40);
 

@@ -116,6 +116,10 @@ export function botStakeForMode(players, mode) {
 export const COMPETITIVE_SLITHER_ENTRY_FEES = [2, 5];
 export const DEFAULT_COMPETITIVE_ENTRY_FEE = 5;
 
+/** Surviv entry tier (USD) — separate pool. */
+export const SURVIV_ENTRY_FEES = [5];
+export const DEFAULT_SURVIV_ENTRY_FEE = 5;
+
 /** Platform cut on Slither Arena cashouts by entry tier ($5 keeps legacy 3.5%). */
 const COMPETITIVE_CASHOUT_FEE_PCT = {
     2: 0.05,
@@ -125,6 +129,11 @@ const COMPETITIVE_CASHOUT_FEE_PCT = {
 export function normalizeCompetitiveEntryFee(fee) {
     const n = Number(fee);
     return COMPETITIVE_SLITHER_ENTRY_FEES.includes(n) ? n : DEFAULT_COMPETITIVE_ENTRY_FEE;
+}
+
+export function normalizeSurvivEntryFee(fee) {
+    const n = Number(fee);
+    return SURVIV_ENTRY_FEES.includes(n) ? n : DEFAULT_SURVIV_ENTRY_FEE;
 }
 
 /** Scaled Slither Arena economy for a given entry tier. */
@@ -137,6 +146,19 @@ export function getCompetitiveEconomy(entryFeeUsd) {
         // Snake mass uses the same baseline as $10 normal slither — size is not tied to entry tier or dollars.
         playerStartBalance: BASE.playerStart,
         massPerPellet: BASE.massPerPellet,
+        cashoutFeePct,
+        cashoutPlayerPct: 1 - cashoutFeePct,
+    };
+}
+
+/** Surviv economy — $5 entry, $2 player start, $3 map loot pool per join. */
+export function getSurvivEconomy(entryFeeUsd) {
+    const entry = normalizeSurvivEntryFee(entryFeeUsd);
+    const cashoutFeePct = 0.035;
+    return {
+        entryFeeUsd: entry,
+        playerStartBalance: 2.0,
+        lootPoolOnJoin: 3.0,
         cashoutFeePct,
         cashoutPlayerPct: 1 - cashoutFeePct,
     };
