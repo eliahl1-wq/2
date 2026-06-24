@@ -637,6 +637,35 @@ function updateSnakeBodyFromPath(snake, spacing) {
     trimSnakePath(path, segments.length * spacing + spacing * 4);
 }
 
+function hueFromColor(color) {
+    const raw = typeof color === 'object' && color !== null ? color.fill : color;
+    if (!raw || typeof raw !== 'string') return Math.floor(Math.random() * 360);
+    const hex = raw.replace('#', '');
+    let r = 128, g = 128, b = 128;
+    if (hex.length === 3) {
+        r = parseInt(hex[0] + hex[0], 16);
+        g = parseInt(hex[1] + hex[1], 16);
+        b = parseInt(hex[2] + hex[2], 16);
+    } else if (hex.length >= 6) {
+        r = parseInt(hex.slice(0, 2), 16);
+        g = parseInt(hex.slice(2, 4), 16);
+        b = parseInt(hex.slice(4, 6), 16);
+    }
+    const rn = r / 255, gn = g / 255, bn = b / 255;
+    const max = Math.max(rn, gn, bn);
+    const min = Math.min(rn, gn, bn);
+    const d = max - min;
+    let h = 0;
+    if (d > 0.0001) {
+        if (max === rn) h = ((gn - bn) / d) % 6;
+        else if (max === gn) h = (bn - rn) / d + 2;
+        else h = (rn - gn) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+    }
+    return Math.floor(h);
+}
+
 function updateSnakeMovement(snake, room = null) {
     const head = snake.segments[0];
     rememberSnakeMouthBeforeMove(snake);
@@ -671,6 +700,7 @@ function updateSnakeMovement(snake, room = null) {
         applyFamShrink(snake, cost);
 
         let poolCredit = cost;
+        let dollarCost = 0;
         // Normal mode: boost spends HUD balance too (size and dollars stay linked).
         if (isCoupledSlitherRoom(room) && snake.dollarBalance != null) {
             const eco = getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
@@ -678,7 +708,7 @@ function updateSnakeMovement(snake, room = null) {
             const targetDollarCost = cost * conversionRatio;
 
             const dollarFloor = minDollarsForSnake(snake);
-            const dollarCost = Math.min(targetDollarCost, Math.max(0, snake.dollarBalance - dollarFloor));
+            dollarCost = Math.min(targetDollarCost, Math.max(0, snake.dollarBalance - dollarFloor));
             if (dollarCost > 1e-9) {
                 snake.dollarBalance -= dollarCost;
             }
@@ -686,6 +716,41 @@ function updateSnakeMovement(snake, room = null) {
             if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
         }
         room.foodPoolBalance += poolCredit;
+
+        // Accumulate boost loss and drop food pellets behind the tail
+        snake._boostMassAcc = (snake._boostMassAcc || 0) + cost;
+        snake._boostDollarAcc = (snake._boostDollarAcc || 0) + dollarCost;
+
+        const eco = getEconomy(snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+        const massPerPellet = eco.massPerPellet || 0.02;
+        const foodBlobValue = eco.foodBlobValue || 0.02;
+
+        if (snake._boostMassAcc >= massPerPellet) {
+            const dropMass = massPerPellet;
+            const dropDollar = Math.min(snake._boostDollarAcc, foodBlobValue);
+
+            snake._boostMassAcc -= dropMass;
+            snake._boostDollarAcc -= dropDollar;
+
+            // Spawn pellet at the tail
+            const tail = snake.segments[snake.segments.length - 1];
+            if (tail) {
+                // Subtract from foodPoolBalance since we spawn a real pellet in the map
+                room.foodPoolBalance = Math.max(0, room.foodPoolBalance - dropDollar);
+
+                const jitter = 5;
+                room.slitherFood.push({
+                    id: randId(),
+                    x: tail.x + (Math.random() - 0.5) * jitter,
+                    y: tail.y + (Math.random() - 0.5) * jitter,
+                    balance: dropMass,
+                    dollarValue: dropDollar,
+                    hue: hueFromColor(snake.color),
+                    radius: SLITHER.foodRadius * 1.15,
+                    deathDrop: true, // boost pellets glow/pulse
+                });
+            }
+        }
     }
 
     const spacing = segmentSpacingForSegmentCount(snake.segments.length);
@@ -847,7 +912,7 @@ function rememberSnakeMouthBeforeMove(snake) {
 }
 
 function foodPickupReach(snakeRadius, foodRadius) {
-    return (snakeRadius + foodRadius) * SLITHER.foodPickupReachMult + SLITHER.foodPickupReachPad;
+    return snakeRadius + foodRadius + 6;
 }
 
 function foodWithinPickup(snake, fx, fy, foodRadius, mouth = null) {
