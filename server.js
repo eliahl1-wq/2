@@ -52,7 +52,7 @@ import {
 import {
     SURVIV,
     createSurvivPlayer,
-    generateSurvivObstacles,
+    generateSurvivMap,
     getSurvivZone,
     processSurvivRoom,
     broadcastSurvivState,
@@ -294,6 +294,7 @@ function createCompetitiveSlitherRoom(entryFeeUsd) {
 const competitiveSlitherRooms = COMPETITIVE_SLITHER_ENTRY_FEES.map(fee => createCompetitiveSlitherRoom(fee));
 
 function createSurvivRoom(entryFeeUsd) {
+    const map = generateSurvivMap(SURVIV.worldHalf);
     return {
         id: `surviv-${entryFeeUsd}`,
         entryFeeUsd,
@@ -301,8 +302,10 @@ function createSurvivRoom(entryFeeUsd) {
         players: [],
         bots: [],
         bullets: [],
-        loot: [],
-        obstacles: generateSurvivObstacles(SURVIV.worldHalf),
+        loot: [...map.loot],
+        obstacles: map.obstacles,
+        spawnPoints: map.spawnPoints,
+        landmarks: map.landmarks,
         lootPoolBalance: 0,
         spectators: [],
         startTime: GLOBAL_ARENA_START,
@@ -862,9 +865,12 @@ async function performGlobalArenaReset() {
             room.players = [];
             room.bots = [];
             room.bullets = [];
-            room.loot = [];
+            const map = generateSurvivMap(SURVIV.worldHalf);
+            room.loot = [...map.loot];
             room.spectators = [];
-            room.obstacles = generateSurvivObstacles(SURVIV.worldHalf);
+            room.obstacles = map.obstacles;
+            room.spawnPoints = map.spawnPoints;
+            room.landmarks = map.landmarks;
         }
 
         GLOBAL_ARENA_START = Date.now();
@@ -4537,7 +4543,7 @@ io.on('connection', (socket) => {
         p.boost = p.isCashingOut ? false : !!boost;
     });
 
-    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload }) => {
+    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit }) => {
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
         if (!p || p.isCashingOut) return;
@@ -4545,6 +4551,7 @@ io.on('connection', (socket) => {
         p.inputDy = Number(dy) || 0;
         if (Number.isFinite(aimAngle)) p.aimAngle = aimAngle;
         p.shooting = p.isCashingOut ? false : !!shooting;
+        if (useMedkit) p.useMedkit = true;
         if (reload && p.weapon && !p.weapon.reloading) {
             const wDef = { pistol: { reloadMs: 1400, clipSize: 15 }, smg: { reloadMs: 1800, clipSize: 30 }, shotgun: { reloadMs: 2200, clipSize: 6 }, assault: { reloadMs: 2000, clipSize: 22 } };
             const def = wDef[p.weapon.type] || wDef.pistol;
