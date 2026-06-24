@@ -131,6 +131,7 @@ const WEAPON_RARITY_POOLS = {
     military: ['assault', 'dmr', 'sniper', 'lmg'],
 };
 const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
+const SURVIV_OBSTACLE_CELL = 700;
 
 function randId() {
     return Math.random().toString(36).slice(2, 10);
@@ -668,18 +669,89 @@ function pickSurvivSpawn(room) {
     return randomSpawnCoord(SURVIV.worldHalf * 0.9);
 }
 
+function obstacleCellKey(cx, cy) {
+    return cx + ':' + cy;
+}
+
+function insertObstacleInGrid(grid, obstacle) {
+    const minX = Math.floor((obstacle.x - obstacle.w / 2) / SURVIV_OBSTACLE_CELL);
+    const maxX = Math.floor((obstacle.x + obstacle.w / 2) / SURVIV_OBSTACLE_CELL);
+    const minY = Math.floor((obstacle.y - obstacle.h / 2) / SURVIV_OBSTACLE_CELL);
+    const maxY = Math.floor((obstacle.y + obstacle.h / 2) / SURVIV_OBSTACLE_CELL);
+    for (let cx = minX; cx <= maxX; cx++) {
+        for (let cy = minY; cy <= maxY; cy++) {
+            const key = obstacleCellKey(cx, cy);
+            let bucket = grid.get(key);
+            if (!bucket) {
+                bucket = [];
+                grid.set(key, bucket);
+            }
+            bucket.push(obstacle);
+        }
+    }
+}
+
+function buildObstacleIndex(room) {
+    const all = new Map();
+    const collidable = new Map();
+    for (const obstacle of room.obstacles || []) {
+        insertObstacleInGrid(all, obstacle);
+        if (obstacle.collidable !== false) insertObstacleInGrid(collidable, obstacle);
+    }
+    room._survivObstacleIndex = {
+        all,
+        collidable,
+        source: room.obstacles,
+        count: room.obstacles?.length || 0,
+    };
+    return room._survivObstacleIndex;
+}
+
+function getObstacleIndex(room) {
+    const count = room.obstacles?.length || 0;
+    if (!room._survivObstacleIndex
+        || room._survivObstacleIndex.source !== room.obstacles
+        || room._survivObstacleIndex.count !== count) {
+        return buildObstacleIndex(room);
+    }
+    return room._survivObstacleIndex;
+}
+
+function queryObstacles(room, x, y, range, collidableOnly = false) {
+    const index = getObstacleIndex(room);
+    const grid = collidableOnly ? index.collidable : index.all;
+    const minX = Math.floor((x - range) / SURVIV_OBSTACLE_CELL);
+    const maxX = Math.floor((x + range) / SURVIV_OBSTACLE_CELL);
+    const minY = Math.floor((y - range) / SURVIV_OBSTACLE_CELL);
+    const maxY = Math.floor((y + range) / SURVIV_OBSTACLE_CELL);
+    const seen = new Set();
+    const out = [];
+    for (let cx = minX; cx <= maxX; cx++) {
+        for (let cy = minY; cy <= maxY; cy++) {
+            const bucket = grid.get(obstacleCellKey(cx, cy));
+            if (!bucket) continue;
+            for (const o of bucket) {
+                if (seen.has(o.id)) continue;
+                seen.add(o.id);
+                if (Math.abs(o.x - x) <= range + o.w / 2
+                    && Math.abs(o.y - y) <= range + o.h / 2) {
+                    out.push(o);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 function isPositionBlocked(room, x, y, r) {
-    for (const o of room.obstacles) {
-        if (o.collidable === false) continue;
+    for (const o of queryObstacles(room, x, y, r + 80, true)) {
         if (circleRectCollision(x, y, r, o)) return true;
     }
     return false;
 }
 
 function getNearbyObstacles(room, x, y, range) {
-    return room.obstacles.filter(o => o.collidable !== false
-        && Math.abs(o.x - x) <= range + o.w / 2
-        && Math.abs(o.y - y) <= range + o.h / 2);
+    return queryObstacles(room, x, y, range, true);
 }
 
 function moveEntity(entity, room, dx, dy, speed) {
@@ -1183,7 +1255,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             .filter(b => isInView(viewX, viewY, b.x, b.y, range))
             .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId }));
 
-        const visibleObstacles = room.obstacles
+        const visibleObstacles = queryObstacles(room, viewX, viewY, range + 200, false)
             .filter(o => isObstacleInView(viewX, viewY, o, range + 200))
             .map(o => ({
                 id: o.id,
