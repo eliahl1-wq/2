@@ -114,7 +114,18 @@ function resolveCircleRect(cx, cy, r, rect) {
     const closestX = clamp(cx, rect.x - rect.w / 2, rect.x + rect.w / 2);
     const closestY = clamp(cy, rect.y - rect.h / 2, rect.y + rect.h / 2);
     const d = dist(cx, cy, closestX, closestY);
-    if (d >= r || d < 1e-6) return { x: cx, y: cy };
+    if (d >= r) return { x: cx, y: cy };
+    if (d < 1e-6) {
+        const left = Math.abs(cx - (rect.x - rect.w / 2));
+        const right = Math.abs((rect.x + rect.w / 2) - cx);
+        const top = Math.abs(cy - (rect.y - rect.h / 2));
+        const bottom = Math.abs((rect.y + rect.h / 2) - cy);
+        const min = Math.min(left, right, top, bottom);
+        if (min === left) return { x: rect.x - rect.w / 2 - r, y: cy };
+        if (min === right) return { x: rect.x + rect.w / 2 + r, y: cy };
+        if (min === top) return { x: cx, y: rect.y - rect.h / 2 - r };
+        return { x: cx, y: rect.y + rect.h / 2 + r };
+    }
     const overlap = r - d;
     const nx = (cx - closestX) / d;
     const ny = (cy - closestY) / d;
@@ -123,17 +134,29 @@ function resolveCircleRect(cx, cy, r, rect) {
 
 export function generateSurvivObstacles(worldHalf) {
     const obstacles = [];
-    const count = 38 + Math.floor(Math.random() * 14);
+    const templates = [
+        { kind: 'tree', min: 34, max: 54, hue: 118, weight: 9 },
+        { kind: 'rock', min: 48, max: 78, hue: 218, weight: 5 },
+        { kind: 'crate', min: 44, max: 70, hue: 30, weight: 6 },
+        { kind: 'house', min: 92, max: 150, hue: 18, weight: 4 },
+        { kind: 'container', min: 70, max: 128, hue: 205, weight: 3 },
+    ];
+    const weighted = templates.flatMap(t => Array(t.weight).fill(t));
+    const count = 62 + Math.floor(Math.random() * 18);
     for (let i = 0; i < count; i++) {
-        const w = 60 + Math.random() * 120;
-        const h = 60 + Math.random() * 120;
+        const t = weighted[Math.floor(Math.random() * weighted.length)];
+        const size = t.min + Math.random() * (t.max - t.min);
+        const w = t.kind === 'tree' || t.kind === 'rock' ? size : size * (0.8 + Math.random() * 0.8);
+        const h = t.kind === 'tree' || t.kind === 'rock' ? size : size * (0.7 + Math.random() * 0.7);
         const { x, y } = randomSpawnCoord(worldHalf * 0.9);
-        const tooClose = obstacles.some(o => dist(x, y, o.x, o.y) < 100);
+        const tooClose = obstacles.some(o => dist(x, y, o.x, o.y) < Math.max(86, (w + h + o.w + o.h) * 0.18));
         if (tooClose) continue;
         obstacles.push({
             id: randId(),
             x, y, w, h,
-            hue: 210 + Math.floor(Math.random() * 30),
+            kind: t.kind,
+            rotation: (Math.random() - 0.5) * 0.35,
+            hue: t.hue + Math.floor((Math.random() - 0.5) * 18),
         });
     }
     return obstacles;
@@ -514,7 +537,6 @@ export function spawnSurvivBotNear(room, x, y) {
     room.bots.push(bot);
     return bot;
 }
-}
 
 function updateBotAI(bot, room, now, effectiveRadius) {
     if (now < bot.botThinkAt) return;
@@ -696,7 +718,16 @@ export function broadcastSurvivState(room, io, lbData, meta) {
 
         const visibleObstacles = room.obstacles
             .filter(o => isInView(viewX, viewY, o.x, o.y, range + 200))
-            .map(o => ({ id: o.id, x: o.x, y: o.y, w: o.w, h: o.h, hue: o.hue }));
+            .map(o => ({
+                id: o.id,
+                x: o.x,
+                y: o.y,
+                w: o.w,
+                h: o.h,
+                hue: o.hue,
+                kind: o.kind,
+                rotation: o.rotation,
+            }));
 
         io.to(socketId).emit('survivTick', {
             you: youId ? serializePlayer(
