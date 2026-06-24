@@ -51,6 +51,7 @@ import {
 } from './economy.js';
 import {
     SURVIV,
+    WEAPONS,
     createSurvivPlayer,
     generateSurvivMap,
     getSurvivZone,
@@ -4543,7 +4544,7 @@ io.on('connection', (socket) => {
         p.boost = p.isCashingOut ? false : !!boost;
     });
 
-    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot }) => {
+    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot, openChestId }) => {
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
         if (!p || p.isCashingOut) return;
@@ -4552,10 +4553,10 @@ io.on('connection', (socket) => {
         if (Number.isFinite(aimAngle)) p.aimAngle = aimAngle;
         p.shooting = p.isCashingOut ? false : !!shooting;
         if (useMedkit) p.useMedkit = true;
+        if (typeof openChestId === 'string' && openChestId.length > 0) p.openChestId = openChestId;
         if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 3) p.equipSlotPending = equipSlot;
         if (reload && p.weapon && !p.weapon.reloading) {
-            const wDef = { pistol: { reloadMs: 1400, clipSize: 15 }, smg: { reloadMs: 1800, clipSize: 30 }, shotgun: { reloadMs: 2200, clipSize: 6 }, assault: { reloadMs: 2000, clipSize: 22 } };
-            const def = wDef[p.weapon.type] || wDef.pistol;
+            const def = WEAPONS[p.weapon.type] || WEAPONS.pistol;
             p.weapon.reloading = true;
             p.weapon.reloadEndAt = Date.now() + def.reloadMs;
         }

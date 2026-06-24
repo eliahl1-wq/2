@@ -1089,6 +1089,9 @@ function dropSnakeAsFood(room, snake) {
     const massEach = mass / pelletCount;
     const dollarEach = dollars / pelletCount;
 
+    const hueMap = [20, 45, 110, 150, 200, 240, 280, 320, 350];
+    const snakeHue = hueMap[(snake.color || 0) % hueMap.length] || 0;
+
     for (let i = 0; i < pelletCount; i++) {
         const seg = segs[i % segs.length];
         const jitter = 14;
@@ -1098,8 +1101,8 @@ function dropSnakeAsFood(room, snake) {
             y: seg.y + (Math.random() - 0.5) * jitter,
             balance: massEach,
             dollarValue: dollarEach,
-            hue: Math.floor(Math.random() * 360),
-            radius: SLITHER.foodRadius + Math.random() * 1.5,
+            hue: snakeHue,
+            radius: SLITHER.foodRadius + 2.5,
             deathDrop: true,
         });
     }
