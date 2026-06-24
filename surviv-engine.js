@@ -228,13 +228,14 @@ function moveEntity(entity, room, dx, dy, speed) {
     let newX = entity.x + nx * speed;
     let newY = entity.y + ny * speed;
 
-    const wh = SURVIV.worldHalf - entity.radius || SURVIV.playerRadius;
+    const r = entity.radius || SURVIV.playerRadius;
+    const wh = SURVIV.worldHalf - r;
     newX = clamp(newX, -wh, wh);
     newY = clamp(newY, -wh, wh);
 
     for (const o of room.obstacles) {
-        if (circleRectCollision(newX, newY, SURVIV.playerRadius, o)) {
-            const resolved = resolveCircleRect(newX, newY, SURVIV.playerRadius, o);
+        if (circleRectCollision(newX, newY, r, o)) {
+            const resolved = resolveCircleRect(newX, newY, r, o);
             newX = resolved.x;
             newY = resolved.y;
         }
@@ -477,42 +478,42 @@ export function spawnLootFromPool(room, poolAmount) {
 }
 
 function syncSurvivBots(room) {
-    const humans = room.players.filter(p => !p.disconnected).length;
-    const target = Math.max(4, SURVIV.botTargetCount - humans);
-    while (room.bots.length < target) {
-        const id = 'surviv_bot_' + randId();
-        const spawn = pickSurvivSpawn(room);
-        const eco = getSurvivEconomy(room.entryFeeUsd);
-        room.bots.push({
-            id,
-            mongoId: null,
-            username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
-            mode: 'surviv',
-            color: `hsl(${Math.floor(Math.random() * 360)}, 55%, 55%)`,
-            x: spawn.x,
-            y: spawn.y,
-            angle: Math.random() * Math.PI * 2,
-            aimAngle: 0,
-            hp: 100,
-            maxHp: 100,
-            armor: 0,
-            maxArmor: 100,
-            weapon: makeWeaponState(Math.random() < 0.3 ? LOOT_WEAPON_TYPES[Math.floor(Math.random() * 3)] : 'pistol'),
-            dollarBalance: eco.playerStartBalance * (0.5 + Math.random()),
-            entryFeeUsd: room.entryFeeUsd,
-            inputDx: 0,
-            inputDy: 0,
-            shooting: false,
-            kills: 0,
-            isBot: true,
-            botThinkAt: 0,
-            botTargetId: null,
-            isCashingOut: false,
-        });
-    }
-    if (room.bots.length > target + 4) {
-        room.bots = room.bots.slice(0, target);
-    }
+    // Automatic bot spawning disabled per user request
+    return;
+}
+
+export function spawnSurvivBotNear(room, x, y) {
+    const id = 'surviv_bot_' + randId();
+    const eco = getSurvivEconomy(room.entryFeeUsd);
+    const bot = {
+        id,
+        mongoId: null,
+        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+        mode: 'surviv',
+        color: `hsl(${Math.floor(Math.random() * 360)}, 55%, 55%)`,
+        x,
+        y,
+        angle: Math.random() * Math.PI * 2,
+        aimAngle: 0,
+        hp: 100,
+        maxHp: 100,
+        armor: 0,
+        maxArmor: 100,
+        weapon: makeWeaponState(Math.random() < 0.3 ? LOOT_WEAPON_TYPES[Math.floor(Math.random() * 3)] : 'pistol'),
+        dollarBalance: eco.playerStartBalance * (0.5 + Math.random()),
+        entryFeeUsd: room.entryFeeUsd,
+        inputDx: 0,
+        inputDy: 0,
+        shooting: false,
+        kills: 0,
+        isBot: true,
+        botThinkAt: 0,
+        botTargetId: null,
+        isCashingOut: false,
+    };
+    room.bots.push(bot);
+    return bot;
+}
 }
 
 function updateBotAI(bot, room, now, effectiveRadius) {

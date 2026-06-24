@@ -57,6 +57,7 @@ import {
     processSurvivRoom,
     broadcastSurvivState,
     spawnLootFromPool,
+    spawnSurvivBotNear,
 } from './surviv-engine.js';
 import {
     setupBattleRoyale,
@@ -4182,21 +4183,24 @@ io.on('connection', (socket) => {
             }
 
             const p = room.players.find(pl => pl.id === socket.id);
+            const isSurviv = room.isSurviv;
             const isCompSlither = room.isCompetitiveSlither;
             const isSlither = isCompSlither || mode === 'slither' || (p && p.mode === 'slither') || room.id.includes('slither');
             const stake = botStakeForRoom(room);
             const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
             const startMass = getEconomy(room.entryFeeUsd ?? 0.10).massStartBalance;
 
-            const spawnX = p ? ((isSlither ? p.x : p.cells?.[0]?.x) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : c.worldWidth));
-            const spawnY = p ? ((isSlither ? p.y : p.cells?.[0]?.y) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : c.worldHeight));
+            const spawnX = p ? ((isSlither || isSurviv ? p.x : p.cells?.[0]?.x) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : isSurviv ? SURVIV.worldHalf * 0.8 : c.worldWidth));
+            const spawnY = p ? ((isSlither || isSurviv ? p.y : p.cells?.[0]?.y) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : isSurviv ? SURVIV.worldHalf * 0.8 : c.worldHeight));
 
             const offsetX = p ? (Math.random() - 0.5) * 600 : 0;
             const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
 
-            console.log(`[Admin Spawn] Spawning ${isCompSlither ? 'CompetitiveSlither' : isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
+            console.log(`[Admin Spawn] Spawning ${isSurviv ? 'Surviv' : isCompSlither ? 'CompetitiveSlither' : isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
 
-            if (isCompSlither) {
+            if (isSurviv) {
+                spawnSurvivBotNear(room, spawnX + offsetX, spawnY + offsetY);
+            } else if (isCompSlither) {
                 // Competitive slither: bots live in room.players (no slitherBots array)
                 const eco = getEconomy(room.entryFeeUsd ?? 2);
                 const angle = Math.random() * Math.PI * 2;
