@@ -8,10 +8,14 @@ export const GOLDEN_BLOB_ENTRY_SHARE = 0.10;
 /** Server tick rate used for wealth-tax decay (matches processRoom interval). */
 export const ECONOMY_TICKS_PER_SECOND = 40;
 
+/** Platform cut on normal agar/slither cashouts (matches Slither Arena $5 tier). */
+export const NORMAL_CASHOUT_FEE_PCT = 0.035;
+
 /** Baseline economy at $10 entry — all values scale linearly with entry fee. */
 const BASE = {
     playerStart: 1.0,
-    ownerCut: 1.0,
+    /** Extra food-pool dollars per join (formerly owner cut). */
+    joinFoodBonus: 1.0,
     foodLow: 12.0,   // 1–2 humans
     foodMid: 16.0,   // 3–7 humans
     foodHigh: 20.0,  // 8+ humans
@@ -48,7 +52,9 @@ export function getEconomy(entryFeeUsd) {
         massStartBalance: BASE.playerStart,
         massPerPellet: BASE.massPerPellet,
         goldenBlobMass: getGoldenBlobValue(DEFAULT_ENTRY_FEE),
-        ownerCut: BASE.ownerCut * s,
+        joinFoodBonus: BASE.joinFoodBonus * s,
+        cashoutFeePct: NORMAL_CASHOUT_FEE_PCT,
+        cashoutPlayerPct: 1 - NORMAL_CASHOUT_FEE_PCT,
         foodLow: BASE.foodLow * s,
         foodMid: BASE.foodMid * s,
         foodHigh: BASE.foodHigh * s,
