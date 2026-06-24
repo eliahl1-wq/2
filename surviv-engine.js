@@ -126,7 +126,7 @@ const BOT_NAMES = [
 ];
 
 const WEAPON_RARITY_POOLS = {
-    common: ['pistol', 'revolver', 'smg'],
+    common: ['revolver', 'smg'],
     rare: ['shotgun', 'assault', 'dmr'],
     military: ['assault', 'dmr', 'sniper', 'lmg'],
 };
