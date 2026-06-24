@@ -556,6 +556,37 @@ function addWeaponToInventory(entity, weaponType) {
     }
 }
 
+function describeContainerItems(contents = {}) {
+    const items = [];
+    if (contents.weaponType && WEAPONS[contents.weaponType]) {
+        items.push({
+            key: 'weapon',
+            kind: 'weapon',
+            label: WEAPONS[contents.weaponType].label,
+            weaponType: contents.weaponType,
+            rarity: WEAPONS[contents.weaponType].rarity || contents.rarity || 'common',
+            value: 1,
+        });
+    }
+    if (contents.money) {
+        items.push({ key: 'money', kind: 'money', label: '$' + Number(contents.money).toFixed(2), value: Number(contents.money) });
+    }
+    if (contents.medkits) {
+        items.push({ key: 'medkits', kind: 'medkit', label: 'Medkit', value: Number(contents.medkits) });
+    }
+    if (contents.ammoPacks) {
+        items.push({ key: 'ammoPacks', kind: 'ammo', label: 'Ammo', value: Number(contents.ammoPacks) });
+    }
+    if (contents.armor) {
+        items.push({ key: 'armor', kind: 'armor', label: 'Armor', value: Number(contents.armor) });
+    }
+    return items;
+}
+
+function isContainerEmpty(contents = {}) {
+    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoPacks && !contents.armor;
+}
+
 function applyLootContents(entity, contents = {}, options = {}) {
     const inv = ensureInventory(entity);
     const summary = {
@@ -646,6 +677,9 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         useMedkit: false,
         openChestId: null,
         lastLoot: null,
+        openedContainerId: null,
+        openedContainer: null,
+        takeChestItem: null,
     };
 }
 
@@ -877,18 +911,84 @@ function eliminateSurvivPlayer(room, player, io) {
     }
 }
 
+function getLootContainer(room, chestId) {
+    const index = room.loot.findIndex(l => l.id === chestId);
+    if (index < 0) return { item: null, index: -1 };
+    const item = room.loot[index];
+    if (item.type !== 'chest' && item.type !== 'deathCrate') return { item: null, index: -1 };
+    return { item, index };
+}
+
+function refreshOpenedContainer(entity, room) {
+    if (!entity.openedContainerId) {
+        entity.openedContainer = null;
+        return;
+    }
+    const { item } = getLootContainer(room, entity.openedContainerId);
+    if (!item || dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius + 44) {
+        entity.openedContainerId = null;
+        entity.openedContainer = null;
+        return;
+    }
+    entity.openedContainer = {
+        id: item.id,
+        type: item.type,
+        tier: item.tier,
+        source: item.source,
+        x: item.x,
+        y: item.y,
+        items: describeContainerItems(item.contents || {}),
+    };
+}
+
 function openLootContainer(entity, room) {
     const chestId = entity.openChestId;
     if (!chestId) return;
     entity.openChestId = null;
-    const index = room.loot.findIndex(l => l.id === chestId);
-    if (index < 0) return;
-    const item = room.loot[index];
-    if (item.type !== 'chest' && item.type !== 'deathCrate') return;
+    const { item } = getLootContainer(room, chestId);
+    if (!item) return;
     if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius) return;
-    const summary = applyLootContents(entity, item.contents || {});
+    if (!item._openedBy) item._openedBy = new Set();
+    if (!item._openedBy.has(entity.id)) {
+        ensureInventory(entity).chestsOpened += 1;
+        item._openedBy.add(entity.id);
+    }
+    entity.openedContainerId = item.id;
+    refreshOpenedContainer(entity, room);
+}
+
+function takeLootContainerItem(entity, room) {
+    const request = entity.takeChestItem;
+    if (!request) return;
+    entity.takeChestItem = null;
+    const chestId = request.chestId || entity.openedContainerId;
+    const itemKey = request.itemKey;
+    if (!chestId || !itemKey) return;
+    const { item, index } = getLootContainer(room, chestId);
+    if (!item) return;
+    if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius + 44) return;
+    const contents = item.contents || {};
+    let picked = null;
+    if (itemKey === 'weapon' && contents.weaponType) {
+        picked = { weaponType: contents.weaponType, rarity: contents.rarity };
+        delete contents.weaponType;
+    } else if (itemKey === 'money' && contents.money) {
+        picked = { money: contents.money, rarity: contents.rarity };
+        delete contents.money;
+    } else if (itemKey === 'medkits' && contents.medkits) {
+        picked = { medkits: contents.medkits, rarity: contents.rarity };
+        delete contents.medkits;
+    } else if (itemKey === 'ammoPacks' && contents.ammoPacks) {
+        picked = { ammoPacks: contents.ammoPacks, rarity: contents.rarity };
+        delete contents.ammoPacks;
+    } else if (itemKey === 'armor' && contents.armor) {
+        picked = { armor: contents.armor, rarity: contents.rarity };
+        delete contents.armor;
+    }
+    if (!picked) return;
+    const summary = applyLootContents(entity, picked, { countChest: false });
     entity.lastLoot = {
-        id: item.id + ':' + Date.now(),
+        id: item.id + ':' + itemKey + ':' + Date.now(),
         chestId: item.id,
         type: item.type,
         tier: item.tier,
@@ -896,11 +996,20 @@ function openLootContainer(entity, room) {
         items: summary,
         openedAt: Date.now(),
     };
-    room.loot.splice(index, 1);
+    if (isContainerEmpty(contents)) {
+        room.loot.splice(index, 1);
+        entity.openedContainerId = null;
+        entity.openedContainer = null;
+    } else {
+        entity.openedContainerId = item.id;
+        refreshOpenedContainer(entity, room);
+    }
 }
 
 function pickupLoot(entity, room) {
     openLootContainer(entity, room);
+    takeLootContainerItem(entity, room);
+    refreshOpenedContainer(entity, room);
 
     for (let i = room.loot.length - 1; i >= 0; i--) {
         const item = room.loot[i];
@@ -1050,6 +1159,9 @@ export function spawnSurvivBotNear(room, x, y) {
         useMedkit: false,
         openChestId: null,
         lastLoot: null,
+        openedContainerId: null,
+        openedContainer: null,
+        takeChestItem: null,
         adminSpawned: true,
     };
     addWeaponToInventory(bot, bot.weapon.type);
@@ -1183,6 +1295,7 @@ function serializePlayer(p, isYou) {
         isCashingOut: !!p.isCashingOut,
         inventory: ensureInventory(p),
         lastLoot: isYou ? (p.lastLoot || null) : null,
+        openedContainer: isYou ? (p.openedContainer || null) : null,
     };
 }
 
@@ -1296,3 +1409,4 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         emitToViewer(spec.id, spec.x, spec.y, null, spec.dollarBalance, true);
     }
 }
+

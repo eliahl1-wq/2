@@ -18,7 +18,7 @@ export const SLITHER = {
     slitherTickRate: 125,
     serverTickRate: 40,
     speedMultiplier: 1.2,
-    turnRate: 7.2,
+    turnRate: 9.0,
     maxInput: 4,
     boostMultiplier: 1.55,
     boostCostPerTick: 0.00125, // $0.05/s at 40Hz
@@ -746,8 +746,8 @@ function updateSnakeMovement(snake, room = null) {
                     balance: dropMass,
                     dollarValue: dropDollar,
                     hue: hueFromColor(snake.color),
-                    radius: SLITHER.foodRadius * 1.15,
-                    deathDrop: true, // boost pellets glow/pulse
+                    radius: SLITHER.foodRadius * (1 + Math.random() * 0.4),
+                    // boost pellets render exactly like normal food, just colored
                 });
             }
         }

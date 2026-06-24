@@ -4544,7 +4544,7 @@ io.on('connection', (socket) => {
         p.boost = p.isCashingOut ? false : !!boost;
     });
 
-    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot, openChestId }) => {
+    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot, openChestId, takeChestItem }) => {
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
         if (!p || p.isCashingOut) return;
@@ -4554,6 +4554,11 @@ io.on('connection', (socket) => {
         p.shooting = p.isCashingOut ? false : !!shooting;
         if (useMedkit) p.useMedkit = true;
         if (typeof openChestId === 'string' && openChestId.length > 0) p.openChestId = openChestId;
+        if (takeChestItem && typeof takeChestItem === 'object') {
+            const chestId = typeof takeChestItem.chestId === 'string' ? takeChestItem.chestId : null;
+            const itemKey = typeof takeChestItem.itemKey === 'string' ? takeChestItem.itemKey : null;
+            if (chestId && itemKey) p.takeChestItem = { chestId, itemKey };
+        }
         if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 3) p.equipSlotPending = equipSlot;
         if (reload && p.weapon && !p.weapon.reloading) {
             const def = WEAPONS[p.weapon.type] || WEAPONS.pistol;
