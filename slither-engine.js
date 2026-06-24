@@ -1104,7 +1104,7 @@ function dropSnakeAsFood(room, snake) {
             balance: massEach,
             dollarValue: dollarEach,
             hue: snakeHue,
-            radius: SLITHER.foodRadius + 1.5,
+            radius: SLITHER.foodRadius + 0.5,
             deathDrop: true,
         });
     }
