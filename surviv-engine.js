@@ -381,8 +381,11 @@ function ensureInventory(entity) {
 
 function addWeaponToInventory(entity, weaponType) {
     const inv = ensureInventory(entity);
-    if (weaponType && WEAPONS[weaponType] && !inv.weapons.includes(weaponType)) {
+    if (!weaponType || !WEAPONS[weaponType] || inv.weapons.includes(weaponType)) return;
+    if (inv.weapons.length < 4) {
         inv.weapons.push(weaponType);
+    } else {
+        inv.weapons[3] = weaponType;
     }
 }
 
@@ -415,6 +418,15 @@ function useInventoryMedkit(entity) {
     if (inv.medkits <= 0 || entity.hp >= entity.maxHp) return;
     inv.medkits -= 1;
     entity.hp = Math.min(entity.maxHp, entity.hp + 45);
+}
+
+function equipInventorySlot(entity, slot) {
+    const inv = ensureInventory(entity);
+    const index = clamp(Number(slot) || 0, 0, 3);
+    const weaponType = inv.weapons[index];
+    if (!weaponType || !WEAPONS[weaponType]) return;
+    if (entity.weapon?.type === weaponType) return;
+    entity.weapon = makeWeaponState(weaponType);
 }
 
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
@@ -821,6 +833,10 @@ function processEntity(entity, room, now, effectiveRadius) {
         useInventoryMedkit(entity);
         entity.useMedkit = false;
     }
+    if (entity.equipSlotPending != null) {
+        equipInventorySlot(entity, entity.equipSlotPending);
+        entity.equipSlotPending = null;
+    }
 
     if (entity.isBot) {
         updateBotAI(entity, room, now, effectiveRadius);
@@ -886,6 +902,11 @@ function isInView(vx, vy, x, y, range) {
     return Math.abs(x - vx) <= range && Math.abs(y - vy) <= range;
 }
 
+function isObstacleInView(vx, vy, obstacle, range) {
+    return Math.abs((obstacle.x || 0) - vx) <= range + (obstacle.w || 0) / 2
+        && Math.abs((obstacle.y || 0) - vy) <= range + (obstacle.h || 0) / 2;
+}
+
 export function processSurvivRoom(room, io, resetTime) {
     room._io = io;
     const now = Date.now();
@@ -947,7 +968,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             .map(b => ({ id: b.id, x: b.x, y: b.y, ownerId: b.ownerId }));
 
         const visibleObstacles = room.obstacles
-            .filter(o => isInView(viewX, viewY, o.x, o.y, range + 200))
+            .filter(o => isObstacleInView(viewX, viewY, o, range + 200))
             .map(o => ({
                 id: o.id,
                 x: o.x,
