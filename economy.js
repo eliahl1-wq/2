@@ -151,14 +151,14 @@ export function getCompetitiveEconomy(entryFeeUsd) {
     };
 }
 
-/** Surviv economy — $5 entry, $2 player start, $3 map loot pool per join. */
+/** Surviv economy - full entry becomes synchronized map loot; players start at $0. */
 export function getSurvivEconomy(entryFeeUsd) {
     const entry = normalizeSurvivEntryFee(entryFeeUsd);
     const cashoutFeePct = 0.035;
     return {
         entryFeeUsd: entry,
-        playerStartBalance: 2.0,
-        lootPoolOnJoin: 3.0,
+        playerStartBalance: 0,
+        lootPoolOnJoin: entry,
         cashoutFeePct,
         cashoutPlayerPct: 1 - cashoutFeePct,
     };

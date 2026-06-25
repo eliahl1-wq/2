@@ -197,10 +197,12 @@ function resolveCircleRect(cx, cy, r, rect) {
     return { x: cx + nx * overlap, y: cy + ny * overlap };
 }
 
-function randomChestContents(tier = 'common') {
+function randomChestContents(tier = 'common', options = {}) {
     const contents = { rarity: tier };
-    const moneyBase = tier === 'rare' ? 0.85 : tier === 'military' ? 1.25 : 0.42;
-    contents.money = Number((moneyBase * (0.55 + Math.random())).toFixed(2));
+    if (options.includeMoney === true) {
+        const moneyBase = tier === 'rare' ? 0.85 : tier === 'military' ? 1.25 : 0.42;
+        contents.money = Number((moneyBase * (0.55 + Math.random())).toFixed(2));
+    }
 
     const weaponChance = tier === 'military' ? 0.84 : tier === 'rare' ? 0.58 : 0.34;
     if (Math.random() < weaponChance) contents.weaponType = pickWeaponForTier(tier);
@@ -227,20 +229,26 @@ function makeChest(x, y, tier = 'common', contents = randomChestContents(tier), 
 }
 
 function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
-    obstacles.push({
+    const options = typeof opts === 'string' ? { variant: opts } : (opts || {});
+    const obstacle = {
         id: randId(),
         kind,
         x,
         y,
         w,
         h,
-        hue: opts.hue,
-        rotation: opts.rotation || 0,
-        collidable: opts.collidable !== false,
-        variant: opts.variant || null,
-        biome: opts.biome || null,
-        label: opts.label || null,
-    });
+        hue: options.hue,
+        rotation: options.rotation || 0,
+        collidable: options.collidable !== false,
+        variant: options.variant || null,
+        biome: options.biome || null,
+        label: options.label || null,
+        houseId: options.houseId || null,
+        roomId: options.roomId || null,
+        role: options.role || null,
+    };
+    obstacles.push(obstacle);
+    return obstacle;
 }
 
 function addRoad(obstacles, x1, y1, x2, y2, width = 150) {
@@ -264,27 +272,97 @@ function addInteriorWall(obstacles, x, y, w, h, variant = 'plaster') {
     addObstacle(obstacles, 'interiorWall', x, y, w, h, { hue: 24, variant });
 }
 
+function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
+    return addObstacle(obstacles, 'roomZone', x, y, w, h, {
+        collidable: false,
+        variant,
+        houseId,
+    });
+}
+
+function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], variant = 'plaster') {
+    const min = y - h / 2;
+    const max = y + h / 2;
+    let cursor = min;
+    const sorted = [...gaps].sort((a, b) => a.center - b.center);
+    for (const gap of sorted) {
+        const gapMin = clamp(y + gap.center - gap.size / 2, min, max);
+        const gapMax = clamp(y + gap.center + gap.size / 2, min, max);
+        if (gapMin - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + gapMin) / 2, wall, gapMin - cursor, variant);
+        cursor = Math.max(cursor, gapMax);
+    }
+    if (max - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + max) / 2, wall, max - cursor, variant);
+}
+
+function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], variant = 'plaster') {
+    const min = x - w / 2;
+    const max = x + w / 2;
+    let cursor = min;
+    const sorted = [...gaps].sort((a, b) => a.center - b.center);
+    for (const gap of sorted) {
+        const gapMin = clamp(x + gap.center - gap.size / 2, min, max);
+        const gapMax = clamp(x + gap.center + gap.size / 2, min, max);
+        if (gapMin - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + gapMin) / 2, y, gapMin - cursor, wall, variant);
+        cursor = Math.max(cursor, gapMax);
+    }
+    if (max - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + max) / 2, y, max - cursor, wall, variant);
+}
 function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const wall = opts.wall || 14;
-    const door = Math.min(70, w * 0.34);
+    const door = Math.min(82, w * 0.34);
     const hue = opts.hue ?? 22;
     const variant = opts.variant || 'house';
-    addObstacle(obstacles, 'houseFloor', x, y, w, h, { collidable: false, hue, variant });
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, { collidable: false, hue, variant });
+    const houseId = floor.id;
+
     addWall(obstacles, x, y - h / 2 + wall / 2, w, wall, variant);
     addWall(obstacles, x - w / 2 + wall / 2, y, wall, h, variant);
     addWall(obstacles, x + w / 2 - wall / 2, y, wall, h, variant);
     addWall(obstacles, x - door * 0.65, y + h / 2 - wall / 2, w / 2 - door * 0.65, wall, variant);
     addWall(obstacles, x + door * 0.65, y + h / 2 - wall / 2, w / 2 - door * 0.65, wall, variant);
 
-    if (w > 190) addInteriorWall(obstacles, x, y, wall, h * 0.55, variant);
-    if (h > 180) addInteriorWall(obstacles, x + w * 0.18, y - h * 0.08, w * 0.38, wall, variant);
-
-    addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, { collidable: false, variant: 'table' });
-    addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, { collidable: false, variant: 'bed' });
+    const large = w >= 430 || h >= 330 || variant === 'mansion' || variant === 'warehouse';
+    if (large) {
+        const hallW = clamp(w * 0.22, 98, 170);
+        const wingW = (w - hallW - wall * 4) / 2;
+        addRoomZone(obstacles, houseId, x, y, hallW, h - wall * 3.5, 'hallway');
+        addRoomZone(obstacles, houseId, x - hallW / 2 - wingW / 2 - wall, y - h * 0.27, wingW, h * 0.28, 'north-room');
+        addRoomZone(obstacles, houseId, x - hallW / 2 - wingW / 2 - wall, y + h * 0.02, wingW, h * 0.28, 'mid-room');
+        addRoomZone(obstacles, houseId, x - hallW / 2 - wingW / 2 - wall, y + h * 0.31, wingW, h * 0.24, 'south-room');
+        addRoomZone(obstacles, houseId, x + hallW / 2 + wingW / 2 + wall, y - h * 0.27, wingW, h * 0.28, 'north-room');
+        addRoomZone(obstacles, houseId, x + hallW / 2 + wingW / 2 + wall, y + h * 0.02, wingW, h * 0.28, 'mid-room');
+        addRoomZone(obstacles, houseId, x + hallW / 2 + wingW / 2 + wall, y + h * 0.31, wingW, h * 0.24, 'south-room');
+        addVerticalInteriorWallSegments(obstacles, x - hallW / 2, y, h - wall * 4, wall, [
+            { center: -h * 0.27, size: 82 },
+            { center: h * 0.02, size: 82 },
+            { center: h * 0.31, size: 82 },
+        ], variant);
+        addVerticalInteriorWallSegments(obstacles, x + hallW / 2, y, h - wall * 4, wall, [
+            { center: -h * 0.27, size: 82 },
+            { center: h * 0.02, size: 82 },
+            { center: h * 0.31, size: 82 },
+        ], variant);
+        addHorizontalInteriorWallSegments(obstacles, x - hallW / 2 - wingW / 2 - wall, y - h * 0.125, wingW, wall, [], variant);
+        addHorizontalInteriorWallSegments(obstacles, x - hallW / 2 - wingW / 2 - wall, y + h * 0.175, wingW, wall, [], variant);
+        addHorizontalInteriorWallSegments(obstacles, x + hallW / 2 + wingW / 2 + wall, y - h * 0.125, wingW, wall, [], variant);
+        addHorizontalInteriorWallSegments(obstacles, x + hallW / 2 + wingW / 2 + wall, y + h * 0.175, wingW, wall, [], variant);
+        addObstacle(obstacles, 'furniture', x - w * 0.32, y - h * 0.28, 54, 32, { collidable: false, variant: 'table' });
+        addObstacle(obstacles, 'furniture', x + w * 0.33, y + h * 0.27, 48, 34, { collidable: false, variant: 'bed' });
+        addObstacle(obstacles, 'furniture', x - w * 0.31, y + h * 0.06, 42, 30, { collidable: false, variant: 'bed' });
+    } else {
+        addRoomZone(obstacles, houseId, x - w * 0.24, y - h * 0.08, w * 0.45, h * 0.62, 'living');
+        addRoomZone(obstacles, houseId, x + w * 0.26, y - h * 0.12, w * 0.42, h * 0.54, 'bedroom');
+        addRoomZone(obstacles, houseId, x + w * 0.08, y + h * 0.28, w * 0.72, h * 0.25, 'entry');
+        if (w > 190) addVerticalInteriorWallSegments(obstacles, x + w * 0.03, y - h * 0.08, h * 0.62, wall, [{ center: h * 0.15, size: 70 }], variant);
+        if (h > 180) addHorizontalInteriorWallSegments(obstacles, x + w * 0.12, y + h * 0.16, w * 0.68, wall, [{ center: -w * 0.06, size: 72 }], variant);
+        addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, { collidable: false, variant: 'table' });
+        addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, { collidable: false, variant: 'bed' });
+    }
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
     loot.push(makeChest(x + w * 0.24, y - h * 0.22, chestTier));
-    if (Math.random() > 0.58) loot.push(makeChest(x - w * 0.28, y + h * 0.18, 'common'));
+    if (Math.random() > 0.58 || large) loot.push(makeChest(x - w * 0.28, y + h * 0.18, large ? chestTier : 'common'));
+    if (large && Math.random() > 0.35) loot.push(makeChest(x + w * 0.28, y + h * 0.24, Math.random() > 0.5 ? 'rare' : 'common'));
     spawnPoints.push({ x, y: y + h / 2 + 70 });
 }
 
@@ -565,6 +643,8 @@ export function generateSurvivMap(worldHalf) {
     const scale = worldHalf / 40000;
     const pois = [
         { name: 'Old Estate', x: 0, y: 0, type: 'mansion' },
+        { name: 'West Manor', x: Math.round(-13500 * scale), y: Math.round(-8200 * scale), type: 'mansion' },
+        { name: 'South Villa', x: Math.round(7800 * scale), y: Math.round(18200 * scale), type: 'mansion' },
         { name: 'North Lab', x: 0, y: Math.round(-27500 * scale), type: 'lab' },
         { name: 'Pine Town', x: Math.round(-16500 * scale), y: Math.round(-12500 * scale), type: 'town' },
         { name: 'Quarry', x: Math.round(18500 * scale), y: Math.round(-14500 * scale), type: 'quarry' },
@@ -645,13 +725,13 @@ export function generateSurvivMap(worldHalf) {
             if (Math.hypot(gx, gy) < 1200) continue;
             const x = clamp(gx + (Math.random() - 0.5) * 1850, -worldHalf + 1200, worldHalf - 1200);
             const y = clamp(gy + (Math.random() - 0.5) * 1850, -worldHalf + 1200, worldHalf - 1200);
-            const biome = y < -22000 * scale ? 'snow' : x < -18000 * scale && y > 8500 * scale ? 'dry' : x > 14500 * scale && y > 9500 * scale ? 'pine' : 'grass';
+            const biome = 'grass';
 
             const roll = Math.random();
             if (roll < 0.36) addMicroSite(obstacles, loot, spawnPoints, x, y, biome);
             else if (roll < 0.40) addGasStation(obstacles, loot, spawnPoints, x, y);
             else if (roll < 0.44) addRadioTower(obstacles, loot, spawnPoints, x, y);
-            else if (roll < 0.74) addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: biome === 'snow' ? 'snow-woods' : biome === 'dry' ? 'scrub' : 'woods' });
+            else if (roll < 0.74) addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
         }
     }
 
@@ -1029,6 +1109,7 @@ function dropDeathLoot(room, entity) {
         ammoPacks: ensureInventory(entity).ammoPacks || 0,
         weaponType: entity.weapon?.type && entity.weapon.type !== 'pistol' ? entity.weapon.type : null,
     };
+    if (isContainerEmpty(contents)) return;
     room.loot.push(makeChest(
         entity.x + (Math.random() - 0.5) * 24,
         entity.y + (Math.random() - 0.5) * 24,
@@ -1342,41 +1423,40 @@ function checkZoneDamage() {
 
 function randomLootSpawn(room) {
     const anchors = room.spawnPoints?.length ? room.spawnPoints : room.landmarks;
-    for (let i = 0; i < 30; i++) {
-        const base = anchors?.length
+    for (let i = 0; i < 44; i++) {
+        const useAnchor = anchors?.length && Math.random() < 0.58;
+        const base = useAnchor
             ? anchors[Math.floor(Math.random() * anchors.length)]
-            : randomSpawnCoord(SURVIV.worldHalf * 0.88);
+            : randomSpawnCoord(SURVIV.worldHalf * 0.92);
+        const spread = useAnchor ? 1200 : 180;
         const pos = {
-            x: base.x + (Math.random() - 0.5) * 900,
-            y: base.y + (Math.random() - 0.5) * 900,
+            x: base.x + (Math.random() - 0.5) * spread,
+            y: base.y + (Math.random() - 0.5) * spread,
         };
         if (!isPositionBlocked(room, pos.x, pos.y, 18)) return pos;
     }
-    return randomSpawnCoord(SURVIV.worldHalf * 0.88);
+    return randomSpawnCoord(SURVIV.worldHalf * 0.9);
 }
 
 export function spawnLootFromPool(room, poolAmount) {
-    if (poolAmount <= 0.01) return;
-    room.lootPoolBalance = (room.lootPoolBalance || 0) + poolAmount;
+    const centsTotal = Math.max(0, Math.round(Number(poolAmount || 0) * 100));
+    if (centsTotal <= 0) return;
 
-    const moneyCrates = Math.max(2, Math.floor(poolAmount / 0.75));
-    const moneyEach = poolAmount * 0.55 / moneyCrates;
-    let spent = moneyEach * moneyCrates;
+    const poolDollars = centsTotal / 100;
+    room.lootPoolBalance = Number(((room.lootPoolBalance || 0) + poolDollars).toFixed(2));
+
+    const moneyCrates = clamp(Math.ceil(centsTotal / 35), 8, 28);
+    const baseCents = Math.floor(centsTotal / moneyCrates);
+    const remainder = centsTotal % moneyCrates;
 
     for (let i = 0; i < moneyCrates; i++) {
+        const amountCents = baseCents + (i < remainder ? 1 : 0);
+        if (amountCents <= 0) continue;
         const pos = randomLootSpawn(room);
-        room.loot.push(makeChest(pos.x, pos.y, 'common', { money: moneyEach }, 'join'));
+        room.loot.push(makeChest(pos.x, pos.y, 'common', { rarity: 'common', money: amountCents / 100 }, 'join'));
     }
 
-    const extras = Math.min(6, Math.floor(poolAmount) + 1);
-    for (let i = 0; i < extras; i++) {
-        const pos = randomLootSpawn(room);
-        const tier = Math.random() > 0.72 ? 'rare' : 'common';
-        room.loot.push(makeChest(pos.x, pos.y, tier, randomChestContents(tier), 'join'));
-        spent += 0.1;
-    }
-
-    room.lootPoolBalance = Math.max(0, room.lootPoolBalance - spent);
+    room.lootPoolBalance = Math.max(0, Number((room.lootPoolBalance - poolDollars).toFixed(2)));
 }
 
 function syncSurvivBots(room) {
@@ -1639,22 +1719,42 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             .filter(b => isInView(viewX, viewY, b.x, b.y, range))
             .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType }));
 
+        const serializeObstacle = (o) => ({
+            id: o.id,
+            x: o.x,
+            y: o.y,
+            w: o.w,
+            h: o.h,
+            hue: o.hue,
+            kind: o.kind,
+            rotation: o.rotation,
+            collidable: o.collidable !== false,
+            variant: o.variant,
+            biome: o.biome,
+            label: o.label,
+            houseId: o.houseId,
+            roomId: o.roomId,
+            role: o.role,
+        });
+
         const visibleObstacles = queryObstacles(room, viewX, viewY, range + 200, false)
             .filter(o => isObstacleInView(viewX, viewY, o, range + 200))
-            .map(o => ({
-                id: o.id,
-                x: o.x,
-                y: o.y,
-                w: o.w,
-                h: o.h,
-                hue: o.hue,
-                kind: o.kind,
-                rotation: o.rotation,
-                collidable: o.collidable !== false,
-                variant: o.variant,
-                biome: o.biome,
-                label: o.label,
-            }));
+            .map(serializeObstacle);
+
+        const minimapRange = range * 3.35;
+        const minimapObstacleKinds = new Set(['road', 'houseFloor', 'wall', 'interiorWall', 'water', 'container']);
+        const minimapObstacles = queryObstacles(room, viewX, viewY, minimapRange, false)
+            .filter(o => minimapObstacleKinds.has(o.kind))
+            .filter(o => isObstacleInView(viewX, viewY, o, minimapRange))
+            .slice(0, 220)
+            .map(serializeObstacle);
+        const minimapLoot = room.loot
+            .filter(l => (l.type === 'chest' || l.type === 'deathCrate' || l.type === 'money') && isInView(viewX, viewY, l.x, l.y, minimapRange))
+            .slice(0, 90)
+            .map(l => ({ x: l.x, y: l.y, golden: l.type !== 'chest' }));
+        const minimapPlayers = allPlayers
+            .filter(p => isInView(viewX, viewY, p.x, p.y, minimapRange))
+            .map(p => ({ x: p.x, y: p.y, isYou: p.id === youId, isBot: !!p.isBot }));
 
         io.to(socketId).emit('survivTick', {
             you: youId ? serializePlayer(
@@ -1665,6 +1765,11 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             loot: visibleLoot,
             bullets: visibleBullets,
             obstacles: visibleObstacles,
+            minimap: {
+                players: minimapPlayers,
+                food: minimapLoot,
+                obstacles: minimapObstacles,
+            },
             zone,
             dollarBalance,
             spectating,
