@@ -9,8 +9,9 @@ const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
 
 export const SURVIV = {
-    worldHalf: 40000,
+    worldHalf: 20000,
     shrinkBeforeResetMs: 3 * 60 * 1000,
+
     playerRadius: 14,
     playerSpeed: 5.2,
     viewRange: 1200,
@@ -561,23 +562,25 @@ export function generateSurvivMap(worldHalf) {
     const spawnPoints = [];
     const landmarks = [];
 
+    const scale = worldHalf / 40000;
     const pois = [
         { name: 'Old Estate', x: 0, y: 0, type: 'mansion' },
-        { name: 'North Lab', x: 0, y: -27500, type: 'lab' },
-        { name: 'Pine Town', x: -16500, y: -12500, type: 'town' },
-        { name: 'Quarry', x: 18500, y: -14500, type: 'quarry' },
-        { name: 'West Village', x: -30500, y: 1500, type: 'town' },
-        { name: 'Dry Farm', x: -21500, y: 15500, type: 'farm' },
-        { name: 'Container Docks', x: 22500, y: 17500, type: 'yard' },
-        { name: 'East Depot', x: 31000, y: -4500, type: 'yard' },
-        { name: 'River Camp', x: 8500, y: 25500, type: 'camp' },
-        { name: 'South Bunker', x: -4200, y: 31500, type: 'bunker' },
-        { name: 'Military Base', x: -25000, y: -25000, type: 'military' },
-        { name: 'Crossroads Gas', x: 12000, y: 12000, type: 'gas' },
-        { name: 'State Prison', x: 28000, y: -25000, type: 'prison' },
-        { name: 'Central Hospital', x: -15000, y: 28000, type: 'hospital' },
-        { name: 'Radio Tower', x: 28000, y: 28000, type: 'tower' },
+        { name: 'North Lab', x: 0, y: Math.round(-27500 * scale), type: 'lab' },
+        { name: 'Pine Town', x: Math.round(-16500 * scale), y: Math.round(-12500 * scale), type: 'town' },
+        { name: 'Quarry', x: Math.round(18500 * scale), y: Math.round(-14500 * scale), type: 'quarry' },
+        { name: 'West Village', x: Math.round(-30500 * scale), y: Math.round(1500 * scale), type: 'town' },
+        { name: 'Dry Farm', x: Math.round(-21500 * scale), y: Math.round(15500 * scale), type: 'farm' },
+        { name: 'Container Docks', x: Math.round(22500 * scale), y: Math.round(17500 * scale), type: 'yard' },
+        { name: 'East Depot', x: Math.round(31000 * scale), y: Math.round(-4500 * scale), type: 'yard' },
+        { name: 'River Camp', x: Math.round(8500 * scale), y: Math.round(25500 * scale), type: 'camp' },
+        { name: 'South Bunker', x: Math.round(-4200 * scale), y: Math.round(31500 * scale), type: 'bunker' },
+        { name: 'Military Base', x: Math.round(-25000 * scale), y: Math.round(-25000 * scale), type: 'military' },
+        { name: 'Crossroads Gas', x: Math.round(12000 * scale), y: Math.round(12000 * scale), type: 'gas' },
+        { name: 'State Prison', x: Math.round(28000 * scale), y: Math.round(-25000 * scale), type: 'prison' },
+        { name: 'Central Hospital', x: Math.round(-15000 * scale), y: Math.round(28000 * scale), type: 'hospital' },
+        { name: 'Radio Tower', x: Math.round(28000 * scale), y: Math.round(28000 * scale), type: 'tower' },
     ];
+
 
     for (const poi of pois) {
         landmarks.push({ name: poi.name, x: poi.x, y: poi.y, type: poi.type });
@@ -642,7 +645,8 @@ export function generateSurvivMap(worldHalf) {
             if (Math.hypot(gx, gy) < 1200) continue;
             const x = clamp(gx + (Math.random() - 0.5) * 1850, -worldHalf + 1200, worldHalf - 1200);
             const y = clamp(gy + (Math.random() - 0.5) * 1850, -worldHalf + 1200, worldHalf - 1200);
-            const biome = y < -22000 ? 'snow' : x < -18000 && y > 8500 ? 'dry' : x > 14500 && y > 9500 ? 'pine' : 'grass';
+            const biome = y < -22000 * scale ? 'snow' : x < -18000 * scale && y > 8500 * scale ? 'dry' : x > 14500 * scale && y > 9500 * scale ? 'pine' : 'grass';
+
             const roll = Math.random();
             if (roll < 0.36) addMicroSite(obstacles, loot, spawnPoints, x, y, biome);
             else if (roll < 0.40) addGasStation(obstacles, loot, spawnPoints, x, y);
