@@ -1495,6 +1495,16 @@ function processEntity(entity, room, now, effectiveRadius) {
         entity.equipSlotPending = null;
     }
 
+    // Process weapon reloading tick independent of shooting
+    if (entity.weapon && entity.weapon.reloading) {
+        const wDef = WEAPONS[entity.weapon.type] || WEAPONS.pistol;
+        if (now >= entity.weapon.reloadEndAt) {
+            entity.weapon.reloading = false;
+            entity.weapon.ammo = wDef.clipSize;
+        }
+    }
+
+
     if (entity.isBot) {
         updateBotAI(entity, room, now, effectiveRadius);
     }
@@ -1546,11 +1556,14 @@ function serializePlayer(p, isYou) {
         ammo: p.weapon?.ammo ?? 0,
         clipSize: wDef.clipSize,
         reloading: !!p.weapon?.reloading,
+        reloadEndAt: p.weapon?.reloadEndAt || 0,
+        reloadMs: wDef.reloadMs,
         dollarBalance: p.dollarBalance,
         kills: p.kills || 0,
         isBot: !!p.isBot,
         isYou,
         isCashingOut: !!p.isCashingOut,
+
         inventory: ensureInventory(p),
         lastLoot: isYou ? (p.lastLoot || null) : null,
         openedContainer: isYou ? (p.openedContainer || null) : null,
