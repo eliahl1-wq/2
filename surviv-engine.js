@@ -16,7 +16,7 @@ export const SURVIV = {
     viewRange: 1200,
     botTargetCount: 12,
     zoneDamagePerTick: 0,
-    bulletLifetimeMs: 1200,
+    bulletLifetimeMs: 800,
     lootPickupRadius: 34,
     chestOpenRadius: 92,
 };
@@ -31,7 +31,7 @@ export const WEAPONS = {
         clipSize: 15,
         reloadMs: 1400,
         spread: 0.06,
-        bulletSpeed: 19,
+        bulletSpeed: 34,
         pellets: 1,
     },
     smg: {
@@ -43,7 +43,7 @@ export const WEAPONS = {
         clipSize: 30,
         reloadMs: 1800,
         spread: 0.14,
-        bulletSpeed: 21,
+        bulletSpeed: 38,
         pellets: 1,
     },
     shotgun: {
@@ -55,7 +55,7 @@ export const WEAPONS = {
         clipSize: 6,
         reloadMs: 2200,
         spread: 0.32,
-        bulletSpeed: 17,
+        bulletSpeed: 30,
         pellets: 5,
     },
     assault: {
@@ -67,7 +67,7 @@ export const WEAPONS = {
         clipSize: 22,
         reloadMs: 2000,
         spread: 0.09,
-        bulletSpeed: 23,
+        bulletSpeed: 42,
         pellets: 1,
     },
     revolver: {
@@ -79,7 +79,7 @@ export const WEAPONS = {
         clipSize: 6,
         reloadMs: 1500,
         spread: 0.035,
-        bulletSpeed: 24,
+        bulletSpeed: 44,
         pellets: 1,
     },
     dmr: {
@@ -91,7 +91,7 @@ export const WEAPONS = {
         clipSize: 10,
         reloadMs: 1900,
         spread: 0.025,
-        bulletSpeed: 27,
+        bulletSpeed: 48,
         pellets: 1,
     },
     sniper: {
@@ -103,7 +103,7 @@ export const WEAPONS = {
         clipSize: 5,
         reloadMs: 2400,
         spread: 0.012,
-        bulletSpeed: 31,
+        bulletSpeed: 58,
         pellets: 1,
     },
     lmg: {
@@ -115,7 +115,7 @@ export const WEAPONS = {
         clipSize: 45,
         reloadMs: 2600,
         spread: 0.13,
-        bulletSpeed: 22,
+        bulletSpeed: 40,
         pellets: 1,
     },
 };
@@ -999,6 +999,7 @@ function tryShoot(entity, room, now) {
             vx: Math.cos(angle) * wDef.bulletSpeed,
             vy: Math.sin(angle) * wDef.bulletSpeed,
             damage: wDef.damage,
+            weaponType: entity.weapon?.type || 'pistol',
             bornAt: now,
         });
     }
@@ -1155,9 +1156,112 @@ function takeLootContainerItem(entity, room) {
     }
 }
 
+function putLootContainerItem(entity, room) {
+    const request = entity.putChestItem;
+    if (!request) return;
+    entity.putChestItem = null;
+    const chestId = request.chestId || entity.openedContainerId;
+    const itemKey = request.itemKey;
+    if (!chestId || !itemKey) return;
+    const { item } = getLootContainer(room, chestId);
+    if (!item) return;
+    if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius + 44) return;
+    const contents = item.contents || {};
+    const inv = ensureInventory(entity);
+
+    if (itemKey === 'weapon') {
+        const weaponType = request.weaponType || (entity.weapon?.type !== 'pistol' ? entity.weapon?.type : null);
+        if (weaponType && weaponType !== 'pistol' && inv.weapons.includes(weaponType)) {
+            // Remove from player inventory
+            inv.weapons = inv.weapons.filter(w => w !== weaponType);
+            // Switch active weapon if player was holding it
+            if (entity.weapon?.type === weaponType) {
+                entity.weapon = makeWeaponState(inv.weapons[0] || 'pistol');
+            }
+            // Put into chest contents
+            contents.weaponType = weaponType;
+            contents.rarity = WEAPONS[weaponType]?.rarity || 'common';
+        }
+    } else if (itemKey === 'medkits' && inv.medkits > 0) {
+        inv.medkits -= 1;
+        contents.medkits = (contents.medkits || 0) + 1;
+    } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
+        inv.ammoPacks -= 1;
+        contents.ammoPacks = (contents.ammoPacks || 0) + 1;
+    } else if (itemKey === 'armor' && entity.armor > 0) {
+        const transfer = Math.min(35, Math.round(entity.armor));
+        entity.armor = Math.max(0, entity.armor - transfer);
+        contents.armor = (contents.armor || 0) + transfer;
+    }
+
+    refreshOpenedContainer(entity, room);
+}
+
+function dropPlayerItem(entity, room) {
+    const request = entity.dropItemPending;
+    if (!request) return;
+    entity.dropItemPending = null;
+    const itemKey = request.itemKey;
+    const slotIdx = request.slotIdx;
+    if (!itemKey) return;
+
+    const inv = ensureInventory(entity);
+    const offset = () => (Math.random() - 0.5) * 48;
+    const dropX = entity.x + offset();
+    const dropY = entity.y + offset();
+
+    if (itemKey === 'weapon') {
+        const idx = Number.isInteger(slotIdx) ? slotIdx : inv.weapons.indexOf(entity.weapon?.type);
+        if (idx >= 0 && idx < inv.weapons.length) {
+            const weaponType = inv.weapons[idx];
+            if (weaponType && weaponType !== 'pistol') {
+                inv.weapons.splice(idx, 1);
+                if (entity.weapon?.type === weaponType) {
+                    entity.weapon = makeWeaponState(inv.weapons[0] || 'pistol');
+                }
+                room.loot.push({
+                    id: randId(),
+                    type: 'weapon',
+                    weaponType: weaponType,
+                    x: dropX,
+                    y: dropY
+                });
+            }
+        }
+    } else if (itemKey === 'medkits' && inv.medkits > 0) {
+        inv.medkits -= 1;
+        room.loot.push({
+            id: randId(),
+            type: 'medkit',
+            x: dropX,
+            y: dropY
+        });
+    } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
+        inv.ammoPacks -= 1;
+        room.loot.push({
+            id: randId(),
+            type: 'ammo',
+            x: dropX,
+            y: dropY
+        });
+    } else if (itemKey === 'armor' && entity.armor > 0) {
+        const transfer = Math.min(35, Math.round(entity.armor));
+        entity.armor = Math.max(0, entity.armor - transfer);
+        room.loot.push({
+            id: randId(),
+            type: 'armor',
+            x: dropX,
+            y: dropY
+        });
+    }
+}
+
 function pickupLoot(entity, room) {
+    if (entity.isCashingOut) return;
     openLootContainer(entity, room);
     takeLootContainerItem(entity, room);
+    putLootContainerItem(entity, room);
+    dropPlayerItem(entity, room);
     refreshOpenedContainer(entity, room);
 
     for (let i = room.loot.length - 1; i >= 0; i--) {
@@ -1374,14 +1478,15 @@ function processEntity(entity, room, now, effectiveRadius) {
     if (entity.hp <= 0) return;
     if (entity.isCashingOut) {
         entity.shooting = false;
-        return;
+        entity.useMedkit = false;
+        entity.equipSlotPending = null;
     }
 
-    if (entity.useMedkit) {
+    if (!entity.isCashingOut && entity.useMedkit) {
         useInventoryMedkit(entity);
         entity.useMedkit = false;
     }
-    if (entity.equipSlotPending != null) {
+    if (!entity.isCashingOut && entity.equipSlotPending != null) {
         equipInventorySlot(entity, entity.equipSlotPending);
         entity.equipSlotPending = null;
     }
@@ -1515,7 +1620,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
 
         const visibleBullets = room.bullets
             .filter(b => isInView(viewX, viewY, b.x, b.y, range))
-            .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId }));
+            .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType }));
 
         const visibleObstacles = queryObstacles(room, viewX, viewY, range + 200, false)
             .filter(o => isObstacleInView(viewX, viewY, o, range + 200))

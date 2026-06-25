@@ -4564,20 +4564,41 @@ io.on('connection', (socket) => {
         p.boost = p.isCashingOut ? false : !!boost;
     });
 
-    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot, openChestId, takeChestItem }) => {
+    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot, openChestId, takeChestItem, putChestItem, closeChest, dropItem }) => {
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
-        if (!p || p.isCashingOut) return;
+        if (!p) return;
         p.inputDx = Number(dx) || 0;
         p.inputDy = Number(dy) || 0;
         if (Number.isFinite(aimAngle)) p.aimAngle = aimAngle;
-        p.shooting = p.isCashingOut ? false : !!shooting;
+
+        if (p.isCashingOut) {
+            p.shooting = false;
+            return;
+        }
+
+        p.shooting = !!shooting;
         if (useMedkit) p.useMedkit = true;
         if (typeof openChestId === 'string' && openChestId.length > 0) p.openChestId = openChestId;
         if (takeChestItem && typeof takeChestItem === 'object') {
             const chestId = typeof takeChestItem.chestId === 'string' ? takeChestItem.chestId : null;
             const itemKey = typeof takeChestItem.itemKey === 'string' ? takeChestItem.itemKey : null;
             if (chestId && itemKey) p.takeChestItem = { chestId, itemKey };
+        }
+        if (putChestItem && typeof putChestItem === 'object') {
+            const chestId = typeof putChestItem.chestId === 'string' ? putChestItem.chestId : null;
+            const itemKey = typeof putChestItem.itemKey === 'string' ? putChestItem.itemKey : null;
+            const weaponType = typeof putChestItem.weaponType === 'string' ? putChestItem.weaponType : null;
+            if (chestId && itemKey) p.putChestItem = { chestId, itemKey, weaponType };
+        }
+        if (dropItem && typeof dropItem === 'object') {
+            const itemKey = typeof dropItem.itemKey === 'string' ? dropItem.itemKey : null;
+            const slotIdx = Number.isInteger(dropItem.slotIdx) ? dropItem.slotIdx : null;
+            if (itemKey) p.dropItemPending = { itemKey, slotIdx };
+        }
+        if (closeChest) {
+            p.openedContainerId = null;
+            p.openedContainer = null;
         }
         if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 3) p.equipSlotPending = equipSlot;
         if (reload && p.weapon && !p.weapon.reloading) {
