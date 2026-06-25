@@ -127,9 +127,9 @@ const BOT_NAMES = [
 ];
 
 const WEAPON_RARITY_POOLS = {
-    common: ['revolver', 'smg'],
-    rare: ['shotgun', 'assault', 'dmr'],
-    military: ['assault', 'dmr', 'sniper', 'lmg'],
+    common: ['revolver', 'revolver', 'smg', 'shotgun'],
+    rare: ['smg', 'shotgun', 'assault', 'assault', 'dmr'],
+    military: ['assault', 'dmr', 'dmr', 'sniper', 'lmg'],
 };
 const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
 const SURVIV_OBSTACLE_CELL = 700;
@@ -781,12 +781,13 @@ function ensureInventory(entity) {
 
 function addWeaponToInventory(entity, weaponType) {
     const inv = ensureInventory(entity);
-    if (!weaponType || !WEAPONS[weaponType] || inv.weapons.includes(weaponType)) return;
+    if (!weaponType || !WEAPONS[weaponType] || inv.weapons.includes(weaponType)) return false;
     if (inv.weapons.length < 4) {
         inv.weapons.push(weaponType);
     } else {
         inv.weapons[3] = weaponType;
     }
+    return true;
 }
 
 function describeContainerItems(contents = {}) {
@@ -852,10 +853,12 @@ function applyLootContents(entity, contents = {}, options = {}) {
         entity.weapon.ammo = Math.min(wDef.clipSize, entity.weapon.ammo + Math.ceil(wDef.clipSize * 0.4 * packs));
     }
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
-        entity.weapon = makeWeaponState(contents.weaponType);
-        addWeaponToInventory(entity, contents.weaponType);
-        summary.weaponType = contents.weaponType;
-        summary.weaponLabel = WEAPONS[contents.weaponType].label;
+        const added = addWeaponToInventory(entity, contents.weaponType);
+        if (added || entity.weapon?.type !== contents.weaponType) {
+            entity.weapon = makeWeaponState(contents.weaponType);
+            summary.weaponType = contents.weaponType;
+            summary.weaponLabel = WEAPONS[contents.weaponType].label;
+        }
     }
     return summary;
 }
@@ -1205,6 +1208,11 @@ function takeLootContainerItem(entity, room) {
     const contents = item.contents || {};
     let picked = null;
     if (itemKey === 'weapon' && contents.weaponType) {
+        const inv = ensureInventory(entity);
+        if (inv.weapons.includes(contents.weaponType)) {
+            refreshOpenedContainer(entity, room);
+            return;
+        }
         picked = { weaponType: contents.weaponType, rarity: contents.rarity };
         delete contents.weaponType;
     } else if (itemKey === 'money' && contents.money) {
@@ -1364,6 +1372,7 @@ function pickupLoot(entity, room) {
         } else if (item.type === 'ammo') {
             applyLootContents(entity, { ammoPacks: 1 }, { countChest: false });
         } else if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) {
+            if (ensureInventory(entity).weapons.includes(item.weaponType)) continue;
             applyLootContents(entity, { weaponType: item.weaponType }, { countChest: false });
         }
         room.loot.splice(i, 1);
