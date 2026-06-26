@@ -3831,11 +3831,14 @@ io.on('connection', (socket) => {
                 });
 
                 socket.roomId = room.id;
+                const survivSkinColor = validatedSkinColor === 'random'
+                    ? util.randomSlitherColor()
+                    : (validatedSkinColor || util.randomSlitherColor());
                 const newPlayer = createSurvivPlayer(
                     socket.id,
                     user._id,
                     username || user.username,
-                    validatedSkinColor || util.randomSlitherColor(),
+                    survivSkinColor,
                     room,
                 );
 
