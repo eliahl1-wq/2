@@ -280,6 +280,15 @@ function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
     });
 }
 
+function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south') {
+    return addObstacle(obstacles, 'door', x, y, w, h, {
+        collidable: false,
+        variant,
+        houseId,
+        role: side,
+    });
+}
+
 function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], variant = 'plaster') {
     const min = y - h / 2;
     const max = y + h / 2;
@@ -309,17 +318,21 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
 }
 function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const wall = opts.wall || 14;
-    const door = Math.min(82, w * 0.34);
     const hue = opts.hue ?? 22;
     const variant = opts.variant || 'house';
+    const door = clamp(w * 0.32, 74, variant === 'mansion' || variant === 'warehouse' ? 132 : 104);
     const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, { collidable: false, hue, variant });
     const houseId = floor.id;
 
     addWall(obstacles, x, y - h / 2 + wall / 2, w, wall, variant);
     addWall(obstacles, x - w / 2 + wall / 2, y, wall, h, variant);
     addWall(obstacles, x + w / 2 - wall / 2, y, wall, h, variant);
-    addWall(obstacles, x - door * 0.65, y + h / 2 - wall / 2, w / 2 - door * 0.65, wall, variant);
-    addWall(obstacles, x + door * 0.65, y + h / 2 - wall / 2, w / 2 - door * 0.65, wall, variant);
+    const bottomWallW = Math.max(0, (w - door) / 2);
+    if (bottomWallW > wall * 2) {
+        addWall(obstacles, x - (door / 2 + bottomWallW / 2), y + h / 2 - wall / 2, bottomWallW, wall, variant);
+        addWall(obstacles, x + (door / 2 + bottomWallW / 2), y + h / 2 - wall / 2, bottomWallW, wall, variant);
+    }
+    addDoor(obstacles, houseId, x, y + h / 2 - wall / 2, door, wall * 2.25, variant, 'south');
 
     const large = w >= 430 || h >= 330 || variant === 'mansion' || variant === 'warehouse';
     if (large) {
