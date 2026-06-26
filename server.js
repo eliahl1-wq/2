@@ -4971,11 +4971,7 @@ function processRoom(room) {
             const cellMouseY = targetWorldY - cell.y;
             const angle = Math.atan2(cellMouseY, cellMouseX);
             const distToMouse = Math.hypot(cellMouseX, cellMouseY);
-
-            // Om spelaren har flera celler som är redo att merga, gör rörelsen lite segare (70% hastighet) för lättare kontroll
-            const isReadyToMerge = cell.lastSplit && (Date.now() - cell.lastSplit > 2000);
-            const speedMultiplier = (player.cells.length > 1 && isReadyToMerge) ? 0.70 : 1.0;
-            const moveSpeed = (distToMouse < 50 ? (speed * distToMouse / 50) : speed) * speedMultiplier;
+            // Each split blob keeps movement speed based on its own size.\r\n            const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
             
             const velX = (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
             const velY = (Math.sin(angle) * moveSpeed) + (cell.vy || 0);
@@ -5062,15 +5058,14 @@ function processRoom(room) {
                         cell.isCollidingWithOwn = true;
                         // INTERNAL: Merge or Push
                         const canMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
-                        // Tvinga sammanslagning efter 2 sekunder om mittpunkterna är tillräckligt nära varandra (90% av summan av radierna)
-                        const forceMerge = cell.lastSplit && otherCell.lastSplit && (d < (r + r2) * 0.90) && (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
+                        // Early merge only happens after a deliberate, deeper overlap.\r\n                        const mergeAgeMs = Math.min(Date.now() - (cell.lastSplit || 0), Date.now() - (otherCell.lastSplit || 0));
+                        const forceMerge = cell.lastSplit && otherCell.lastSplit && mergeAgeMs > 6000 && d < (r + r2) * 0.65;
 
                         if (canMerge || forceMerge) {
                             // INTERNAL sammanslagning: Ingen 5% regel.
-                            // Merge om timern är klar (d < r+r2*0.8) ELLER om de trycks in i varandra djupt (forceMerge)
-                            if (d < r + r2 * 0.8 || forceMerge) {
+                            if (d < r + r2 * 0.55 || forceMerge) {
                                 cell.mergeTicks = (cell.mergeTicks || 0) + 1;
-                                if (cell.mergeTicks >= 12) { // Kräver ~300ms av kontinuerlig överlappning för att slås ihop (segare/kontrollerat)
+                                if (cell.mergeTicks >= 20) {
                                     cell.balance += otherCell.balance;
                                     cell.radius = calculateCellRadius(
                                         cell.balance,
@@ -5090,11 +5085,10 @@ function processRoom(room) {
                             }
                             // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Mycket mjukare glidning. Om cellerna har varit delade i >2s, försvaga repulsionen avsevärt (0.005) så de glider ihop smidigt.
-                            const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
+                            // Keep some separation until the player intentionally presses blobs together.\r\n                            const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
                             const overlap = (r + r2 - d);
-                            const isReadyToMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > 2000) && (Date.now() - otherCell.lastSplit > 2000);
-                            const pushStrength = isReadyToMerge ? 0.005 : 0.08;
+                            const isReadyToMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > 6000) && (Date.now() - otherCell.lastSplit > 6000);
+                            const pushStrength = isReadyToMerge ? 0.018 : 0.08;
                             cell.x += Math.cos(pushAngle) * overlap * pushStrength;
                             cell.y += Math.sin(pushAngle) * overlap * pushStrength;
                             cell.mergeTicks = 0;

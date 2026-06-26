@@ -149,11 +149,11 @@ export function scaleForSegmentCount(sct) {
     return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
 }
 
-/** Slither.io angular speed scale — thick snakes turn much slower. */
+/** Slither.io angular speed scale - thick snakes turn slower, but not too sluggishly. */
 export function scangForSegmentCount(sct) {
     const sc = scaleForSegmentCount(sct);
-    // Large snakes steer in wider, slower arcs so they do not fold into themselves weirdly.
-    return Math.max(0.025, (0.13 + 0.87 * Math.pow((7 - sc) / 6, 2)) * (1.0 / Math.pow(sc, 0.45)));
+    const sizeT = Math.max(0, Math.min(1, (7 - sc) / 6));
+    return Math.max(0.045, (0.22 + 0.78 * Math.pow(sizeT, 1.35)) * (1.0 / Math.pow(sc, 0.25)));
 }
 
 export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
