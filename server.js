@@ -89,6 +89,11 @@ if (DEV_FREE_PLAY) {
     console.warn('⚠️ DEV_FREE_PLAY is ON — join/cashout/reset use simulated money (no real Solana).');
 }
 
+function logGameLoopError(label, err) {
+    const message = err?.stack || err?.message || err;
+    console.error(`[GAME LOOP ERROR] ${label}:`, message);
+}
+
 async function updateSolPrice() {
     try {
         const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -4498,7 +4503,8 @@ io.on('connection', (socket) => {
         }, duration);
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+        console.log(`[socket disconnect] id=${socket.id} room=${socket.roomId || 'none'} reason=${reason}`);
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
         if (room.spectators) {
@@ -4720,23 +4726,50 @@ setupSandbox(io, {
 });
 
 setInterval(() => {
-    processBRQueues(io, getBattleRoyaleDeps());
+    try {
+        processBRQueues(io, getBattleRoyaleDeps());
+    } catch (err) {
+        logGameLoopError('battle royale queue', err);
+    }
 }, 1000);
 
 setInterval(() => {
-    const age = Date.now() - GLOBAL_ARENA_START;
-    if (age > c.roomDuration && !isArenaResetting()) {
-        performGlobalArenaReset();
-        return;
-    }
-    if (isArenaResetting()) return;
+    try {
+        const age = Date.now() - GLOBAL_ARENA_START;
+        if (age > c.roomDuration && !isArenaResetting()) {
+            performGlobalArenaReset();
+            return;
+        }
+        if (isArenaResetting()) return;
 
-    rooms.forEach(room => {
-        processRoom(room);
-    });
-    processCompetitiveSlitherTick();
-    processSurvivTick();
-    processBattleRoyaleMatches(io, getBattleRoyaleDeps());
+        rooms.forEach(room => {
+            try {
+                processRoom(room);
+            } catch (err) {
+                logGameLoopError(`room ${room?.id || 'unknown'}`, err);
+            }
+        });
+
+        try {
+            processCompetitiveSlitherTick();
+        } catch (err) {
+            logGameLoopError('competitive slither', err);
+        }
+
+        try {
+            processSurvivTick();
+        } catch (err) {
+            logGameLoopError('surviv', err);
+        }
+
+        try {
+            processBattleRoyaleMatches(io, getBattleRoyaleDeps());
+        } catch (err) {
+            logGameLoopError('battle royale matches', err);
+        }
+    } catch (err) {
+        logGameLoopError('main tick', err);
+    }
 }, 1000 / 40);
 
 function processRoom(room) {
