@@ -3894,13 +3894,22 @@ io.on('connection', (socket) => {
                 return;
             }
             const existingMode = existing?.player?.mode || null;
-            if (existingMode && existingMode !== gameMode) {
-                socket.emit('error', `You already have an active ${existingMode === 'slither' ? 'Slither' : 'Agar'} game. Finish or cash out before starting ${gameMode === 'slither' ? 'Slither' : 'Agar'}.`);
-                return;
-            }
+            const switchingNormalMode = existing?.room && existingMode && existingMode !== gameMode;
 
             const room = existing?.room ?? getRoomForEntry(entryFeeUsd);
-            const existingPlayer = existing?.player ?? null;
+            const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
+            let switchedDollarBalance = null;
+            if (switchingNormalMode) {
+                const oldPlayer = existing.player;
+                switchedDollarBalance = oldPlayer.dollarBalance ?? oldPlayer.balance ?? null;
+                if (oldPlayer.removeTimeout) clearTimeout(oldPlayer.removeTimeout);
+                const oldSocket = io.sockets.sockets.get(oldPlayer.id);
+                if (oldSocket?.connected && oldSocket.id !== socket.id) {
+                    oldSocket.emit('forcedDisconnect');
+                }
+                room.players = room.players.filter(p => p.mongoId?.toString() !== userKey);
+                socket.emit('modeSwitched', { from: existingMode, to: gameMode });
+            }
 
             if (existingPlayer) {
                 const oldSocketId = existingPlayer.id;
@@ -3940,7 +3949,7 @@ io.on('connection', (socket) => {
             // FINANCIAL: Check SOL balance for entry fee
             const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
-            if (!DEV_FREE_PLAY) {
+            if (!switchingNormalMode && !DEV_FREE_PLAY) {
                 // 1. Kontrollera on-chain balans direkt innan start
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const currentLamports = await connection.getBalance(userPubKey);
@@ -3979,12 +3988,12 @@ io.on('connection', (socket) => {
                     socket.emit('error', 'Blockchain transfer failed. Please try again.');
                     return;
                 }
-            } else {
-                console.log(`🎮 [FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
+            } else if (!switchingNormalMode) {
+                console.log(`[FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
             }
 
             // Log Join
-            await Transaction.create({
+            if (!switchingNormalMode) await Transaction.create({
                 userId: user._id,
                 type: 'game',
                 amount: entryFeeInSol,
@@ -4011,8 +4020,10 @@ io.on('connection', (socket) => {
             const maxAi = getTargetBots(agarAfter) * joinBotStake + getSlitherTargetBots(slitherAfter) * joinBotStake;
             const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
             const aiToAdd = Math.min(aiAlloc, aiDeficit);
-            room.aiBudgetBalance += aiToAdd;
-            room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd) + economy.joinFoodBonus;
+            if (!switchingNormalMode) {
+                room.aiBudgetBalance += aiToAdd;
+                room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd) + economy.joinFoodBonus;
+            }
 
             // DYNAMIC BOT SCALING (mode-specific)
             let targetBots = gameMode === 'slither'
@@ -4041,7 +4052,7 @@ io.on('connection', (socket) => {
             }
 
             const startMass = economy.massStartBalance;
-            const startDollars = economy.playerStartBalance;
+            const startDollars = switchedDollarBalance ?? economy.playerStartBalance;
             let newPlayer;
 
             if (gameMode === 'slither') {
@@ -4054,6 +4065,10 @@ io.on('connection', (socket) => {
                     startMass,
                     startDollars,
                 );
+                if (switchedDollarBalance != null) {
+                    newPlayer.dollarBalance = switchedDollarBalance;
+                    newPlayer.balance = Math.max(newPlayer.balance, getEconomy(room.entryFeeUsd).massStartBalance);
+                }
             } else {
                 const spawnX = Math.random() * c.worldWidth;
                 const spawnY = Math.random() * c.worldHeight;
@@ -4085,8 +4100,8 @@ io.on('connection', (socket) => {
                         }
                         return util.randomColor();
                     })(),
-                    x: c.worldWidth / 2,
-                    y: c.worldHeight / 2,
+                    x: spawnX,
+                    y: spawnY,
                     mouseX: 0,
                     mouseY: 0,
                     screenWidth: 1920,
@@ -4102,6 +4117,10 @@ io.on('connection', (socket) => {
                         lastSplit: Date.now()
                     }]
                 };
+                if (switchedDollarBalance != null) {
+                    newPlayer.dollarBalance = switchedDollarBalance;
+                    newPlayer.balance = switchedDollarBalance;
+                }
             }
 
             // Race guard: another join may have completed while we awaited payment
