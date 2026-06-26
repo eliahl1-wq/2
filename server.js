@@ -3877,6 +3877,7 @@ io.on('connection', (socket) => {
             }
 
             const entryFeeUsd = normalizeEntryFee(rawEntryFee);
+            const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const economy = getEconomy(entryFeeUsd);
 
             const existing = findPlayerInArena(userKey);
@@ -3890,6 +3891,11 @@ io.on('connection', (socket) => {
             }
             if (existing && existing.room.entryFeeUsd !== entryFeeUsd) {
                 socket.emit('error', `You have an active $${existing.room.entryFeeUsd} game. Rejoin that stake tier first.`);
+                return;
+            }
+            const existingMode = existing?.player?.mode || null;
+            if (existingMode && existingMode !== gameMode) {
+                socket.emit('error', `You already have an active ${existingMode === 'slither' ? 'Slither' : 'Agar'} game. Finish or cash out before starting ${gameMode === 'slither' ? 'Slither' : 'Agar'}.`);
                 return;
             }
 
@@ -3993,7 +3999,6 @@ io.on('connection', (socket) => {
             });
 
             // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population)
-            const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
             const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
