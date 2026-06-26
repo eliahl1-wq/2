@@ -73,16 +73,20 @@ export function getGoldenBlobValue(entryFeeUsd) {
     return normalizeEntryFee(entryFeeUsd) * GOLDEN_BLOB_ENTRY_SHARE;
 }
 
-/** Food + AI allocation for current population after a join. */
+/**
+ * Conserved food + AI allocation for one paid join.
+ * Player start value + food + AI must always equal exactly the entry fee.
+ */
 export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
     const eco = getEconomy(entryFeeUsd);
-    if (activeHumansAfterJoin < 3) {
-        return { food: eco.foodLow, ai: eco.aiLow };
-    }
-    if (activeHumansAfterJoin < 8) {
-        return { food: eco.foodMid, ai: eco.aiMid };
-    }
-    return { food: eco.foodHigh, ai: eco.aiHigh };
+    const aiTarget = activeHumansAfterJoin < 3
+        ? eco.aiLow
+        : activeHumansAfterJoin < 8
+            ? eco.aiMid
+            : eco.aiHigh;
+    const distributable = Math.max(0, eco.entryFeeUsd - eco.playerStartBalance);
+    const ai = Math.min(distributable, Math.max(0, aiTarget));
+    return { food: distributable - ai, ai };
 }
 
 /**

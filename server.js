@@ -276,6 +276,9 @@ function createArenaRoom(entryFeeUsd) {
         foodPoolBalance: 0,
         aiBudgetBalance: 0,
         ownerBalance: 0,
+        fundedEntryUsd: 0,
+        reservedCashoutUsd: 0,
+        paidCashoutUsd: 0,
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
         qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4),
@@ -367,6 +370,42 @@ function arenaCashoutUsd(player) {
         return player.dollarBalance ?? player.balance ?? 0;
     }
     return player?.balance ?? 0;
+}
+
+function reserveArenaCashout(room, player, requestedUsd) {
+    const requested = Math.max(0, Number(requestedUsd) || 0);
+    const funded = Math.max(0, Number(room.fundedEntryUsd) || 0);
+    const reserved = Math.max(0, Number(room.reservedCashoutUsd) || 0);
+    const paid = Math.max(0, Number(room.paidCashoutUsd) || 0);
+    const available = Math.max(0, funded - reserved - paid);
+    const amount = Math.min(requested, available);
+
+    if (amount + 1e-9 < requested) {
+        console.error(
+            `ECONOMY INVARIANT: ${room.id} requested $${requested.toFixed(6)} cashout `
+            + `with only $${available.toFixed(6)} of paid entries available; payout capped.`,
+        );
+    }
+    if (amount <= 1e-9) throw new Error('No funded arena value available for cashout');
+
+    room.reservedCashoutUsd = reserved + amount;
+    player._arenaCashoutReservationUsd = amount;
+    return amount;
+}
+
+function releaseArenaCashoutReservation(room, player) {
+    const amount = Math.max(0, Number(player?._arenaCashoutReservationUsd) || 0);
+    if (amount <= 0) return;
+    room.reservedCashoutUsd = Math.max(0, (Number(room.reservedCashoutUsd) || 0) - amount);
+    delete player._arenaCashoutReservationUsd;
+}
+
+function commitArenaCashoutReservation(room, player) {
+    const amount = Math.max(0, Number(player?._arenaCashoutReservationUsd) || 0);
+    if (amount <= 0) return;
+    room.reservedCashoutUsd = Math.max(0, (Number(room.reservedCashoutUsd) || 0) - amount);
+    room.paidCashoutUsd = (Number(room.paidCashoutUsd) || 0) + amount;
+    delete player._arenaCashoutReservationUsd;
 }
 
 async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
@@ -572,7 +611,8 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
 }
 
 async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
-    const dollarBalance = arenaCashoutUsd(player);
+    const requestedDollarBalance = arenaCashoutUsd(player);
+    const dollarBalance = reserveArenaCashout(room, player, requestedDollarBalance);
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
     const { cashoutPlayerPct, cashoutFeePct } = getEconomy(entryFeeUsd);
     const playerPayout = dollarBalance * cashoutPlayerPct;
@@ -608,6 +648,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
+        commitArenaCashoutReservation(room, player);
         return { playerPayout, platformFee, signature: 'simulated' };
     }
 
@@ -625,8 +666,10 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
-    if (totalLamports < payoutLamports + feeLamports + feeBuffer) {
+    const feeBuffer = Math.round(0.00002 * solanaWeb3.LAMPORTS_PER_SOL);
+    const canTransferOwnerFee = !!OWNER_VAULT_ADDRESS
+        && totalLamports >= payoutLamports + feeLamports + feeBuffer;
+    if (totalLamports < payoutLamports + feeBuffer) {
         throw new Error('House wallet lacks liquidity');
     }
 
@@ -638,7 +681,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             lamports: payoutLamports,
         })
     );
-    if (feeLamports > 0 && OWNER_VAULT_ADDRESS) {
+    if (feeLamports > 0 && canTransferOwnerFee) {
         transaction.add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: housePubKey,
@@ -649,6 +692,9 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     }
 
     const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+    // The transfer is final even if a later DB/log write fails. Commit now so
+    // this funded value can never be paid twice.
+    commitArenaCashoutReservation(room, player);
 
     room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
     user.playtime += (Date.now() - player.startTime);
@@ -662,8 +708,9 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             ...logMeta,
             signature,
             solAmount: solPayout,
-            feeSolAmount: feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
-            feeDestination: OWNER_VAULT_ADDRESS || null,
+            feeSolAmount: canTransferOwnerFee ? feeLamports / solanaWeb3.LAMPORTS_PER_SOL : 0,
+            feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
+            retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
         status: 'confirmed',
     });
@@ -674,14 +721,22 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 }
 
 async function cashOutCompetitiveRoomPlayers(room) {
+    let allSettled = true;
     const playersToProcess = [...room.players];
     for (const p of playersToProcess) {
-        if (p.isCashingOut) continue;
+        if (p.isCashingOut) {
+            allSettled = false;
+            continue;
+        }
         const mongoId = p.mongoId?.toString();
-        if (!acquireCashoutLock(mongoId)) continue;
+        if (!acquireCashoutLock(mongoId)) {
+            allSettled = false;
+            continue;
+        }
         try {
             await executeCompetitiveCashout(p, room, 'Auto Room Reset');
         } catch (err) {
+            allSettled = false;
             console.error(`Competitive reset cashout failed for ${p.username}:`, err.message);
             await Transaction.create({
                 type: 'game',
@@ -697,18 +752,26 @@ async function cashOutCompetitiveRoomPlayers(room) {
             releaseCashoutLock(mongoId);
         }
     }
-    room.players = [];
+    return allSettled && room.players.length === 0;
 }
 
 async function cashOutSurvivRoomPlayers(room) {
     const playersToProcess = [...room.players];
+    let allSettled = true;
     for (const p of playersToProcess) {
-        if (p.isCashingOut) continue;
+        if (p.isCashingOut) {
+            allSettled = false;
+            continue;
+        }
         const mongoId = p.mongoId?.toString();
-        if (!acquireCashoutLock(mongoId)) continue;
+        if (!acquireCashoutLock(mongoId)) {
+            allSettled = false;
+            continue;
+        }
         try {
             await executeSurvivCashout(p, room, 'Auto Room Reset');
         } catch (err) {
+            allSettled = false;
             console.error(`Surviv reset cashout failed for ${p.username}:`, err.message);
             await Transaction.create({
                 type: 'game',
@@ -724,24 +787,25 @@ async function cashOutSurvivRoomPlayers(room) {
             releaseCashoutLock(mongoId);
         }
     }
-    room.players = [];
-    room.bots = [];
-    room.bullets = [];
-    room.loot = [];
-    room.spectators = [];
+    return allSettled && room.players.length === 0;
 }
 
 // --- RESET FLOW LOGIC ---
 async function cashOutRoomPlayers(room) {
+    let allSettled = true;
     const playersToProcess = [...room.players];
     for (const p of playersToProcess) {
         if (p.isCashingOut || !acquireCashoutLock(p.mongoId)) {
+            allSettled = false;
             console.log(`⏭️ Reset skip cashout for ${p.username} (cashout in progress)`);
             continue;
         }
         try {
             const user = await User.findById(p.mongoId);
-            if (!user) continue;
+            if (!user) {
+                allSettled = false;
+                continue;
+            }
             if (DEV_FREE_PLAY || (user.depositAddress && HOUSE_WALLET_SECRET)) {
                 await executeArenaCashout(
                     p,
@@ -749,6 +813,7 @@ async function cashOutRoomPlayers(room) {
                     DEV_FREE_PLAY ? 'Auto Room Reset (Free Play)' : 'Auto Room Reset to Account Address',
                 );
             } else {
+                allSettled = false;
                 console.warn(`⚠️ Reset cashout skipped for ${p.username}: no depositAddress or house wallet`);
                 await Transaction.create({
                     type: 'game',
@@ -757,6 +822,8 @@ async function cashOutRoomPlayers(room) {
                 });
             }
         } catch (err) {
+            releaseArenaCashoutReservation(room, p);
+            allSettled = false;
             await Transaction.create({
                 type: 'game',
                 amount: 0,
@@ -766,7 +833,7 @@ async function cashOutRoomPlayers(room) {
             releaseCashoutLock(p.mongoId);
         }
     }
-    room.players = [];
+    return allSettled && room.players.length === 0;
 }
 
 function resetRoomEntities(room) {
@@ -781,6 +848,9 @@ function resetRoomEntities(room) {
     room.aiBudgetBalance = 0;
     room.foodPoolBalance = 0;
     room.ownerBalance = 0;
+    room.fundedEntryUsd = 0;
+    room.reservedCashoutUsd = 0;
+    room.paidCashoutUsd = 0;
 }
 
 async function sweepHouseWalletOnReset() {
@@ -839,14 +909,33 @@ async function performGlobalArenaReset() {
     });
 
     try {
+        let allCashoutsSettled = true;
         for (const room of rooms) {
-            await cashOutRoomPlayers(room);
+            const settled = await cashOutRoomPlayers(room);
+            allCashoutsSettled = settled && allCashoutsSettled;
         }
         for (const room of competitiveSlitherRooms) {
-            await cashOutCompetitiveRoomPlayers(room);
+            const settled = await cashOutCompetitiveRoomPlayers(room);
+            allCashoutsSettled = settled && allCashoutsSettled;
         }
         for (const room of survivRooms) {
-            await cashOutSurvivRoomPlayers(room);
+            const settled = await cashOutSurvivRoomPlayers(room);
+            allCashoutsSettled = settled && allCashoutsSettled;
+        }
+
+        if (!allCashoutsSettled) {
+            console.error('Arena reset deferred: every player cashout must settle before any wallet sweep.');
+            await Transaction.create({
+                type: 'game',
+                amount: 0,
+                meta: { event: 'reset_deferred', reason: 'unsettled_cashouts' },
+                status: 'confirmed',
+            });
+            GLOBAL_ARENA_START = Date.now() - c.roomDuration + 30_000;
+            for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
+                room.startTime = GLOBAL_ARENA_START;
+            }
+            return;
         }
 
         try {
@@ -2685,6 +2774,18 @@ app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
     if (globalArenaResetting || rooms.some(r => r.isResetting)) {
         return res.status(409).json({ message: 'Cannot sweep while arena reset is in progress' });
     }
+    const hasNormalLiabilities = rooms.some(room =>
+        (Number(room.fundedEntryUsd) || 0) - (Number(room.paidCashoutUsd) || 0) > 1e-9
+    );
+    const hasCompetitiveLiabilities = competitiveSlitherRooms.some(room =>
+        room.players.length > 0 || room.slitherFood.some(food => (Number(food.dollarValue) || 0) > 0)
+    );
+    const hasSurvivLiabilities = survivRooms.some(room =>
+        room.players.length > 0 || room.bots.length > 0 || room.loot.some(item => (Number(item.contents?.money) || 0) > 0)
+    );
+    if (hasNormalLiabilities || hasCompetitiveLiabilities || hasSurvivLiabilities) {
+        return res.status(409).json({ message: 'Cannot sweep while player-funded game value is outstanding' });
+    }
     try {
         await sweepHouseWalletOnReset();
         res.json({
@@ -2791,6 +2892,7 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
             await executeArenaCashout(p, room, 'Admin Forced Cashout');
             return res.json({ success: true });
         } finally {
+            releaseArenaCashoutReservation(room, p);
             releaseCashoutLock(p.mongoId);
         }
     } catch (err) { res.status(500).send(err.message); }
@@ -4036,7 +4138,8 @@ io.on('connection', (socket) => {
             const aiToAdd = Math.min(aiAlloc, aiDeficit);
             if (!switchingNormalMode) {
                 room.aiBudgetBalance += aiToAdd;
-                room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd) + economy.joinFoodBonus;
+                room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd);
+                room.fundedEntryUsd += entryFeeUsd;
             }
 
             // DYNAMIC BOT SCALING (mode-specific)
@@ -4540,6 +4643,7 @@ io.on('connection', (socket) => {
             try {
                 await executeArenaCashout(activePlayer, activeRoom, 'Arena Cashout');
             } catch (err) {
+                releaseArenaCashoutReservation(activeRoom, activePlayer);
                 console.error('❌ Cashout error:', err.message);
                 io.to(activePlayer.id).emit('error', err.message || 'Transfer failed.');
                 if (activePlayer) activePlayer.isCashingOut = false;
@@ -5088,6 +5192,9 @@ function processRoom(room) {
 
                 if (item.type === 'food') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                        // Quadtree entries are a tick snapshot; another cell may
+                        // already have consumed this exact blob.
+                        if (!room.food.some(f => f.id === item.data.id)) continue;
                         applyAgarFoodPickup(cell, item.data, player, room);
                         cell.radius = calculateCellRadius(
                             cell.balance,
@@ -5099,6 +5206,7 @@ function processRoom(room) {
                     }
                 } else if (item.type === 'ejected') {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                        if (!room.ejected.some(e => e.id === item.data.id)) continue;
                         cell.balance += item.data.balance;
                         const s = playerDollarStart(player);
                         const dollarGain = item.data.dollarValue ?? (item.data.balance * s);
@@ -5183,10 +5291,14 @@ function processRoom(room) {
                         // EXTERNAL: Eat
                         // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r för en mjukare känsla där man äter lättare)
                         if (cell.balance > otherCell.balance * 1.05 && d < r) {
+                            const victim = room.players.find(p => p.id === item.socketId)
+                                || room.bots.find(b => b.id === item.botId);
+                            // Reject stale quadtree cells already consumed by another eater.
+                            if (!victim?.cells?.some(c => c.id === otherCell.id)) continue;
+
                             // EKONOMI: Absorberar 100% av cellmassan + proportionell dollar-andel
                             cell.balance += otherCell.balance;
-                            const victim = room.players.find(p => p.id === item.socketId) || room.bots.find(b => b.id === item.botId);
-                            if (victim) transferAgarDollars(victim, player, otherCell.balance);
+                            transferAgarDollars(victim, player, otherCell.balance);
                             cell.radius = calculateCellRadius(
                                 cell.balance,
                                 playerTotalMass(player),
