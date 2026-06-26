@@ -5053,7 +5053,8 @@ function processRoom(room) {
             const cellMouseY = targetWorldY - cell.y;
             const angle = Math.atan2(cellMouseY, cellMouseX);
             const distToMouse = Math.hypot(cellMouseX, cellMouseY);
-            // Each split blob keeps movement speed based on its own size.\r\n            const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
+            // Each split blob keeps movement speed based on its own size.
+            const moveSpeed = distToMouse < 50 ? (speed * distToMouse / 50) : speed;
             
             const velX = (Math.cos(angle) * moveSpeed) + (cell.vx || 0);
             const velY = (Math.sin(angle) * moveSpeed) + (cell.vy || 0);
@@ -5140,7 +5141,8 @@ function processRoom(room) {
                         cell.isCollidingWithOwn = true;
                         // INTERNAL: Merge or Push
                         const canMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
-                        // Early merge only happens after a deliberate, deeper overlap.\r\n                        const mergeAgeMs = Math.min(Date.now() - (cell.lastSplit || 0), Date.now() - (otherCell.lastSplit || 0));
+                        // Early merge only happens after a deliberate, deeper overlap.
+                        const mergeAgeMs = Math.min(Date.now() - (cell.lastSplit || 0), Date.now() - (otherCell.lastSplit || 0));
                         const forceMerge = cell.lastSplit && otherCell.lastSplit && mergeAgeMs > 6000 && d < (r + r2) * 0.65;
 
                         if (canMerge || forceMerge) {
@@ -5167,7 +5169,8 @@ function processRoom(room) {
                             }
                             // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
                         } else if (d < r + r2) {
-                            // Keep some separation until the player intentionally presses blobs together.\r\n                            const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
+                            // Keep some separation until the player intentionally presses blobs together.
+                            const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
                             const overlap = (r + r2 - d);
                             const isReadyToMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > 6000) && (Date.now() - otherCell.lastSplit > 6000);
                             const pushStrength = isReadyToMerge ? 0.018 : 0.08;
