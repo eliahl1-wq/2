@@ -4105,7 +4105,7 @@ io.on('connection', (socket) => {
                     })(),
                     x: spawnX,
                     y: spawnY,
-                    mouseX: 0,
+                    mouseX: 220,
                     mouseY: 0,
                     screenWidth: 1920,
                     screenHeight: 1080,
@@ -4364,8 +4364,10 @@ io.on('connection', (socket) => {
     socket.on('0', (data) => {
         const br = findBRPlayerBySocket(socket.id);
         if (br) {
-            br.player.mouseX = data.x;
-            br.player.mouseY = data.y;
+            const inputX = Number(data?.x);
+            const inputY = Number(data?.y);
+            if (Number.isFinite(inputX)) br.player.mouseX = inputX;
+            if (Number.isFinite(inputY)) br.player.mouseY = inputY;
             if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
                 br.player.screenWidth = data.screenWidth;
             }
@@ -4377,8 +4379,10 @@ io.on('connection', (socket) => {
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (p) {
-            p.mouseX = data.x;
-            p.mouseY = data.y;
+            const inputX = Number(data?.x);
+            const inputY = Number(data?.y);
+            if (Number.isFinite(inputX)) p.mouseX = inputX;
+            if (Number.isFinite(inputY)) p.mouseY = inputY;
             if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
                 p.screenWidth = data.screenWidth;
             }
