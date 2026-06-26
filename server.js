@@ -3257,7 +3257,8 @@ function playerDollarStart(player) {
 }
 
 function playerTotalMass(player) {
-    return player.cells.reduce((sum, cell) => sum + cell.balance, 0);
+    if (!Array.isArray(player?.cells)) return 0;
+    return player.cells.reduce((sum, cell) => sum + (Number(cell?.balance) || 0), 0);
 }
 
 function applyAgarFoodPickup(cell, food, player, room) {
@@ -3446,7 +3447,9 @@ function rebuildQuadTree(room, allUsers) {
         room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e }));
     });
     allUsers.forEach(player => {
+        if (!Array.isArray(player.cells)) return;
         for (const cell of player.cells) {
+            if (!cell || !Number.isFinite(cell.x) || !Number.isFinite(cell.y)) continue;
             room.qt.insert(new Point(cell.x, cell.y, {
                 type: player.isBot ? 'bot' : 'player',
                 socketId: player.isBot ? undefined : player.id,
@@ -4911,6 +4914,8 @@ function processRoom(room) {
     allUsers.forEach(u => userMap.set(u.id, u));
 
     allUsers.forEach(player => {
+        try {
+        if (!Array.isArray(player.cells)) return;
         // Slither players use server-side physics in slither-engine — skip Agar cell physics
         if (player.mode === 'slither') return;
 
@@ -5238,6 +5243,9 @@ function processRoom(room) {
         if (player.cells.length > 0) {
             player.x = totalX / player.cells.length;
             player.y = totalY / player.cells.length;
+        }
+        } catch (err) {
+            logGameLoopError('agar player tick ' + (player?.id || 'unknown'), err);
         }
     });
 
