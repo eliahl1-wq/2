@@ -3540,6 +3540,17 @@ function playerStartBalance(player) {
     return playerDollarStart(player);
 }
 
+function ensureAgarMovementInput(player) {
+    if (!player || player.isBot || player.mode === 'slither' || player.mode === 'surviv') return;
+    const hasRecentInput = player.lastAgarInputAt && Date.now() - player.lastAgarInputAt < 1500;
+    const x = Number(player.mouseX);
+    const y = Number(player.mouseY);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || (!hasRecentInput && Math.hypot(x || 0, y || 0) < 8)) {
+        player.mouseX = 220;
+        player.mouseY = 0;
+    }
+}
+
 function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c.playerStartBalance) {
     const startMassPerCell = massStart / cellCount;
     const extraMass = Math.max(0, cellMass - startMassPerCell);
@@ -4383,6 +4394,7 @@ io.on('connection', (socket) => {
             const inputY = Number(data?.y);
             if (Number.isFinite(inputX)) p.mouseX = inputX;
             if (Number.isFinite(inputY)) p.mouseY = inputY;
+            if (Number.isFinite(inputX) || Number.isFinite(inputY)) p.lastAgarInputAt = Date.now();
             if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
                 p.screenWidth = data.screenWidth;
             }
@@ -5023,6 +5035,7 @@ function processRoom(room) {
         const cellsToDelete = new Set();
 
         // Calculate absolute target position in the world
+        ensureAgarMovementInput(player);
         const targetWorldX = player.isBot ? player.targetX : (player.x + (player.mouseX || 0));
         const targetWorldY = player.isBot ? player.targetY : (player.y + (player.mouseY || 0));
 
