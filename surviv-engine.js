@@ -9,13 +9,14 @@ const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
 
 export const SURVIV = {
-    worldHalf: 20000,
+    worldHalf: 10000,
     shrinkBeforeResetMs: 3 * 60 * 1000,
 
     playerRadius: 14,
     playerSpeed: 5.2,
     viewRange: 1200,
-    botTargetCount: 12,
+    botMinCount: 3,
+    botMaxCount: 8,
     zoneDamagePerTick: 0,
     bulletLifetimeMs: 800,
     lootPickupRadius: 34,
@@ -23,6 +24,21 @@ export const SURVIV = {
 };
 
 export const WEAPONS = {
+    fists: {
+        id: 'fists',
+        label: 'Fists',
+        rarity: 'common',
+        damage: 18,
+        fireRateMs: 430,
+        melee: true,
+        meleeReach: 58,
+        meleeArc: 0.95,
+        clipSize: 0,
+        reloadMs: 0,
+        spread: 0,
+        bulletSpeed: 0,
+        pellets: 0,
+    },
     pistol: {
         id: 'pistol',
         label: 'Pistol',
@@ -204,15 +220,18 @@ function randomChestContents(tier = 'common', options = {}) {
         contents.money = Number((moneyBase * (0.55 + Math.random())).toFixed(2));
     }
 
-    const weaponChance = tier === 'military' ? 0.84 : tier === 'rare' ? 0.58 : 0.34;
+    const weaponChance = tier === 'military' ? 1 : tier === 'rare' ? 0.82 : 0.48;
     if (Math.random() < weaponChance) contents.weaponType = pickWeaponForTier(tier);
 
-    const ammoRoll = Math.random();
-    if (tier !== 'common' || ammoRoll > 0.22) {
-        contents.ammoPacks = 1 + Math.floor(Math.random() * (tier === 'military' ? 3 : 2));
+    contents.ammoPacks = tier === 'military'
+        ? 2 + Math.floor(Math.random() * 2)
+        : tier === 'rare' ? 2 : 1;
+    if (Math.random() < (tier === 'military' ? 0.86 : tier === 'rare' ? 0.68 : 0.36)) {
+        contents.medkits = tier === 'military' && Math.random() > 0.55 ? 2 : 1;
     }
-    if (Math.random() > (tier === 'common' ? 0.54 : 0.38)) contents.medkits = 1;
-    if (tier !== 'common' || Math.random() > 0.72) contents.armor = tier === 'military' ? 60 : 35;
+    if (Math.random() < (tier === 'military' ? 0.9 : tier === 'rare' ? 0.62 : 0.24)) {
+        contents.armor = tier === 'military' ? 60 : 35;
+    }
     return contents;
 }
 
@@ -225,6 +244,17 @@ function makeChest(x, y, tier = 'common', contents = randomChestContents(tier), 
         tier,
         contents,
         source,
+    };
+}
+
+function makeGroundLoot(type, x, y, extra = {}) {
+    return {
+        id: randId(),
+        type,
+        x,
+        y,
+        source: extra.source || 'ground',
+        ...extra,
     };
 }
 
@@ -373,9 +403,13 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     }
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
-    loot.push(makeChest(x + w * 0.24, y - h * 0.22, chestTier));
-    if (Math.random() > 0.58 || large) loot.push(makeChest(x - w * 0.28, y + h * 0.18, large ? chestTier : 'common'));
-    if (large && Math.random() > 0.35) loot.push(makeChest(x + w * 0.28, y + h * 0.24, Math.random() > 0.5 ? 'rare' : 'common'));
+    const primaryChestChance = large ? 0.84 : 0.46;
+    if (Math.random() < primaryChestChance) {
+        loot.push(makeChest(x + w * 0.24, y - h * 0.22, chestTier));
+    }
+    if (large && Math.random() < 0.24) {
+        loot.push(makeChest(x - w * 0.28, y + h * 0.18, chestTier === 'common' ? 'rare' : chestTier));
+    }
     spawnPoints.push({ x, y: y + h / 2 + 70 });
 }
 
@@ -384,14 +418,16 @@ function addMansion(obstacles, loot, spawnPoints, x, y) {
     addHouse(obstacles, loot, spawnPoints, x, y, 720, 520, { hue: 32, variant: 'mansion', tier: 'rare', wall: 18 });
     addHouse(obstacles, loot, spawnPoints, x - 560, y + 240, 320, 260, { hue: 28, variant: 'guesthouse', tier: 'rare' });
     addHouse(obstacles, loot, spawnPoints, x + 570, y + 250, 300, 250, { hue: 28, variant: 'garage', tier: 'military' });
+    // Perimeter walls with gate on south side
     addWall(obstacles, x, y - 590, 1500, 18, 'stone');
     addWall(obstacles, x - 750, y, 18, 1180, 'stone');
     addWall(obstacles, x + 750, y, 18, 1180, 'stone');
-    addWall(obstacles, x - 260, y + 590, 980, 18, 'stone');
-    addWall(obstacles, x + 600, y + 590, 280, 18, 'stone');
-    for (let i = 0; i < 9; i++) {
-        loot.push(makeChest(x - 320 + i * 80, y - 170 + (i % 3) * 170, i % 3 === 0 ? 'rare' : 'common'));
-    }
+    addWall(obstacles, x - 500, y + 590, 500, 18, 'stone');
+    addWall(obstacles, x + 500, y + 590, 500, 18, 'stone');
+    // Gate pillars
+    addObstacle(obstacles, 'wall', x - 240, y + 590, 40, 40, 'stone');
+    addObstacle(obstacles, 'wall', x + 240, y + 590, 40, 40, 'stone');
+    spawnPoints.push({ x, y: y + 660 });
 }
 
 function addContainerYard(obstacles, loot, spawnPoints, x, y) {
@@ -404,9 +440,10 @@ function addContainerYard(obstacles, loot, spawnPoints, x, y) {
             rotation: (i % 2) * 0.02,
             variant: i % 3 === 0 ? 'red' : 'blue',
         });
-        if (i % 4 === 0) loot.push(makeChest(x - 430 + col * 185, y - 215 + row * 230, 'military'));
     }
+    // Office + warehouse buildings contain all loot
     addHouse(obstacles, loot, spawnPoints, x + 430, y + 285, 300, 220, { variant: 'warehouse', tier: 'military', hue: 205 });
+    addHouse(obstacles, loot, spawnPoints, x - 430, y + 285, 260, 200, { variant: 'warehouse', tier: 'military', hue: 195 });
 }
 
 function addForest(obstacles, loot, spawnPoints, x, y, count = 34, radius = 680) {
@@ -420,25 +457,33 @@ function addForest(obstacles, loot, spawnPoints, x, y, count = 34, radius = 680)
             rotation: Math.random() * Math.PI,
         });
     }
-    loot.push(makeChest(x + 90, y - 60, Math.random() > 0.5 ? 'rare' : 'common'));
+    // Forest cabin so chests are inside a building
+    if (Math.random() > 0.35) {
+        addHouse(obstacles, loot, spawnPoints, x + 90, y - 60, 180, 150, { variant: 'cabin', hue: 18 + Math.floor(Math.random() * 16), tier: Math.random() > 0.5 ? 'rare' : 'common' });
+    }
     spawnPoints.push({ x: x - 130, y: y + 150 });
 }
 
 function addSettlement(obstacles, loot, spawnPoints, x, y, size = 5, variant = 'village') {
-    addObstacle(obstacles, 'field', x, y, 900, 760, { collidable: false, variant });
+    // Scale field to match house count, wider spacing
+    const cols = Math.min(size, 3);
+    const rows = Math.ceil(size / 3);
+    const fieldW = cols * 320 + 200;
+    const fieldH = rows * 290 + 180;
+    addObstacle(obstacles, 'field', x, y, fieldW, fieldH, { collidable: false, variant });
     for (let i = 0; i < size; i++) {
         const col = i % 3;
         const row = Math.floor(i / 3);
-        const hx = x - 260 + col * 260 + (Math.random() - 0.5) * 70;
-        const hy = y - 180 + row * 240 + (Math.random() - 0.5) * 70;
-        addHouse(obstacles, loot, spawnPoints, hx, hy, 160 + Math.random() * 80, 140 + Math.random() * 70, {
+        const hx = x - (cols - 1) * 160 + col * 320 + (Math.random() - 0.5) * 60;
+        const hy = y - (rows - 1) * 145 + row * 290 + (Math.random() - 0.5) * 60;
+        addHouse(obstacles, loot, spawnPoints, hx, hy, 190 + Math.random() * 70, 170 + Math.random() * 60, {
             hue: 18 + Math.floor(Math.random() * 28),
             variant,
             tier: Math.random() > 0.86 ? 'rare' : 'common',
         });
     }
-    for (let i = 0; i < 5; i++) {
-        addObstacle(obstacles, 'crate', x - 360 + Math.random() * 720, y - 320 + Math.random() * 640, 44 + Math.random() * 22, 44 + Math.random() * 22, {
+    for (let i = 0; i < 3; i++) {
+        addObstacle(obstacles, 'crate', x - fieldW * 0.4 + Math.random() * fieldW * 0.8, y - fieldH * 0.4 + Math.random() * fieldH * 0.8, 44 + Math.random() * 22, 44 + Math.random() * 22, {
             hue: 28,
             rotation: (Math.random() - 0.5) * 0.4,
         });
@@ -467,7 +512,7 @@ function addCoverPatch(obstacles, loot, spawnPoints, x, y, opts = {}) {
             rotation: Math.random() * 0.6,
         });
     }
-    if (Math.random() > 0.55) loot.push(makeChest(x + (Math.random() - 0.5) * radius, y + (Math.random() - 0.5) * radius, Math.random() > 0.86 ? 'rare' : 'common'));
+    // No ground chests — chests only in buildings
     if (Math.random() > 0.4) spawnPoints.push({ x, y });
 }
 
@@ -475,106 +520,114 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
     const roll = Math.random();
     const tier = roll > 0.78 ? 'rare' : 'common';
     if (roll < 0.22) {
+        // Cabin site — all loot inside house
         addObstacle(obstacles, 'field', x, y, 650, 520, { collidable: false, variant: 'village' });
-        addHouse(obstacles, loot, spawnPoints, x - 80, y - 20, 170 + Math.random() * 80, 145 + Math.random() * 70, { variant: 'cabin', hue: 18 + Math.floor(Math.random() * 20), tier });
+        addHouse(obstacles, loot, spawnPoints, x - 80, y - 20, 200 + Math.random() * 70, 170 + Math.random() * 60, { variant: 'cabin', hue: 18 + Math.floor(Math.random() * 20), tier });
         addObstacle(obstacles, 'crate', x + 180, y + 100, 46, 46, { hue: 30, rotation: Math.random() * 0.4 });
-        loot.push(makeChest(x + 220, y - 115, tier));
     } else if (roll < 0.42) {
+        // Checkpoint with guardhouse — chest inside building
         addObstacle(obstacles, 'road', x, y, 760, 78, { collidable: false, variant: 'dirt' });
         for (let i = 0; i < 7; i++) {
             const sx = x - 250 + i * 84;
             addObstacle(obstacles, 'sandbag', sx, y - 92, 58, 28, { rotation: (Math.random() - 0.5) * 0.35, variant: 'checkpoint' });
             if (i % 2 === 0) addObstacle(obstacles, 'barrel', sx + 26, y + 78, 30, 30, { hue: 18 + i * 12, variant: 'fuel' });
         }
-        loot.push(makeChest(x + 15, y + 6, Math.random() > 0.55 ? 'military' : 'rare'));
+        addHouse(obstacles, loot, spawnPoints, x + 200, y - 180, 200, 160, { variant: 'warehouse', tier: Math.random() > 0.55 ? 'military' : 'rare', hue: 195 });
         spawnPoints.push({ x: x - 260, y: y + 160 });
     } else if (roll < 0.6) {
+        // Camp with supply tent house
         addObstacle(obstacles, 'field', x, y, 720, 520, { collidable: false, variant: 'camp' });
         for (let i = 0; i < 4; i++) {
             addObstacle(obstacles, 'tent', x - 210 + i * 140, y + (i % 2) * 110 - 55, 92, 64, { hue: 78 + i * 8, rotation: (Math.random() - 0.5) * 0.8, variant: 'camp' });
         }
-        addCoverPatch(obstacles, loot, spawnPoints, x + 40, y - 80, { radius: 260, variant: biome === 'snow' ? 'snow-woods' : 'woods' });
-        loot.push(makeChest(x + 140, y + 135, tier));
+        addHouse(obstacles, loot, spawnPoints, x + 200, y - 160, 190, 160, { variant: 'cabin', hue: 24, tier });
+        addCoverPatch(obstacles, loot, spawnPoints, x - 120, y - 80, { radius: 220, variant: biome === 'snow' ? 'snow-woods' : 'woods' });
     } else if (roll < 0.78) {
+        // Farm — all loot inside barn
         addObstacle(obstacles, 'field', x, y, 820, 580, { collidable: false, variant: 'farm' });
-        addHouse(obstacles, loot, spawnPoints, x - 160, y - 30, 230, 180, { variant: 'barn', hue: 8, tier });
+        addHouse(obstacles, loot, spawnPoints, x - 160, y - 30, 250, 200, { variant: 'barn', hue: 8, tier });
         for (let i = 0; i < 5; i++) addObstacle(obstacles, 'field', x - 300 + i * 145, y + 210, 110, 240, { collidable: false, variant: 'crop' });
         addObstacle(obstacles, 'crate', x + 190, y - 80, 54, 54, { hue: 34, variant: 'hay' });
-        loot.push(makeChest(x + 230, y + 35, Math.random() > 0.7 ? 'rare' : 'common'));
     } else if (roll < 0.9) {
+        // Pond with fishing shack
         addObstacle(obstacles, 'water', x, y, 420 + Math.random() * 220, 250 + Math.random() * 140, { collidable: false, variant: 'pond', rotation: Math.random() * 0.25 });
-        addCoverPatch(obstacles, loot, spawnPoints, x, y, { radius: 420, variant: 'wetlands' });
+        addHouse(obstacles, loot, spawnPoints, x + 280, y - 180, 180, 150, { variant: 'cabin', hue: 22, tier: 'common' });
+        addCoverPatch(obstacles, loot, spawnPoints, x - 200, y + 100, { radius: 300, variant: 'wetlands' });
     } else {
+        // Ruins with shelter
         addObstacle(obstacles, 'field', x, y, 760, 560, { collidable: false, variant: 'ruins' });
         addWall(obstacles, x - 180, y - 90, 260, 16, 'stone');
         addWall(obstacles, x - 300, y + 20, 16, 210, 'stone');
         addWall(obstacles, x + 120, y + 105, 300, 16, 'stone');
         addObstacle(obstacles, 'barrel', x + 160, y - 130, 36, 36, { hue: 210, variant: 'water' });
-        loot.push(makeChest(x - 60, y + 50, Math.random() > 0.4 ? 'rare' : 'common'));
+        addHouse(obstacles, loot, spawnPoints, x - 60, y + 50, 190, 160, { variant: 'cabin', hue: 20, tier: Math.random() > 0.4 ? 'rare' : 'common' });
         spawnPoints.push({ x: x + 230, y: y + 160 });
     }
 }
 
 function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1600, 1400, { collidable: false, variant: 'industrial' });
+    // Perimeter walls with gate on south
     addWall(obstacles, x, y - 690, 1600, 20, 'stone');
     addWall(obstacles, x - 790, y, 20, 1400, 'stone');
     addWall(obstacles, x + 790, y, 20, 1400, 'stone');
-    addWall(obstacles, x - 400, y + 690, 800, 20, 'stone');
-    addWall(obstacles, x + 500, y + 690, 600, 20, 'stone');
+    addWall(obstacles, x - 500, y + 690, 580, 20, 'stone');
+    addWall(obstacles, x + 500, y + 690, 580, 20, 'stone');
+    // Gate pillars
+    addObstacle(obstacles, 'wall', x - 200, y + 690, 36, 36, 'stone');
+    addObstacle(obstacles, 'wall', x + 200, y + 690, 36, 36, 'stone');
 
     // Central Warehouse
     addHouse(obstacles, loot, spawnPoints, x, y, 600, 450, { variant: 'warehouse', tier: 'military', hue: 205, wall: 16 });
-    
-    // Tents and barracks
-    for (let i = 0; i < 4; i++) {
-        addObstacle(obstacles, 'tent', x - 550 + i * 160, y - 450, 120, 80, { hue: 80, rotation: 0, variant: 'camp' });
-        loot.push(makeChest(x - 550 + i * 160, y - 450, 'military'));
+
+    // Barracks buildings (replace open tents with actual buildings)
+    addHouse(obstacles, loot, spawnPoints, x - 550, y - 400, 280, 220, { variant: 'warehouse', tier: 'military', hue: 195, wall: 14 });
+    addHouse(obstacles, loot, spawnPoints, x + 550, y - 400, 280, 220, { variant: 'warehouse', tier: 'military', hue: 195, wall: 14 });
+
+    // Containers (decorative)
+    for (let i = 0; i < 6; i++) {
+        addObstacle(obstacles, 'container', x + 550, y + 100 + i * 90, 125, 54, { hue: 195, rotation: Math.PI / 2, variant: 'blue' });
     }
-    
-    // Containers
-    for (let i = 0; i < 8; i++) {
-        addObstacle(obstacles, 'container', x + 550, y - 400 + i * 110, 125, 54, { hue: 195, rotation: Math.PI / 2, variant: 'blue' });
-    }
-    
+
     // Sandbags and defensive positions
     for (let i = 0; i < 6; i++) {
         addObstacle(obstacles, 'sandbag', x - 200 + i * 80, y + 550, 60, 30, { rotation: 0 });
     }
-    
-    spawnPoints.push({ x: x, y: y + 800 });
+
+    spawnPoints.push({ x: x, y: y + 780 });
 }
 
 function addGasStation(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'road', x, y, 1200, 800, { collidable: false, variant: 'asphalt' });
-    
-    // Store
+
+    // Store — all chests inside
     addHouse(obstacles, loot, spawnPoints, x, y - 200, 450, 250, { variant: 'warehouse', tier: 'rare', hue: 10, wall: 12 });
-    
+
     // Pumps Canopy
     addObstacle(obstacles, 'field', x, y + 150, 500, 200, { collidable: false, variant: 'industrial' });
-    
+
     // Fuel pumps
     for (let i = 0; i < 4; i++) {
         addObstacle(obstacles, 'barrel', x - 150 + i * 100, y + 150, 36, 36, { hue: 15, variant: 'fuel' });
     }
-    
+
     // Cars (colored containers)
     addObstacle(obstacles, 'container', x - 400, y + 250, 110, 50, { hue: 0, rotation: 0.2, variant: 'red' });
     addObstacle(obstacles, 'container', x + 350, y + 100, 110, 50, { hue: 200, rotation: -0.1, variant: 'blue' });
-
-    loot.push(makeChest(x - 100, y + 150, 'common'));
-    loot.push(makeChest(x + 100, y + 150, 'common'));
 }
 
 function addPrison(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1800, 1800, { collidable: false, variant: 'quarry' });
-    
-    // High walls
+
+    // High walls with gate on south
     addWall(obstacles, x, y - 890, 1800, 24, 'stone');
-    addWall(obstacles, x, y + 890, 1800, 24, 'stone');
+    addWall(obstacles, x - 500, y + 890, 780, 24, 'stone');
+    addWall(obstacles, x + 500, y + 890, 780, 24, 'stone');
     addWall(obstacles, x - 890, y, 24, 1800, 'stone');
     addWall(obstacles, x + 890, y, 24, 1800, 'stone');
+    // Gate pillars
+    addObstacle(obstacles, 'wall', x - 100, y + 890, 50, 50, 'stone');
+    addObstacle(obstacles, 'wall', x + 100, y + 890, 50, 50, 'stone');
 
     // Central Yard
     addObstacle(obstacles, 'field', x, y, 600, 600, { collidable: false, variant: 'estate' });
@@ -582,11 +635,13 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
         addObstacle(obstacles, 'barrel', x - 200 + Math.random() * 400, y - 200 + Math.random() * 400, 30, 30, { hue: 20, variant: 'water' });
     }
 
-    // Cell blocks
-    addHouse(obstacles, loot, spawnPoints, x - 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
-    addHouse(obstacles, loot, spawnPoints, x + 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+    // Cell blocks — all loot is inside these buildings
+    addHouse(obstacles, loot, spawnPoints, x - 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'military', hue: 200, wall: 16 });
+    addHouse(obstacles, loot, spawnPoints, x + 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'military', hue: 200, wall: 16 });
     addHouse(obstacles, loot, spawnPoints, x - 500, y + 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
     addHouse(obstacles, loot, spawnPoints, x + 500, y + 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+    // Warden office (center)
+    addHouse(obstacles, loot, spawnPoints, x, y, 260, 220, { variant: 'warehouse', tier: 'military', hue: 210, wall: 14 });
 
     // Guard towers (stone boxes)
     addObstacle(obstacles, 'wall', x - 800, y - 800, 100, 100, 'stone');
@@ -594,57 +649,219 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'wall', x - 800, y + 800, 100, 100, 'stone');
     addObstacle(obstacles, 'wall', x + 800, y + 800, 100, 100, 'stone');
 
-    for (let i = 0; i < 5; i++) loot.push(makeChest(x - 200 + i * 100, y, 'military'));
+    spawnPoints.push({ x, y: y + 960 });
 }
 
 function addHospital(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1400, 1000, { collidable: false, variant: 'estate' });
-    
+
     // Main building
-    addObstacle(obstacles, 'houseFloor', x, y, 1000, 800, { collidable: false, hue: 0, variant: 'mansion' });
+    const hFloor = addObstacle(obstacles, 'houseFloor', x, y, 1000, 800, { collidable: false, hue: 0, variant: 'mansion' });
+    const houseId = hFloor.id;
+    // North wall
     addWall(obstacles, x, y - 400 + 8, 1000, 16, 'plaster');
-    addWall(obstacles, x, y + 400 - 8, 1000, 16, 'plaster');
+    // South wall with entrance gap
+    addWall(obstacles, x - 300, y + 400 - 8, 400, 16, 'plaster');
+    addWall(obstacles, x + 300, y + 400 - 8, 400, 16, 'plaster');
+    addDoor(obstacles, houseId, x, y + 400 - 8, 200, 32, 'plaster', 'south');
+    // Side walls
     addWall(obstacles, x - 500 + 8, y, 16, 800, 'plaster');
     addWall(obstacles, x + 500 - 8, y, 16, 800, 'plaster');
-    
-    // Corridors & Rooms
-    addInteriorWall(obstacles, x - 200, y, 16, 800, 'plaster');
-    addInteriorWall(obstacles, x + 200, y, 16, 800, 'plaster');
-    
-    addInteriorWall(obstacles, x - 350, y, 300, 16, 'plaster');
-    addInteriorWall(obstacles, x + 350, y, 300, 16, 'plaster');
 
-    // Beds everywhere
+    // Corridor walls with doorway gaps
+    addVerticalInteriorWallSegments(obstacles, x - 200, y, 800, 16, [
+        { center: -200, size: 90 },
+        { center: 0, size: 90 },
+        { center: 200, size: 90 },
+    ], 'plaster');
+    addVerticalInteriorWallSegments(obstacles, x + 200, y, 800, 16, [
+        { center: -200, size: 90 },
+        { center: 0, size: 90 },
+        { center: 200, size: 90 },
+    ], 'plaster');
+
+    // Horizontal dividers with gaps
+    addHorizontalInteriorWallSegments(obstacles, x - 350, y, 300, 16, [{ center: 0, size: 80 }], 'plaster');
+    addHorizontalInteriorWallSegments(obstacles, x + 350, y, 300, 16, [{ center: 0, size: 80 }], 'plaster');
+
+    // Room zones
+    addRoomZone(obstacles, houseId, x - 350, y - 200, 300, 400, 'north-room');
+    addRoomZone(obstacles, houseId, x - 350, y + 200, 300, 400, 'south-room');
+    addRoomZone(obstacles, houseId, x, y, 400, 800, 'hallway');
+    addRoomZone(obstacles, houseId, x + 350, y - 200, 300, 400, 'north-room');
+    addRoomZone(obstacles, houseId, x + 350, y + 200, 300, 400, 'south-room');
+
+    // Beds
     for (let i = 0; i < 4; i++) {
-        addObstacle(obstacles, 'furniture', x - 400, y - 250 + i * 80, 36, 28, { collidable: false, variant: 'bed' });
-        addObstacle(obstacles, 'furniture', x + 400, y - 250 + i * 80, 36, 28, { collidable: false, variant: 'bed' });
+        addObstacle(obstacles, 'furniture', x - 400, y - 250 + i * 130, 36, 28, { collidable: false, variant: 'bed' });
+        addObstacle(obstacles, 'furniture', x + 400, y - 250 + i * 130, 36, 28, { collidable: false, variant: 'bed' });
     }
+    addObstacle(obstacles, 'furniture', x - 100, y - 100, 42, 30, { collidable: false, variant: 'table' });
+    addObstacle(obstacles, 'furniture', x + 100, y - 100, 42, 30, { collidable: false, variant: 'table' });
 
-    // Lots of loot
-    for (let i = 0; i < 12; i++) {
-        loot.push(makeChest(x - 450 + Math.random() * 900, y - 350 + Math.random() * 700, Math.random() > 0.5 ? 'rare' : 'common'));
-    }
+    // The hospital is a high-value landmark, but the crates stay sparse and meaningful.
+    loot.push(makeChest(x - 380, y - 240, 'rare'));
+    loot.push(makeChest(x + 380, y + 220, 'rare'));
+    loot.push(makeChest(x - 60, y + 250, 'military'));
+    if (Math.random() < 0.45) loot.push(makeChest(x + 380, y - 220, 'rare'));
+
+    spawnPoints.push({ x, y: y + 480 });
 }
 
 function addRadioTower(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 800, 800, { collidable: false, variant: 'industrial' });
-    
-    // Fence
+
+    // Fence with gate on south
     addWall(obstacles, x, y - 390, 800, 10, 'stone');
-    addWall(obstacles, x, y + 390, 800, 10, 'stone');
+    addWall(obstacles, x - 250, y + 390, 280, 10, 'stone');
+    addWall(obstacles, x + 250, y + 390, 280, 10, 'stone');
     addWall(obstacles, x - 390, y, 10, 800, 'stone');
     addWall(obstacles, x + 390, y, 10, 800, 'stone');
 
-    // Tower Base
-    addObstacle(obstacles, 'wall', x, y, 150, 150, 'warehouse');
-    addInteriorWall(obstacles, x, y, 250, 20, 'warehouse');
-    addInteriorWall(obstacles, x, y, 20, 250, 'warehouse');
+    // Tower Base (decorative, not blocking)
+    addObstacle(obstacles, 'wall', x, y, 80, 80, 'warehouse');
 
-    // Control building
-    addHouse(obstacles, loot, spawnPoints, x - 200, y - 200, 150, 150, { variant: 'warehouse', tier: 'rare', hue: 200 });
-    
-    loot.push(makeChest(x + 100, y + 100, 'military'));
-    loot.push(makeChest(x - 100, y + 100, 'military'));
+    // Control building — all loot inside
+    addHouse(obstacles, loot, spawnPoints, x - 200, y - 200, 200, 180, { variant: 'warehouse', tier: 'rare', hue: 200 });
+    addHouse(obstacles, loot, spawnPoints, x + 160, y + 160, 200, 180, { variant: 'warehouse', tier: 'military', hue: 205 });
+
+    spawnPoints.push({ x, y: y + 460 });
+}
+
+// --- Rivers & Bridges ---
+
+function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12) {
+    const points = [{ x: startX, y: startY }];
+    for (let i = 1; i < segments; i++) {
+        const t = i / segments;
+        const baseX = startX + (endX - startX) * t;
+        const baseY = startY + (endY - startY) * t;
+        const wander = worldHalf * 0.12;
+        points.push({
+            x: baseX + (Math.random() - 0.5) * wander,
+            y: baseY + (Math.random() - 0.5) * wander,
+        });
+    }
+    points.push({ x: endX, y: endY });
+    return points;
+}
+
+function addRiver(obstacles, worldHalf, startX, startY, endX, endY, width = 220) {
+    const points = generateRiverPath(worldHalf, startX, startY, endX, endY, 14);
+    const riverSegments = [];
+    for (let i = 0; i < points.length - 1; i++) {
+        const a = points[i];
+        const b = points[i + 1];
+        const mx = (a.x + b.x) / 2;
+        const my = (a.y + b.y) / 2;
+        const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+        const angle = Math.atan2(b.y - a.y, b.x - a.x);
+        const segWidth = width * (0.8 + Math.random() * 0.4);
+        addObstacle(obstacles, 'river', mx, my, segLen + width * 0.5, segWidth, {
+            collidable: false,
+            variant: 'river',
+            rotation: angle,
+        });
+        riverSegments.push({ x: mx, y: my, w: segLen + width * 0.5, h: segWidth, angle });
+    }
+    return { points, segments: riverSegments };
+}
+
+function addBridge(obstacles, x, y, width, length, rotation = 0) {
+    // Road surface
+    addObstacle(obstacles, 'bridge', x, y, length, width, {
+        collidable: false,
+        variant: 'bridge',
+        rotation,
+    });
+    // Railings
+    const cos = Math.cos(rotation);
+    const sin = Math.sin(rotation);
+    const railOffset = width / 2 - 8;
+    addObstacle(obstacles, 'wall', x - sin * railOffset, y + cos * railOffset, length, 12, {
+        rotation,
+        variant: 'stone',
+        hue: 210,
+    });
+    addObstacle(obstacles, 'wall', x + sin * railOffset, y - cos * railOffset, length, 12, {
+        rotation,
+        variant: 'stone',
+        hue: 210,
+    });
+}
+
+function addBridgesAlongRiver(obstacles, riverData, roadPositions) {
+    // Place bridges where roads are closest to the river
+    for (const rp of roadPositions) {
+        let bestDist = Infinity;
+        let bestSeg = null;
+        for (const seg of riverData.segments) {
+            const d = Math.hypot(rp.x - seg.x, rp.y - seg.y);
+            if (d < bestDist) {
+                bestDist = d;
+                bestSeg = seg;
+            }
+        }
+        if (bestSeg && bestDist < 2000) {
+            const bridgeAngle = bestSeg.angle + Math.PI / 2;
+            addBridge(obstacles, bestSeg.x, bestSeg.y, 140, bestSeg.h + 80, bridgeAngle);
+        }
+    }
+}
+
+// --- Standalone house for filling gaps ---
+
+function addStandaloneHouse(obstacles, loot, spawnPoints, x, y) {
+    const variants = ['cabin', 'house', 'barn'];
+    const variant = variants[Math.floor(Math.random() * variants.length)];
+    const w = 190 + Math.random() * 80;
+    const h = 170 + Math.random() * 60;
+    const tier = Math.random() > 0.82 ? 'rare' : 'common';
+    addHouse(obstacles, loot, spawnPoints, x, y, w, h, {
+        variant,
+        hue: 14 + Math.floor(Math.random() * 24),
+        tier,
+    });
+    // Some decoration around the house
+    if (Math.random() > 0.4) {
+        addObstacle(obstacles, 'crate', x + w * 0.5 + 40, y + (Math.random() - 0.5) * h * 0.5, 44, 44, {
+            hue: 28, rotation: Math.random() * 0.3,
+        });
+    }
+    if (Math.random() > 0.5) {
+        addObstacle(obstacles, 'tree', x - w * 0.5 - 50 - Math.random() * 40, y - h * 0.3, 36 + Math.random() * 20, 36 + Math.random() * 20, {
+            hue: 108 + Math.floor(Math.random() * 24),
+            rotation: Math.random() * Math.PI,
+        });
+    }
+}
+
+function addScatteredGroundLoot(obstacles, loot, worldHalf) {
+    const groundItemCount = 42;
+    for (let i = 0; i < groundItemCount; i++) {
+        for (let attempt = 0; attempt < 40; attempt++) {
+            const pos = randomSpawnCoord(worldHalf * 0.92);
+            const blocked = obstacles.some(o => o.collidable !== false && circleRectCollision(pos.x, pos.y, 24, o));
+            if (blocked) continue;
+
+            const roll = Math.random();
+            if (roll < 0.36) {
+                loot.push(makeGroundLoot('ammo', pos.x, pos.y));
+            } else if (roll < 0.62) {
+                loot.push(makeGroundLoot('medkit', pos.x, pos.y));
+            } else if (roll < 0.82) {
+                loot.push(makeGroundLoot('armor', pos.x, pos.y, { armorValue: 35 }));
+            } else {
+                const tier = Math.random() < 0.08 ? 'rare' : 'common';
+                const weaponType = pickWeaponForTier(tier);
+                loot.push(makeGroundLoot('weapon', pos.x, pos.y, {
+                    weaponType,
+                    tier: WEAPONS[weaponType]?.rarity || tier,
+                }));
+            }
+            break;
+        }
+    }
 }
 
 export function generateSurvivMap(worldHalf) {
@@ -674,10 +891,12 @@ export function generateSurvivMap(worldHalf) {
         { name: 'Radio Tower', x: Math.round(28000 * scale), y: Math.round(28000 * scale), type: 'tower' },
     ];
 
-
+    // --- Place POIs ---
+    const poiPositions = [];
     for (const poi of pois) {
         landmarks.push({ name: poi.name, x: poi.x, y: poi.y, type: poi.type });
         addRoad(obstacles, 0, 0, poi.x, poi.y, poi.type === 'mansion' ? 190 : 145);
+        poiPositions.push({ x: poi.x, y: poi.y });
         if (poi.type === 'mansion') addMansion(obstacles, loot, spawnPoints, poi.x, poi.y);
         else if (poi.type === 'yard') addContainerYard(obstacles, loot, spawnPoints, poi.x, poi.y);
         else if (poi.type === 'quarry') {
@@ -685,21 +904,24 @@ export function generateSurvivMap(worldHalf) {
             for (let i = 0; i < 24; i++) {
                 addObstacle(obstacles, 'rock', poi.x - 520 + Math.random() * 1040, poi.y - 390 + Math.random() * 780, 54 + Math.random() * 48, 48 + Math.random() * 42, { hue: 220, rotation: Math.random() * 0.4 });
             }
+            // Quarry buildings contain all loot
             addHouse(obstacles, loot, spawnPoints, poi.x + 360, poi.y - 260, 300, 230, { variant: 'warehouse', tier: 'military', hue: 205 });
-            for (let i = 0; i < 8; i++) loot.push(makeChest(poi.x - 420 + i * 120, poi.y + 250 + (i % 2) * 70, 'military'));
+            addHouse(obstacles, loot, spawnPoints, poi.x - 340, poi.y + 200, 280, 210, { variant: 'warehouse', tier: 'military', hue: 200 });
         } else if (poi.type === 'lab') {
             addSettlement(obstacles, loot, spawnPoints, poi.x, poi.y, 7, 'snow-lab');
-            addContainerYard(obstacles, loot, spawnPoints, poi.x + 650, poi.y + 200);
+            addContainerYard(obstacles, loot, spawnPoints, poi.x + 850, poi.y + 300);
         } else if (poi.type === 'farm') {
             addSettlement(obstacles, loot, spawnPoints, poi.x, poi.y, 6, 'farm');
             for (let i = 0; i < 7; i++) addObstacle(obstacles, 'field', poi.x - 780 + i * 260, poi.y + 560, 190, 420, { collidable: false, variant: 'crop' });
         } else if (poi.type === 'camp') {
-            for (let i = 0; i < 7; i++) addMicroSite(obstacles, loot, spawnPoints, poi.x - 700 + i * 220, poi.y + (i % 2) * 260 - 120, 'wetlands');
+            for (let i = 0; i < 5; i++) addMicroSite(obstacles, loot, spawnPoints, poi.x - 550 + i * 280, poi.y + (i % 2) * 300 - 150, 'wetlands');
             addForest(obstacles, loot, spawnPoints, poi.x, poi.y - 380, 38, 760);
         } else if (poi.type === 'bunker') {
             addObstacle(obstacles, 'field', poi.x, poi.y, 1200, 820, { collidable: false, variant: 'ruins' });
+            // All loot inside bunker buildings
             addHouse(obstacles, loot, spawnPoints, poi.x, poi.y, 520, 360, { variant: 'warehouse', tier: 'military', hue: 205, wall: 18 });
-            for (let i = 0; i < 10; i++) loot.push(makeChest(poi.x - 340 + i * 78, poi.y - 130 + (i % 3) * 120, i % 2 ? 'rare' : 'military'));
+            addHouse(obstacles, loot, spawnPoints, poi.x - 380, poi.y - 200, 260, 200, { variant: 'warehouse', tier: 'military', hue: 200 });
+            addHouse(obstacles, loot, spawnPoints, poi.x + 380, poi.y - 200, 260, 200, { variant: 'warehouse', tier: 'rare', hue: 200 });
         } else if (poi.type === 'hospital') {
             addHospital(obstacles, loot, spawnPoints, poi.x, poi.y);
         } else if (poi.type === 'prison') {
@@ -715,38 +937,91 @@ export function generateSurvivMap(worldHalf) {
         }
     }
 
+    // --- Inter-POI roads ---
     for (let i = 0; i < pois.length - 1; i++) {
         const a = pois[i];
         const b = pois[i + 1];
-        if (Math.random() > 0.25) addRoad(obstacles, a.x, a.y, b.x, b.y, 100);
+        if (Math.random() > 0.2) addRoad(obstacles, a.x, a.y, b.x, b.y, 100);
     }
 
-    for (let i = 0; i < 68; i++) {
+    // --- Rivers (2-3 crossing the map) ---
+    const rivers = [];
+    rivers.push(addRiver(obstacles, worldHalf,
+        -worldHalf * 0.85, -worldHalf * 0.3,
+        worldHalf * 0.9, worldHalf * 0.5, 200 + Math.random() * 60));
+    rivers.push(addRiver(obstacles, worldHalf,
+        -worldHalf * 0.2, -worldHalf * 0.9,
+        worldHalf * 0.4, worldHalf * 0.85, 180 + Math.random() * 50));
+    if (Math.random() > 0.3) {
+        rivers.push(addRiver(obstacles, worldHalf,
+            -worldHalf * 0.7, worldHalf * 0.6,
+            worldHalf * 0.8, -worldHalf * 0.4, 160 + Math.random() * 40));
+    }
+
+    // --- Bridges where roads cross rivers ---
+    for (const river of rivers) {
+        addBridgesAlongRiver(obstacles, river, poiPositions);
+    }
+
+    // --- Even distribution: grid-based settlement placement ---
+    // Use a grid to evenly spread settlements across the map
+    const settlementStep = 5200;
+    const settlementMargin = 3000;
+    const minPoiDist = 2200;
+    const placedPositions = [...poiPositions];
+
+    for (let gx = -worldHalf + settlementMargin; gx <= worldHalf - settlementMargin; gx += settlementStep) {
+        for (let gy = -worldHalf + settlementMargin; gy <= worldHalf - settlementMargin; gy += settlementStep) {
+            const x = clamp(gx + (Math.random() - 0.5) * 2200, -worldHalf + 1800, worldHalf - 1800);
+            const y = clamp(gy + (Math.random() - 0.5) * 2200, -worldHalf + 1800, worldHalf - 1800);
+            // Skip if too close to a POI or already placed settlement
+            const tooClose = placedPositions.some(p => Math.hypot(p.x - x, p.y - y) < minPoiDist);
+            if (tooClose) continue;
+            placedPositions.push({ x, y });
+
+            const roll = Math.random();
+            if (roll < 0.40) {
+                const size = 3 + Math.floor(Math.random() * 3);
+                const variant = roll < 0.10 ? 'farm' : roll < 0.18 ? 'camp' : 'village';
+                addSettlement(obstacles, loot, spawnPoints, x, y, size, variant);
+            } else if (roll < 0.65) {
+                addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
+            } else {
+                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
+            }
+        }
+    }
+
+    // --- Forests (evenly scattered, fewer than before) ---
+    for (let i = 0; i < 18; i++) {
         const pos = randomSpawnCoord(worldHalf * 0.88);
-        addSettlement(obstacles, loot, spawnPoints, pos.x, pos.y, 3 + Math.floor(Math.random() * 4), i % 5 === 0 ? 'farm' : i % 7 === 0 ? 'camp' : 'village');
-    }
-
-    for (let i = 0; i < 46; i++) {
-        const pos = randomSpawnCoord(worldHalf * 0.9);
         addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 18 + Math.floor(Math.random() * 22), 360 + Math.random() * 420);
     }
 
-    const step = 3900;
-    const margin = 2600;
-    for (let gx = -worldHalf + margin; gx <= worldHalf - margin; gx += step) {
-        for (let gy = -worldHalf + margin; gy <= worldHalf - margin; gy += step) {
-            if (Math.hypot(gx, gy) < 1200) continue;
-            const x = clamp(gx + (Math.random() - 0.5) * 1850, -worldHalf + 1200, worldHalf - 1200);
-            const y = clamp(gy + (Math.random() - 0.5) * 1850, -worldHalf + 1200, worldHalf - 1200);
-            const biome = 'grass';
+    // --- Fill remaining grid with cover/sites/houses ---
+    const fillStep = 3200;
+    const fillMargin = 2000;
+    for (let gx = -worldHalf + fillMargin; gx <= worldHalf - fillMargin; gx += fillStep) {
+        for (let gy = -worldHalf + fillMargin; gy <= worldHalf - fillMargin; gy += fillStep) {
+            const x = clamp(gx + (Math.random() - 0.5) * 1600, -worldHalf + 1200, worldHalf - 1200);
+            const y = clamp(gy + (Math.random() - 0.5) * 1600, -worldHalf + 1200, worldHalf - 1200);
+            const nearAny = placedPositions.some(p => Math.hypot(p.x - x, p.y - y) < 1800);
+            if (nearAny) continue;
 
             const roll = Math.random();
-            if (roll < 0.36) addMicroSite(obstacles, loot, spawnPoints, x, y, biome);
-            else if (roll < 0.40) addGasStation(obstacles, loot, spawnPoints, x, y);
-            else if (roll < 0.44) addRadioTower(obstacles, loot, spawnPoints, x, y);
-            else if (roll < 0.74) addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
+            if (roll < 0.35) {
+                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
+                placedPositions.push({ x, y });
+            } else if (roll < 0.55) {
+                addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
+                placedPositions.push({ x, y });
+            } else if (roll < 0.80) {
+                addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
+            }
         }
     }
+
+    addScatteredGroundLoot(obstacles, loot, worldHalf);
 
     return { obstacles, loot, spawnPoints, landmarks };
 }
@@ -764,7 +1039,7 @@ export function getSurvivZone() {
 }
 
 function makeWeaponState(typeId) {
-    const def = WEAPONS[typeId] || WEAPONS.pistol;
+    const def = WEAPONS[typeId] || WEAPONS.fists;
     return {
         type: def.id,
         ammo: def.clipSize,
@@ -776,7 +1051,7 @@ function makeWeaponState(typeId) {
 
 function makeInventory() {
     return {
-        weapons: ['pistol'],
+        weapons: ['fists'],
         medkits: 0,
         ammoPacks: 0,
         chestsOpened: 0,
@@ -785,7 +1060,11 @@ function makeInventory() {
 
 function ensureInventory(entity) {
     if (!entity.inventory) entity.inventory = makeInventory();
-    if (!Array.isArray(entity.inventory.weapons)) entity.inventory.weapons = ['pistol'];
+    const currentWeapons = Array.isArray(entity.inventory.weapons) ? entity.inventory.weapons : [];
+    const validWeapons = currentWeapons.filter((weapon, index) => (
+        weapon !== 'fists' && WEAPONS[weapon] && currentWeapons.indexOf(weapon) === index
+    ));
+    entity.inventory.weapons = ['fists', ...validWeapons].slice(0, 4);
     entity.inventory.medkits = Number(entity.inventory.medkits) || 0;
     entity.inventory.ammoPacks = Number(entity.inventory.ammoPacks) || 0;
     entity.inventory.chestsOpened = Number(entity.inventory.chestsOpened) || 0;
@@ -862,7 +1141,7 @@ function applyLootContents(entity, contents = {}, options = {}) {
         const packs = Number(contents.ammoPacks || 0);
         summary.ammoPacks = packs;
         inv.ammoPacks = Math.min(9, inv.ammoPacks + packs);
-        const wDef = WEAPONS[entity.weapon.type] || WEAPONS.pistol;
+        const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
         entity.weapon.ammo = Math.min(wDef.clipSize, entity.weapon.ammo + Math.ceil(wDef.clipSize * 0.4 * packs));
     }
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
@@ -908,7 +1187,7 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         maxHp: 100,
         armor: 0,
         maxArmor: 100,
-        weapon: makeWeaponState('pistol'),
+        weapon: makeWeaponState('fists'),
         dollarBalance: eco.playerStartBalance,
         entryFeeUsd: room.entryFeeUsd,
         inputDx: 0,
@@ -1061,8 +1340,38 @@ function moveEntity(entity, room, dx, dy, speed) {
 
 function tryShoot(entity, room, now) {
     if (entity.isCashingOut || entity.hp <= 0) return;
-    const wDef = WEAPONS[entity.weapon.type] || WEAPONS.pistol;
+    const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
     const w = entity.weapon;
+
+    if (wDef.melee) {
+        if (now - w.lastShotAt < wDef.fireRateMs) return;
+        w.lastShotAt = now;
+        entity.meleeUntil = now + 150;
+
+        const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
+        const targets = [
+            ...room.players.filter(p => !p.disconnected),
+            ...room.bots,
+        ].filter(target => target.id !== entity.id && target.hp > 0);
+        let closest = null;
+        let closestDistance = Infinity;
+        for (const target of targets) {
+            const targetDistance = dist(entity.x, entity.y, target.x, target.y);
+            if (targetDistance > wDef.meleeReach + SURVIV.playerRadius) continue;
+            const targetAngle = Math.atan2(target.y - entity.y, target.x - entity.x);
+            const angleDelta = Math.abs(Math.atan2(Math.sin(targetAngle - baseAngle), Math.cos(targetAngle - baseAngle)));
+            if (angleDelta > wDef.meleeArc) continue;
+            if (targetDistance < closestDistance) {
+                closest = target;
+                closestDistance = targetDistance;
+            }
+        }
+        if (closest) {
+            applyDamage(closest, wDef.damage, entity);
+            if (closest.hp <= 0) eliminateSurvivPlayer(room, closest, room._io);
+        }
+        return;
+    }
 
     if (w.reloading) {
         if (now >= w.reloadEndAt) {
@@ -1099,7 +1408,7 @@ function tryShoot(entity, room, now) {
             vx: Math.cos(angle) * wDef.bulletSpeed,
             vy: Math.sin(angle) * wDef.bulletSpeed,
             damage: wDef.damage,
-            weaponType: entity.weapon?.type || 'pistol',
+            weaponType: entity.weapon?.type || 'fists',
             bornAt: now,
         });
     }
@@ -1119,20 +1428,41 @@ function applyDamage(target, damage, attacker) {
 }
 
 function dropDeathLoot(room, entity) {
-    const contents = {
-        money: Math.max(0, Number(entity.dollarBalance || 0)),
-        medkits: ensureInventory(entity).medkits || 0,
-        ammoPacks: ensureInventory(entity).ammoPacks || 0,
-        weaponType: entity.weapon?.type && entity.weapon.type !== 'pistol' ? entity.weapon.type : null,
+    const inventory = ensureInventory(entity);
+    const scatter = (index, total, radius = 36) => {
+        const angle = (index / Math.max(1, total)) * Math.PI * 2 + Math.random() * 0.35;
+        const distance = 16 + Math.random() * radius;
+        return {
+            x: entity.x + Math.cos(angle) * distance,
+            y: entity.y + Math.sin(angle) * distance,
+        };
     };
-    if (isContainerEmpty(contents)) return;
-    room.loot.push(makeChest(
-        entity.x + (Math.random() - 0.5) * 24,
-        entity.y + (Math.random() - 0.5) * 24,
-        'rare',
-        contents,
-        'death',
-    ));
+    const drops = [];
+    const money = Math.max(0, Number(entity.dollarBalance || 0));
+    if (money > 0) drops.push({ type: 'money', dollarValue: money });
+    for (const weaponType of inventory.weapons) {
+        if (weaponType !== 'fists' && WEAPONS[weaponType]) {
+            drops.push({ type: 'weapon', weaponType, tier: WEAPONS[weaponType].rarity || 'common' });
+        }
+    }
+    if (inventory.medkits > 0) drops.push({ type: 'medkit', amount: inventory.medkits });
+    if (inventory.ammoPacks > 0) drops.push({ type: 'ammo', amount: inventory.ammoPacks });
+    if (entity.armor > 0) drops.push({ type: 'armor', armorValue: Math.round(entity.armor) });
+
+    drops.forEach((drop, index) => {
+        const pos = scatter(index, drops.length);
+        room.loot.push(makeGroundLoot(drop.type, pos.x, pos.y, {
+            ...drop,
+            source: 'death',
+            pickupAfter: Date.now() + 900,
+        }));
+    });
+
+    entity.dollarBalance = 0;
+    entity.armor = 0;
+    inventory.weapons = ['fists'];
+    inventory.medkits = 0;
+    inventory.ammoPacks = 0;
 }
 
 function eliminateSurvivPlayer(room, player, io) {
@@ -1276,13 +1606,13 @@ function putLootContainerItem(entity, room) {
     const inv = ensureInventory(entity);
 
     if (itemKey === 'weapon') {
-        const weaponType = request.weaponType || (entity.weapon?.type !== 'pistol' ? entity.weapon?.type : null);
-        if (weaponType && weaponType !== 'pistol' && inv.weapons.includes(weaponType)) {
+        const weaponType = request.weaponType || (entity.weapon?.type !== 'fists' ? entity.weapon?.type : null);
+        if (weaponType && weaponType !== 'fists' && inv.weapons.includes(weaponType)) {
             // Remove from player inventory
             inv.weapons = inv.weapons.filter(w => w !== weaponType);
             // Switch active weapon if player was holding it
             if (entity.weapon?.type === weaponType) {
-                entity.weapon = makeWeaponState(inv.weapons[0] || 'pistol');
+                entity.weapon = makeWeaponState(inv.weapons[0] || 'fists');
             }
             // Put into chest contents
             contents.weaponType = weaponType;
@@ -1320,45 +1650,29 @@ function dropPlayerItem(entity, room) {
         const idx = Number.isInteger(slotIdx) ? slotIdx : inv.weapons.indexOf(entity.weapon?.type);
         if (idx >= 0 && idx < inv.weapons.length) {
             const weaponType = inv.weapons[idx];
-            if (weaponType && weaponType !== 'pistol') {
+            if (weaponType && weaponType !== 'fists') {
                 inv.weapons.splice(idx, 1);
                 if (entity.weapon?.type === weaponType) {
-                    entity.weapon = makeWeaponState(inv.weapons[0] || 'pistol');
+                    entity.weapon = makeWeaponState(inv.weapons[0] || 'fists');
                 }
-                room.loot.push({
-                    id: randId(),
-                    type: 'weapon',
-                    weaponType: weaponType,
-                    x: dropX,
-                    y: dropY
-                });
+                room.loot.push(makeGroundLoot('weapon', dropX, dropY, {
+                    weaponType,
+                    tier: WEAPONS[weaponType]?.rarity || 'common',
+                    source: 'player-drop',
+                    pickupAfter: Date.now() + 900,
+                }));
             }
         }
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
-        room.loot.push({
-            id: randId(),
-            type: 'medkit',
-            x: dropX,
-            y: dropY
-        });
+        room.loot.push(makeGroundLoot('medkit', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
         inv.ammoPacks -= 1;
-        room.loot.push({
-            id: randId(),
-            type: 'ammo',
-            x: dropX,
-            y: dropY
-        });
+        room.loot.push(makeGroundLoot('ammo', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     } else if (itemKey === 'armor' && entity.armor > 0) {
         const transfer = Math.min(35, Math.round(entity.armor));
         entity.armor = Math.max(0, entity.armor - transfer);
-        room.loot.push({
-            id: randId(),
-            type: 'armor',
-            x: dropX,
-            y: dropY
-        });
+        room.loot.push(makeGroundLoot('armor', dropX, dropY, { armorValue: transfer, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     }
 }
 
@@ -1372,6 +1686,7 @@ function pickupLoot(entity, room) {
 
     for (let i = room.loot.length - 1; i >= 0; i--) {
         const item = room.loot[i];
+        if (item.pickupAfter && Date.now() < item.pickupAfter) continue;
         if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.lootPickupRadius) continue;
 
         if (item.type === 'chest' || item.type === 'deathCrate') {
@@ -1379,11 +1694,11 @@ function pickupLoot(entity, room) {
         } else if (item.type === 'money') {
             entity.dollarBalance = (entity.dollarBalance || 0) + (item.dollarValue || item.amount || 0);
         } else if (item.type === 'medkit') {
-            ensureInventory(entity).medkits = Math.min(6, ensureInventory(entity).medkits + 1);
+            ensureInventory(entity).medkits = Math.min(6, ensureInventory(entity).medkits + Math.max(1, Number(item.amount) || 1));
         } else if (item.type === 'armor') {
-            entity.armor = Math.min(entity.maxArmor, entity.armor + 35);
+            entity.armor = Math.min(entity.maxArmor, entity.armor + Math.max(1, Number(item.armorValue) || 35));
         } else if (item.type === 'ammo') {
-            applyLootContents(entity, { ammoPacks: 1 }, { countChest: false });
+            applyLootContents(entity, { ammoPacks: Math.max(1, Number(item.amount) || 1) }, { countChest: false });
         } else if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) {
             if (ensureInventory(entity).weapons.includes(item.weaponType)) continue;
             applyLootContents(entity, { weaponType: item.weaponType }, { countChest: false });
@@ -1481,14 +1796,33 @@ export function spawnLootFromPool(room, poolAmount) {
     room.lootPoolBalance = Math.max(0, Number((room.lootPoolBalance - poolDollars).toFixed(2)));
 }
 
-function syncSurvivBots(room) {
-    // Automatic bot spawning disabled per user request
-    return;
+function getSurvivBotTarget(humanCount) {
+    if (humanCount <= 0) return 0;
+    return clamp(Math.max(SURVIV.botMinCount, humanCount * 2), SURVIV.botMinCount, SURVIV.botMaxCount);
 }
 
-export function spawnSurvivBotNear(room, x, y) {
+function syncSurvivBots(room) {
+    const now = Date.now();
+    if (now < (room._nextSurvivBotSyncAt || 0)) return;
+    room._nextSurvivBotSyncAt = now + 1000;
+
+    const humanCount = room.players.filter(player => !player.disconnected && player.hp > 0).length;
+    const targetCount = getSurvivBotTarget(humanCount);
+    const automaticBots = room.bots.filter(bot => !bot.adminSpawned && bot.hp > 0);
+    if (automaticBots.length >= targetCount) return;
+
+    const missing = targetCount - automaticBots.length;
+    const spawnCount = automaticBots.length < SURVIV.botMinCount
+        ? Math.min(missing, SURVIV.botMinCount - automaticBots.length)
+        : Math.min(2, missing);
+    for (let i = 0; i < spawnCount; i++) {
+        const spawn = pickSurvivSpawn(room);
+        spawnSurvivBotNear(room, spawn.x, spawn.y, { adminSpawned: false });
+    }
+}
+
+export function spawnSurvivBotNear(room, x, y, options = {}) {
     const id = 'surviv_bot_' + randId();
-    const eco = getSurvivEconomy(room.entryFeeUsd);
     const bot = {
         id,
         mongoId: null,
@@ -1503,8 +1837,8 @@ export function spawnSurvivBotNear(room, x, y) {
         maxHp: 100,
         armor: 0,
         maxArmor: 100,
-        weapon: makeWeaponState(Math.random() < 0.5 ? pickWeaponForTier(Math.random() > 0.72 ? 'rare' : 'common') : 'pistol'),
-        dollarBalance: eco.playerStartBalance * (0.5 + Math.random()),
+        weapon: makeWeaponState('fists'),
+        dollarBalance: 0,
         entryFeeUsd: room.entryFeeUsd,
         inputDx: 0,
         inputDy: 0,
@@ -1521,11 +1855,20 @@ export function spawnSurvivBotNear(room, x, y) {
         openedContainerId: null,
         openedContainer: null,
         takeChestItem: null,
-        adminSpawned: true,
+        adminSpawned: options.adminSpawned !== false,
     };
-    addWeaponToInventory(bot, bot.weapon.type);
+
     room.bots.push(bot);
     return bot;
+}
+
+function getBotLootWaypoint(bot, item, room) {
+    const house = room.obstacles.find(obstacle => (
+        obstacle.kind === 'houseFloor' && pointInRect(item.x, item.y, obstacle)
+    ));
+    if (!house || pointInRect(bot.x, bot.y, house)) return item;
+    const door = room.obstacles.find(obstacle => obstacle.kind === 'door' && obstacle.houseId === house.id);
+    return door || item;
 }
 
 function updateBotAI(bot, room, now, effectiveRadius) {
@@ -1543,6 +1886,20 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         }
     }
 
+    if (bot.openedContainer?.items?.length) {
+        const inventory = ensureInventory(bot);
+        const wanted = bot.openedContainer.items.find(item => item.kind === 'weapon' && !inventory.weapons.includes(item.weaponType))
+            || bot.openedContainer.items.find(item => item.kind === 'money')
+            || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
+            || bot.openedContainer.items.find(item => item.kind === 'medkit' && inventory.medkits < 6)
+            || bot.openedContainer.items.find(item => item.kind === 'ammo' && inventory.ammoPacks < 9);
+        if (wanted) bot.takeChestItem = { chestId: bot.openedContainer.id, itemKey: wanted.key };
+        bot.inputDx = 0;
+        bot.inputDy = 0;
+        bot.shooting = false;
+        return;
+    }
+
     const distFromCenter = Math.hypot(bot.x, bot.y);
     if (distFromCenter > effectiveRadius * 0.75) {
         const { dx, dy } = normalize(-bot.x, -bot.y);
@@ -1550,28 +1907,41 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         bot.inputDy = dy;
     } else if (nearest && nearestDist < 500) {
         bot.botTargetId = nearest.id;
-        if (nearestDist > 180) {
+        const melee = !!WEAPONS[bot.weapon?.type]?.melee;
+        const preferredMax = melee ? 55 : 180;
+        const preferredMin = melee ? 25 : 100;
+        if (nearestDist > preferredMax) {
             const { dx, dy } = normalize(nearest.x - bot.x, nearest.y - bot.y);
             bot.inputDx = dx;
             bot.inputDy = dy;
-        } else if (nearestDist < 100) {
+        } else if (nearestDist < preferredMin) {
             const { dx, dy } = normalize(bot.x - nearest.x, bot.y - nearest.y);
-            bot.inputDx = dx;
-            bot.inputDy = dy;
+            bot.inputDx = dx * (melee ? 0.2 : 1);
+            bot.inputDy = dy * (melee ? 0.2 : 1);
         } else {
             bot.inputDx = 0;
             bot.inputDy = 0;
         }
         bot.aimAngle = Math.atan2(nearest.y - bot.y, nearest.x - bot.x);
-        bot.shooting = nearestDist < 420;
+        bot.shooting = nearestDist < (melee ? 74 : 420);
     } else {
-        const nearLoot = room.loot.find(l => dist(bot.x, bot.y, l.x, l.y) < 350);
+        let nearLoot = null;
+        let nearLootDist = Infinity;
+        for (const item of room.loot) {
+            const itemDistance = dist(bot.x, bot.y, item.x, item.y);
+            if (itemDistance < nearLootDist && itemDistance < 1800) {
+                nearLoot = item;
+                nearLootDist = itemDistance;
+            }
+        }
         if (nearLoot) {
-            const nearLootDist = dist(bot.x, bot.y, nearLoot.x, nearLoot.y);
-            if (nearLootDist < SURVIV.chestOpenRadius) bot.openChestId = nearLoot.id;
-            const { dx, dy } = normalize(nearLoot.x - bot.x, nearLoot.y - bot.y);
-            bot.inputDx = dx * 0.7;
-            bot.inputDy = dy * 0.7;
+            if ((nearLoot.type === 'chest' || nearLoot.type === 'deathCrate') && nearLootDist < SURVIV.chestOpenRadius) {
+                bot.openChestId = nearLoot.id;
+            }
+            const waypoint = getBotLootWaypoint(bot, nearLoot, room);
+            const { dx, dy } = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
+            bot.inputDx = dx * 0.82;
+            bot.inputDy = dy * 0.82;
         } else {
             bot.inputDx = (Math.random() - 0.5) * 2;
             bot.inputDy = (Math.random() - 0.5) * 2;
@@ -1599,7 +1969,7 @@ function processEntity(entity, room, now, effectiveRadius) {
 
     // Process weapon reloading tick independent of shooting
     if (entity.weapon && entity.weapon.reloading) {
-        const wDef = WEAPONS[entity.weapon.type] || WEAPONS.pistol;
+        const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
         if (now >= entity.weapon.reloadEndAt) {
             entity.weapon.reloading = false;
             entity.weapon.ammo = wDef.clipSize;
@@ -1643,7 +2013,7 @@ function buildLeaderboard(room) {
 }
 
 function serializePlayer(p, isYou) {
-    const wDef = WEAPONS[p.weapon?.type] || WEAPONS.pistol;
+    const wDef = WEAPONS[p.weapon?.type] || WEAPONS.fists;
     return {
         id: p.id,
         username: p.username,
@@ -1654,10 +2024,11 @@ function serializePlayer(p, isYou) {
         hp: p.hp,
         maxHp: p.maxHp,
         armor: p.armor,
-        weapon: p.weapon?.type || 'pistol',
+        weapon: p.weapon?.type || 'fists',
         ammo: p.weapon?.ammo ?? 0,
         clipSize: wDef.clipSize,
         reloading: !!p.weapon?.reloading,
+        meleeUntil: p.meleeUntil || 0,
         reloadEndAt: p.weapon?.reloadEndAt || 0,
         reloadMs: wDef.reloadMs,
         dollarBalance: p.dollarBalance,
@@ -1735,6 +2106,8 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 weaponType: l.weaponType,
                 tier: l.tier,
                 source: l.source,
+                amount: l.amount,
+                armorValue: l.armorValue,
             }));
 
         const visibleBullets = room.bullets
