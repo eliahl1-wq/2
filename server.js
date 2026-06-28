@@ -894,7 +894,7 @@ async function sweepHouseWalletOnReset() {
 }
 
 async function performGlobalArenaReset() {
-    if (globalArenaResetting) return;
+    if (globalArenaResetting) return { success: false, alreadyRunning: true };
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
     for (const room of competitiveSlitherRooms) room.isResetting = true;
@@ -935,7 +935,7 @@ async function performGlobalArenaReset() {
             for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
                 room.startTime = GLOBAL_ARENA_START;
             }
-            return;
+            return { success: false, deferred: true, reason: 'unsettled_cashouts' };
         }
 
         try {
@@ -947,6 +947,11 @@ async function performGlobalArenaReset() {
                 amount: 0,
                 meta: { event: 'failure', reason: 'pool_sweep_failed', error: sweepErr.message },
             });
+            GLOBAL_ARENA_START = Date.now() - c.roomDuration + 30_000;
+            for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
+                room.startTime = GLOBAL_ARENA_START;
+            }
+            return { success: false, deferred: true, reason: 'pool_sweep_failed' };
         }
 
         for (const room of rooms) {
@@ -987,6 +992,7 @@ async function performGlobalArenaReset() {
             meta: { event: 'reset_complete', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
             status: 'confirmed',
         });
+        return { success: true };
     } finally {
         for (const room of rooms) room.isResetting = false;
         for (const room of competitiveSlitherRooms) room.isResetting = false;
@@ -2774,23 +2780,17 @@ app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
     if (globalArenaResetting || rooms.some(r => r.isResetting)) {
         return res.status(409).json({ message: 'Cannot sweep while arena reset is in progress' });
     }
-    const hasNormalLiabilities = rooms.some(room =>
-        (Number(room.fundedEntryUsd) || 0) - (Number(room.paidCashoutUsd) || 0) > 1e-9
-    );
-    const hasCompetitiveLiabilities = competitiveSlitherRooms.some(room =>
-        room.players.length > 0 || room.slitherFood.some(food => (Number(food.dollarValue) || 0) > 0)
-    );
-    const hasSurvivLiabilities = survivRooms.some(room =>
-        room.players.length > 0 || room.bots.length > 0 || room.loot.some(item => (Number(item.contents?.money) || 0) > 0)
-    );
-    if (hasNormalLiabilities || hasCompetitiveLiabilities || hasSurvivLiabilities) {
-        return res.status(409).json({ message: 'Cannot sweep while player-funded game value is outstanding' });
-    }
     try {
-        await sweepHouseWalletOnReset();
+        const result = await performGlobalArenaReset();
+        if (!result?.success) {
+            return res.status(409).json({
+                message: 'Reset + sweep deferred until every player cashout has settled.',
+                reason: result?.reason || 'reset_in_progress',
+            });
+        }
         res.json({
             success: true,
-            message: 'Main house wallet sweep completed. BR house wallets were not touched.',
+            message: 'Full arena reset completed: players cashed out, pools cleared, and main house wallet swept. BR wallets were not touched.',
             wallet: HOUSE_WALLET_ADDRESS || null,
         });
     } catch (err) {
