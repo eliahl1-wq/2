@@ -798,11 +798,12 @@ function applyWallAvoidance(snake) {
 }
 
 /** Bot AI aligned with agar mode: flee → chase → food → wander, plus wall avoidance. */
-function findNearestFoodForBot(head, food, foodGrid, minDistFood) {
+function findNearestFoodForBot(head, food, foodGrid, minDistFood, predicate = null) {
     let nearestFood = null;
     let nearestFoodDist2 = minDistFood * minDistFood;
 
     const tryFood = (f) => {
+        if (predicate && !predicate(f)) return;
         const fdx = head.x - f.x;
         if (fdx > minDistFood || fdx < -minDistFood) return;
         const fdy = head.y - f.y;
@@ -935,11 +936,27 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius) {
         }
     }
 
+    // Paid death drops are scanned across the whole active zone and beat prey,
+    // wandering and ordinary food. Immediate survival and zone safety still win.
+    const deathDropRange = Math.max(minDistFood, effectiveRadius * 2);
+    const paidDeathDrop = findNearestFoodForBot(
+        head,
+        food,
+        null,
+        deathDropRange,
+        f => f.competitiveDeathDrop && (f.dollarValue || 0) > 0,
+    );
+
     if (threat) {
         const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
         snake.targetX = head.x + Math.cos(angle) * fleeDistance;
         snake.targetY = head.y + Math.sin(angle) * fleeDistance;
         snake.boost = nearestThreatDist < fleeDistance * 0.3;
+    } else if (paidDeathDrop) {
+        snake.targetX = paidDeathDrop.x;
+        snake.targetY = paidDeathDrop.y;
+        snake.lastTargetUpdate = Date.now();
+        snake.boost = dist(head.x, head.y, paidDeathDrop.x, paidDeathDrop.y) > 80;
     } else if (targetPrey) {
         snake.targetX = targetPrey.x;
         snake.targetY = targetPrey.y;
@@ -1737,6 +1754,55 @@ export function clampCompetitiveSpawnToZone(x, y, effectiveRadius, balance) {
     return { x: x * scale, y: y * scale };
 }
 
+export function createCompetitiveSlitherAdminBot(room, effectiveRadius, nearX = null, nearY = null) {
+    const eco = getCompetitiveEconomy(room.entryFeeUsd);
+    const startMass = eco.playerStartBalance;
+    let spawn;
+
+    if (Number.isFinite(nearX) && Number.isFinite(nearY)) {
+        spawn = clampCompetitiveSpawnToZone(nearX, nearY, effectiveRadius, startMass);
+    } else {
+        const maxRadius = Math.max(0, effectiveRadius - Math.max(180, headRadiusForBalance(startMass) * 6));
+        const angle = Math.random() * Math.PI * 2;
+        const radius = Math.sqrt(Math.random()) * maxRadius * 0.78;
+        spawn = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+    }
+
+    const { x, y } = spawn;
+    const angle = Math.hypot(x, y) > 1
+        ? Math.atan2(-y, -x)
+        : Math.random() * Math.PI * 2;
+    return {
+        id: 'bot_' + randId(),
+        mongoId: null,
+        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+        mode: 'competitive-slither',
+        kills: 0,
+        balance: startMass,
+        dollarBalance: eco.dollarStart,
+        entryFeeUsd: eco.entryFeeUsd,
+        botStake: eco.dollarStart,
+        startTime: Date.now(),
+        spawnGraceUntil: Date.now() + 4500,
+        color: util.randomSlitherColor(),
+        x,
+        y,
+        inputDx: Math.cos(angle),
+        inputDy: Math.sin(angle),
+        boost: false,
+        targetX: 0,
+        targetY: 0,
+        lastTargetUpdate: 0,
+        angle,
+        fam: 0,
+        segments: createSegments(x, y, startMass, angle),
+        screenWidth: 1920,
+        screenHeight: 1080,
+        isBot: true,
+        adminSpawned: true,
+    };
+}
+
 export function getCompetitiveZone(resetTime) {
     const radius = getCompetitiveEffectiveRadius(resetTime);
     const msUntilReset = resetTime - Date.now();
@@ -1866,6 +1932,11 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
     }
 
     dropCompetitiveSnakeAsFood(room, snake);
+    room.players = room.players.filter(p => p.id !== snake.id);
+
+    // Admin bots are server-owned entities: never turn them into spectators or
+    // run account writes for their null mongoId.
+    if (snake.isBot) return;
 
     const socketId = snake.id;
     const head = snake.segments?.[0];
@@ -1883,8 +1954,9 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
     }
 
     io.to(socketId).emit('RIP');
-    room.players = room.players.filter(p => p.id !== snake.id);
-    User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
+    if (snake.mongoId) {
+        User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
+    }
     if (Transaction && snake.mongoId) {
         Transaction.create({
             userId: snake.mongoId,
@@ -2018,7 +2090,11 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
     }
 
     for (const { snake, killer } of toRemove) {
+        const respawnAdminBot = snake.isBot && snake.adminSpawned && !room.isResetting;
         eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction);
+        if (respawnAdminBot) {
+            room.players.push(createCompetitiveSlitherAdminBot(room, effectiveRadius));
+        }
     }
 
     return getCompetitiveSnakes(room)

@@ -18,6 +18,7 @@ import {
     COMPETITIVE_SLITHER,
     createSlitherPlayer,
     createCompetitiveSlitherPlayer,
+    createCompetitiveSlitherAdminBot,
     addSlitherBots,
     getSlitherTargetBots,
     trimSlitherBots,
@@ -30,7 +31,6 @@ import {
     spawnGoldenSlitherBlob,
     getCompetitiveEffectiveRadius,
     getCompetitiveZone,
-    clampCompetitiveSpawnToZone,
     addSlitherFood,
     createSegments,
 } from './slither-engine.js';
@@ -410,6 +410,21 @@ function commitArenaCashoutReservation(room, player) {
     delete player._arenaCashoutReservationUsd;
 }
 
+function keepCompetitiveCashoutSpectator(room, player) {
+    const head = player.segments?.[0];
+    if (!room.competitiveSpectators) room.competitiveSpectators = [];
+    room.competitiveSpectators = room.competitiveSpectators.filter(s =>
+        s.id !== player.id && s.mongoId?.toString() !== player.mongoId?.toString()
+    );
+    room.competitiveSpectators.push({
+        id: player.id,
+        mongoId: player.mongoId,
+        x: head?.x ?? player.x ?? 0,
+        y: head?.y ?? player.y ?? 0,
+        dollarBalance: player.dollarBalance,
+    });
+}
+
 async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE;
@@ -436,6 +451,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
 
     if (DEV_FREE_PLAY) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        keepCompetitiveCashoutSpectator(room, player);
         user.playtime += (Date.now() - player.startTime);
         await user.save();
         await Transaction.create({
@@ -489,6 +505,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
 
     room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+    keepCompetitiveCashoutSpectator(room, player);
     user.playtime += (Date.now() - player.startTime);
     await user.save();
 
@@ -4363,51 +4380,13 @@ io.on('connection', (socket) => {
             if (isSurviv) {
                 spawnSurvivBotNear(room, spawnX + offsetX, spawnY + offsetY);
             } else if (isCompSlither) {
-                // Competitive slither: bots live in room.players (no slitherBots array)
-                const eco = getCompetitiveEconomy(room.entryFeeUsd ?? 2);
-                const competitiveStartMass = eco.playerStartBalance;
                 const effectiveRadius = getCompetitiveEffectiveRadius(room.startTime + c.roomDuration);
-                const safeSpawn = clampCompetitiveSpawnToZone(
+                room.players.push(createCompetitiveSlitherAdminBot(
+                    room,
+                    effectiveRadius,
                     spawnX + offsetX,
                     spawnY + offsetY,
-                    effectiveRadius,
-                    competitiveStartMass,
-                );
-                const bx = safeSpawn.x;
-                const by = safeSpawn.y;
-                // Start toward the arena center; AI takes over on the next physics tick.
-                const angle = Math.hypot(bx, by) > 1
-                    ? Math.atan2(-by, -bx)
-                    : Math.random() * Math.PI * 2;
-                room.players.push({
-                    id: 'bot_' + Math.random().toString(36).substr(2, 5),
-                    mongoId: null,
-                    username: botNames[Math.floor(Math.random() * botNames.length)],
-                    mode: 'competitive-slither',
-                    kills: 0,
-                    balance: competitiveStartMass,
-                    dollarBalance: eco.dollarStart,
-                    entryFeeUsd: eco.entryFeeUsd,
-                    botStake: eco.dollarStart,
-                    startTime: Date.now(),
-                    spawnGraceUntil: Date.now() + 4500,
-                    color: util.randomSlitherColor(),
-                    x: bx,
-                    y: by,
-                    inputDx: Math.cos(angle),
-                    inputDy: Math.sin(angle),
-                    boost: false,
-                    targetX: 0,
-                    targetY: 0,
-                    lastTargetUpdate: 0,
-                    angle,
-                    fam: 0,
-                    segments: createSegments(bx, by, competitiveStartMass, angle),
-                    screenWidth: 1920,
-                    screenHeight: 1080,
-                    isBot: true,
-                    adminSpawned: true,
-                });
+                ));
             } else if (isSlither) {
                 const dollarStart = getEconomy(room.entryFeeUsd ?? 0.10).botStartBalance;
                 const angle = Math.random() * Math.PI * 2;
