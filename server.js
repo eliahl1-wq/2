@@ -242,7 +242,7 @@ const c = {
     ejectMass: 0.05,
     ejectMassGain: 0.05,
     massLossRate: 1.0,
-    mergeTimer: 30,
+    mergeTimer: 18,
     speedMult: 1.45,
     houseFee: 0.0,
     targetPopulation: 30,
@@ -3678,6 +3678,88 @@ function ensureAgarMovementInput(player) {
     }
 }
 
+function resolveAgarOwnCells(player, now, massStart) {
+    if (!Array.isArray(player.cells) || player.cells.length < 2) return;
+
+    const cells = player.cells;
+    const mergedIds = new Set();
+    const mergeDelayMs = c.mergeTimer * 1000;
+
+    for (let i = 0; i < cells.length; i++) {
+        const first = cells[i];
+        if (mergedIds.has(first.id)) continue;
+
+        for (let j = i + 1; j < cells.length; j++) {
+            const second = cells[j];
+            if (mergedIds.has(second.id)) continue;
+
+            let dx = second.x - first.x;
+            let dy = second.y - first.y;
+            let distance = Math.hypot(dx, dy);
+            const combinedRadius = first.radius + second.radius;
+            if (distance >= combinedRadius) continue;
+
+            if (distance < 0.0001) {
+                const direction = first.id < second.id ? 1 : -1;
+                dx = direction;
+                dy = 0;
+                distance = 1;
+            }
+
+            const ux = dx / distance;
+            const uy = dy / distance;
+            const firstMass = Math.max(0.0001, first.balance);
+            const secondMass = Math.max(0.0001, second.balance);
+            const combinedMass = firstMass + secondMass;
+            const firstShare = secondMass / combinedMass;
+            const secondShare = firstMass / combinedMass;
+            const overlap = combinedRadius - distance;
+            const firstAge = now - (first.lastSplit || now);
+            const secondAge = now - (second.lastSplit || now);
+            const readyToMerge = firstAge >= mergeDelayMs && secondAge >= mergeDelayMs;
+
+            if (!readyToMerge) {
+                const mergeReadiness = Math.max(0, Math.min(1, Math.min(firstAge, secondAge) / mergeDelayMs));
+                const push = overlap * (0.12 - mergeReadiness * 0.085);
+                first.x -= ux * push * firstShare;
+                first.y -= uy * push * firstShare;
+                second.x += ux * push * secondShare;
+                second.y += uy * push * secondShare;
+                continue;
+            }
+
+            // Once ready, touching pieces flow into one another instead of bouncing.
+            const pull = Math.min(3.2, 0.45 + overlap * 0.065);
+            first.x += ux * pull * firstShare;
+            first.y += uy * pull * firstShare;
+            second.x -= ux * pull * secondShare;
+            second.y -= uy * pull * secondShare;
+
+            const mergeDistance = Math.max(4, Math.abs(first.radius - second.radius) + Math.min(first.radius, second.radius) * 0.28);
+            if (distance - pull > mergeDistance) continue;
+
+            const survivor = firstMass >= secondMass ? first : second;
+            const absorbed = survivor === first ? second : first;
+            survivor.x = (first.x * firstMass + second.x * secondMass) / combinedMass;
+            survivor.y = (first.y * firstMass + second.y * secondMass) / combinedMass;
+            survivor.vx = ((first.vx || 0) * firstMass + (second.vx || 0) * secondMass) / combinedMass;
+            survivor.vy = ((first.vy || 0) * firstMass + (second.vy || 0) * secondMass) / combinedMass;
+            survivor.balance = combinedMass;
+            survivor.lastSplit = Math.min(first.lastSplit || now, second.lastSplit || now);
+            mergedIds.add(absorbed.id);
+
+            if (absorbed === first) break;
+        }
+    }
+
+    if (mergedIds.size === 0) return;
+    player.cells = cells.filter(cell => !mergedIds.has(cell.id));
+    const totalMass = playerTotalMass(player);
+    const cellCount = player.cells.length;
+    player.cells.forEach(cell => {
+        cell.radius = calculateCellRadius(cell.balance, totalMass, cellCount, massStart);
+    });
+}
 function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c.playerStartBalance) {
     const startMassPerCell = massStart / cellCount;
     const extraMass = Math.max(0, cellMass - startMassPerCell);
@@ -4514,27 +4596,36 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p || p.cells.length >= c.maxCells) return;
 
-        let newCells = [];
-        p.cells.forEach(cell => {
-            const massStart = playerMassStart(p);
-            const totalMass = playerTotalMass(p);
+        const totalMass = playerTotalMass(p);
+        const massStart = playerMassStart(p);
+        const availableSlots = c.maxCells - p.cells.length;
+        const newCells = [];
+        for (const cell of p.cells) {
+            if (newCells.length >= availableSlots) break;
             if (cell.balance >= massStart * 2) {
                 cell.balance /= 2;
-                cell.radius = calculateCellRadius(cell.balance, totalMass, p.cells.length + 1, massStart);
                 cell.lastSplit = Date.now(); // Starta timern även för ursprungscellen
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 newCells.push({
                     id: Math.random().toString(36).substr(2, 9),
                     x: cell.x, y: cell.y,
                     balance: cell.balance,
-                    radius: calculateCellRadius(cell.balance, totalMass, p.cells.length + 1, massStart),
+                    radius: cell.radius,
                     vx: Math.cos(angle) * 25,
                     vy: Math.sin(angle) * 25,
                     lastSplit: Date.now()
                 });
             }
-        });
+        }
+
+        // A multi-split can add several cells at once. Radius depends on the final
+        // cell count, so recalculate every piece only after the split is complete.
         p.cells.push(...newCells);
+        const finalCellCount = p.cells.length;
+        p.cells.forEach(cell => {
+            cell.radius = calculateCellRadius(cell.balance, totalMass, finalCellCount, massStart);
+        });
+
     });
 
     // Protokoll-matchning: 1 = eject mass
@@ -5136,6 +5227,7 @@ function processRoom(room) {
 
         let totalX = 0;
         let totalY = 0;
+        let totalWeight = 0;
         const cellsToDelete = new Set();
 
         // Calculate absolute target position in the world
@@ -5146,7 +5238,6 @@ function processRoom(room) {
         // 1. Beräkna rörelse för alla celler
         for (let i = 0; i < player.cells.length; i++) {
             const cell = player.cells[i];
-            cell.isCollidingWithOwn = false; // Återställ kollisionsflagga för denna tick
             
             // PHYSICS: Movement & Friction
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
@@ -5174,6 +5265,8 @@ function processRoom(room) {
             cell.y = Math.max(r, Math.min(c.worldHeight - r, cell.y));
         }
 
+
+        resolveAgarOwnCells(player, Date.now(), massStart);
         if (!player.isBot) {
             applyAgarWealthTax(player, room, dollarStart);
         }
@@ -5246,46 +5339,7 @@ function processRoom(room) {
                     const r2 = otherCell.radius;
 
                     if (item.socketId === player.id || item.botId === player.id) {
-                        cell.isCollidingWithOwn = true;
-                        // INTERNAL: Merge or Push
-                        const canMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > c.mergeTimer * 1000) && (Date.now() - otherCell.lastSplit > c.mergeTimer * 1000);
-                        // Early merge only happens after a deliberate, deeper overlap.
-                        const mergeAgeMs = Math.min(Date.now() - (cell.lastSplit || 0), Date.now() - (otherCell.lastSplit || 0));
-                        const forceMerge = cell.lastSplit && otherCell.lastSplit && mergeAgeMs > 6000 && d < (r + r2) * 0.65;
-
-                        if (canMerge || forceMerge) {
-                            // INTERNAL sammanslagning: Ingen 5% regel.
-                            if (d < r + r2 * 0.55 || forceMerge) {
-                                cell.mergeTicks = (cell.mergeTicks || 0) + 1;
-                                if (cell.mergeTicks >= 20) {
-                                    cell.balance += otherCell.balance;
-                                    cell.radius = calculateCellRadius(
-                                        cell.balance,
-                                        playerTotalMass(player),
-                                        player.cells.length,
-                                        massStart,
-                                    );
-                                    cellsToDelete.add(otherCell.id);
-                                } else {
-                                    // Trög/seg sammanslagning: Sug in dem mot varandra långsamt
-                                    const pullAngle = Math.atan2(otherCell.y - cell.y, otherCell.x - cell.x);
-                                    cell.x += Math.cos(pullAngle) * 0.5;
-                                    cell.y += Math.sin(pullAngle) * 0.5;
-                                }
-                            } else {
-                                cell.mergeTicks = 0;
-                            }
-                            // Ingen repulsion når vi kan merga, så de kan "pressas ihop" mjukt
-                        } else if (d < r + r2) {
-                            // Keep some separation until the player intentionally presses blobs together.
-                            const pushAngle = Math.atan2(cell.y - otherCell.y, cell.x - otherCell.x);
-                            const overlap = (r + r2 - d);
-                            const isReadyToMerge = cell.lastSplit && otherCell.lastSplit && (Date.now() - cell.lastSplit > 6000) && (Date.now() - otherCell.lastSplit > 6000);
-                            const pushStrength = isReadyToMerge ? 0.018 : 0.08;
-                            cell.x += Math.cos(pushAngle) * overlap * pushStrength;
-                            cell.y += Math.sin(pushAngle) * overlap * pushStrength;
-                            cell.mergeTicks = 0;
-                        }
+                        continue;
                     } else {
                         if (isSandbox && room.sandboxInvincible) continue;
                         // EXTERNAL: Eat
@@ -5357,11 +5411,10 @@ function processRoom(room) {
         }
 
         player.cells.forEach(cell => {
-            if (!cell.isCollidingWithOwn) {
-                cell.mergeTicks = 0;
-            }
-            totalX += cell.x;
-            totalY += cell.y;
+            const weight = Math.max(0.0001, cell.balance);
+            totalX += cell.x * weight;
+            totalY += cell.y * weight;
+            totalWeight += weight;
         });
 
         // HUD / cashout balance is dollars; cell.balance is mass. Coupled directly via tier scale factor.
@@ -5373,8 +5426,8 @@ function processRoom(room) {
         player.balance = player.dollarBalance;
 
         if (player.cells.length > 0) {
-            player.x = totalX / player.cells.length;
-            player.y = totalY / player.cells.length;
+            player.x = totalX / totalWeight;
+            player.y = totalY / totalWeight;
         }
         } catch (err) {
             logGameLoopError('agar player tick ' + (player?.id || 'unknown'), err);
