@@ -115,3 +115,62 @@ test('manual reload only starts for a partially empty firearm', () => {
     const fists = { weapon: { type: 'fists', ammo: 0, reloading: false, reloadEndAt: 0 } };
     assert.equal(beginSurvivReload(fists, 1000), false);
 });
+
+test('ground loot creates a pickup summary for the player', () => {
+    const room = makeRoom();
+    const player = createSurvivPlayer('human-loot', 'mongo-loot', 'Collector', '#fff', room);
+    room.players.push(player);
+    room.loot = [
+        { id: 'ammo-drop', type: 'ammo', x: player.x, y: player.y, amount: 2, tier: 'common' },
+        { id: 'medkit-drop', type: 'medkit', x: player.x, y: player.y, amount: 1, tier: 'rare' },
+    ];
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(player.inventory.ammoPacks, 2);
+    assert.equal(player.inventory.medkits, 1);
+    assert.equal(player.lastLoot.source, 'ground');
+    assert.equal(player.lastLoot.items.ammoPacks, 2);
+    assert.equal(player.lastLoot.items.medkits, 1);
+});
+test('fast bullets hit and eliminate bots along their full travel path', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    const player = createSurvivPlayer('human-shot', 'mongo-shot', 'Shooter', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'sniper', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['fists', 'sniper'];
+    player.shooting = true;
+    room.players.push(player);
+    const bot = spawnSurvivBotNear(room, 90, 0, { adminSpawned: true });
+    bot.hp = 40;
+    bot.botThinkAt = Number.POSITIVE_INFINITY;
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.bots.some(candidate => candidate.id === bot.id), false);
+    assert.equal(player.kills, 1);
+});
+
+test('surviv bots automatically collect useful ground loot', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('human-far', 'mongo-far', 'Observer', '#fff', room);
+    player.x = 1000;
+    player.y = 1000;
+    room.players.push(player);
+    const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
+    room.loot.push({ id: 'bot-medkit', type: 'medkit', x: 0, y: 0, amount: 1, tier: 'common' });
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(bot.inventory.medkits, 1);
+    assert.equal(room.loot.some(item => item.id === 'bot-medkit'), false);
+});

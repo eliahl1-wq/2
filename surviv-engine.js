@@ -7,6 +7,7 @@ import { getSurvivEconomy } from './economy.js';
 
 const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
+const MELEE_ANIMATION_MS = 280;
 
 export const SURVIV = {
     worldHalf: 10000,
@@ -156,6 +157,15 @@ function randId() {
 
 function dist(x1, y1, x2, y2) {
     return Math.hypot(x2 - x1, y2 - y1);
+}
+
+function distanceToSegment(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lengthSq = dx * dx + dy * dy;
+    if (lengthSq <= 1e-9) return dist(px, py, x1, y1);
+    const t = clamp(((px - x1) * dx + (py - y1) * dy) / lengthSq, 0, 1);
+    return dist(px, py, x1 + dx * t, y1 + dy * t);
 }
 
 function clamp(v, lo, hi) {
@@ -1358,7 +1368,8 @@ function tryShoot(entity, room, now) {
     if (wDef.melee) {
         if (now - w.lastShotAt < wDef.fireRateMs) return;
         w.lastShotAt = now;
-        entity.meleeUntil = now + 150;
+        entity.meleeStartedAt = now;
+        entity.meleeUntil = now + MELEE_ANIMATION_MS;
 
         const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
         const targets = [
@@ -1695,6 +1706,17 @@ function pickupLoot(entity, room) {
     dropPlayerItem(entity, room);
     refreshOpenedContainer(entity, room);
 
+    const pickedUp = {
+        money: 0,
+        medkits: 0,
+        armor: 0,
+        ammoPacks: 0,
+        weaponType: null,
+        weaponLabel: null,
+    };
+    let pickupCount = 0;
+    let pickupTier = 'common';
+
     for (let i = room.loot.length - 1; i >= 0; i--) {
         const item = room.loot[i];
         if (item.pickupAfter && Date.now() < item.pickupAfter) continue;
@@ -1703,24 +1725,49 @@ function pickupLoot(entity, room) {
         if (item.type === 'chest' || item.type === 'deathCrate') {
             continue;
         } else if (item.type === 'money') {
-            entity.dollarBalance = (entity.dollarBalance || 0) + (item.dollarValue || item.amount || 0);
+            const amount = Number(item.dollarValue || item.amount || 0);
+            entity.dollarBalance = (entity.dollarBalance || 0) + amount;
+            pickedUp.money += amount;
         } else if (item.type === 'medkit') {
-            ensureInventory(entity).medkits = Math.min(6, ensureInventory(entity).medkits + Math.max(1, Number(item.amount) || 1));
+            const amount = Math.max(1, Number(item.amount) || 1);
+            ensureInventory(entity).medkits = Math.min(6, ensureInventory(entity).medkits + amount);
+            pickedUp.medkits += amount;
         } else if (item.type === 'armor') {
-            entity.armor = Math.min(entity.maxArmor, entity.armor + Math.max(1, Number(item.armorValue) || 35));
+            const amount = Math.max(1, Number(item.armorValue) || 35);
+            entity.armor = Math.min(entity.maxArmor, entity.armor + amount);
+            pickedUp.armor += amount;
         } else if (item.type === 'ammo') {
-            applyLootContents(entity, { ammoPacks: Math.max(1, Number(item.amount) || 1) }, { countChest: false });
+            const amount = Math.max(1, Number(item.amount) || 1);
+            applyLootContents(entity, { ammoPacks: amount }, { countChest: false });
+            pickedUp.ammoPacks += amount;
         } else if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) {
             if (ensureInventory(entity).weapons.includes(item.weaponType)) continue;
             applyLootContents(entity, { weaponType: item.weaponType }, { countChest: false });
+            pickedUp.weaponType = item.weaponType;
+            pickedUp.weaponLabel = WEAPONS[item.weaponType].label;
         }
+        pickupCount += 1;
+        pickupTier = item.tier || pickupTier;
         room.loot.splice(i, 1);
+    }
+
+    if (pickupCount > 0) {
+        entity.lastLoot = {
+            id: `ground:${entity.id}:${Date.now()}:${pickupCount}`,
+            type: 'ground',
+            tier: pickupTier,
+            source: 'ground',
+            items: pickedUp,
+            pickedAt: Date.now(),
+        };
     }
 }
 
 function updateBullets(room, now, effectiveRadius) {
     for (let i = room.bullets.length - 1; i >= 0; i--) {
         const b = room.bullets[i];
+        const previousX = b.x;
+        const previousY = b.y;
         b.x += b.vx;
         b.y += b.vy;
 
@@ -1749,7 +1796,7 @@ function updateBullets(room, now, effectiveRadius) {
         const allEntities = [...room.players, ...room.bots];
         for (const ent of allEntities) {
             if (ent.id === b.ownerId || ent.hp <= 0) continue;
-            if (dist(b.x, b.y, ent.x, ent.y) < SURVIV.playerRadius) {
+            if (distanceToSegment(ent.x, ent.y, previousX, previousY, b.x, b.y) <= SURVIV.playerRadius) {
                 const attacker = allEntities.find(e => e.id === b.ownerId)
                     || room.bots.find(e => e.id === b.ownerId)
                     || room.players.find(e => e.id === b.ownerId);
@@ -2039,8 +2086,10 @@ function serializePlayer(p, isYou) {
         ammo: p.weapon?.ammo ?? 0,
         clipSize: wDef.clipSize,
         reloading: !!p.weapon?.reloading,
+        meleeStartedAt: p.meleeStartedAt || 0,
         meleeUntil: p.meleeUntil || 0,
         reloadEndAt: p.weapon?.reloadEndAt || 0,
+        reloadRemainingMs: p.weapon?.reloading ? Math.max(0, (p.weapon.reloadEndAt || 0) - Date.now()) : 0,
         reloadMs: wDef.reloadMs,
         dollarBalance: p.dollarBalance,
         kills: p.kills || 0,
@@ -2191,4 +2240,3 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         emitToViewer(spec.id, spec.x, spec.y, null, spec.dollarBalance, true);
     }
 }
-
