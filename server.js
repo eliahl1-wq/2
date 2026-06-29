@@ -4364,13 +4364,14 @@ io.on('connection', (socket) => {
                 spawnSurvivBotNear(room, spawnX + offsetX, spawnY + offsetY);
             } else if (isCompSlither) {
                 // Competitive slither: bots live in room.players (no slitherBots array)
-                const eco = getEconomy(room.entryFeeUsd ?? 2);
+                const eco = getCompetitiveEconomy(room.entryFeeUsd ?? 2);
+                const competitiveStartMass = eco.playerStartBalance;
                 const effectiveRadius = getCompetitiveEffectiveRadius(room.startTime + c.roomDuration);
                 const safeSpawn = clampCompetitiveSpawnToZone(
                     spawnX + offsetX,
                     spawnY + offsetY,
                     effectiveRadius,
-                    startMass,
+                    competitiveStartMass,
                 );
                 const bx = safeSpawn.x;
                 const by = safeSpawn.y;
@@ -4384,10 +4385,10 @@ io.on('connection', (socket) => {
                     username: botNames[Math.floor(Math.random() * botNames.length)],
                     mode: 'competitive-slither',
                     kills: 0,
-                    balance: startMass,
-                    dollarBalance: eco.botStartBalance ?? stake,
-                    entryFeeUsd: room.entryFeeUsd,
-                    botStake: stake,
+                    balance: competitiveStartMass,
+                    dollarBalance: eco.dollarStart,
+                    entryFeeUsd: eco.entryFeeUsd,
+                    botStake: eco.dollarStart,
                     startTime: Date.now(),
                     spawnGraceUntil: Date.now() + 4500,
                     color: util.randomSlitherColor(),
@@ -4401,7 +4402,7 @@ io.on('connection', (socket) => {
                     lastTargetUpdate: 0,
                     angle,
                     fam: 0,
-                    segments: createSegments(bx, by, startMass, angle),
+                    segments: createSegments(bx, by, competitiveStartMass, angle),
                     screenWidth: 1920,
                     screenHeight: 1080,
                     isBot: true,
