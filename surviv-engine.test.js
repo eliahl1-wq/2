@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
     SURVIV,
+    beginSurvivReload,
     createSurvivPlayer,
     generateSurvivMap,
     processSurvivRoom,
@@ -97,4 +98,20 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     assert.ok(deathDrops.some(item => item.type === 'ammo' && item.amount === 2));
     assert.ok(deathDrops.some(item => item.type === 'armor' && item.armorValue > 0));
     assert.equal(room.loot.some(item => item.type === 'deathCrate'), false);
+});
+test('manual reload only starts for a partially empty firearm', () => {
+    const fullWeapon = { weapon: { type: 'smg', ammo: 30, reloading: false, reloadEndAt: 0 } };
+    assert.equal(beginSurvivReload(fullWeapon, 1000), false);
+    assert.equal(fullWeapon.weapon.reloading, false);
+
+    const partialWeapon = { weapon: { type: 'smg', ammo: 11, reloading: false, reloadEndAt: 0 } };
+    assert.equal(beginSurvivReload(partialWeapon, 1000), true);
+    assert.equal(partialWeapon.weapon.reloading, true);
+    assert.equal(partialWeapon.weapon.reloadEndAt, 2800);
+
+    assert.equal(beginSurvivReload(partialWeapon, 1500), false);
+    assert.equal(partialWeapon.weapon.reloadEndAt, 2800);
+
+    const fists = { weapon: { type: 'fists', ammo: 0, reloading: false, reloadEndAt: 0 } };
+    assert.equal(beginSurvivReload(fists, 1000), false);
 });

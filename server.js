@@ -51,7 +51,7 @@ import {
 } from './economy.js';
 import {
     SURVIV,
-    WEAPONS,
+    beginSurvivReload,
     createSurvivPlayer,
     generateSurvivMap,
     getSurvivZone,
@@ -4757,11 +4757,7 @@ io.on('connection', (socket) => {
             p.openedContainer = null;
         }
         if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 3) p.equipSlotPending = equipSlot;
-        if (reload && p.weapon && !p.weapon.reloading) {
-            const def = WEAPONS[p.weapon.type] || WEAPONS.pistol;
-            p.weapon.reloading = true;
-            p.weapon.reloadEndAt = Date.now() + def.reloadMs;
-        }
+        if (reload) beginSurvivReload(p);
     });
 
     socket.on('survivSpectateCam', ({ x, y }) => {

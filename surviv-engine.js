@@ -1049,6 +1049,18 @@ function makeWeaponState(typeId) {
     };
 }
 
+export function beginSurvivReload(entity, now = Date.now()) {
+    const weapon = entity?.weapon;
+    if (!weapon || weapon.reloading) return false;
+    const definition = WEAPONS[weapon.type];
+    if (!definition || definition.melee || definition.clipSize <= 0) return false;
+    if ((Number(weapon.ammo) || 0) >= definition.clipSize) return false;
+
+    weapon.reloading = true;
+    weapon.reloadEndAt = now + definition.reloadMs;
+    return true;
+}
+
 function makeInventory() {
     return {
         weapons: ['fists'],
@@ -1383,8 +1395,7 @@ function tryShoot(entity, room, now) {
     }
 
     if (w.ammo <= 0) {
-        w.reloading = true;
-        w.reloadEndAt = now + wDef.reloadMs;
+        beginSurvivReload(entity, now);
         return;
     }
 
