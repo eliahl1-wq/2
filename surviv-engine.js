@@ -1169,7 +1169,23 @@ function applyLootContents(entity, contents = {}, options = {}) {
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
         const added = addWeaponToInventory(entity, contents.weaponType);
         if (added || entity.weapon?.type !== contents.weaponType) {
-            entity.weapon = makeWeaponState(contents.weaponType);
+            if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
+            // Set full clip for the newly acquired weapon
+            const def = WEAPONS[contents.weaponType];
+            entity.weaponsAmmo[contents.weaponType] = def.clipSize;
+
+            // Save old weapon's ammo
+            if (entity.weapon) {
+                entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
+            }
+
+            entity.weapon = {
+                type: def.id,
+                ammo: def.clipSize,
+                reloading: false,
+                reloadEndAt: 0,
+                lastShotAt: 0,
+            };
             summary.weaponType = contents.weaponType;
             summary.weaponLabel = WEAPONS[contents.weaponType].label;
         }
@@ -1190,7 +1206,26 @@ function equipInventorySlot(entity, slot) {
     const weaponType = inv.weapons[index];
     if (!weaponType || !WEAPONS[weaponType]) return;
     if (entity.weapon?.type === weaponType) return;
-    entity.weapon = makeWeaponState(weaponType);
+
+    // Save current ammo
+    if (entity.weapon) {
+        if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
+        entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
+    }
+
+    // Load target ammo
+    if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
+    const targetAmmo = entity.weaponsAmmo[weaponType] !== undefined 
+        ? entity.weaponsAmmo[weaponType] 
+        : WEAPONS[weaponType].clipSize;
+
+    entity.weapon = {
+        type: weaponType,
+        ammo: targetAmmo,
+        reloading: false,
+        reloadEndAt: 0,
+        lastShotAt: 0,
+    };
 }
 
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
@@ -2097,6 +2132,7 @@ function serializePlayer(p, isYou) {
         isYou,
         isCashingOut: !!p.isCashingOut,
 
+        weaponsAmmo: p.weaponsAmmo || {},
         inventory: ensureInventory(p),
         lastLoot: isYou ? (p.lastLoot || null) : null,
         openedContainer: isYou ? (p.openedContainer || null) : null,
