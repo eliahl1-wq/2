@@ -743,6 +743,9 @@ async function cashOutCompetitiveRoomPlayers(room) {
     let allSettled = true;
     const playersToProcess = [...room.players];
     for (const p of playersToProcess) {
+        // Competitive admin bots have no account and are cleared only after
+        // every real player cashout has settled.
+        if (p.isBot) continue;
         if (p.isCashingOut) {
             allSettled = false;
             continue;
@@ -4601,7 +4604,9 @@ io.on('connection', (socket) => {
 
         setTimeout(async () => {
             const activeRoom = getArenaRoomById(roomId);
-            const activePlayer = activeRoom?.players.find(pl => pl.mongoId.toString() === playerMongoId);
+            // Competitive admin bots live in room.players with mongoId=null.
+            // Keep this lookup null-safe so bots can never crash the cashout timer.
+            const activePlayer = activeRoom?.players.find(pl => pl.mongoId?.toString() === playerMongoId);
 
             if (!activePlayer || !activePlayer.isCashingOut) {
                 console.log(`❌ Cashout cancelled (died or invalid state)`);
@@ -4788,12 +4793,13 @@ function getSandboxRoomById(roomId) {
 function processCompetitiveSlitherTick() {
     for (const room of competitiveSlitherRooms) {
         if (room.isResetting) continue;
-        const humanCount = room.players.filter(p => !p.disconnected).length;
+        const activeEntities = room.players.filter(p => !p.disconnected).length;
+        const activeHumans = room.players.filter(p => !p.isBot && !p.disconnected).length;
         const spectatorCount = room.competitiveSpectators?.length ?? 0;
-        if (humanCount === 0 && spectatorCount === 0) continue;
+        if (activeEntities === 0 && spectatorCount === 0) continue;
 
         const resetTime = room.startTime + c.roomDuration;
-        syncCompetitiveSlitherFood(room, humanCount);
+        syncCompetitiveSlitherFood(room, activeHumans);
         const lb = processCompetitiveSlitherRoom(
             room,
             io,

@@ -910,7 +910,7 @@ function applyCompetitiveZoneAvoidance(snake, effectiveRadius) {
     return true;
 }
 
-function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius) {
+function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, paidDeathDrops, paidDeathDropIds) {
     const head = snake.segments[0];
     if (applyCompetitiveZoneAvoidance(snake, effectiveRadius)) return;
 
@@ -939,13 +939,14 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius) {
     // Paid death drops are scanned across the whole active zone and beat prey,
     // wandering and ordinary food. Immediate survival and zone safety still win.
     const deathDropRange = Math.max(minDistFood, effectiveRadius * 2);
-    const paidDeathDrop = findNearestFoodForBot(
-        head,
-        food,
-        null,
-        deathDropRange,
-        f => f.competitiveDeathDrop && (f.dollarValue || 0) > 0,
-    );
+    const now = Date.now();
+    let paidDeathDrop = snake._paidDeathDropTarget;
+    const targetStillExists = paidDeathDrop?.id != null && paidDeathDropIds.has(paidDeathDrop.id);
+    if (!targetStillExists || now - (snake._lastPaidDeathDropScan || 0) >= 250) {
+        paidDeathDrop = findNearestFoodForBot(head, paidDeathDrops, null, deathDropRange);
+        snake._paidDeathDropTarget = paidDeathDrop;
+        snake._lastPaidDeathDropScan = now;
+    }
 
     if (threat) {
         const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
@@ -1917,8 +1918,9 @@ function dropCompetitiveSnakeAsFood(room, snake) {
             y: seg.y + (Math.random() - 0.5) * jitter,
             balance: massEach,
             dollarValue: dollarEach,
+            // Render with the normal dead-snake food shape and clustering,
+            // while hue 48 keeps the arena payout unmistakably golden.
             hue: 48,
-            golden: true,
             deathDrop: true,
             competitiveDeathDrop: true,
             radius: COMPETITIVE_SLITHER.deathFoodRadius,
@@ -2070,10 +2072,21 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
     const effectiveRadius = getCompetitiveEffectiveRadius(resetTime);
     const allSnakes = getCompetitiveSnakes(room);
     const toRemove = [];
+    const paidDeathDrops = room.slitherFood.filter(
+        f => f.competitiveDeathDrop && (f.dollarValue || 0) > 0
+    );
+    const paidDeathDropIds = new Set(paidDeathDrops.map(f => f.id));
 
     for (const { entity: snake } of allSnakes) {
         if (snake.isBot) {
-            runCompetitiveSlitherBotAI(snake, allSnakes, room.slitherFood, effectiveRadius);
+            runCompetitiveSlitherBotAI(
+                snake,
+                allSnakes,
+                room.slitherFood,
+                effectiveRadius,
+                paidDeathDrops,
+                paidDeathDropIds,
+            );
         }
         updateCompetitiveSnakeMovement(snake);
         checkCompetitiveFoodCollisions(snake, room);
@@ -2120,11 +2133,14 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
     const sendFoodThisTick = room._compSlitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
     const sendMinimapThisTick = room._compSlitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
-    const compPlayers = room.players.filter(p => p.mode === 'competitive-slither' && !p.disconnected);
+    // Bots have fake IDs, not sockets. Never build or emit viewer payloads for them.
+    const compPlayers = room.players.filter(
+        p => p.mode === 'competitive-slither' && !p.isBot && !p.disconnected
+    );
     const compSpecs = room.competitiveSpectators || [];
     const needsCompFoodRefresh = sendFoodThisTick
         || compPlayers.some(p => !room._lastCompFoodByPlayer?.[p.id])
-        || compSpecs.length > 0;
+        || compSpecs.some(s => !room._lastCompFoodByPlayer?.[s.id]);
     const compFoodGrid = needsCompFoodRefresh && room.slitherFood.length > 80
         ? buildSlitherFoodGrid(room.slitherFood, room._sharedCompFoodGrid)
         : null;
@@ -2146,8 +2162,7 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
 
         let visibleFood = null;
-        const refreshFood = spectating
-            || sendFoodThisTick
+        const refreshFood = sendFoodThisTick
             || !room._lastCompFoodByPlayer?.[socketId];
         if (refreshFood) {
             visibleFood = collectSlitherFoodInView(
@@ -2159,14 +2174,12 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 MAX_VISIBLE_FOOD,
                 COMPETITIVE_SLITHER.foodRadius,
             );
-            if (!spectating) {
-                if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
-                room._lastCompFoodByPlayer[socketId] = visibleFood;
-            }
+            if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
+            room._lastCompFoodByPlayer[socketId] = visibleFood;
         }
 
         let minimap = null;
-        if (sendMinimapThisTick || spectating || !room._lastCompMinimapByPlayer?.[socketId]) {
+        if (sendMinimapThisTick || !room._lastCompMinimapByPlayer?.[socketId]) {
             const minimapPlayers = allSnakes.map(({ entity: s }) => {
                 const h = s.segments[0];
                 if (!h) return null;
