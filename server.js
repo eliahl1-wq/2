@@ -774,7 +774,10 @@ async function cashOutCompetitiveRoomPlayers(room) {
             releaseCashoutLock(mongoId);
         }
     }
-    return allSettled && room.players.length === 0;
+    // Server-owned bots deliberately remain in room.players until the reset
+    // reaches its entity-clearing phase. They must not keep the cashout phase
+    // pending forever; only real players can have unsettled cashouts.
+    return allSettled && room.players.every(p => p.isBot);
 }
 
 async function cashOutSurvivRoomPlayers(room) {
