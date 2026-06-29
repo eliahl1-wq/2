@@ -10,6 +10,7 @@ export const SLITHER = {
     segmentsPerCent: 0.125,
     maxScale: 6,
     scaleDivisor: 106,
+    radiusScaleDivisor: 150,
     baseRadius: 6.2,
     segmentSepFactor: 3.6,
     nsp1: 5.39,
@@ -149,6 +150,17 @@ export function scaleForSegmentCount(sct) {
     return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
 }
 
+/** Width grows more slowly than body length as segment count increases. */
+export function radiusScaleForSegmentCount(sct) {
+    const normalized = Math.max(2, sct);
+    const baseSegments = Math.min(normalized, SLITHER.spawnSegments);
+    const extraSegments = Math.max(0, normalized - SLITHER.spawnSegments);
+    return Math.min(
+        SLITHER.maxScale,
+        1 + (baseSegments - 2) / SLITHER.scaleDivisor + extraSegments / SLITHER.radiusScaleDivisor,
+    );
+}
+
 /** Slither.io angular speed scale - thick snakes turn slower, but not too sluggishly. */
 export function scangForSegmentCount(sct) {
     const sc = scaleForSegmentCount(sct);
@@ -161,7 +173,7 @@ export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
 }
 
 export function headRadiusForBalance(balance, referenceBalance = 1.0) {
-    const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
+    const sc = radiusScaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
     return SLITHER.baseRadius * sc;
 }
 
@@ -170,7 +182,7 @@ export function segmentSpacingForSegmentCount(sct) {
 }
 
 export function headRadiusForSegmentCount(sct) {
-    return SLITHER.baseRadius * scaleForSegmentCount(sct);
+    return SLITHER.baseRadius * radiusScaleForSegmentCount(sct);
 }
 
 export function segmentSpacingForBalance(balance, referenceBalance = 1.0) {
@@ -876,6 +888,83 @@ function runSlitherBotAI(snake, allSnakes, food, foodGrid = null) {
     }
 }
 
+function applyCompetitiveZoneAvoidance(snake, effectiveRadius) {
+    const head = snake.segments[0];
+    const headDistance = Math.hypot(head.x, head.y);
+    if (headDistance < 1e-6) return false;
+
+    const snakeRadius = headRadiusForBalance(snake.balance);
+    const safetyMargin = Math.min(220, Math.max(70, effectiveRadius * 0.24));
+    const safeRadius = Math.max(0, effectiveRadius - snakeRadius - safetyMargin);
+    if (headDistance < safeRadius) return false;
+
+    // Zone safety always wins over food, prey and wandering. Aim well inside the
+    // circle so the snake has enough room to complete its gradual turn.
+    const inwardDistance = Math.max(180, safetyMargin * 1.5);
+    snake.targetX = head.x - (head.x / headDistance) * inwardDistance;
+    snake.targetY = head.y - (head.y / headDistance) * inwardDistance;
+    snake.inputDx = snake.targetX - head.x;
+    snake.inputDy = snake.targetY - head.y;
+    snake.boost = false;
+    return true;
+}
+
+function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius) {
+    const head = snake.segments[0];
+    if (applyCompetitiveZoneAvoidance(snake, effectiveRadius)) return;
+
+    const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
+    const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
+    const minDistFood = scaleAgarBotDistance(AGAR_BOT_FOOD_RANGE);
+    const fleeDistance = scaleAgarBotDistance(AGAR_BOT_FLEE_DISTANCE);
+    let threat = null;
+    let targetPrey = null;
+    let nearestThreatDist = minDistThreat;
+    let nearestPreyDist = minDistPrey;
+
+    for (const { entity: other } of allSnakes) {
+        if (other.id === snake.id) continue;
+        const otherHead = other.segments[0];
+        const d = dist(head.x, head.y, otherHead.x, otherHead.y);
+        if (other.balance > snake.balance * 1.10 && d < nearestThreatDist) {
+            nearestThreatDist = d;
+            threat = otherHead;
+        } else if (snake.balance > other.balance * 1.10 && d < nearestPreyDist) {
+            nearestPreyDist = d;
+            targetPrey = otherHead;
+        }
+    }
+
+    if (threat) {
+        const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
+        snake.targetX = head.x + Math.cos(angle) * fleeDistance;
+        snake.targetY = head.y + Math.sin(angle) * fleeDistance;
+        snake.boost = nearestThreatDist < fleeDistance * 0.3;
+    } else if (targetPrey) {
+        snake.targetX = targetPrey.x;
+        snake.targetY = targetPrey.y;
+        snake.boost = nearestPreyDist < fleeDistance * 0.25;
+    } else if (Date.now() - (snake.lastTargetUpdate || 0) > AGAR_BOT_TARGET_INTERVAL_MS) {
+        const nearestFood = findNearestFoodForBot(head, food, null, minDistFood);
+        if (nearestFood) {
+            snake.targetX = nearestFood.x;
+            snake.targetY = nearestFood.y;
+        } else if (!Number.isFinite(snake.targetX)
+            || dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
+            const maxTargetRadius = Math.max(0, effectiveRadius - 220);
+            const angle = Math.random() * Math.PI * 2;
+            const radius = Math.sqrt(Math.random()) * maxTargetRadius;
+            snake.targetX = Math.cos(angle) * radius;
+            snake.targetY = Math.sin(angle) * radius;
+        }
+        snake.lastTargetUpdate = Date.now();
+        snake.boost = false;
+    }
+
+    snake.inputDx = snake.targetX - head.x;
+    snake.inputDy = snake.targetY - head.y;
+}
+
 function checkWallCollision(snake) {
     const head = snake.segments[0];
     const r = headRadiusForBalance(snake.balance);
@@ -1200,7 +1289,8 @@ function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS
 
 function serializeSnake(snake, isYou) {
     const sct = snake.segments.length;
-    const sc = scaleForSegmentCount(sct);
+    const sc = radiusScaleForSegmentCount(sct);
+    const lengthSc = scaleForSegmentCount(sct);
     const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
     return {
         id: snake.id,
@@ -1215,7 +1305,7 @@ function serializeSnake(snake, isYou) {
         angle: snake.angle || 0,
         sc,
         fam: snake.fam ?? 0,
-        wsep: SLITHER.segmentSepFactor * sc,
+        wsep: SLITHER.segmentSepFactor * lengthSc,
         radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
@@ -1639,6 +1729,14 @@ export function getCompetitiveEffectiveRadius(resetTime) {
     return worldHalf * (msUntilReset / shrinkMs);
 }
 
+export function clampCompetitiveSpawnToZone(x, y, effectiveRadius, balance) {
+    const distanceFromCenter = Math.hypot(x, y);
+    const safeRadius = Math.max(0, effectiveRadius - Math.max(160, headRadiusForBalance(balance) * 6));
+    if (distanceFromCenter <= safeRadius || distanceFromCenter < 1e-6) return { x, y };
+    const scale = safeRadius / distanceFromCenter;
+    return { x: x * scale, y: y * scale };
+}
+
 export function getCompetitiveZone(resetTime) {
     const radius = getCompetitiveEffectiveRadius(resetTime);
     const msUntilReset = resetTime - Date.now();
@@ -1873,7 +1971,8 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
 
 function serializeCompetitiveSnake(snake, isYou) {
     const sct = snake.segments.length;
-    const sc = scaleForSegmentCount(sct);
+    const sc = radiusScaleForSegmentCount(sct);
+    const lengthSc = scaleForSegmentCount(sct);
     const segments = downsampleSegmentsForNetwork(snake.segments, isYou ? MAX_NETWORK_SEGMENTS : 72);
     return {
         id: snake.id,
@@ -1888,7 +1987,7 @@ function serializeCompetitiveSnake(snake, isYou) {
         angle: snake.angle || 0,
         sc,
         fam: snake.fam ?? 0,
-        wsep: SLITHER.segmentSepFactor * sc,
+        wsep: SLITHER.segmentSepFactor * lengthSc,
         radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
@@ -1901,6 +2000,9 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
     const toRemove = [];
 
     for (const { entity: snake } of allSnakes) {
+        if (snake.isBot) {
+            runCompetitiveSlitherBotAI(snake, allSnakes, room.slitherFood, effectiveRadius);
+        }
         updateCompetitiveSnakeMovement(snake);
         checkCompetitiveFoodCollisions(snake, room);
 

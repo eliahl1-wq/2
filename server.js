@@ -28,7 +28,9 @@ import {
     syncSlitherFood,
     syncCompetitiveSlitherFood,
     spawnGoldenSlitherBlob,
+    getCompetitiveEffectiveRadius,
     getCompetitiveZone,
+    clampCompetitiveSpawnToZone,
     addSlitherFood,
     createSegments,
 } from './slither-engine.js';
@@ -4363,9 +4365,19 @@ io.on('connection', (socket) => {
             } else if (isCompSlither) {
                 // Competitive slither: bots live in room.players (no slitherBots array)
                 const eco = getEconomy(room.entryFeeUsd ?? 2);
-                const angle = Math.random() * Math.PI * 2;
-                const bx = spawnX + offsetX;
-                const by = spawnY + offsetY;
+                const effectiveRadius = getCompetitiveEffectiveRadius(room.startTime + c.roomDuration);
+                const safeSpawn = clampCompetitiveSpawnToZone(
+                    spawnX + offsetX,
+                    spawnY + offsetY,
+                    effectiveRadius,
+                    startMass,
+                );
+                const bx = safeSpawn.x;
+                const by = safeSpawn.y;
+                // Start toward the arena center; AI takes over on the next physics tick.
+                const angle = Math.hypot(bx, by) > 1
+                    ? Math.atan2(-by, -bx)
+                    : Math.random() * Math.PI * 2;
                 room.players.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
                     mongoId: null,
@@ -4384,6 +4396,9 @@ io.on('connection', (socket) => {
                     inputDx: Math.cos(angle),
                     inputDy: Math.sin(angle),
                     boost: false,
+                    targetX: 0,
+                    targetY: 0,
+                    lastTargetUpdate: 0,
                     angle,
                     fam: 0,
                     segments: createSegments(bx, by, startMass, angle),
