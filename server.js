@@ -1712,7 +1712,7 @@ function classifyTxActivity(tx) {
     if (m.event === 'pool_sweep' || m.event === 'br_owner_sweep') return 'sweep';
     if (tx.type === 'game') {
         if (m.event === 'join' || m.event === 'br_join') return 'entry';
-        if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated') return 'death';
+        if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated' || m.reason === 'Competitive Slither Death') return 'death';
         if (m.event === 'br_refund') return 'refund';
         return 'game';
     }
@@ -1756,7 +1756,7 @@ function buildTxCategoryFilter(category) {
         case 'cashout':
             return buildGameCashoutTxFilter();
         case 'death':
-            return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } };
+            return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } };
         case 'sweep':
             return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }] };
         case 'game':
@@ -2142,7 +2142,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 withdrawalCount += 1;
             }
             if (tx.type === 'game' && ['join', 'br_join'].includes(tx.meta?.event)) gameJoinCount += 1;
-            if (tx.type === 'game' && ['Arena Death', 'BR Eliminated'].includes(tx.meta?.reason)) deathCount += 1;
+            if (tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(tx.meta?.reason)) deathCount += 1;
             if (tx.type === 'withdraw' && /BR Victory/i.test(tx.meta?.reason || '')) brWinCount += 1;
         }
 
@@ -2164,7 +2164,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             }
 
             let eventType = join.meta?.event === 'br_join' ? 'br_join' : 'join';
-            if (join.meta?.reason === 'Arena Death' || join.meta?.reason === 'BR Eliminated') eventType = 'death';
+            if (join.meta?.reason === 'Arena Death' || join.meta?.reason === 'BR Eliminated' || join.meta?.reason === 'Competitive Slither Death') eventType = 'death';
 
             return {
                 id: join._id,
@@ -2523,6 +2523,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
                 { type: 'game', 'meta.event': 'br_join' },
                 { type: 'game', 'meta.reason': 'Arena Death' },
                 { type: 'game', 'meta.reason': 'BR Eliminated' },
+                { type: 'game', 'meta.reason': 'Competitive Slither Death' },
                 { type: 'game', 'meta.event': 'br_refund' },
                 { type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } },
             ]
@@ -2536,7 +2537,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
         if (eventType === 'entry') {
             andClauses.push({ type: 'game', 'meta.event': { $in: ['join', 'br_join'] } });
         } else if (eventType === 'death') {
-            andClauses.push({ type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } });
+            andClauses.push({ type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } });
         } else if (eventType === 'cashout') {
             andClauses.push({ type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } });
         } else if (eventType === 'refund') {
@@ -2553,7 +2554,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
         const history = events.map(tx => {
             let eventType = tx.meta?.event || tx.meta?.reason || tx.type;
             if (tx.meta?.event === 'join' || tx.meta?.event === 'br_join') eventType = 'join';
-            else if (tx.meta?.reason === 'Arena Death' || tx.meta?.reason === 'BR Eliminated') eventType = 'death';
+            else if (tx.meta?.reason === 'Arena Death' || tx.meta?.reason === 'BR Eliminated' || tx.meta?.reason === 'Competitive Slither Death') eventType = 'death';
             else if (/BR Victory/i.test(tx.meta?.reason || '')) eventType = 'br_win';
             else if (/Arena Cashout/i.test(tx.meta?.reason || '')) eventType = 'cashout';
             else if (/Auto Room Reset/i.test(tx.meta?.reason || '')) eventType = 'reset_cashout';
@@ -3293,7 +3294,7 @@ app.get('/api/leaderboard-live', async (req, res) => {
         const baseMatch = await reportedTxMatch({
             $or: [
                 buildGameCashoutTxFilter(),
-                { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated'] } },
+                { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } },
             ],
         });
 
@@ -3305,7 +3306,7 @@ app.get('/api/leaderboard-live', async (req, res) => {
         const events = txs.map((tx) => {
             const username = tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : 'Unknown';
             const amountUsd = Number(txAmountUsd(tx).toFixed(2));
-            const isDeath = tx.type === 'game' && ['Arena Death', 'BR Eliminated'].includes(tx.meta?.reason);
+            const isDeath = tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(tx.meta?.reason);
             const text = isDeath
                 ? `${username} died with $${amountUsd.toFixed(2)}`
                 : `${username} cashed out $${amountUsd.toFixed(2)}`;
@@ -4488,7 +4489,6 @@ io.on('connection', (socket) => {
                     botStake: stake,
                     entryFeeUsd: room.entryFeeUsd,
                     startTime: Date.now(),
-                    spawnGraceUntil: Date.now() + 4500,
                     color: util.randomSlitherColor(),
                     x: spawnX + offsetX,
                     y: spawnY + offsetY,

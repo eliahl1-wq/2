@@ -1181,7 +1181,7 @@ export function processBattleRoyaleMatches(io, deps) {
         if (room.variant === 'slither') {
             const humanCount = room.players.filter(p => !p.disconnected).length;
             syncBRSlitherFood(room, humanCount);
-            processSlitherRoom(room, io, deps.User, null);
+            processSlitherRoom(room, io, deps.User, deps.Transaction);
             applyZoneDamageSlither(room, io, deps);
             const lb = room.players
                 .filter(p => !p.disconnected)

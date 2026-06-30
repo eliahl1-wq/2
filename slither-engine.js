@@ -251,14 +251,46 @@ function isSpawnClear(room, x, y, minDist = 200) {
 }
 
 function pickSlitherSpawn(room) {
-    for (let i = 0; i < 80; i++) {
+    let bestX = 0;
+    let bestY = 0;
+    let maxMinDist = -1;
+
+    for (let i = 0; i < 100; i++) {
         const { x, y } = randomCoordInRoom(room);
-        if (isSpawnClear(room, x, y, 180)) return { x, y };
+        let minDistToAnySegment = Infinity;
+
+        for (const { entity: s } of getAllSlitherSnakes(room)) {
+            const r = headRadiusForBalance(s.balance ?? 1);
+            for (let j = 0; j < (s.segments?.length ?? 0); j += (j === 0 ? 1 : 8)) {
+                const seg = s.segments[j];
+                const segR = j === 0 ? r : r * 0.75;
+                const d = dist(x, y, seg.x, seg.y) - segR;
+                if (d < minDistToAnySegment) {
+                    minDistToAnySegment = d;
+                }
+            }
+            const last = s.segments?.[s.segments.length - 1];
+            if (last) {
+                const d = dist(x, y, last.x, last.y) - (r * 0.75);
+                if (d < minDistToAnySegment) minDistToAnySegment = d;
+            }
+        }
+
+        if (minDistToAnySegment > 180) {
+            return { x, y };
+        }
+
+        if (minDistToAnySegment > maxMinDist) {
+            maxMinDist = minDistToAnySegment;
+            bestX = x;
+            bestY = y;
+        }
     }
-    for (let i = 0; i < 40; i++) {
-        const { x, y } = randomCoordInRoom(room);
-        if (isSpawnClear(room, x, y, 120)) return { x, y };
+
+    if (maxMinDist > 30) {
+        return { x: bestX, y: bestY };
     }
+
     return randomCoordInRoom(room);
 }
 
@@ -773,6 +805,22 @@ function updateSnakeMovement(snake, room = null) {
         snake.x = head.x;
         snake.y = head.y;
     }
+
+    // Compute bounding box for fast collision culling
+    if (snake.segments && snake.segments.length > 0) {
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (let i = 0; i < snake.segments.length; i++) {
+            const seg = snake.segments[i];
+            if (seg.x < minX) minX = seg.x;
+            if (seg.x > maxX) maxX = seg.x;
+            if (seg.y < minY) minY = seg.y;
+            if (seg.y > maxY) maxY = seg.y;
+        }
+        snake.minX = minX;
+        snake.maxX = maxX;
+        snake.minY = minY;
+        snake.maxY = maxY;
+    }
 }
 
 function applyWallAvoidance(snake) {
@@ -1046,12 +1094,25 @@ function checkSnakeCollisions(snake, allSnakes) {
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
         if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) continue;
-        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 4)) {
+
+        // Bounding box check to cull segment collision checks
+        const maxOtherR = headRadiusForBalance(other.balance);
+        const pad = r + maxOtherR + 10;
+        if (other.minX !== undefined && (
+            head.x < other.minX - pad ||
+            head.x > other.maxX + pad ||
+            head.y < other.minY - pad ||
+            head.y > other.maxY + pad
+        )) {
+            continue;
+        }
+
+        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 2)) {
             const seg = other.segments[i];
             const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
             const dx = head.x - seg.x;
             const dy = head.y - seg.y;
-            const threshold = r * 0.65 + segR * 0.45;
+            const threshold = r * 0.85 + segR * 0.75;
             if (dx * dx + dy * dy < threshold * threshold) {
                 return other;
             }
@@ -1265,7 +1326,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
                 type: 'game',
                 amount: lostDollars,
                 meta: {
-                    reason: 'Arena Death',
+                    reason: snake.isBattleRoyale ? 'BR Eliminated' : 'Arena Death',
                     event: 'death',
                     mode: 'slither',
                     entryFeeUsd: snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
@@ -1575,7 +1636,24 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
         const visibleSnakes = allSnakes
             .filter(({ entity: s }) => {
                 const h = s.segments[0];
-                return isInView(head.x, head.y, h.x, h.y, range);
+                if (!h) return false;
+
+                // Bypass culling in Arena modes since the map is small
+                if (!room.isBattleRoyale && !meta.battleRoyale) return true;
+
+                // For Battle Royale, check if any segment is in view (with a buffer) so large snakes don't pop out
+                const buffer = 400; // Extra buffer to cover large snake body parts
+                for (let i = 0; i < s.segments.length; i += 8) {
+                    const seg = s.segments[i];
+                    if (isInView(head.x, head.y, seg.x, seg.y, range + buffer)) {
+                        return true;
+                    }
+                }
+                const last = s.segments[s.segments.length - 1];
+                if (last && isInView(head.x, head.y, last.x, last.y, range + buffer)) {
+                    return true;
+                }
+                return false;
             })
             .map(({ entity: s }) => {
                 const isYou = !r.isSpectator && s.id === r.id;
@@ -1668,7 +1746,6 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
         dollarBalance: dollarStart,
         entryFeeUsd: room.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
         startTime: Date.now(),
-        spawnGraceUntil: Date.now() + 4500,
         color,
         x,
         y,
@@ -1732,10 +1809,46 @@ function isCompetitiveSpawnClear(room, x, y, minDist = 120) {
 }
 
 function pickCompetitiveSpawn(room) {
-    for (let i = 0; i < 80; i++) {
+    let bestX = 0;
+    let bestY = 0;
+    let maxMinDist = -1;
+
+    for (let i = 0; i < 100; i++) {
         const { x, y } = randomCompetitiveSpawnCoord();
-        if (isCompetitiveSpawnClear(room, x, y, 120)) return { x, y };
+        let minDistToAnySegment = Infinity;
+
+        for (const { entity: s } of getCompetitiveSnakes(room)) {
+            const r = headRadiusForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
+            for (let j = 0; j < (s.segments?.length ?? 0); j += (j === 0 ? 1 : 8)) {
+                const seg = s.segments[j];
+                const segR = j === 0 ? r : r * 0.75;
+                const d = dist(x, y, seg.x, seg.y) - segR;
+                if (d < minDistToAnySegment) {
+                    minDistToAnySegment = d;
+                }
+            }
+            const last = s.segments?.[s.segments.length - 1];
+            if (last) {
+                const d = dist(x, y, last.x, last.y) - (r * 0.75);
+                if (d < minDistToAnySegment) minDistToAnySegment = d;
+            }
+        }
+
+        if (minDistToAnySegment > 180) {
+            return { x, y };
+        }
+
+        if (minDistToAnySegment > maxMinDist) {
+            maxMinDist = minDistToAnySegment;
+            bestX = x;
+            bestY = y;
+        }
     }
+
+    if (maxMinDist > 30) {
+        return { x: bestX, y: bestY };
+    }
+
     return randomCompetitiveSpawnCoord();
 }
 
@@ -1785,7 +1898,6 @@ export function createCompetitiveSlitherAdminBot(room, effectiveRadius, nearX = 
         entryFeeUsd: eco.entryFeeUsd,
         botStake: eco.dollarStart,
         startTime: Date.now(),
-        spawnGraceUntil: Date.now() + 4500,
         color: util.randomSlitherColor(),
         x,
         y,
@@ -2029,7 +2141,6 @@ export function createCompetitiveSlitherPlayer(socketId, mongoId, username, colo
         dollarBalance: eco.dollarStart,
         entryFeeUsd: eco.entryFeeUsd,
         startTime: Date.now(),
-        spawnGraceUntil: Date.now() + 4500,
         color,
         x,
         y,
