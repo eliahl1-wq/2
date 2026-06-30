@@ -282,77 +282,7 @@ TransactionSchema.post('save', async function(doc) {
                     user.sponsoredRewardsCompleted = true; // Revert to normal split
                     console.log(`[Challenge Unlocked] User ${user.username} completed all sponsored reward challenges!`);
                     
-                    // Payout sponsored balance if >0
-                    if (user.sponsoredRewardsBalance > 0) {
-                        const amountToUnlock = user.sponsoredRewardsBalance;
-                        console.log(`[Challenge Payout] Unlocking $${amountToUnlock.toFixed(2)} for ${user.username}`);
-                        
-                        if (DEV_FREE_PLAY) {
-                            console.log(`[FREE PLAY] Simulated payout of $${amountToUnlock.toFixed(2)} to ${user.depositAddress}`);
-                            user.sponsoredRewardsBalance = 0;
-                            
-                            setImmediate(async () => {
-                                try {
-                                    await mongoose.model('Transaction').create({
-                                        userId: user._id,
-                                        type: 'deposit',
-                                        amount: amountToUnlock / SOL_PRICE_USD,
-                                        meta: {
-                                            event: 'sponsored_rewards_unlock',
-                                            amountUsd: amountToUnlock,
-                                            simulated: true,
-                                            signature: 'simulated_unlock'
-                                        },
-                                        status: 'confirmed'
-                                    });
-                                } catch (e) {
-                                    console.error("Error creating free-play unlock transaction:", e.message);
-                                }
-                            });
-                        } else if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
-                            const solPayout = amountToUnlock / SOL_PRICE_USD;
-                            const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
-                            
-                            try {
-                                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-                                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
-                                );
-                                const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                                
-                                const transaction = new solanaWeb3.Transaction().add(
-                                    solanaWeb3.SystemProgram.transfer({
-                                        fromPubkey: houseKeypair.publicKey,
-                                        toPubkey: userPubKey,
-                                        lamports: payoutLamports,
-                                    })
-                                );
-                                
-                                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-                                console.log(`[Challenge Payout] Successfully paid $${amountToUnlock.toFixed(2)} on-chain. Sig: ${signature}`);
-                                user.sponsoredRewardsBalance = 0;
-                                
-                                setImmediate(async () => {
-                                    try {
-                                        await mongoose.model('Transaction').create({
-                                            userId: user._id,
-                                            type: 'deposit',
-                                            amount: solPayout,
-                                            meta: {
-                                                event: 'sponsored_rewards_unlock',
-                                                amountUsd: amountToUnlock,
-                                                signature
-                                            },
-                                            status: 'confirmed'
-                                        });
-                                    } catch (e) {
-                                        console.error("Error creating on-chain unlock transaction:", e.message);
-                                    }
-                                });
-                            } catch (err) {
-                                console.error("[Challenge Payout Error] On-chain payout failed:", err.message);
-                            }
-                        }
-                    }
+                    // Payout is now handled manually via /api/user/claim-rewards endpoint
                 }
                 await user.save();
             }
@@ -1617,6 +1547,101 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
             await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } }).catch(() => { });
         }
         res.status(500).json({ error: "Blockchain transaction failed" });
+    }
+});
+
+app.post('/api/user/claim-rewards', authenticateToken, async (req, res) => {
+    try {
+        const User = mongoose.model('User');
+        const user = await User.findById(req.user.userId);
+        
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        
+        if (!user.sponsoredRewardsUnlocked || !user.sponsoredRewardsCompleted) {
+            return res.status(400).json({ error: 'Challenges not fully completed' });
+        }
+        
+        if (user.sponsoredRewardsBalance <= 0) {
+            return res.status(400).json({ error: 'No rewards available to claim' });
+        }
+        
+        const amountToUnlock = user.sponsoredRewardsBalance;
+        console.log(`[Manual Claim] Unlocking $${amountToUnlock.toFixed(2)} for ${user.username}`);
+        
+        if (DEV_FREE_PLAY) {
+            console.log(`[FREE PLAY] Simulated manual claim payout of $${amountToUnlock.toFixed(2)} to ${user.depositAddress}`);
+            user.sponsoredRewardsBalance = 0;
+            await user.save();
+            
+            try {
+                await mongoose.model('Transaction').create({
+                    userId: user._id,
+                    type: 'deposit',
+                    amount: amountToUnlock / SOL_PRICE_USD,
+                    meta: {
+                        event: 'sponsored_rewards_claim',
+                        amountUsd: amountToUnlock,
+                        simulated: true,
+                        signature: 'simulated_claim'
+                    },
+                    status: 'confirmed'
+                });
+            } catch (e) {
+                console.error("Error creating free-play claim transaction:", e.message);
+            }
+            
+            return res.json({ success: true, amount: amountToUnlock });
+        } else if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
+            const solPayout = amountToUnlock / SOL_PRICE_USD;
+            const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+            
+            try {
+                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                );
+                const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                
+                const transaction = new solanaWeb3.Transaction().add(
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: houseKeypair.publicKey,
+                        toPubkey: userPubKey,
+                        lamports: payoutLamports,
+                    })
+                );
+                
+                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+                console.log(`[Manual Claim] Successfully paid $${amountToUnlock.toFixed(2)} on-chain. Sig: ${signature}`);
+                
+                user.sponsoredRewardsBalance = 0;
+                await user.save();
+                
+                try {
+                    await mongoose.model('Transaction').create({
+                        userId: user._id,
+                        type: 'deposit',
+                        amount: solPayout,
+                        meta: {
+                            event: 'sponsored_rewards_claim',
+                            amountUsd: amountToUnlock,
+                            signature
+                        },
+                        status: 'confirmed'
+                    });
+                } catch (e) {
+                    console.error("Error creating on-chain claim transaction:", e.message);
+                }
+                
+                return res.json({ success: true, amount: amountToUnlock, signature });
+            } catch (err) {
+                console.error("[Manual Claim Error] On-chain payout failed:", err.message);
+                return res.status(500).json({ error: 'Failed to process on-chain payout' });
+            }
+        } else {
+            return res.status(500).json({ error: 'Server wallet not configured for payouts' });
+        }
+    } catch (err) {
+        console.error("Claim rewards error:", err);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
