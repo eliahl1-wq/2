@@ -611,6 +611,29 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
         throw new Error('House wallet lacks liquidity');
     }
 
+    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+    const userLamports = await connection.getBalance(userPubKey);
+    const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
+
+    if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
+        console.log(`[Rent Exemption] Payout too small for ${user.username}. Crediting $${playerPayout.toFixed(2)} to sponsored rewards.`);
+        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        keepCompetitiveCashoutSpectator(room, player);
+        user.playtime += (Date.now() - player.startTime);
+        user.sponsoredRewardsBalance += playerPayout;
+        await user.save();
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            status: 'confirmed',
+        });
+        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
+    }
+
     const transaction = new solanaWeb3.Transaction();
     transaction.add(
         solanaWeb3.SystemProgram.transfer({
@@ -711,6 +734,28 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
     if (totalLamports < payoutLamports + feeLamports + feeBuffer) {
         throw new Error('House wallet lacks liquidity');
+    }
+
+    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+    const userLamports = await connection.getBalance(userPubKey);
+    const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
+
+    if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
+        console.log(`[Rent Exemption] Payout too small for ${user.username}. Crediting $${playerPayout.toFixed(2)} to sponsored rewards.`);
+        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        user.playtime += (Date.now() - player.startTime);
+        user.sponsoredRewardsBalance += playerPayout;
+        await user.save();
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            status: 'confirmed',
+        });
+        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -840,6 +885,29 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         && totalLamports >= payoutLamports + feeLamports + feeBuffer;
     if (totalLamports < payoutLamports + feeBuffer) {
         throw new Error('House wallet lacks liquidity');
+    }
+
+    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+    const userLamports = await connection.getBalance(userPubKey);
+    const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
+
+    if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
+        console.log(`[Rent Exemption] Payout too small for ${user.username}. Crediting $${playerPayout.toFixed(2)} to sponsored rewards.`);
+        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        user.playtime += (Date.now() - player.startTime);
+        user.sponsoredRewardsBalance += playerPayout;
+        await user.save();
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            status: 'confirmed',
+        });
+        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        commitArenaCashoutReservation(room, player);
+        return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
