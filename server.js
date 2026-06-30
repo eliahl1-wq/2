@@ -10,7 +10,7 @@ import * as util from './utils.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import passport from 'passport';
-import { randomUUID } from 'crypto';
+import { randomBytes } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import {
@@ -77,6 +77,20 @@ import {
     getActiveBRMatchesRaw,
 } from './battle-royale.js';
 import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
+import {
+    RewardClaim,
+    RewardSecurityAlert,
+    addRewardFundingUsd,
+    completeRewardClaim,
+    failAndReleaseRewardClaim,
+    getCachedPendingRewardUsd,
+    hydrateRewardPoolState,
+    markClaimBroadcast,
+    recordDepositSource,
+    reducePendingRewardUsd,
+    reserveRewardClaim,
+    resolveRewardSecurityAlert,
+} from './reward-system.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
 
 // --- SOLANA KONFIGURATION ---
@@ -88,7 +102,10 @@ const REWARD_WALLET_SECRET = process.env.REWARD_WALLET_SECRET;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
-let rewardPoolBalance = 0; // In-memory USD tracking (server is source of truth)
+const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString('hex');
+if (!process.env.JWT_SECRET) {
+    console.warn('JWT_SECRET is not configured; using a process-local development secret. Sessions will reset on restart.');
+}
 let SOL_PRICE_USD = 57; // Default fallback price, updated by market scanner
 
 if (DEV_FREE_PLAY) {
@@ -220,7 +237,14 @@ const UserSchema = new mongoose.Schema({
     completedFiveDollarNormalGames: { type: Number, default: 0 },
     completedTenDollarNormalGames: { type: Number, default: 0 },
     sponsoredRewardsUnlocked: { type: Boolean, default: false },
-    sponsoredRewardsBalance: { type: Number, default: 0 }, // in USD, as rewards are dollar-denominated in description
+    sponsoredRewardsBalance: { type: Number, default: 0 }, // USD-denominated promotional reward
+    rentFallbackBalanceUsd: { type: Number, default: 0 }, // Real cashouts retained because the destination was below rent minimum
+    rewardsDisabled: { type: Boolean, default: false },
+    rewardsDisabledReason: { type: String, default: '' },
+    rewardClaimInProgress: { type: Boolean, default: false },
+    rewardClaimReservedUsd: { type: Number, default: 0 },
+    activeRewardClaimId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    lastDepositSourceSignature: { type: String, default: null },
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -248,98 +272,89 @@ function getDynamicChallengeReqs(sponsoredRewardsBalance) {
 
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed') return;
-    
-    // Check if this is a completed normal game (not free-ticket play)
     const isNormalGameDeath = doc.type === 'game' && doc.meta?.event === 'death' && doc.meta?.reason === 'Arena Death';
-    const isNormalGameCashout = doc.type === 'withdraw' && (doc.meta?.reason === 'Arena Cashout' || doc.meta?.reason === 'Auto Room Reset to Account Address');
-    
-    if (isNormalGameDeath || isNormalGameCashout) {
-        const userId = doc.userId;
-        const entryFeeUsd = doc.meta?.entryFeeUsd;
-        const mode = doc.meta?.mode;
-        const isFreeTicketPlay = doc.meta?.isFreeTicketPlay;
-        
-        // Only normal games count: Agar normal or Slither normal
-        const isNormalMode = mode === 'agar' || mode === 'slither';
-        if (!userId || !isNormalMode || isFreeTicketPlay) return;
-        
-        try {
-            const UserMod = mongoose.model('User');
-            const user = await UserMod.findById(userId);
-            if (!user || user.sponsoredRewardsUnlocked || !user.freeTicketUsed) return;
-            
-            const reqs = getDynamicChallengeReqs(user.sponsoredRewardsBalance);
-            
-            let updated = false;
-            if (entryFeeUsd === 5) {
-                // Count completed $5 games
-                if (user.completedFiveDollarNormalGames < reqs.req5) {
-                    user.completedFiveDollarNormalGames += 1;
-                    updated = true;
-                    console.log(`[Challenge Progress] User ${user.username} completed a $5 normal game. Total: ${user.completedFiveDollarNormalGames}/${reqs.req5}`);
-                }
-            } else if (entryFeeUsd === 10) {
-                // Count completed $10 games
-                if (user.completedTenDollarNormalGames < reqs.req10) {
-                    user.completedTenDollarNormalGames += 1;
-                    updated = true;
-                    console.log(`[Challenge Progress] User ${user.username} completed a $10 normal game. Total: ${user.completedTenDollarNormalGames}/${reqs.req10}`);
-                }
-            }
-            
-            if (updated) {
-                // Check if challenge is fully complete
-                if (user.completedFiveDollarNormalGames >= reqs.req5 && user.completedTenDollarNormalGames >= reqs.req10) {
-                    user.sponsoredRewardsUnlocked = true;
-                    user.sponsoredRewardsCompleted = true; // Revert to normal split
-                    
-                    const totalContribution = (user.completedFiveDollarNormalGames * 1) + (user.completedTenDollarNormalGames * 2);
-                    const excess = totalContribution - (user.sponsoredRewardsBalance || 0);
-                    
-                    if (excess > 0 && rewardPoolBalance >= excess) {
-                        rewardPoolBalance -= excess;
-                        console.log(`[Challenge Unlocked] Transferring excess $${excess.toFixed(2)} from Reward Pool to Owner Vault.`);
-                        
-                        try {
-                            const TransactionMod = mongoose.model('Transaction');
-                            await TransactionMod.create({
-                                userId: user._id,
-                                type: 'game',
-                                amount: -(excess / SOL_PRICE_USD),
-                                meta: {
-                                    event: 'reward_pool_correction',
-                                    note: 'Transfer excess to owner vault',
-                                    correctionUsd: -excess
-                                },
-                                status: 'confirmed'
-                            });
-                            
-                            await TransactionMod.create({
-                                userId: user._id,
-                                type: 'game',
-                                amount: (excess / SOL_PRICE_USD),
-                                meta: {
-                                    event: 'owner_vault_contribution',
-                                    note: 'Excess from sponsored challenges',
-                                    contributionUsd: excess
-                                },
-                                status: 'confirmed'
-                            });
-                        } catch (e) {
-                            console.error("Failed to log excess transfer tx:", e.message);
-                        }
-                    }
+    const isNormalGameCashout = doc.type === 'withdraw'
+        && (doc.meta?.reason === 'Arena Cashout' || doc.meta?.reason === 'Auto Room Reset to Account Address');
+    if (!isNormalGameDeath && !isNormalGameCashout) return;
 
-                    console.log(`[Challenge Unlocked] User ${user.username} completed all sponsored reward challenges!`);
-                }
-                await user.save();
-            }
-        } catch (err) {
-            console.error("Error in Transaction post-save challenge processing:", err.message);
+    const userId = doc.userId;
+    const entryFeeUsd = Number(doc.meta?.entryFeeUsd);
+    const mode = doc.meta?.mode;
+    if (!userId || !['agar', 'slither'].includes(mode) || doc.meta?.isFreeTicketPlay || ![5, 10].includes(entryFeeUsd)) return;
+
+    const TransactionMod = mongoose.model('Transaction');
+    const marker = await TransactionMod.updateOne(
+        { _id: doc._id, 'meta.challengeProgressApplied': { $ne: true } },
+        { $set: { 'meta.challengeProgressApplied': true, 'meta.challengeProgressAppliedAt': new Date().toISOString() } },
+    );
+    if (!marker.modifiedCount) return;
+
+    try {
+        const UserMod = mongoose.model('User');
+        const current = await UserMod.findOne({
+            _id: userId,
+            sponsoredRewardsUnlocked: { $ne: true },
+            freeTicketUsed: true,
+            rewardsDisabled: { $ne: true },
+        }).lean();
+        if (!current) return;
+
+        const reqs = getDynamicChallengeReqs(current.sponsoredRewardsBalance);
+        const progressField = entryFeeUsd === 5
+            ? 'completedFiveDollarNormalGames'
+            : 'completedTenDollarNormalGames';
+        const required = entryFeeUsd === 5 ? reqs.req5 : reqs.req10;
+        const updated = await UserMod.findOneAndUpdate(
+            {
+                _id: userId,
+                sponsoredRewardsUnlocked: { $ne: true },
+                freeTicketUsed: true,
+                rewardsDisabled: { $ne: true },
+                [progressField]: { $lt: required },
+            },
+            { $inc: { [progressField]: 1 } },
+            { new: true },
+        );
+        if (!updated) return;
+
+        console.log(`[Challenge Progress] User ${updated.username} completed a $${entryFeeUsd} normal game. `
+            + `${updated[progressField]}/${required}`);
+
+        const unlocked = await UserMod.findOneAndUpdate(
+            {
+                _id: userId,
+                sponsoredRewardsUnlocked: { $ne: true },
+                completedFiveDollarNormalGames: { $gte: reqs.req5 },
+                completedTenDollarNormalGames: { $gte: reqs.req10 },
+            },
+            { $set: { sponsoredRewardsUnlocked: true, sponsoredRewardsCompleted: true } },
+            { new: true },
+        );
+        if (!unlocked) return;
+
+        const totalContribution = (unlocked.completedFiveDollarNormalGames * 1)
+            + (unlocked.completedTenDollarNormalGames * 2);
+        const excess = Math.max(0, totalContribution - (unlocked.sponsoredRewardsBalance || 0));
+        if (excess > 0) {
+            await reducePendingRewardUsd(excess);
+            await TransactionMod.create({
+                userId: unlocked._id,
+                type: 'game',
+                amount: -(excess / SOL_PRICE_USD),
+                currency: 'SOL',
+                meta: { event: 'reward_pool_correction', note: 'Unused sponsored contribution', correctionUsd: -excess },
+                status: 'confirmed',
+            });
         }
+        console.log(`[Challenge Unlocked] User ${unlocked.username} completed all sponsored reward challenges!`);
+    } catch (err) {
+        await TransactionMod.updateOne(
+            { _id: doc._id },
+            { $unset: { 'meta.challengeProgressApplied': 1, 'meta.challengeProgressAppliedAt': 1 } },
+        ).catch(() => {});
+        console.error('Error in Transaction post-save challenge processing:', err.message);
     }
 });
-
 const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 /** In-game cashouts only — excludes account withdrawals to external wallets. */
@@ -616,12 +631,13 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
 
     if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
-        console.log(`[Rent Exemption] Payout too small for ${user.username}. Crediting $${playerPayout.toFixed(2)} to sponsored rewards.`);
+        console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepCompetitiveCashoutSpectator(room, player);
         user.playtime += (Date.now() - player.startTime);
-        user.sponsoredRewardsBalance += playerPayout;
+        user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
+        await addRewardFundingUsd(playerPayout);
 
         await Transaction.create({
             userId: user._id,
@@ -741,11 +757,12 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
 
     if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
-        console.log(`[Rent Exemption] Payout too small for ${user.username}. Crediting $${playerPayout.toFixed(2)} to sponsored rewards.`);
+        console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
-        user.sponsoredRewardsBalance += playerPayout;
+        user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
+        await addRewardFundingUsd(playerPayout);
 
         await Transaction.create({
             userId: user._id,
@@ -830,24 +847,28 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     if (player.isFreeTicketPlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
-        user.sponsoredRewardsBalance += playerPayout;
+        const creditedPayout = user.rewardsDisabled ? 0 : playerPayout;
+        if (creditedPayout > 0) user.sponsoredRewardsBalance += creditedPayout;
         await user.save();
 
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
-            amount: playerPayout,
-            meta: { 
-                ...logMeta, 
-                isFreeTicketPlay: true, 
-                locked: true,
-                signature: 'sponsored_locked' 
+            amount: creditedPayout,
+            meta: {
+                ...logMeta,
+                playerPayout: creditedPayout,
+                isFreeTicketPlay: true,
+                locked: creditedPayout > 0,
+                rewardBlocked: !!user.rewardsDisabled,
+                signature: user.rewardsDisabled ? 'sponsored_blocked' : 'sponsored_locked'
             },
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_locked' });
+        const signature = user.rewardsDisabled ? 'sponsored_blocked' : 'sponsored_locked';
+        io.to(playerId).emit('cashOutSuccess', { amount: creditedPayout, signature });
         commitArenaCashoutReservation(room, player);
-        return { playerPayout, platformFee, signature: 'sponsored_locked' };
+        return { playerPayout: creditedPayout, platformFee, signature };
     }
 
     if (DEV_FREE_PLAY) {
@@ -892,11 +913,12 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
 
     if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
-        console.log(`[Rent Exemption] Payout too small for ${user.username}. Crediting $${playerPayout.toFixed(2)} to sponsored rewards.`);
+        console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
-        user.sponsoredRewardsBalance += playerPayout;
+        user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
+        await addRewardFundingUsd(playerPayout);
 
         await Transaction.create({
             userId: user._id,
@@ -1108,13 +1130,28 @@ async function sweepHouseWalletOnReset() {
 
     if (totalSweepLamports <= 0) return;
 
-    // Calculate how much should go to the Reward Wallet
+    // Persisted pending contributions survive restarts. Also top the reward wallet
+    // up to 110% of current user liabilities before any owner sweep.
+    const rewardState = await hydrateRewardPoolState();
+    const pendingRewardUsd = Math.max(0, Number(rewardState.pendingHouseUsd) || 0);
+    const liabilities = await User.aggregate([{ $group: {
+        _id: null,
+        lockedPromoUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+        lockedRentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
+        reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
+    } }]);
+    const liabilityUsd = Math.max(0,
+        (liabilities[0]?.lockedPromoUsd || 0)
+        + (liabilities[0]?.lockedRentFallbackUsd || 0)
+        + (liabilities[0]?.reservedUsd || 0));
     let rewardSweepLamports = 0;
-    if (REWARD_WALLET_ADDRESS && rewardPoolBalance > 0) {
-        rewardSweepLamports = Math.round((rewardPoolBalance / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
-        if (rewardSweepLamports > totalSweepLamports) {
-            rewardSweepLamports = totalSweepLamports; // Cap at available liquidity
-        }
+    if (REWARD_WALLET_ADDRESS) {
+        const rewardPubKey = new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS);
+        const rewardWalletLamports = await connection.getBalance(rewardPubKey);
+        const pendingLamports = Math.round((pendingRewardUsd / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
+        const liabilityTargetLamports = Math.round(((liabilityUsd * 1.10) / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
+        const liabilityShortfallLamports = Math.max(0, liabilityTargetLamports - rewardWalletLamports);
+        rewardSweepLamports = Math.min(totalSweepLamports, Math.max(pendingLamports, liabilityShortfallLamports));
     }
     
     const ownerSweepLamports = totalSweepLamports - rewardSweepLamports;
@@ -1149,13 +1186,14 @@ async function sweepHouseWalletOnReset() {
 
     if (rewardSweepLamports > 0) {
         const sweptUsd = (rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice;
-        rewardPoolBalance = Math.max(0, rewardPoolBalance - sweptUsd);
+        await reducePendingRewardUsd(Math.min(pendingRewardUsd, sweptUsd), { swept: true });
         await Transaction.create({
             type: 'withdraw',
-            amount: (rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice,
+            amount: rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
             currency: 'SOL',
             meta: {
                 event: 'reward_pool_sweep',
+                amountUsd: sweptUsd,
                 signature: sig,
                 reason: 'Room Reset Reward Sweep',
                 solAmount: rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
@@ -1301,6 +1339,71 @@ let isScanningDeposits = false;
 let globalPlayerEarningsSol = 0;
 let globalPlayerEarningsUsd = 0;
 
+function getTransactionAccountKeys(txDetails) {
+    const message = txDetails?.transaction?.message;
+    const staticKeys = message?.staticAccountKeys || message?.accountKeys || [];
+    const loaded = txDetails?.meta?.loadedAddresses;
+    return [
+        ...staticKeys,
+        ...(loaded?.writable || []),
+        ...(loaded?.readonly || []),
+    ];
+}
+
+function extractNativeDeposit(txDetails, destinationAddress) {
+    if (!txDetails || txDetails.meta?.err) return null;
+    const keys = getTransactionAccountKeys(txDetails);
+    const destinationIndex = keys.findIndex(key => key.toString() === destinationAddress);
+    if (destinationIndex < 0) return null;
+    const creditedLamports = (txDetails.meta.postBalances[destinationIndex] || 0) - (txDetails.meta.preBalances[destinationIndex] || 0);
+    if (creditedLamports <= 0) return null;
+
+    let sourceIndex = -1;
+    let largestDebit = 0;
+    for (let index = 0; index < keys.length; index += 1) {
+        if (index === destinationIndex) continue;
+        const debit = (txDetails.meta.preBalances[index] || 0) - (txDetails.meta.postBalances[index] || 0);
+        if (debit > largestDebit) {
+            largestDebit = debit;
+            sourceIndex = index;
+        }
+    }
+    if (sourceIndex < 0) return null;
+    return {
+        sourceWallet: keys[sourceIndex].toString(),
+        creditedLamports,
+    };
+}
+
+async function captureRecentDepositSources(user, pubKey) {
+    const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 50 });
+    const previousCursor = user.lastDepositSourceSignature;
+    const unseen = [];
+    for (const info of signatures) {
+        if (info.signature === previousCursor) break;
+        unseen.push(info);
+    }
+
+    for (const info of unseen.slice().reverse()) {
+        if (info.err) continue;
+        const txDetails = await connection.getTransaction(info.signature, { maxSupportedTransactionVersion: 0 });
+        const deposit = extractNativeDeposit(txDetails, user.depositAddress);
+        if (!deposit) continue;
+        await recordDepositSource({
+            signature: info.signature,
+            userId: user._id,
+            sourceWallet: deposit.sourceWallet,
+            destinationWallet: user.depositAddress,
+            amountLamports: deposit.creditedLamports,
+        });
+    }
+
+    const newestSignature = signatures[0]?.signature;
+    if (newestSignature && newestSignature !== previousCursor) {
+        user.lastDepositSourceSignature = newestSignature;
+        await User.updateOne({ _id: user._id }, { $set: { lastDepositSourceSignature: newestSignature } });
+    }
+}
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
     if (isScanningDeposits) return;
@@ -1316,7 +1419,8 @@ async function scanDeposits() {
                 const lamports = await connection.getBalance(pubKey);
                 const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-                // AUTOMATISK SYNK: Databasen speglar alltid vad som finns på plånboken
+                // Scan by signature cursor even if the funds were already spent between scans.
+                await captureRecentDepositSources(user, pubKey);
                 if (Math.abs(user.balance - solOnChain) > 0.00001) {
                     user.balance = solOnChain;
                     await user.save();
@@ -1350,6 +1454,28 @@ const io = new Server(httpServer, {
 
 app.use(passport.initialize());
 
+const sensitiveRequestBuckets = new Map();
+function sensitiveRateLimit({ limit, windowMs }) {
+    return (req, res, next) => {
+        const key = `${req.ip || req.socket?.remoteAddress || 'unknown'}:${req.path}`;
+        const now = Date.now();
+        const current = sensitiveRequestBuckets.get(key);
+        if (!current || current.resetAt <= now) {
+            sensitiveRequestBuckets.set(key, { count: 1, resetAt: now + windowMs });
+            return next();
+        }
+        if (current.count >= limit) {
+            res.setHeader('Retry-After', Math.ceil((current.resetAt - now) / 1000));
+            return res.status(429).json({ error: 'Too many requests. Try again later.' });
+        }
+        current.count += 1;
+        return next();
+    };
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of sensitiveRequestBuckets) if (value.resetAt <= now) sensitiveRequestBuckets.delete(key);
+}, 10 * 60_000).unref();
 // --- GOOGLE OAUTH KONFIGURATION ---
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID || "DIN_GOOGLE_CLIENT_ID",
@@ -1389,7 +1515,7 @@ app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile',
 app.get('/api/auth/google/callback',
     passport.authenticate('google', { session: false, failureRedirect: '/login' }),
     (req, res) => {
-        const secret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
+        const secret = JWT_SECRET;
         const token = jwt.sign({ id: req.user._id }, secret, { expiresIn: '24h' });
         // Skicka tillbaka användaren till frontenden med token i URL:en
         const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
@@ -1415,7 +1541,7 @@ const authenticateToken = (req, res, next) => {
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ message: 'No token provided' });
 
-    const jwtSecret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
+    const jwtSecret = JWT_SECRET;
 
     jwt.verify(token, jwtSecret, (err, user) => {
         if (err) {
@@ -1453,6 +1579,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
                 const lamports = await connection.getBalance(pubKey);
                 solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
+                await captureRecentDepositSources(user, pubKey);
                 if (Math.abs(user.balance - solOnChain) > 0.00001) {
                     user.balance = solOnChain;
                     await user.save();
@@ -1714,109 +1841,208 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/api/user/claim-rewards', authenticateToken, async (req, res) => {
-    try {
-        const User = mongoose.model('User');
-        const user = await User.findById(req.user.id);
-        
-        if (!user) return res.status(404).json({ error: 'User not found' });
-        
-        if (!user.sponsoredRewardsUnlocked || !user.sponsoredRewardsCompleted) {
-            return res.status(400).json({ error: 'Challenges not fully completed' });
-        }
-        
-        if (user.sponsoredRewardsBalance <= 0) {
-            return res.status(400).json({ error: 'No rewards available to claim' });
-        }
-        
-        const amountToUnlock = user.sponsoredRewardsBalance;
-        console.log(`[Manual Claim] Unlocking $${amountToUnlock.toFixed(2)} for ${user.username}`);
-        
-        if (DEV_FREE_PLAY) {
-            console.log(`[FREE PLAY] Simulated manual claim payout of $${amountToUnlock.toFixed(2)} to ${user.depositAddress}`);
-            user.sponsoredRewardsBalance = 0;
-            await user.save();
-            
-            try {
-                await mongoose.model('Transaction').create({
-                    userId: user._id,
-                    type: 'deposit',
-                    amount: amountToUnlock / SOL_PRICE_USD,
-                    meta: {
-                        event: 'sponsored_rewards_claim',
-                        amountUsd: amountToUnlock,
-                        simulated: true,
-                        signature: 'simulated_claim'
-                    },
-                    status: 'confirmed'
-                });
-            } catch (e) {
-                console.error("Error creating free-play claim transaction:", e.message);
-            }
-            
-            return res.json({ success: true, amount: amountToUnlock });
-        } else if (REWARD_WALLET_ADDRESS && REWARD_WALLET_SECRET) {
-            const solPayout = amountToUnlock / SOL_PRICE_USD;
-            const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
-            
-            try {
-                const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
-                    Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
-                );
-                const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                
-                const transaction = new solanaWeb3.Transaction().add(
-                    solanaWeb3.SystemProgram.transfer({
-                        fromPubkey: rewardKeypair.publicKey,
-                        toPubkey: userPubKey,
-                        lamports: payoutLamports,
-                    })
-                );
-                
-                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [rewardKeypair]);
-                console.log(`[Manual Claim] Successfully paid $${amountToUnlock.toFixed(2)} on-chain from Reward Pool. Sig: ${signature}`);
-                
-                user.sponsoredRewardsBalance = 0;
-                await user.save();
-                
-                try {
-                    await mongoose.model('Transaction').create({
-                        userId: user._id,
-                        type: 'deposit',
-                        amount: solPayout,
-                        meta: {
-                            event: 'sponsored_rewards_claim',
-                            amountUsd: amountToUnlock,
-                            signature
-                        },
-                        status: 'confirmed'
-                    });
-                } catch (e) {
-                    console.error("Error creating on-chain claim transaction:", e.message);
-                }
-                
-                return res.json({ success: true, amount: amountToUnlock, signature });
-            } catch (err) {
-                console.error("[Manual Claim Error] On-chain payout failed:", err.message);
-                return res.status(500).json({ error: 'Failed to process on-chain payout' });
-            }
-        } else {
-            return res.status(500).json({ error: 'Server wallet not configured for payouts' });
-        }
-    } catch (err) {
-        console.error("Claim rewards error:", err);
-        res.status(500).json({ error: 'Internal server error' });
+async function ensureRewardWalletLiquidity(requiredLamports) {
+    if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET) {
+        throw new Error('Reward wallet not configured');
     }
+    const rewardPubKey = new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS);
+    const feeBuffer = 15_000;
+    const rewardBalance = await connection.getBalance(rewardPubKey);
+    const shortfall = Math.max(0, requiredLamports + feeBuffer - rewardBalance);
+    if (!shortfall) return;
+
+    if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
+        throw new Error('Reward wallet lacks liquidity');
+    }
+    const pendingRewardLamports = Math.round((getCachedPendingRewardUsd() / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    if (shortfall > pendingRewardLamports) {
+        throw new Error('Reward reserve is awaiting the next arena settlement');
+    }
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+    );
+    const houseBalance = await connection.getBalance(houseKeypair.publicKey);
+    if (houseBalance < shortfall + feeBuffer) throw new Error('Reward and house wallets lack liquidity');
+
+    const topUpTx = new solanaWeb3.Transaction().add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: houseKeypair.publicKey,
+            toPubkey: rewardPubKey,
+            lamports: shortfall,
+        })
+    );
+    await solanaWeb3.sendAndConfirmTransaction(connection, topUpTx, [houseKeypair]);
+    await reducePendingRewardUsd((shortfall / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, { swept: true });
+}
+
+async function logConfirmedRewardClaim(claim) {
+    const existing = claim.signature
+        ? await Transaction.findOne({ 'meta.signature': claim.signature, 'meta.event': 'sponsored_rewards_claim' })
+        : null;
+    if (existing) return;
+    await Transaction.create({
+        userId: claim.userId,
+        type: 'game',
+        amount: claim.solAmount ?? (claim.amountUsd / SOL_PRICE_USD),
+        currency: 'SOL',
+        meta: {
+            event: 'sponsored_rewards_claim',
+            amountUsd: claim.amountUsd,
+            signature: claim.signature || 'simulated_claim',
+            claimId: claim._id.toString(),
+            ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+        },
+        status: 'confirmed',
+    });
+}
+
+async function reconcileRewardClaims() {
+    if (mongoose.connection.readyState !== 1) return;
+
+    // Finish cross-document cleanup that may have been interrupted after the
+    // terminal claim status was persisted. The active claim id prevents double restores.
+    const lockedUsers = await User.find({
+        rewardClaimInProgress: true,
+        activeRewardClaimId: { $ne: null },
+    }).select('_id activeRewardClaimId').limit(100).lean();
+    for (const lockedUser of lockedUsers) {
+        const terminalClaim = await RewardClaim.findById(lockedUser.activeRewardClaimId).select('status error');
+        if (terminalClaim?.status === 'confirmed') {
+            await completeRewardClaim(terminalClaim._id);
+        } else if (terminalClaim?.status === 'failed') {
+            await failAndReleaseRewardClaim(terminalClaim._id, terminalClaim.error);
+        }
+    }
+
+    // Reserved claims are never auto-released: a server could have broadcast a
+    // transfer and crashed before persisting its signature. Manual review is safer than double-paying.
+    const broadcast = await RewardClaim.find({ status: 'broadcast', signature: { $ne: null } }).limit(50);
+    for (const claim of broadcast) {
+        try {
+            const result = await connection.getSignatureStatuses([claim.signature], { searchTransactionHistory: true });
+            const status = result.value[0];
+            if (!status) continue;
+            if (status.err) {
+                await failAndReleaseRewardClaim(claim._id, `On-chain claim failed: ${JSON.stringify(status.err)}`);
+            } else if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+                const completed = await completeRewardClaim(claim._id);
+                await logConfirmedRewardClaim(completed).catch(err => console.error('Claim log error:', err.message));
+            }
+        } catch (err) {
+            console.error('Reward claim reconciliation error:', err.message);
+        }
+    }
+}
+setInterval(() => reconcileRewardClaims().catch(err => console.error('Claim reconciliation failed:', err.message)), 30_000);
+
+app.get('/api/user/reward-claim-status', authenticateToken, async (req, res) => {
+    const claim = await RewardClaim.findOne({ userId: req.user.id }).sort({ createdAt: -1 }).lean();
+    res.json({ claim: claim ? {
+        id: claim._id,
+        status: claim.status,
+        amountUsd: claim.amountUsd,
+        signature: claim.signature,
+        error: claim.error,
+        createdAt: claim.createdAt,
+    } : null });
 });
 
+app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+    let reserved = null;
+    let broadcastSignature = null;
+    try {
+        reserved = await reserveRewardClaim(req.user.id);
+        if (!reserved) {
+            const user = await User.findById(req.user.id).lean();
+            if (user?.rewardsDisabled) return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
+            if (user?.rewardClaimInProgress) return res.status(409).json({ error: 'A reward claim is already processing' });
+            return res.status(400).json({ error: 'No unlocked rewards available to claim' });
+        }
+
+        const { user, claim } = reserved;
+        const amountUsd = claim.amountUsd;
+
+        // Close the narrow race where a shared-wallet alert is raised while a
+        // promo claim is being reserved. Real retained winnings are restored.
+        if (claim.sponsoredAmountUsd > 0) {
+            const currentSecurity = await User.findById(req.user.id).select('rewardsDisabled').lean();
+            if (currentSecurity?.rewardsDisabled) {
+                await failAndReleaseRewardClaim(claim._id, 'Promotional rewards disabled during linked-wallet review');
+                await User.updateOne({ _id: req.user.id }, { $set: { sponsoredRewardsBalance: 0 } });
+                return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
+            }
+        }
+        if (DEV_FREE_PLAY) {
+            const completed = await completeRewardClaim(claim._id);
+            await logConfirmedRewardClaim(completed);
+            return res.json({ success: true, amount: amountUsd, signature: 'simulated_claim' });
+        }
+
+        const solAmount = amountUsd / SOL_PRICE_USD;
+        const payoutLamports = Math.round(solAmount * solanaWeb3.LAMPORTS_PER_SOL);
+        if (payoutLamports <= 0) throw new Error('Reward amount is too small');
+        if (!REWARD_WALLET_SECRET || !REWARD_WALLET_ADDRESS) throw new Error('Reward wallet not configured');
+        const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
+        );
+        if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
+            throw new Error('Reward wallet address does not match configured secret');
+        }
+        await ensureRewardWalletLiquidity(payoutLamports);
+        const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+        const transaction = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: rewardKeypair.publicKey,
+                toPubkey: userPubKey,
+                lamports: payoutLamports,
+            })
+        );
+
+        broadcastSignature = await connection.sendTransaction(transaction, [rewardKeypair], { maxRetries: 3 });
+        await markClaimBroadcast(claim._id, { signature: broadcastSignature, solAmount });
+        const confirmation = await connection.confirmTransaction(broadcastSignature, 'confirmed');
+        if (confirmation.value.err) {
+            await failAndReleaseRewardClaim(claim._id, `On-chain claim failed: ${JSON.stringify(confirmation.value.err)}`);
+            return res.status(502).json({ error: 'On-chain reward payment failed' });
+        }
+
+        const completed = await completeRewardClaim(claim._id);
+        await logConfirmedRewardClaim(completed).catch(err => console.error('Claim log error:', err.message));
+        return res.json({ success: true, amount: amountUsd, signature: broadcastSignature });
+    } catch (err) {
+        console.error('Claim rewards error:', err);
+        if (reserved?.claim?._id && !broadcastSignature) {
+            await failAndReleaseRewardClaim(reserved.claim._id, err.message).catch(() => {});
+        }
+        if (broadcastSignature) {
+            return res.status(202).json({
+                success: false,
+                processing: true,
+                message: 'Payment was submitted and is still being confirmed.',
+                signature: broadcastSignature,
+            });
+        }
+        return res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+});
 // --- NYTT: Endpoint för att verifiera insättning och spara i historik ---
-app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
+app.post('/api/deposit-verify', sensitiveRateLimit({ limit: 20, windowMs: 60_000 }), authenticateToken, async (req, res) => {
     const { signature } = req.body;
     try {
         if (!signature) return res.status(400).json({ message: 'Missing signature' });
 
-        const existing = await Transaction.findOne({ 'meta.signature': signature });
-        if (existing) return res.json({ success: true, message: 'Already processed' });
+        // A single Solana transaction may legitimately fund several account addresses.
+        const existing = await Transaction.findOne({ 'meta.signature': signature, userId: req.user.id });
+        if (existing?.meta?.sourceWallet) {
+            await recordDepositSource({
+                signature,
+                userId: req.user.id,
+                sourceWallet: existing.meta.sourceWallet,
+                destinationWallet: existing.meta.destinationWallet || 'unknown',
+                amountLamports: Math.round((existing.meta.solAmount || existing.amount || 0) * solanaWeb3.LAMPORTS_PER_SOL),
+            });
+            return res.json({ success: true, message: 'Already processed' });
+        }
 
         const txDetails = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
         if (!txDetails || txDetails.meta?.err) {
@@ -1827,7 +2053,7 @@ app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
         if (!user?.depositAddress) return res.status(404).json({ message: 'Användare hittades ej' });
 
         const depositPubkey = new solanaWeb3.PublicKey(user.depositAddress);
-        const accountKeys = txDetails.transaction.message.staticAccountKeys;
+        const accountKeys = getTransactionAccountKeys(txDetails);
         let creditedLamports = 0;
         for (let i = 0; i < accountKeys.length; i++) {
             if (accountKeys[i].equals(depositPubkey)) {
@@ -1843,20 +2069,42 @@ app.post('/api/deposit-verify', authenticateToken, async (req, res) => {
             return res.status(400).json({ message: 'Deposit address not credited in this transaction' });
         }
 
+        const depositSource = extractNativeDeposit(txDetails, user.depositAddress);
+        if (!depositSource) return res.status(400).json({ message: 'Could not identify the funding wallet' });
         const solReceived = creditedLamports / solanaWeb3.LAMPORTS_PER_SOL;
-        user.balance += solReceived;
+        user.balance = (await connection.getBalance(depositPubkey)) / solanaWeb3.LAMPORTS_PER_SOL;
         await user.save();
 
-        await Transaction.create({
+        if (existing) {
+            existing.meta = {
+                ...(existing.meta || {}),
+                signature,
+                solAmount: solReceived,
+                amountUsd: solReceived * SOL_PRICE_USD,
+                verifiedOnChain: true,
+                sourceWallet: depositSource.sourceWallet,
+                destinationWallet: user.depositAddress,
+            };
+            await existing.save();
+        } else {
+            await Transaction.create({
+                userId: user._id,
+                type: 'deposit',
+                amount: solReceived,
+                currency: 'SOL',
+                meta: { signature, solAmount: solReceived, amountUsd: solReceived * SOL_PRICE_USD, verifiedOnChain: true, sourceWallet: depositSource.sourceWallet, destinationWallet: user.depositAddress },
+                status: 'confirmed',
+            });
+        }
+        const securityAlert = await recordDepositSource({
+            signature,
             userId: user._id,
-            type: 'deposit',
-            amount: solReceived,
-            currency: 'SOL',
-            meta: { signature, solAmount: solReceived, amountUsd: solReceived * SOL_PRICE_USD, verifiedOnChain: true },
-            status: 'confirmed',
+            sourceWallet: depositSource.sourceWallet,
+            destinationWallet: user.depositAddress,
+            amountLamports: depositSource.creditedLamports,
         });
 
-        res.json({ success: true, balance: user.balance, solReceived });
+        res.json({ success: true, balance: user.balance, solReceived, rewardsReview: securityAlert?.status === 'pending' });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1888,7 +2136,7 @@ app.post('/api/entry-pay', authenticateToken, async (req, res) => {
         // Ensure the transfer went to our house wallet and amount matches
         const toPubkey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
         // Find any transfer instructions that credited the house address
-        const accountKeys = txDetails.transaction.message.staticAccountKeys;
+        const accountKeys = getTransactionAccountKeys(txDetails);
         let credited = false;
         let creditedLamports = 0;
         for (let i = 0; i < accountKeys.length; i++) {
@@ -2208,6 +2456,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                         totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } },
                         accountCount: { $sum: 1 },
                         totalSponsoredRewards: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                        totalRetainedWinnings: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
                         activeSponsoredPlayers: { $sum: { $cond: [{ $gt: ['$sponsoredRewardsBalance', 0] }, 1, 0] } },
                         completedBeginnerChallenges: { $sum: { $cond: [{ $eq: ['$sponsoredRewardsCompleted', true] }, 1, 0] } },
                         unusedFreeTickets: { $sum: { $cond: [{ $and: [{ $eq: ['$hasFreeTicket', true] }, { $ne: ['$freeTicketUsed', true] }] }, 1, 0] } },
@@ -2239,11 +2488,12 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerSweepCount: ownerEarnings.sweepCount,
             ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
             ownerEarningsBrSol: ownerEarnings.brSweepSol,
-            rewardPoolBalanceUsd: Number(rewardPoolBalance.toFixed(2)),
+            rewardPoolBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
             totalSponsoredRewards: userBalanceAgg[0]?.totalSponsoredRewards ?? 0,
+            totalRetainedWinnings: userBalanceAgg[0]?.totalRetainedWinnings ?? 0,
             activeSponsoredPlayers: userBalanceAgg[0]?.activeSponsoredPlayers ?? 0,
             completedBeginnerChallenges: userBalanceAgg[0]?.completedBeginnerChallenges ?? 0,
             unusedFreeTickets: userBalanceAgg[0]?.unusedFreeTickets ?? 0,
@@ -2615,6 +2865,9 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
         if (!user) return res.status(404).json({ message: 'User not found' });
         
         if (action === 'grant_ticket') {
+            if (user.rewardsDisabled) {
+                return res.status(409).json({ message: 'Resolve the linked-wallet alert in Reward Alerts first.' });
+            }
             user.hasFreeTicket = true;
             user.freeTicketUsed = false;
             await user.save();
@@ -2632,62 +2885,14 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
             await user.save();
             return res.json({ success: true, message: 'Challenge progress reset successfully.', user });
         } else if (action === 'manual_unlock') {
+            // Unlock only. Payout must go through the same atomic reward-claim ledger as every user claim.
+            if (user.rewardsDisabled) {
+                return res.status(409).json({ message: 'Resolve the linked-wallet alert in Reward Alerts first.' });
+            }
             user.sponsoredRewardsUnlocked = true;
             user.sponsoredRewardsCompleted = true;
-            
-            // Perform payout if balance > 0
-            if (user.sponsoredRewardsBalance > 0) {
-                const amountToUnlock = user.sponsoredRewardsBalance;
-                if (DEV_FREE_PLAY) {
-                    user.sponsoredRewardsBalance = 0;
-                    await user.save();
-                    await Transaction.create({
-                        userId: user._id,
-                        type: 'deposit',
-                        amount: amountToUnlock / SOL_PRICE_USD,
-                        meta: {
-                            event: 'sponsored_rewards_unlock',
-                            amountUsd: amountToUnlock,
-                            simulated: true,
-                            signature: 'manual_simulated_unlock'
-                        },
-                        status: 'confirmed'
-                    });
-                } else if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
-                    const solPayout = amountToUnlock / SOL_PRICE_USD;
-                    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
-                    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-                        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
-                    );
-                    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                    
-                    const transaction = new solanaWeb3.Transaction().add(
-                        solanaWeb3.SystemProgram.transfer({
-                            fromPubkey: houseKeypair.publicKey,
-                            toPubkey: userPubKey,
-                            lamports: payoutLamports,
-                        })
-                    );
-                    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-                    user.sponsoredRewardsBalance = 0;
-                    await user.save();
-                    
-                    await Transaction.create({
-                        userId: user._id,
-                        type: 'deposit',
-                        amount: solPayout,
-                        meta: {
-                            event: 'sponsored_rewards_unlock',
-                            amountUsd: amountToUnlock,
-                            signature
-                        },
-                        status: 'confirmed'
-                    });
-                }
-            } else {
-                await user.save();
-            }
-            return res.json({ success: true, message: 'Sponsored rewards unlocked successfully.', user });
+            await user.save();
+            return res.json({ success: true, message: 'Sponsored rewards unlocked; user can now claim safely.', user });
         } else {
             return res.status(400).json({ message: 'Invalid action' });
         }
@@ -2697,6 +2902,38 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
     }
 });
 
+app.get('/api/admin/reward-security-alerts', authenticateAdmin, async (req, res) => {
+    try {
+        const [alerts, pendingClaims] = await Promise.all([
+            RewardSecurityAlert.find({})
+                .sort({ status: -1, createdAt: -1 })
+                .limit(200)
+                .populate('userIds', 'username email depositAddress rewardsDisabled')
+                .lean(),
+            RewardClaim.find({ status: { $in: ['reserved', 'broadcast'] } })
+                .sort({ createdAt: 1 })
+                .populate('userId', 'username email')
+                .lean(),
+        ]);
+        res.json({ alerts, pendingClaims });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/reward-security-alerts/:alertId/resolve', authenticateAdmin, async (req, res) => {
+    try {
+        const alert = await resolveRewardSecurityAlert(
+            req.params.alertId,
+            req.body?.action,
+            req.user.id,
+            req.body?.note,
+        );
+        res.json({ success: true, alert });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
 app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
@@ -2811,7 +3048,7 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
                     address: REWARD_WALLET_ADDRESS,
                     balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
                     balanceUsd: (lamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
-                    inMemoryBalanceUsd: Number(rewardPoolBalance.toFixed(2)),
+                    inMemoryBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
                 };
             } catch (err) {
                 console.error('Failed to fetch reward wallet balance:', err.message);
@@ -2820,7 +3057,7 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
                     address: REWARD_WALLET_ADDRESS,
                     balanceSol: 0,
                     balanceUsd: 0,
-                    inMemoryBalanceUsd: Number(rewardPoolBalance.toFixed(2)),
+                    inMemoryBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
                     error: err.message,
                 };
             }
@@ -3431,46 +3668,44 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db";
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
-    .then(() => console.log("Ansluten till databasen!"))
+    .then(async () => {
+        await hydrateRewardPoolState();
+        console.log("Ansluten till databasen och reward-poolen återställd!");
+    })
     .catch(err => console.error("Kunde inte ansluta:", err));
 
 // 3. REGISTRERING (Spara ny användare)
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
-        const { email, username, password } = req.body;
+        const email = String(req.body?.email || '').trim().toLowerCase();
+        const username = String(req.body?.username || '').trim();
+        const password = String(req.body?.password || '');
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: 'Enter a valid email address' });
+        if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) return res.status(400).json({ message: 'Username must be 3–20 letters, numbers, or underscores' });
+        if (password.length < 8 || password.length > 128) return res.status(400).json({ message: 'Password must be at least 8 characters' });
 
-        // Kolla om användaren redan finns
         const existingUser = await User.findOne({ $or: [{ username }, { email }] });
-        if (existingUser) return res.status(400).json({ message: "Username or Email already taken" });
-
-        // Hasha lösenordet (gör det oläsbart)
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        // Generera unik Solana-plånbok för insättningar
+        if (existingUser) return res.status(400).json({ message: 'Username or email already taken' });
         const keypair = solanaWeb3.Keypair.generate();
-
         const newUser = new User({
             email,
             username,
-            password: hashedPassword,
+            password: await bcrypt.hash(password, 10),
             balance: 0,
             depositAddress: keypair.publicKey.toBase58(),
-            depositSecret: Buffer.from(keypair.secretKey).toString('hex')
+            depositSecret: Buffer.from(keypair.secretKey).toString('hex'),
         });
-
         await newUser.save();
-        console.log("✅ SUCCESS: Användare skapad i databasen:", newUser.username);
-        res.status(201).json({
-            message: "Användare skapad!",
+        return res.status(201).json({
+            message: 'Account created!',
             userId: newUser._id.toString(),
             username: newUser.username,
         });
     } catch (err) {
-        console.error("Fel vid registrering:", err.message);
-        res.status(500).json({ error: err.message });
+        console.error('Registration error:', err.message);
+        return res.status(500).json({ error: err.message });
     }
 });
-
 // 4. INLOGGNING (Verifiera användare)
 app.post('/api/login', async (req, res) => {
     console.log("Mottog inloggningsförfrågan:", req.body.username);
@@ -3498,7 +3733,7 @@ app.post('/api/login', async (req, res) => {
         await ensureUserDepositWallet(user);
 
         // Skapa en JWT (Inloggningskvitto). Använd en hemlig nyckel från .env
-        const secret = process.env.JWT_SECRET || "fallback_hemlighet_byt_ut_mig";
+        const secret = JWT_SECRET;
         const token = jwt.sign({ id: user._id }, secret, { expiresIn: '7d' });
 
         console.log("✅ SUCCESS: Inloggning lyckades, skickar token för:", username);
@@ -4274,12 +4509,75 @@ function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c
     return util.massToRadius(visualMass * c.sizeMult);
 }
 
+async function rollbackJoinEconomy(pending, reason) {
+    if (!pending) return;
+    const { room } = pending;
+    room.aiBudgetBalance = pending.aiBudgetBalance;
+    room.foodPoolBalance = pending.foodPoolBalance;
+    room.fundedEntryUsd = pending.fundedEntryUsd;
+    room.ownerBalance = pending.ownerBalance;
+    room.bots.splice(0, room.bots.length, ...pending.bots);
+    room.slitherBots.splice(0, room.slitherBots.length, ...pending.slitherBots);
+
+    if (pending.rewardFundingUsd > 0) {
+        await reducePendingRewardUsd(pending.rewardFundingUsd);
+        await Transaction.create({
+            userId: pending.userId,
+            type: 'game',
+            amount: -(pending.rewardFundingUsd / SOL_PRICE_USD),
+            currency: 'SOL',
+            meta: {
+                event: 'reward_pool_correction',
+                correctionUsd: -pending.rewardFundingUsd,
+                reason: `join_rollback:${String(reason || 'unknown').slice(0, 120)}`,
+            },
+            status: 'confirmed',
+        }).catch(err => console.error('Join rollback correction log failed:', err.message));
+    }
+}
+
+async function refundPaidJoin(pending, reason) {
+    if (!pending || DEV_FREE_PLAY) return;
+    try {
+        const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+        );
+        const refundTx = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(pending.destination),
+                lamports: pending.lamports,
+            })
+        );
+        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, refundTx, [houseKeypair]);
+        await Transaction.create({
+            userId: pending.userId,
+            type: 'withdraw',
+            amount: pending.lamports / solanaWeb3.LAMPORTS_PER_SOL,
+            currency: 'SOL',
+            meta: { event: 'entry_refund', reason, originalSignature: pending.signature, signature },
+            status: 'confirmed',
+        });
+    } catch (err) {
+        console.error('CRITICAL: automatic paid-entry refund failed:', err.message, pending);
+        await Transaction.create({
+            userId: pending.userId,
+            type: 'game',
+            amount: 0,
+            meta: { event: 'failure', reason: 'entry_refund_failed', error: err.message, originalSignature: pending.signature },
+            status: 'failed',
+        }).catch(() => {});
+    }
+}
 io.on('connection', (socket) => {
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, useFreeTicket }) => {
         let userKey = null;
+        let pendingPaidJoin = null;
+        let pendingTicketUserId = null;
+        let pendingJoinEconomy = null;
         try {
             if (mode === 'br-agar' || mode === 'br-slither') {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
@@ -4289,10 +4587,14 @@ io.on('connection', (socket) => {
             if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
-            const decoded = jwt.verify(token, process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193");
+            const decoded = jwt.verify(token, JWT_SECRET);
             let user = await User.findById(decoded.id);
             if (!user) {
                 socket.emit('error', 'Account not found — please log in again.');
+                return;
+            }
+            if (user.rewardsDisabled && useFreeTicket) {
+                socket.emit('error', 'Rewards are disabled while your linked-wallet review is pending.');
                 return;
             }
             user = await ensureUserDepositWallet(user);
@@ -4392,6 +4694,7 @@ io.on('connection', (socket) => {
                             [userKeypair],
                             { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                         );
+                        pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
                         console.log(`🎟️ Competitive Slither Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
                         console.error('Competitive join transaction failed:', txErr.message);
@@ -4427,6 +4730,10 @@ io.on('connection', (socket) => {
 
                 const raced = room.players.find(p => p.mongoId?.toString() === userKey);
                 if (raced) {
+                    if (pendingPaidJoin) {
+                        await refundPaidJoin(pendingPaidJoin, 'duplicate_join_race');
+                        pendingPaidJoin = null;
+                    }
                     raced.id = socket.id;
                     raced.disconnected = false;
                     socket.emit('welcome', raced, {
@@ -4444,6 +4751,7 @@ io.on('connection', (socket) => {
                 }
 
                 room.players.push(newPlayer);
+                pendingPaidJoin = null;
                 syncCompetitiveSlitherFood(room, room.players.length);
 
                 socket.emit('welcome', newPlayer, {
@@ -4536,6 +4844,7 @@ io.on('connection', (socket) => {
                             [userKeypair],
                             { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                         );
+                        pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
                         console.log(`🎟️ Surviv Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
                         console.error('Surviv join transaction failed:', txErr.message);
@@ -4574,6 +4883,10 @@ io.on('connection', (socket) => {
 
                 const raced = room.players.find(p => p.mongoId?.toString() === userKey);
                 if (raced) {
+                    if (pendingPaidJoin) {
+                        await refundPaidJoin(pendingPaidJoin, 'duplicate_join_race');
+                        pendingPaidJoin = null;
+                    }
                     raced.id = socket.id;
                     raced.disconnected = false;
                     socket.emit('welcome', raced, {
@@ -4592,6 +4905,7 @@ io.on('connection', (socket) => {
                 const eco = getSurvivEconomy(entryFeeUsd);
                 spawnLootFromPool(room, eco.lootPoolOnJoin);
                 room.players.push(newPlayer);
+                pendingPaidJoin = null;
 
                 socket.emit('welcome', newPlayer, {
                     width: SURVIV.worldHalf * 2,
@@ -4727,6 +5041,7 @@ io.on('connection', (socket) => {
                         [userKeypair],
                         { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                     );
+                    pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
                     console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                 } catch (txErr) {
                     console.error("Join transaction failed:", txErr.message);
@@ -4744,10 +5059,15 @@ io.on('connection', (socket) => {
             // Log Join
             if (!switchingNormalMode) {
                 if (isFreeTicketPlay) {
-                    // Consume ticket in DB
-                    user.hasFreeTicket = false;
-                    user.freeTicketUsed = true;
-                    await user.save();
+                    // Atomically consume the ticket across every server instance.
+                    const consumedTicket = await User.findOneAndUpdate(
+                        { _id: user._id, hasFreeTicket: true, freeTicketUsed: { $ne: true }, rewardsDisabled: { $ne: true } },
+                        { $set: { hasFreeTicket: false, freeTicketUsed: true } },
+                        { new: true },
+                    );
+                    if (!consumedTicket) throw new Error('Free ticket is unavailable or already used.');
+                    user = consumedTicket;
+                    pendingTicketUserId = user._id;
 
                     await Transaction.create({
                         userId: user._id,
@@ -4785,7 +5105,7 @@ io.on('connection', (socket) => {
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
             let foodAlloc, aiAlloc, rewardContribution = 0, ownerContribution = 0;
 
-            if (!user.sponsoredRewardsCompleted && !isFreeTicketPlay) {
+            if (!user.sponsoredRewardsCompleted && !user.rewardsDisabled && !isFreeTicketPlay) {
                 const rpSplit = getRewardPoolSplit(entryFeeUsd);
                 foodAlloc = rpSplit.food;
                 aiAlloc = rpSplit.ai;
@@ -4807,6 +5127,19 @@ io.on('connection', (socket) => {
             const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
             const aiToAdd = Math.min(aiAlloc, aiDeficit);
 
+            // Snapshot every mutable join-funded field until the player is safely in the room.
+            pendingJoinEconomy = {
+                room,
+                userId: user._id,
+                aiBudgetBalance: room.aiBudgetBalance,
+                foodPoolBalance: room.foodPoolBalance,
+                fundedEntryUsd: room.fundedEntryUsd,
+                ownerBalance: room.ownerBalance,
+                bots: [...room.bots],
+                slitherBots: [...room.slitherBots],
+                rewardFundingUsd: 0,
+            };
+
             // Bot budget: if room already has >1 bot, only 10% of AI allocation funds bots
             const existingBotCount = gameMode === 'slither' ? room.slitherBots.length : room.bots.length;
             if (!switchingNormalMode) {
@@ -4823,8 +5156,9 @@ io.on('connection', (socket) => {
 
                 // Reward pool / owner vault contributions
                 if (rewardContribution > 0) {
-                    rewardPoolBalance += rewardContribution;
-                    console.log(`🏆 REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${rewardPoolBalance.toFixed(2)}`);
+                    await addRewardFundingUsd(rewardContribution);
+                    pendingJoinEconomy.rewardFundingUsd = rewardContribution;
+                    console.log(`🏆 REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${getCachedPendingRewardUsd().toFixed(2)}`);
                     Transaction.create({
                         userId: user._id,
                         type: 'game',
@@ -4967,6 +5301,19 @@ io.on('connection', (socket) => {
             // Race guard: another join may have completed while we awaited payment
             const raced = room.players.find(p => p.mongoId?.toString() === userKey);
             if (raced) {
+                await rollbackJoinEconomy(pendingJoinEconomy, 'duplicate_join_race');
+                pendingJoinEconomy = null;
+                if (pendingPaidJoin) {
+                    await refundPaidJoin(pendingPaidJoin, 'duplicate_join_race');
+                    pendingPaidJoin = null;
+                }
+                if (pendingTicketUserId) {
+                    await User.updateOne(
+                        { _id: pendingTicketUserId, freeTicketUsed: true, hasFreeTicket: false },
+                        { $set: { freeTicketUsed: false, hasFreeTicket: true } },
+                    );
+                    pendingTicketUserId = null;
+                }
                 raced.id = socket.id;
                 raced.disconnected = false;
                 socket.roomId = room.id;
@@ -4987,6 +5334,9 @@ io.on('connection', (socket) => {
             }
 
             room.players.push(newPlayer);
+            pendingJoinEconomy = null;
+            pendingPaidJoin = null;
+            pendingTicketUserId = null;
 
             // Seed arena food from this join's pool share (same as agar — funded by entry, not free)
             {
@@ -5027,6 +5377,15 @@ io.on('connection', (socket) => {
                 solPrice: SOL_PRICE_USD,
             });
         } catch (err) {
+            await rollbackJoinEconomy(pendingJoinEconomy, err.message || 'join_failed');
+            pendingJoinEconomy = null;
+            if (pendingPaidJoin) await refundPaidJoin(pendingPaidJoin, err.message || 'join_failed_after_payment');
+            if (pendingTicketUserId) {
+                await User.updateOne(
+                    { _id: pendingTicketUserId, freeTicketUsed: true, hasFreeTicket: false },
+                    { $set: { freeTicketUsed: false, hasFreeTicket: true } },
+                ).catch(restoreErr => console.error('Ticket restore failed:', restoreErr.message));
+            }
             console.error('joinGame error:', err.message);
             if (err.name === 'TokenExpiredError') {
                 socket.emit('error', 'Session expired — please log in again.');
@@ -5043,7 +5402,7 @@ io.on('connection', (socket) => {
     socket.on('adminSpawnBotNearMe', async ({ token, mode }) => {
         console.log(`[Admin Spawn] Received request. Mode parameter: ${mode}, Socket ID: ${socket.id}, Room ID: ${socket.roomId}`);
         try {
-            const secret = process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193";
+            const secret = JWT_SECRET;
             const decoded = jwt.verify(token, secret);
             const user = await User.findById(decoded.id);
             if (!user) {
@@ -5149,7 +5508,7 @@ io.on('connection', (socket) => {
 
     socket.on('adminClearBots', async ({ token }) => {
         try {
-            const secret = process.env.JWT_SECRET || "464163655a063465904c19aed8d3566cc5dfe1627dce6857e70abb1efad0c193";
+            const secret = JWT_SECRET;
             const decoded = jwt.verify(token, secret);
             const user = await User.findById(decoded.id);
             if (!user) return;
@@ -5555,7 +5914,7 @@ function getBattleRoyaleDeps() {
         addFood,
         calculateCellRadius,
         rooms,
-        JWT_SECRET: process.env.JWT_SECRET,
+        JWT_SECRET,
         DEV_FREE_PLAY,
         SOL_PRICE_USD,
         connection,
@@ -5580,7 +5939,7 @@ setupSandbox(io, {
     rebuildQuadTree,
     processRoom,
     DEFAULT_ENTRY_FEE,
-    JWT_SECRET: process.env.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig',
+    JWT_SECRET: JWT_SECRET,
 });
 
 setInterval(() => {
