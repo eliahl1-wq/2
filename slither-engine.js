@@ -420,10 +420,11 @@ export function getSlitherTargetBots(humanCount) {
     
     // Target a lively arena with a mix of players and bots.
     // The fewer humans, the more bots we spawn to fill the room up to a target size.
-    const targetEntities = 12;
+    // Max 5 bots per normal game (reduced from 8).
+    const targetEntities = 8;
     if (humanCount >= targetEntities) return 0;
     
-    return Math.min(8, targetEntities - humanCount);
+    return Math.min(5, targetEntities - humanCount);
 }
 
 function getAllSlitherSnakes(room) {
@@ -1336,6 +1337,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
                     event: 'death',
                     mode: 'slither',
                     entryFeeUsd: snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                    isFreeTicketPlay: !!snake.isFreeTicketPlay,
                 },
                 status: 'confirmed',
             }).catch(err => console.error('Error logging slither death:', err));

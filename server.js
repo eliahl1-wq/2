@@ -48,6 +48,7 @@ import {
     getCompetitiveEconomy,
     getSurvivEconomy,
     getJoinPoolSplit,
+    getRewardPoolSplit,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
 } from './economy.js';
@@ -82,9 +83,12 @@ import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js'
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
 const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET;
 const OWNER_VAULT_ADDRESS = process.env.OWNER_VAULT_ADDRESS; // Din personliga plånbok för vinst
+const REWARD_WALLET_ADDRESS = process.env.REWARD_WALLET_ADDRESS;
+const REWARD_WALLET_SECRET = process.env.REWARD_WALLET_SECRET;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
+let rewardPoolBalance = 0; // In-memory USD tracking (server is source of truth)
 let SOL_PRICE_USD = 57; // Default fallback price, updated by market scanner
 
 if (DEV_FREE_PLAY) {
@@ -132,6 +136,15 @@ if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
 }
 
 validateBRWalletsOnStartup({ devFreePlay: DEV_FREE_PLAY });
+
+// Reward wallet startup validation
+if (REWARD_WALLET_ADDRESS && REWARD_WALLET_SECRET) {
+    console.log('✅ Reward Wallet configured:', REWARD_WALLET_ADDRESS);
+} else if (REWARD_WALLET_ADDRESS || REWARD_WALLET_SECRET) {
+    console.warn('⚠️  Reward Wallet incomplete — set BOTH REWARD_WALLET_ADDRESS and REWARD_WALLET_SECRET.');
+} else {
+    console.warn('⚠️  Reward Wallet not configured — reward pool contributions tracked in-memory only (no on-chain transfers).');
+}
 
 const allowedOrigins = [
     "http://localhost:5173",
@@ -201,6 +214,13 @@ const UserSchema = new mongoose.Schema({
     depositSecret: { type: String },
     playtime: { type: Number, default: 0 },
     excludedFromReports: { type: Boolean, default: false },
+    sponsoredRewardsCompleted: { type: Boolean, default: false },
+    hasFreeTicket: { type: Boolean, default: true },
+    freeTicketUsed: { type: Boolean, default: false },
+    completedFiveDollarNormalGames: { type: Number, default: 0 },
+    completedTenDollarNormalGames: { type: Number, default: 0 },
+    sponsoredRewardsUnlocked: { type: Boolean, default: false },
+    sponsoredRewardsBalance: { type: Number, default: 0 }, // in USD, as rewards are dollar-denominated in description
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -214,6 +234,132 @@ const TransactionSchema = new mongoose.Schema({
     status: { type: String, enum: ['pending', 'confirmed', 'failed'], default: 'confirmed' },
     excludedFromReports: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
+});
+
+TransactionSchema.post('save', async function(doc) {
+    if (doc.status !== 'confirmed') return;
+    
+    // Check if this is a completed normal game (not free-ticket play)
+    const isNormalGameDeath = doc.type === 'game' && doc.meta?.event === 'death' && doc.meta?.reason === 'Arena Death';
+    const isNormalGameCashout = doc.type === 'withdraw' && (doc.meta?.reason === 'Arena Cashout' || doc.meta?.reason === 'Auto Room Reset to Account Address');
+    
+    if (isNormalGameDeath || isNormalGameCashout) {
+        const userId = doc.userId;
+        const entryFeeUsd = doc.meta?.entryFeeUsd;
+        const mode = doc.meta?.mode;
+        const isFreeTicketPlay = doc.meta?.isFreeTicketPlay;
+        
+        // Only normal games count: Agar normal or Slither normal
+        const isNormalMode = mode === 'agar' || mode === 'slither';
+        if (!userId || !isNormalMode || isFreeTicketPlay) return;
+        
+        try {
+            const UserMod = mongoose.model('User');
+            const user = await UserMod.findById(userId);
+            if (!user || user.sponsoredRewardsUnlocked) return;
+            
+            let updated = false;
+            if (entryFeeUsd === 5) {
+                // Count up to 3 completed $5 games
+                if (user.completedFiveDollarNormalGames < 3) {
+                    user.completedFiveDollarNormalGames += 1;
+                    updated = true;
+                    console.log(`[Challenge Progress] User ${user.username} completed a $5 normal game. Total: ${user.completedFiveDollarNormalGames}/3`);
+                }
+            } else if (entryFeeUsd === 10) {
+                // Count up to 1 completed $10 game
+                if (user.completedTenDollarNormalGames < 1) {
+                    user.completedTenDollarNormalGames += 1;
+                    updated = true;
+                    console.log(`[Challenge Progress] User ${user.username} completed a $10 normal game. Total: ${user.completedTenDollarNormalGames}/1`);
+                }
+            }
+            
+            if (updated) {
+                // Check if challenge is fully complete
+                if (user.completedFiveDollarNormalGames >= 3 && user.completedTenDollarNormalGames >= 1) {
+                    user.sponsoredRewardsUnlocked = true;
+                    user.sponsoredRewardsCompleted = true; // Revert to normal split
+                    console.log(`[Challenge Unlocked] User ${user.username} completed all sponsored reward challenges!`);
+                    
+                    // Payout sponsored balance if >0
+                    if (user.sponsoredRewardsBalance > 0) {
+                        const amountToUnlock = user.sponsoredRewardsBalance;
+                        console.log(`[Challenge Payout] Unlocking $${amountToUnlock.toFixed(2)} for ${user.username}`);
+                        
+                        if (DEV_FREE_PLAY) {
+                            console.log(`[FREE PLAY] Simulated payout of $${amountToUnlock.toFixed(2)} to ${user.depositAddress}`);
+                            user.sponsoredRewardsBalance = 0;
+                            
+                            setImmediate(async () => {
+                                try {
+                                    await mongoose.model('Transaction').create({
+                                        userId: user._id,
+                                        type: 'deposit',
+                                        amount: amountToUnlock / SOL_PRICE_USD,
+                                        meta: {
+                                            event: 'sponsored_rewards_unlock',
+                                            amountUsd: amountToUnlock,
+                                            simulated: true,
+                                            signature: 'simulated_unlock'
+                                        },
+                                        status: 'confirmed'
+                                    });
+                                } catch (e) {
+                                    console.error("Error creating free-play unlock transaction:", e.message);
+                                }
+                            });
+                        } else if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
+                            const solPayout = amountToUnlock / SOL_PRICE_USD;
+                            const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+                            
+                            try {
+                                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                                );
+                                const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                                
+                                const transaction = new solanaWeb3.Transaction().add(
+                                    solanaWeb3.SystemProgram.transfer({
+                                        fromPubkey: houseKeypair.publicKey,
+                                        toPubkey: userPubKey,
+                                        lamports: payoutLamports,
+                                    })
+                                );
+                                
+                                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+                                console.log(`[Challenge Payout] Successfully paid $${amountToUnlock.toFixed(2)} on-chain. Sig: ${signature}`);
+                                user.sponsoredRewardsBalance = 0;
+                                
+                                setImmediate(async () => {
+                                    try {
+                                        await mongoose.model('Transaction').create({
+                                            userId: user._id,
+                                            type: 'deposit',
+                                            amount: solPayout,
+                                            meta: {
+                                                event: 'sponsored_rewards_unlock',
+                                                amountUsd: amountToUnlock,
+                                                signature
+                                            },
+                                            status: 'confirmed'
+                                        });
+                                    } catch (e) {
+                                        console.error("Error creating on-chain unlock transaction:", e.message);
+                                    }
+                                });
+                            } catch (err) {
+                                console.error("[Challenge Payout Error] On-chain payout failed:", err.message);
+                            }
+                        }
+                    }
+                }
+                await user.save();
+            }
+        } catch (err) {
+            console.error("Error in Transaction post-save challenge processing:", err.message);
+        }
+    }
 });
 
 const Transaction = mongoose.model('Transaction', TransactionSchema);
@@ -288,7 +434,10 @@ function createArenaRoom(entryFeeUsd) {
     };
 }
 
-const rooms = ALLOWED_ENTRY_FEES.map(fee => createArenaRoom(fee));
+const rooms = [
+    ...ALLOWED_ENTRY_FEES.map(fee => createArenaRoom(fee)),
+    Object.assign(createArenaRoom(5), { id: 'arena-free-ticket', isFreeTicketRoom: true })
+];
 
 function createCompetitiveSlitherRoom(entryFeeUsd) {
     return {
@@ -654,6 +803,29 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         playerId: mongoId,
         timestamp: new Date().toISOString(),
     };
+
+    if (player.isFreeTicketPlay) {
+        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        user.playtime += (Date.now() - player.startTime);
+        user.sponsoredRewardsBalance += playerPayout;
+        await user.save();
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            meta: { 
+                ...logMeta, 
+                isFreeTicketPlay: true, 
+                locked: true,
+                signature: 'sponsored_locked' 
+            },
+            status: 'confirmed',
+        });
+        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_locked' });
+        commitArenaCashoutReservation(room, player);
+        return { playerPayout, platformFee, signature: 'sponsored_locked' };
+    }
 
     if (DEV_FREE_PLAY) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
@@ -1841,7 +2013,18 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             computeOwnerEarnings(),
             User.aggregate([
                 { $match: USER_REPORTED },
-                { $group: { _id: null, totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } }, accountCount: { $sum: 1 } } },
+                {
+                    $group: {
+                        _id: null,
+                        totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } },
+                        accountCount: { $sum: 1 },
+                        totalSponsoredRewards: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                        activeSponsoredPlayers: { $sum: { $cond: [{ $gt: ['$sponsoredRewardsBalance', 0] }, 1, 0] } },
+                        completedBeginnerChallenges: { $sum: { $cond: [{ $eq: ['$sponsoredRewardsCompleted', true] }, 1, 0] } },
+                        unusedFreeTickets: { $sum: { $cond: [{ $and: [{ $eq: ['$hasFreeTicket', true] }, { $ne: ['$freeTicketUsed', true] }] }, 1, 0] } },
+                        usedFreeTickets: { $sum: { $cond: [{ $eq: ['$freeTicketUsed', true] }, 1, 0] } }
+                    }
+                }
             ]),
         ]);
 
@@ -1867,9 +2050,15 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerSweepCount: ownerEarnings.sweepCount,
             ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
             ownerEarningsBrSol: ownerEarnings.brSweepSol,
+            rewardPoolBalanceUsd: Number(rewardPoolBalance.toFixed(2)),
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
+            totalSponsoredRewards: userBalanceAgg[0]?.totalSponsoredRewards ?? 0,
+            activeSponsoredPlayers: userBalanceAgg[0]?.activeSponsoredPlayers ?? 0,
+            completedBeginnerChallenges: userBalanceAgg[0]?.completedBeginnerChallenges ?? 0,
+            unusedFreeTickets: userBalanceAgg[0]?.unusedFreeTickets ?? 0,
+            usedFreeTickets: userBalanceAgg[0]?.usedFreeTickets ?? 0,
             excludedTxCount,
             excludedUsersCount,
             solPrice: SOL_PRICE_USD,
@@ -2050,7 +2239,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports playtime email').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsUnlocked sponsoredRewardsBalance').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
             { $match: depositMatch },
@@ -2075,6 +2264,12 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 playtime: u.playtime ?? 0,
                 createdAt: objectIdCreatedAt(u._id),
                 excludedFromReports: !!u.excludedFromReports,
+                hasFreeTicket: !!u.hasFreeTicket,
+                freeTicketUsed: !!u.freeTicketUsed,
+                completedFiveDollarNormalGames: u.completedFiveDollarNormalGames ?? 0,
+                completedTenDollarNormalGames: u.completedTenDollarNormalGames ?? 0,
+                sponsoredRewardsUnlocked: !!u.sponsoredRewardsUnlocked,
+                sponsoredRewardsBalance: u.sponsoredRewardsBalance ?? 0,
             };
         });
 
@@ -2218,6 +2413,101 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
     }
 });
 
+app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { action } = req.body; // 'grant_ticket', 'revoke_ticket', 'reset_challenges', 'manual_unlock'
+        
+        if (!mongoose.Types.ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid user id' });
+        }
+        
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        
+        if (action === 'grant_ticket') {
+            user.hasFreeTicket = true;
+            user.freeTicketUsed = false;
+            await user.save();
+            return res.json({ success: true, message: 'Free ticket granted successfully.', user });
+        } else if (action === 'revoke_ticket') {
+            user.hasFreeTicket = false;
+            user.freeTicketUsed = true;
+            await user.save();
+            return res.json({ success: true, message: 'Free ticket revoked successfully.', user });
+        } else if (action === 'reset_challenges') {
+            user.completedFiveDollarNormalGames = 0;
+            user.completedTenDollarNormalGames = 0;
+            user.sponsoredRewardsUnlocked = false;
+            user.sponsoredRewardsCompleted = false;
+            await user.save();
+            return res.json({ success: true, message: 'Challenge progress reset successfully.', user });
+        } else if (action === 'manual_unlock') {
+            user.sponsoredRewardsUnlocked = true;
+            user.sponsoredRewardsCompleted = true;
+            
+            // Perform payout if balance > 0
+            if (user.sponsoredRewardsBalance > 0) {
+                const amountToUnlock = user.sponsoredRewardsBalance;
+                if (DEV_FREE_PLAY) {
+                    user.sponsoredRewardsBalance = 0;
+                    await user.save();
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'deposit',
+                        amount: amountToUnlock / SOL_PRICE_USD,
+                        meta: {
+                            event: 'sponsored_rewards_unlock',
+                            amountUsd: amountToUnlock,
+                            simulated: true,
+                            signature: 'manual_simulated_unlock'
+                        },
+                        status: 'confirmed'
+                    });
+                } else if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
+                    const solPayout = amountToUnlock / SOL_PRICE_USD;
+                    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+                    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                    );
+                    const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                    
+                    const transaction = new solanaWeb3.Transaction().add(
+                        solanaWeb3.SystemProgram.transfer({
+                            fromPubkey: houseKeypair.publicKey,
+                            toPubkey: userPubKey,
+                            lamports: payoutLamports,
+                        })
+                    );
+                    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
+                    user.sponsoredRewardsBalance = 0;
+                    await user.save();
+                    
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'deposit',
+                        amount: solPayout,
+                        meta: {
+                            event: 'sponsored_rewards_unlock',
+                            amountUsd: amountToUnlock,
+                            signature
+                        },
+                        status: 'confirmed'
+                    });
+                }
+            } else {
+                await user.save();
+            }
+            return res.json({ success: true, message: 'Sponsored rewards unlocked successfully.', user });
+        } else {
+            return res.status(400).json({ message: 'Invalid action' });
+        }
+    } catch (err) {
+        console.error('Admin sponsored control error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/admin/dashboard/betting-history', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
@@ -2323,6 +2613,30 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
             };
         }
 
+        let rewardWallet = null;
+        if (REWARD_WALLET_ADDRESS) {
+            try {
+                const lamports = await connection.getBalance(new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS));
+                rewardWallet = {
+                    label: 'Reward Pool',
+                    address: REWARD_WALLET_ADDRESS,
+                    balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    balanceUsd: (lamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+                    inMemoryBalanceUsd: Number(rewardPoolBalance.toFixed(2)),
+                };
+            } catch (err) {
+                console.error('Failed to fetch reward wallet balance:', err.message);
+                rewardWallet = {
+                    label: 'Reward Pool',
+                    address: REWARD_WALLET_ADDRESS,
+                    balanceSol: 0,
+                    balanceUsd: 0,
+                    inMemoryBalanceUsd: Number(rewardPoolBalance.toFixed(2)),
+                    error: err.message,
+                };
+            }
+        }
+
         const roomPools = rooms.map(r => ({
             entryFeeUsd: r.entryFeeUsd,
             foodPoolBalance: r.foodPoolBalance,
@@ -2335,6 +2649,7 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
             mainHouse,
             brWallets,
             ownerVault,
+            rewardWallet,
             roomPools,
             solPrice: SOL_PRICE_USD,
             devFreePlay: DEV_FREE_PLAY,
@@ -3535,7 +3850,8 @@ function findPlayerInArena(mongoId) {
 
 function getRoomForEntry(entryFeeUsd) {
     const fee = normalizeEntryFee(entryFeeUsd);
-    return rooms.find(r => r.entryFeeUsd === fee) ?? rooms.find(r => r.entryFeeUsd === DEFAULT_ENTRY_FEE);
+    return rooms.find(r => r.entryFeeUsd === fee && !r.isFreeTicketRoom) 
+        ?? rooms.find(r => r.entryFeeUsd === DEFAULT_ENTRY_FEE && !r.isFreeTicketRoom);
 }
 
 function isArenaResetting() {
@@ -3644,10 +3960,11 @@ function getTargetBots(humanCount) {
 
     // Target a lively arena with a mix of players and bots.
     // The fewer humans, the more bots we spawn to fill the room up to a target size.
-    const targetEntities = 12;
+    // Max 5 bots per normal game (reduced from 8).
+    const targetEntities = 8;
     if (humanCount >= targetEntities) return 0;
 
-    return Math.min(8, targetEntities - humanCount);
+    return Math.min(5, targetEntities - humanCount);
 }
 
 function countHumansInMode(room, mode) {
@@ -3772,7 +4089,7 @@ io.on('connection', (socket) => {
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
 
-    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor }) => {
+    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, useFreeTicket }) => {
         let userKey = null;
         try {
             if (mode === 'br-agar' || mode === 'br-slither') {
@@ -4105,6 +4422,21 @@ io.on('connection', (socket) => {
             const economy = getEconomy(entryFeeUsd);
 
             const existing = findPlayerInArena(userKey);
+            const isFreeTicketPlay = !!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom);
+
+            if (isFreeTicketPlay && !existing) {
+                // First time joining with a free ticket
+                if (!user.hasFreeTicket || user.freeTicketUsed) {
+                    throw new Error('You do not have an active free ticket or it has already been used.');
+                }
+                if (entryFeeUsd !== 5) {
+                    throw new Error('Free ticket is only valid for $5 games.');
+                }
+                if (gameMode !== 'agar' && gameMode !== 'slither') {
+                    throw new Error('Free ticket is only valid for Agar or Slither normal games.');
+                }
+            }
+
             if (existing && existing.room.isCompetitiveSlither) {
                 socket.emit('error', 'You have an active Competitive Slither game. Rejoin or cash out first.');
                 return;
@@ -4120,7 +4452,7 @@ io.on('connection', (socket) => {
             const existingMode = existing?.player?.mode || null;
             const switchingNormalMode = existing?.room && existingMode && existingMode !== gameMode;
 
-            const room = existing?.room ?? getRoomForEntry(entryFeeUsd);
+            const room = existing?.room ?? (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd));
             const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
             let switchedDollarBalance = null;
             if (switchingNormalMode) {
@@ -4173,7 +4505,7 @@ io.on('connection', (socket) => {
             // FINANCIAL: Check SOL balance for entry fee
             const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
-            if (!switchingNormalMode && !DEV_FREE_PLAY) {
+            if (!switchingNormalMode && !DEV_FREE_PLAY && !isFreeTicketPlay) {
                 // 1. Kontrollera on-chain balans direkt innan start
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const currentLamports = await connection.getBalance(userPubKey);
@@ -4213,28 +4545,69 @@ io.on('connection', (socket) => {
                     return;
                 }
             } else if (!switchingNormalMode) {
-                console.log(`[FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
+                if (isFreeTicketPlay) {
+                    console.log(`[FREE TICKET] ${user.username} joined Slither/Agar normal $10 match using free ticket.`);
+                } else {
+                    console.log(`[FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
+                }
             }
 
             // Log Join
-            if (!switchingNormalMode) await Transaction.create({
-                userId: user._id,
-                type: 'game',
-                amount: entryFeeInSol,
-                meta: {
-                    event: 'join',
-                    roomId: room.id,
-                    entryFeeUsd,
-                    mode: mode === 'slither' ? 'slither' : 'agar',
-                    ...(DEV_FREE_PLAY ? { simulated: true } : {}),
-                },
-                status: 'confirmed'
-            });
+            if (!switchingNormalMode) {
+                if (isFreeTicketPlay) {
+                    // Consume ticket in DB
+                    user.hasFreeTicket = false;
+                    user.freeTicketUsed = true;
+                    await user.save();
+
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'game',
+                        amount: 0,
+                        meta: {
+                            event: 'free_ticket_join',
+                            roomId: room.id,
+                            entryFeeUsd,
+                            mode: mode === 'slither' ? 'slither' : 'agar',
+                            isFreeTicketPlay: true,
+                        },
+                        status: 'confirmed'
+                    });
+                } else {
+                    await Transaction.create({
+                        userId: user._id,
+                        type: 'game',
+                        amount: entryFeeInSol,
+                        meta: {
+                            event: 'join',
+                            roomId: room.id,
+                            entryFeeUsd,
+                            mode: mode === 'slither' ? 'slither' : 'agar',
+                            ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                        },
+                        status: 'confirmed'
+                    });
+                }
+            }
 
             // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population)
+            // If user hasn't completed Sponsored Rewards, use reduced split with reward pool contribution
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
-            const { food: foodAlloc, ai: aiAlloc } = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
+            let foodAlloc, aiAlloc, rewardContribution = 0, ownerContribution = 0;
+
+            if (!user.sponsoredRewardsCompleted && !isFreeTicketPlay) {
+                const rpSplit = getRewardPoolSplit(entryFeeUsd);
+                foodAlloc = rpSplit.food;
+                aiAlloc = rpSplit.ai;
+                rewardContribution = rpSplit.rewardPoolContribution;
+                ownerContribution = rpSplit.ownerVaultContribution;
+            } else {
+                const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
+                foodAlloc = stdSplit.food;
+                aiAlloc = stdSplit.ai;
+            }
+
             const foodToPool = Math.max(0, foodAlloc - goldenBlobValue);
 
             // Only fund bots up to the cap for current population; surplus → food pool
@@ -4244,28 +4617,76 @@ io.on('connection', (socket) => {
             const maxAi = getTargetBots(agarAfter) * joinBotStake + getSlitherTargetBots(slitherAfter) * joinBotStake;
             const aiDeficit = Math.max(0, maxAi - room.aiBudgetBalance);
             const aiToAdd = Math.min(aiAlloc, aiDeficit);
+
+            // Bot budget: if room already has >1 bot, only 10% of AI allocation funds bots
+            const existingBotCount = gameMode === 'slither' ? room.slitherBots.length : room.bots.length;
             if (!switchingNormalMode) {
-                room.aiBudgetBalance += aiToAdd;
-                room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd);
+                if (existingBotCount > 1) {
+                    const usableAi = aiToAdd * 0.10;
+                    const overflowAi = aiToAdd - usableAi;
+                    room.aiBudgetBalance += usableAi;
+                    room.foodPoolBalance += foodToPool + overflowAi + (aiAlloc - aiToAdd);
+                } else {
+                    room.aiBudgetBalance += aiToAdd;
+                    room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd);
+                }
                 room.fundedEntryUsd += entryFeeUsd;
+
+                // Reward pool / owner vault contributions
+                if (rewardContribution > 0) {
+                    rewardPoolBalance += rewardContribution;
+                    console.log(`🏆 REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${rewardPoolBalance.toFixed(2)}`);
+                    Transaction.create({
+                        userId: user._id,
+                        type: 'game',
+                        amount: rewardContribution / SOL_PRICE_USD,
+                        meta: {
+                            event: 'reward_pool_contribution',
+                            entryFeeUsd,
+                            contributionUsd: rewardContribution,
+                            roomId: room.id,
+                            mode: gameMode,
+                        },
+                        status: 'confirmed',
+                    }).catch(err => console.error('Reward pool TX log error:', err.message));
+                }
+                if (ownerContribution > 0) {
+                    room.ownerBalance += ownerContribution;
+                    console.log(`💼 OWNER VAULT: +$${ownerContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry)`);
+                    Transaction.create({
+                        userId: user._id,
+                        type: 'game',
+                        amount: ownerContribution / SOL_PRICE_USD,
+                        meta: {
+                            event: 'owner_vault_contribution',
+                            entryFeeUsd,
+                            contributionUsd: ownerContribution,
+                            roomId: room.id,
+                            mode: gameMode,
+                        },
+                        status: 'confirmed',
+                    }).catch(err => console.error('Owner vault TX log error:', err.message));
+                }
             }
 
-            // DYNAMIC BOT SCALING (mode-specific)
+            // DYNAMIC BOT SCALING (mode-specific, max 1 bot spawned per entry)
             let targetBots = gameMode === 'slither'
                 ? getSlitherTargetBots(modeHumansAfterJoin)
                 : getTargetBots(modeHumansAfterJoin);
 
             if (gameMode === 'slither') {
                 targetBots += room.slitherBots.filter(b => b.adminSpawned).length;
-                if (room.slitherBots.length < targetBots) {
-                    addSlitherBots(room, targetBots - room.slitherBots.length, joinBotStake);
+                const botsToSpawn = Math.min(1, Math.max(0, targetBots - room.slitherBots.length));
+                if (botsToSpawn > 0) {
+                    addSlitherBots(room, botsToSpawn, joinBotStake);
                 } else if (room.slitherBots.length > targetBots) {
                     trimSlitherBots(room, targetBots);
                 }
             } else {
                 targetBots += room.bots.filter(b => b.adminSpawned).length;
-                if (room.bots.length < targetBots) {
-                    addBots(room, targetBots - room.bots.length, joinBotStake);
+                const botsToSpawn = Math.min(1, Math.max(0, targetBots - room.bots.length));
+                if (botsToSpawn > 0) {
+                    addBots(room, botsToSpawn, joinBotStake);
                 } else if (room.bots.length > targetBots) {
                     trimAgarBots(room, targetBots);
                 }
@@ -4293,6 +4714,9 @@ io.on('connection', (socket) => {
                 if (switchedDollarBalance != null) {
                     newPlayer.dollarBalance = switchedDollarBalance;
                     newPlayer.balance = Math.max(newPlayer.balance, getEconomy(room.entryFeeUsd).massStartBalance);
+                }
+                if (isFreeTicketPlay) {
+                    newPlayer.isFreeTicketPlay = true;
                 }
             } else {
                 const spawnX = Math.random() * c.worldWidth;
@@ -4345,6 +4769,9 @@ io.on('connection', (socket) => {
                 if (switchedDollarBalance != null) {
                     newPlayer.dollarBalance = switchedDollarBalance;
                     newPlayer.balance = switchedDollarBalance;
+                }
+                if (isFreeTicketPlay) {
+                    newPlayer.isFreeTicketPlay = true;
                 }
             }
 
@@ -5386,6 +5813,7 @@ function processRoom(room) {
                                                 mode: victim.mode || 'agar',
                                                 entryFeeUsd: victim.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                                                 inGameBalanceUsd: balanceAtDeath,
+                                                isFreeTicketPlay: !!victim.isFreeTicketPlay,
                                             },
                                             status: 'confirmed',
                                         }).catch(err => console.error("Error logging agar death:", err));

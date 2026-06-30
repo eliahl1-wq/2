@@ -90,6 +90,38 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
 }
 
 /**
+ * Modified entry split for users who have NOT completed Sponsored Rewards.
+ * Allocations (of entry fee):
+ *   10 % → player start balance (unchanged, deducted before this split)
+ *   50 % → food pool (includes 10 % golden blob deducted in join handler)
+ *   20 % → bots (AI budget)
+ *   20 % → reward pool ($5/$10) or owner vault ($20)
+ *
+ * Dollar amounts:
+ *   $5:  food $2.50 (golden $0.50 + pool $2.00), bots $1.00, reward $1.00
+ *   $10: food $5.00 (golden $1.00 + pool $4.00), bots $2.00, reward $2.00
+ *   $20: food $10.00 (golden $2.00 + pool $8.00), bots $4.00, owner vault $4.00
+ *
+ * Returns { food, ai, rewardPoolContribution, ownerVaultContribution }.
+ * food includes golden blob — join handler subtracts it before adding to foodPoolBalance.
+ */
+export function getRewardPoolSplit(entryFeeUsd) {
+    const entry = normalizeEntryFee(entryFeeUsd);
+    const playerStart = entry * 0.10; // already deducted as playerStartBalance
+    const food = entry * 0.50;        // includes golden blob (10%)
+    const ai   = entry * 0.20;
+    const contribution = entry - playerStart - food - ai; // 20 %
+
+    if (entry <= 10) {
+        // $5 and $10: contribution goes to reward pool
+        return { food, ai, rewardPoolContribution: contribution, ownerVaultContribution: 0 };
+    }
+    // $20+: contribution goes to owner vault (not reward pool)
+    return { food, ai, rewardPoolContribution: 0, ownerVaultContribution: contribution };
+}
+
+
+/**
  * Soft wealth tax: decay scales with excess balance above starting size.
  * Returns USD lost this tick (never below startBalance).
  */
