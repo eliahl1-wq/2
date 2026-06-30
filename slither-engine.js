@@ -469,9 +469,10 @@ function applySlitherFoodPickup(snake, food, room) {
 
 /** Slither.io-style gradual length growth via fam fullness before adding a segment. */
 function famVolumeForSegment(sct) {
-    const sc = scaleForSegmentCount(sct);
-    // Higher volume = slower segment adds per pellet (subtle, gradual growth).
-    return 0.09 + sc * 0.022 + sct * 0.0016;
+    // Always grow the same amount in length, independent of current width/scale or segment count.
+    // We use the initial volume at spawn to keep growth rate consistent.
+    const spawnSc = scaleForSegmentCount(SLITHER.spawnSegments);
+    return 0.09 + spawnSc * 0.022 + SLITHER.spawnSegments * 0.0016;
 }
 
 function applyFamGrowth(snake, maxAdd = 1) {
