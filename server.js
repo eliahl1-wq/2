@@ -256,7 +256,7 @@ TransactionSchema.post('save', async function(doc) {
         try {
             const UserMod = mongoose.model('User');
             const user = await UserMod.findById(userId);
-            if (!user || user.sponsoredRewardsUnlocked) return;
+            if (!user || user.sponsoredRewardsUnlocked || !user.freeTicketUsed) return;
             
             let updated = false;
             if (entryFeeUsd === 5) {
