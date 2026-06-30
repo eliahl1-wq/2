@@ -236,6 +236,16 @@ const TransactionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
+function getDynamicChallengeReqs(sponsoredRewardsBalance) {
+    const balance = sponsoredRewardsBalance || 0;
+    const requiredContribution = Math.max(5, balance);
+    const multiplier = Math.ceil(requiredContribution / 5);
+    return {
+        req5: multiplier * 3,
+        req10: multiplier * 1
+    };
+}
+
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed') return;
     
@@ -258,31 +268,69 @@ TransactionSchema.post('save', async function(doc) {
             const user = await UserMod.findById(userId);
             if (!user || user.sponsoredRewardsUnlocked || !user.freeTicketUsed) return;
             
+            const reqs = getDynamicChallengeReqs(user.sponsoredRewardsBalance);
+            
             let updated = false;
             if (entryFeeUsd === 5) {
-                // Count up to 3 completed $5 games
-                if (user.completedFiveDollarNormalGames < 3) {
+                // Count completed $5 games
+                if (user.completedFiveDollarNormalGames < reqs.req5) {
                     user.completedFiveDollarNormalGames += 1;
                     updated = true;
-                    console.log(`[Challenge Progress] User ${user.username} completed a $5 normal game. Total: ${user.completedFiveDollarNormalGames}/3`);
+                    console.log(`[Challenge Progress] User ${user.username} completed a $5 normal game. Total: ${user.completedFiveDollarNormalGames}/${reqs.req5}`);
                 }
             } else if (entryFeeUsd === 10) {
-                // Count up to 1 completed $10 game
-                if (user.completedTenDollarNormalGames < 1) {
+                // Count completed $10 games
+                if (user.completedTenDollarNormalGames < reqs.req10) {
                     user.completedTenDollarNormalGames += 1;
                     updated = true;
-                    console.log(`[Challenge Progress] User ${user.username} completed a $10 normal game. Total: ${user.completedTenDollarNormalGames}/1`);
+                    console.log(`[Challenge Progress] User ${user.username} completed a $10 normal game. Total: ${user.completedTenDollarNormalGames}/${reqs.req10}`);
                 }
             }
             
             if (updated) {
                 // Check if challenge is fully complete
-                if (user.completedFiveDollarNormalGames >= 3 && user.completedTenDollarNormalGames >= 1) {
+                if (user.completedFiveDollarNormalGames >= reqs.req5 && user.completedTenDollarNormalGames >= reqs.req10) {
                     user.sponsoredRewardsUnlocked = true;
                     user.sponsoredRewardsCompleted = true; // Revert to normal split
-                    console.log(`[Challenge Unlocked] User ${user.username} completed all sponsored reward challenges!`);
                     
-                    // Payout is now handled manually via /api/user/claim-rewards endpoint
+                    const totalContribution = (user.completedFiveDollarNormalGames * 1) + (user.completedTenDollarNormalGames * 2);
+                    const excess = totalContribution - (user.sponsoredRewardsBalance || 0);
+                    
+                    if (excess > 0 && rewardPoolBalance >= excess) {
+                        rewardPoolBalance -= excess;
+                        console.log(`[Challenge Unlocked] Transferring excess $${excess.toFixed(2)} from Reward Pool to Owner Vault.`);
+                        
+                        try {
+                            const TransactionMod = mongoose.model('Transaction');
+                            await TransactionMod.create({
+                                userId: user._id,
+                                type: 'game',
+                                amount: -(excess / SOL_PRICE_USD),
+                                meta: {
+                                    event: 'reward_pool_correction',
+                                    note: 'Transfer excess to owner vault',
+                                    correctionUsd: -excess
+                                },
+                                status: 'confirmed'
+                            });
+                            
+                            await TransactionMod.create({
+                                userId: user._id,
+                                type: 'game',
+                                amount: (excess / SOL_PRICE_USD),
+                                meta: {
+                                    event: 'owner_vault_contribution',
+                                    note: 'Excess from sponsored challenges',
+                                    contributionUsd: excess
+                                },
+                                status: 'confirmed'
+                            });
+                        } catch (e) {
+                            console.error("Failed to log excess transfer tx:", e.message);
+                        }
+                    }
+
+                    console.log(`[Challenge Unlocked] User ${user.username} completed all sponsored reward challenges!`);
                 }
                 await user.save();
             }
