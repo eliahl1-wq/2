@@ -4764,9 +4764,8 @@ io.on('connection', (socket) => {
         if (p) {
             p.disconnected = true;
             p.disconnectedAt = Date.now();
-            const mongoId = p.mongoId?.toString();
             p.removeTimeout = setTimeout(() => {
-                room.players = room.players.filter(x => x.mongoId?.toString() !== mongoId);
+                room.players = room.players.filter(x => x !== p);
                 console.log(`🗑️ Removed disconnected player ${p.username} after timeout`);
             }, 5 * 60 * 1000);
         }
@@ -4887,10 +4886,12 @@ function getSandboxRoomById(roomId) {
 function processCompetitiveSlitherTick() {
     for (const room of competitiveSlitherRooms) {
         if (room.isResetting) continue;
-        const activeEntities = room.players.filter(p => !p.disconnected).length;
+        const liveEntities = room.players.filter(
+            p => p.mode === 'competitive-slither' && p.segments?.length
+        ).length;
         const activeHumans = room.players.filter(p => !p.isBot && !p.disconnected).length;
         const spectatorCount = room.competitiveSpectators?.length ?? 0;
-        if (activeEntities === 0 && spectatorCount === 0) continue;
+        if (liveEntities === 0 && spectatorCount === 0) continue;
 
         const resetTime = room.startTime + c.roomDuration;
         syncCompetitiveSlitherFood(room, activeHumans);

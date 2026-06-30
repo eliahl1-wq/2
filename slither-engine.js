@@ -428,7 +428,7 @@ export function getSlitherTargetBots(humanCount) {
 
 function getAllSlitherSnakes(room) {
     const humans = room.players
-        .filter(p => p.mode === 'slither' && !p.disconnected && p.segments?.length)
+        .filter(p => p.mode === 'slither' && p.segments?.length)
         .map(p => ({ entity: p, isHuman: true }));
     const bots = room.slitherBots.map(b => ({ entity: b, isHuman: false }));
     const statics = (room.sandboxStaticWorms || []).map(s => ({ entity: s, isHuman: false }));
@@ -556,7 +556,7 @@ function trimSnakePath(path, maxArcLength) {
 function ensurePathArcLength(path, segments, spacing, angle = 0) {
     const required = Math.max(spacing, (segments.length - 1) * spacing);
     let arc = pathArcLength(path);
-    if (arc >= required * 0.98) return;
+    if (arc >= required) return;
 
     let dirX = 0;
     let dirY = 0;
@@ -1297,25 +1297,31 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 
     if (isHuman) {
         const socketId = snake.id;
-        if (!room.spectators) room.spectators = [];
-        room.spectators = room.spectators.filter(s => s.id !== socketId);
-        const head = snake.segments?.[0];
-        room.spectators.push({
-            id: socketId,
-            x: head?.x ?? snake.x ?? 0,
-            y: head?.y ?? snake.y ?? 0,
-        });
-
-        if (snake.isBattleRoyale) {
-            const placement = room.players.filter(p => p.id !== snake.id).length + 1;
-            io.to(socketId).emit('brEliminated', {
-                placement,
-                playersRemaining: placement - 1,
-                reason: killer ? 'killed' : 'eliminated',
-                prizePool: room.prizePool,
-            });
+        if (snake.removeTimeout) {
+            clearTimeout(snake.removeTimeout);
+            delete snake.removeTimeout;
         }
-        io.to(socketId).emit('RIP');
+        if (!snake.disconnected) {
+            if (!room.spectators) room.spectators = [];
+            room.spectators = room.spectators.filter(s => s.id !== socketId);
+            const head = snake.segments?.[0];
+            room.spectators.push({
+                id: socketId,
+                x: head?.x ?? snake.x ?? 0,
+                y: head?.y ?? snake.y ?? 0,
+            });
+
+            if (snake.isBattleRoyale) {
+                const placement = room.players.filter(p => p.id !== snake.id).length + 1;
+                io.to(socketId).emit('brEliminated', {
+                    placement,
+                    playersRemaining: placement - 1,
+                    reason: killer ? 'killed' : 'eliminated',
+                    prizePool: room.prizePool,
+                });
+            }
+            io.to(socketId).emit('RIP');
+        }
         room.players = room.players.filter(p => p.id !== snake.id);
         if (snake.mongoId) {
             User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
@@ -1353,16 +1359,13 @@ function downsampleSegmentsForNetwork(segments, maxPoints = MAX_NETWORK_SEGMENTS
     if (segments.length <= maxPoints) {
         return segments.map(s => ({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 }));
     }
-    const step = Math.ceil(segments.length / maxPoints);
     const slim = [];
-    for (let i = 0; i < segments.length; i += step) {
-        const s = segments[i];
-        slim.push({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 });
-    }
-    const last = segments[segments.length - 1];
-    const tail = slim[slim.length - 1];
-    if (!tail || tail.x !== Math.round(last.x * 10) / 10 || tail.y !== Math.round(last.y * 10) / 10) {
-        slim.push({ x: Math.round(last.x * 10) / 10, y: Math.round(last.y * 10) / 10 });
+    for (let i = 0; i < maxPoints; i++) {
+        const idx = Math.round((i * (segments.length - 1)) / (maxPoints - 1));
+        const s = segments[idx];
+        if (s) {
+            slim.push({ x: Math.round(s.x * 10) / 10, y: Math.round(s.y * 10) / 10 });
+        }
     }
     return slim;
 }
@@ -1930,7 +1933,7 @@ export function getCompetitiveZone(resetTime) {
 
 function getCompetitiveSnakes(room) {
     return room.players
-        .filter(p => p.mode === 'competitive-slither' && !p.disconnected && p.segments?.length)
+        .filter(p => p.mode === 'competitive-slither' && p.segments?.length)
         .map(p => ({ entity: p, isHuman: true }));
 }
 
@@ -2046,6 +2049,10 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
         killer.kills = (killer.kills || 0) + 1;
     }
 
+    if (snake.removeTimeout) {
+        clearTimeout(snake.removeTimeout);
+        delete snake.removeTimeout;
+    }
     dropCompetitiveSnakeAsFood(room, snake);
     room.players = room.players.filter(p => p.id !== snake.id);
 
@@ -2054,21 +2061,23 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
     if (snake.isBot) return;
 
     const socketId = snake.id;
-    const head = snake.segments?.[0];
-    if (!room.competitiveSpectators) room.competitiveSpectators = [];
-    room.competitiveSpectators = room.competitiveSpectators.filter(s => s.id !== socketId);
-    room.competitiveSpectators.push({
-        id: socketId,
-        mongoId: snake.mongoId,
-        x: head?.x ?? snake.x ?? 0,
-        y: head?.y ?? snake.y ?? 0,
-        dollarBalance: snake.dollarBalance,
-    });
+    if (!snake.disconnected) {
+        const head = snake.segments?.[0];
+        if (!room.competitiveSpectators) room.competitiveSpectators = [];
+        room.competitiveSpectators = room.competitiveSpectators.filter(s => s.id !== socketId);
+        room.competitiveSpectators.push({
+            id: socketId,
+            mongoId: snake.mongoId,
+            x: head?.x ?? snake.x ?? 0,
+            y: head?.y ?? snake.y ?? 0,
+            dollarBalance: snake.dollarBalance,
+        });
+    }
     if (room._lastCompFoodByPlayer) {
         delete room._lastCompFoodByPlayer[socketId];
     }
 
-    io.to(socketId).emit('RIP');
+    if (!snake.disconnected) io.to(socketId).emit('RIP');
     if (snake.mongoId) {
         User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
     }
