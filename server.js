@@ -1104,36 +1104,84 @@ async function sweepHouseWalletOnReset() {
     const totalLamports = await connection.getBalance(housePubKey);
     const solPrice = Number(SOL_PRICE_USD || 64);
     const bufferLamports = Math.round((1.0 / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
-    const sweepLamports = totalLamports - bufferLamports;
+    const totalSweepLamports = totalLamports - bufferLamports;
 
-    if (sweepLamports <= 0) return;
+    if (totalSweepLamports <= 0) return;
+
+    // Calculate how much should go to the Reward Wallet
+    let rewardSweepLamports = 0;
+    if (REWARD_WALLET_ADDRESS && rewardPoolBalance > 0) {
+        rewardSweepLamports = Math.round((rewardPoolBalance / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
+        if (rewardSweepLamports > totalSweepLamports) {
+            rewardSweepLamports = totalSweepLamports; // Cap at available liquidity
+        }
+    }
+    
+    const ownerSweepLamports = totalSweepLamports - rewardSweepLamports;
+    if (ownerSweepLamports <= 0 && rewardSweepLamports <= 0) return;
 
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
         Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
     );
-    const sweepTx = new solanaWeb3.Transaction().add(
-        solanaWeb3.SystemProgram.transfer({
-            fromPubkey: houseKeypair.publicKey,
-            toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
-            lamports: sweepLamports,
-        })
-    );
+    const sweepTx = new solanaWeb3.Transaction();
+    
+    if (rewardSweepLamports > 0) {
+        sweepTx.add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS),
+                lamports: rewardSweepLamports,
+            })
+        );
+    }
+    
+    if (ownerSweepLamports > 0) {
+        sweepTx.add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: ownerSweepLamports,
+            })
+        );
+    }
+
     const sig = await solanaWeb3.sendAndConfirmTransaction(connection, sweepTx, [houseKeypair]);
 
-    await Transaction.create({
-        type: 'withdraw',
-        amount: (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
-        currency: 'SOL',
-        meta: {
-            event: 'pool_sweep',
-            signature: sig,
-            reason: 'Room Reset Wallet Sweep',
-            solAmount: sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
-            from: HOUSE_WALLET_ADDRESS,
-            destination: OWNER_VAULT_ADDRESS,
-        },
-    });
-    console.log(`💸 Wallet Sweep: ${sweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
+    if (rewardSweepLamports > 0) {
+        const sweptUsd = (rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice;
+        rewardPoolBalance = Math.max(0, rewardPoolBalance - sweptUsd);
+        await Transaction.create({
+            type: 'withdraw',
+            amount: (rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice,
+            currency: 'SOL',
+            meta: {
+                event: 'reward_pool_sweep',
+                signature: sig,
+                reason: 'Room Reset Reward Sweep',
+                solAmount: rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                from: HOUSE_WALLET_ADDRESS,
+                destination: REWARD_WALLET_ADDRESS,
+            },
+        });
+        console.log(`💸 Reward Sweep: ${rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to Reward Pool.`);
+    }
+
+    if (ownerSweepLamports > 0) {
+        await Transaction.create({
+            type: 'withdraw',
+            amount: (ownerSweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice,
+            currency: 'SOL',
+            meta: {
+                event: 'pool_sweep',
+                signature: sig,
+                reason: 'Room Reset Wallet Sweep',
+                solAmount: ownerSweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                from: HOUSE_WALLET_ADDRESS,
+                destination: OWNER_VAULT_ADDRESS,
+            },
+        });
+        console.log(`💸 Wallet Sweep: ${ownerSweepLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL sent to owner.`);
+    }
 }
 
 async function performGlobalArenaReset() {
@@ -1669,7 +1717,7 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
 app.post('/api/user/claim-rewards', authenticateToken, async (req, res) => {
     try {
         const User = mongoose.model('User');
-        const user = await User.findById(req.user.userId);
+        const user = await User.findById(req.user.id);
         
         if (!user) return res.status(404).json({ error: 'User not found' });
         
@@ -1707,26 +1755,26 @@ app.post('/api/user/claim-rewards', authenticateToken, async (req, res) => {
             }
             
             return res.json({ success: true, amount: amountToUnlock });
-        } else if (HOUSE_WALLET_ADDRESS && HOUSE_WALLET_SECRET && OWNER_VAULT_ADDRESS) {
+        } else if (REWARD_WALLET_ADDRESS && REWARD_WALLET_SECRET) {
             const solPayout = amountToUnlock / SOL_PRICE_USD;
             const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
             
             try {
-                const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-                    Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+                const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
+                    Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
                 );
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 
                 const transaction = new solanaWeb3.Transaction().add(
                     solanaWeb3.SystemProgram.transfer({
-                        fromPubkey: houseKeypair.publicKey,
+                        fromPubkey: rewardKeypair.publicKey,
                         toPubkey: userPubKey,
                         lamports: payoutLamports,
                     })
                 );
                 
-                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-                console.log(`[Manual Claim] Successfully paid $${amountToUnlock.toFixed(2)} on-chain. Sig: ${signature}`);
+                const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [rewardKeypair]);
+                console.log(`[Manual Claim] Successfully paid $${amountToUnlock.toFixed(2)} on-chain from Reward Pool. Sig: ${signature}`);
                 
                 user.sponsoredRewardsBalance = 0;
                 await user.save();
