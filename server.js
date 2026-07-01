@@ -1965,7 +1965,6 @@ async function logConfirmedRewardOwnerSurplusSweep(state) {
             signature: sweep.signature,
             from: REWARD_WALLET_ADDRESS,
             destination: OWNER_VAULT_ADDRESS,
-            retainedBufferUsd: REWARD_OWNER_SURPLUS_BUFFER_USD,
         },
         status: 'confirmed',
     });
@@ -2669,7 +2668,6 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             rewardOwnerSurplusReservedUsd: Number((rewardPoolState?.ownerSurplusReservedUsd || 0).toFixed(2)),
             rewardOwnerSurplusSweptUsd: Number((rewardPoolState?.totalOwnerSurplusSweptUsd || 0).toFixed(2)),
             rewardOwnerSurplusSweep: rewardPoolState?.ownerSurplusSweep || null,
-            rewardOwnerSurplusBufferUsd: REWARD_OWNER_SURPLUS_BUFFER_USD,
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
