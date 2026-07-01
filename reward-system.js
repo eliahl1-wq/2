@@ -148,7 +148,6 @@ export async function reserveRewardOwnerSurplusSweep() {
     return RewardPoolState.findOneAndUpdate(
         {
             key: 'global',
-            ownerSurplusUsd: { $gt: 0 },
             'ownerSurplusSweep.status': { $nin: ['reserved', 'broadcast'] },
         },
         [{ $set: {
@@ -156,7 +155,7 @@ export async function reserveRewardOwnerSurplusSweep() {
             ownerSurplusUsd: 0,
             ownerSurplusSweep: {
                 sweepId,
-                amountUsd: { $ifNull: ['$ownerSurplusUsd', 0] },
+                amountUsd: 0,
                 solAmount: null,
                 status: 'reserved',
                 signature: null,
