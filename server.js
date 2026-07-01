@@ -3867,9 +3867,9 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             }
         }
 
-        await User.updateMany({}, [{ $set: {
-            hasFreeTicket: { $cond: [{ $eq: ['$rewardsDisabled', true] }, false, true] },
-            freeTicketUsed: { $cond: [{ $eq: ['$rewardsDisabled', true] }, true, false] },
+        await User.updateMany({ rewardsDisabled: { $ne: true } }, { $set: {
+            hasFreeTicket: true,
+            freeTicketUsed: false,
             completedFiveDollarNormalGames: 0,
             completedTenDollarNormalGames: 0,
             sponsoredRewardsUnlocked: false,
@@ -3879,7 +3879,21 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             rewardClaimInProgress: false,
             rewardClaimReservedUsd: 0,
             activeRewardClaimId: null,
-        } }]);
+        } });
+
+        await User.updateMany({ rewardsDisabled: true }, { $set: {
+            hasFreeTicket: false,
+            freeTicketUsed: true,
+            completedFiveDollarNormalGames: 0,
+            completedTenDollarNormalGames: 0,
+            sponsoredRewardsUnlocked: false,
+            sponsoredRewardsCompleted: false,
+            sponsoredRewardsBalance: 0,
+            rentFallbackBalanceUsd: 0,
+            rewardClaimInProgress: false,
+            rewardClaimReservedUsd: 0,
+            activeRewardClaimId: null,
+        } });
         await RewardSecurityAlert.updateMany(
             { 'snapshots.0': { $exists: true } },
             { $set: {
