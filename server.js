@@ -49,6 +49,7 @@ import {
     getSurvivEconomy,
     getJoinPoolSplit,
     getRewardPoolSplit,
+    getRewardChallengeFundingSummary,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
 } from './economy.js';
@@ -79,16 +80,22 @@ import {
 import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
 import {
     RewardClaim,
+    RewardPoolState,
     RewardSecurityAlert,
     addRewardFundingUsd,
+    addRewardOwnerSurplusUsd,
     completeRewardClaim,
+    completeRewardOwnerSurplusSweep,
     failAndReleaseRewardClaim,
+    failAndReleaseRewardOwnerSurplusSweep,
     getCachedPendingRewardUsd,
     hydrateRewardPoolState,
     markClaimBroadcast,
+    markRewardOwnerSurplusBroadcast,
     recordDepositSource,
     reducePendingRewardUsd,
     reserveRewardClaim,
+    reserveRewardOwnerSurplusSweep,
     resolveRewardSecurityAlert,
 } from './reward-system.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
@@ -115,6 +122,18 @@ if (DEV_FREE_PLAY) {
 function logGameLoopError(label, err) {
     const message = err?.stack || err?.message || err;
     console.error(`[GAME LOOP ERROR] ${label}:`, message);
+}
+
+async function logSolanaTransactionError(label, err) {
+    let logs = err?.logs || null;
+    if (!logs && typeof err?.getLogs === 'function') {
+        try {
+            logs = await err.getLogs(connection);
+        } catch {
+            // The original error remains the useful fallback.
+        }
+    }
+    console.error(label, err?.message || err, logs ? { logs } : '');
 }
 
 async function updateSolPrice() {
@@ -332,17 +351,26 @@ TransactionSchema.post('save', async function(doc) {
         );
         if (!unlocked) return;
 
-        const totalContribution = (unlocked.completedFiveDollarNormalGames * 1)
-            + (unlocked.completedTenDollarNormalGames * 2);
-        const excess = Math.max(0, totalContribution - (unlocked.sponsoredRewardsBalance || 0));
+        const { fundedUsd: totalContribution, surplusUsd: excess } = getRewardChallengeFundingSummary(
+            unlocked.sponsoredRewardsBalance,
+            unlocked.completedFiveDollarNormalGames,
+            unlocked.completedTenDollarNormalGames,
+        );
         if (excess > 0) {
-            await reducePendingRewardUsd(excess);
+            // The full challenge contribution still moves to the reward wallet.
+            // Only the part above the player's reward becomes manually sweepable owner surplus.
+            await addRewardOwnerSurplusUsd(excess);
             await TransactionMod.create({
                 userId: unlocked._id,
                 type: 'game',
-                amount: -(excess / SOL_PRICE_USD),
+                amount: excess / SOL_PRICE_USD,
                 currency: 'SOL',
-                meta: { event: 'reward_pool_correction', note: 'Unused sponsored contribution', correctionUsd: -excess },
+                meta: {
+                    event: 'reward_owner_surplus_accrual',
+                    amountUsd: excess,
+                    fundedByChallengesUsd: totalContribution,
+                    playerRewardUsd: unlocked.sponsoredRewardsBalance || 0,
+                },
                 status: 'confirmed',
             });
         }
@@ -365,7 +393,7 @@ function buildGameCashoutTxFilter() {
         type: 'withdraw',
         'meta.reason': { $regex: GAME_CASHOUT_REASON_RE },
         'meta.destination': { $exists: false },
-        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
+        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] },
     };
 }
 
@@ -567,6 +595,24 @@ function keepCompetitiveCashoutSpectator(room, player) {
     });
 }
 
+let cachedSystemAccountRentLamports = null;
+async function getSystemAccountRentLamports() {
+    if (cachedSystemAccountRentLamports == null) {
+        cachedSystemAccountRentLamports = await connection.getMinimumBalanceForRentExemption(0);
+    }
+    return cachedSystemAccountRentLamports;
+}
+
+async function canReceiveSystemTransfer(address, lamports) {
+    if (!address || !(lamports > 0)) return false;
+    const pubkey = new solanaWeb3.PublicKey(address);
+    const [balance, rentMinimum] = await Promise.all([
+        connection.getBalance(pubkey),
+        getSystemAccountRentLamports(),
+    ]);
+    return balance + lamports >= rentMinimum;
+}
+
 async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE;
@@ -622,15 +668,19 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
 
     const totalLamports = await connection.getBalance(housePubKey);
     const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
-    if (totalLamports < payoutLamports + feeLamports + feeBuffer) {
+    // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
+    // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
+    const canTransferOwnerFee = false;
+    const transferredFeeLamports = 0;
+    if (totalLamports < payoutLamports + transferredFeeLamports + feeBuffer) {
         throw new Error('House wallet lacks liquidity');
     }
 
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const userLamports = await connection.getBalance(userPubKey);
-    const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
+    const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
+    if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepCompetitiveCashoutSpectator(room, player);
@@ -658,7 +708,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
             lamports: payoutLamports,
         })
     );
-    if (feeLamports > 0 && OWNER_VAULT_ADDRESS) {
+    if (canTransferOwnerFee) {
         transaction.add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: housePubKey,
@@ -683,8 +733,9 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
             ...logMeta,
             signature,
             solAmount: solPayout,
-            feeSolAmount: feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
-            feeDestination: OWNER_VAULT_ADDRESS || null,
+            feeSolAmount: transferredFeeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
+            retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
         status: 'confirmed',
     });
@@ -748,15 +799,19 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
 
     const totalLamports = await connection.getBalance(housePubKey);
     const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
-    if (totalLamports < payoutLamports + feeLamports + feeBuffer) {
+    // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
+    // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
+    const canTransferOwnerFee = false;
+    const transferredFeeLamports = 0;
+    if (totalLamports < payoutLamports + transferredFeeLamports + feeBuffer) {
         throw new Error('House wallet lacks liquidity');
     }
 
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const userLamports = await connection.getBalance(userPubKey);
-    const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
+    const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
+    if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
@@ -783,7 +838,7 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
             lamports: payoutLamports,
         })
     );
-    if (feeLamports > 0 && OWNER_VAULT_ADDRESS) {
+    if (canTransferOwnerFee) {
         transaction.add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: housePubKey,
@@ -807,8 +862,9 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
             ...logMeta,
             signature,
             solAmount: solPayout,
-            feeSolAmount: feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
-            feeDestination: OWNER_VAULT_ADDRESS || null,
+            feeSolAmount: transferredFeeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
+            retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
         status: 'confirmed',
     });
@@ -902,17 +958,17 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 
     const totalLamports = await connection.getBalance(housePubKey);
     const feeBuffer = Math.round(0.00002 * solanaWeb3.LAMPORTS_PER_SOL);
-    const canTransferOwnerFee = !!OWNER_VAULT_ADDRESS
-        && totalLamports >= payoutLamports + feeLamports + feeBuffer;
+    // Cashout fees remain in house and are sent in the batched reset sweep.
+    const canTransferOwnerFee = false;
     if (totalLamports < payoutLamports + feeBuffer) {
         throw new Error('House wallet lacks liquidity');
     }
 
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const userLamports = await connection.getBalance(userPubKey);
-    const RENT_EXEMPT_MINIMUM = 2039280; // ~0.002 SOL
+    const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports > 0 && (userLamports + payoutLamports < RENT_EXEMPT_MINIMUM)) {
+    if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
@@ -1130,8 +1186,8 @@ async function sweepHouseWalletOnReset() {
 
     if (totalSweepLamports <= 0) return;
 
-    // Persisted pending contributions survive restarts. Also top the reward wallet
-    // up to 110% of current user liabilities before any owner sweep.
+    // Persisted contributions survive restarts. Fund the reward wallet for all
+    // player liabilities, tracked owner surplus, and the permanent $0.50 buffer.
     const rewardState = await hydrateRewardPoolState();
     const pendingRewardUsd = Math.max(0, Number(rewardState.pendingHouseUsd) || 0);
     const liabilities = await User.aggregate([{ $group: {
@@ -1149,12 +1205,28 @@ async function sweepHouseWalletOnReset() {
         const rewardPubKey = new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS);
         const rewardWalletLamports = await connection.getBalance(rewardPubKey);
         const pendingLamports = Math.round((pendingRewardUsd / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
-        const liabilityTargetLamports = Math.round(((liabilityUsd * 1.10) / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
-        const liabilityShortfallLamports = Math.max(0, liabilityTargetLamports - rewardWalletLamports);
-        rewardSweepLamports = Math.min(totalSweepLamports, Math.max(pendingLamports, liabilityShortfallLamports));
+        const trackedSurplusUsd = Math.max(0,
+            (Number(rewardState.ownerSurplusUsd) || 0)
+            + (Number(rewardState.ownerSurplusReservedUsd) || 0));
+        const rewardTargetUsd = liabilityUsd + trackedSurplusUsd + REWARD_OWNER_SURPLUS_BUFFER_USD;
+        const rewardTargetLamports = Math.ceil((rewardTargetUsd / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
+        const rewardTargetShortfallLamports = Math.max(0, rewardTargetLamports - rewardWalletLamports);
+        rewardSweepLamports = Math.min(totalSweepLamports, Math.max(pendingLamports, rewardTargetShortfallLamports));
     }
     
-    const ownerSweepLamports = totalSweepLamports - rewardSweepLamports;
+    const reservedRewardSweepLamports = rewardSweepLamports;
+    if (rewardSweepLamports > 0
+        && !await canReceiveSystemTransfer(REWARD_WALLET_ADDRESS, rewardSweepLamports)) {
+        console.log('Reward sweep deferred until it can satisfy the destination rent minimum.');
+        rewardSweepLamports = 0;
+    }
+
+    let ownerSweepLamports = totalSweepLamports - reservedRewardSweepLamports;
+    if (ownerSweepLamports > 0
+        && !await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, ownerSweepLamports)) {
+        console.log('Owner sweep deferred until it can satisfy the destination rent minimum.');
+        ownerSweepLamports = 0;
+    }
     if (ownerSweepLamports <= 0 && rewardSweepLamports <= 0) return;
 
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -1875,6 +1947,84 @@ async function ensureRewardWalletLiquidity(requiredLamports) {
     await reducePendingRewardUsd((shortfall / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, { swept: true });
 }
 
+const REWARD_OWNER_SURPLUS_BUFFER_USD = 0.50;
+
+async function getRewardWalletLiabilityUsd() {
+    const liabilities = await User.aggregate([{ $group: {
+        _id: null,
+        sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+        rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
+        reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
+    } }]);
+    return Math.max(0,
+        (liabilities[0]?.sponsoredUsd || 0)
+        + (liabilities[0]?.rentFallbackUsd || 0)
+        + (liabilities[0]?.reservedUsd || 0));
+}
+
+async function logConfirmedRewardOwnerSurplusSweep(state) {
+    const sweep = state?.ownerSurplusSweep;
+    if (!sweep?.signature) return;
+    const existing = await Transaction.findOne({
+        'meta.event': 'reward_owner_surplus_sweep',
+        'meta.signature': sweep.signature,
+    });
+    if (existing) return;
+    await Transaction.create({
+        type: 'withdraw',
+        amount: sweep.solAmount,
+        currency: 'SOL',
+        meta: {
+            event: 'reward_owner_surplus_sweep',
+            reason: 'Manual Reward Surplus Sweep',
+            amountUsd: sweep.amountUsd,
+            solAmount: sweep.solAmount,
+            signature: sweep.signature,
+            from: REWARD_WALLET_ADDRESS,
+            destination: OWNER_VAULT_ADDRESS,
+            retainedBufferUsd: REWARD_OWNER_SURPLUS_BUFFER_USD,
+        },
+        status: 'confirmed',
+    });
+}
+
+async function validateRewardOwnerSurplusLiquidity(amountUsd) {
+    if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
+        throw new Error('Reward wallet or owner vault is not configured');
+    }
+    const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
+    );
+    if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
+        throw new Error('Reward wallet address does not match configured secret');
+    }
+
+    const solAmount = amountUsd / SOL_PRICE_USD;
+    const sweepLamports = Math.floor(solAmount * solanaWeb3.LAMPORTS_PER_SOL);
+    const [rewardBalance, liabilityUsd, rentMinimum] = await Promise.all([
+        connection.getBalance(rewardKeypair.publicKey),
+        getRewardWalletLiabilityUsd(),
+        getSystemAccountRentLamports(),
+    ]);
+    const liabilityLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    const bufferLamports = Math.ceil((REWARD_OWNER_SURPLUS_BUFFER_USD / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeReserveLamports = 15_000;
+    const mustRemainLamports = Math.max(rentMinimum, liabilityLamports + bufferLamports);
+    const safelyAvailableLamports = Math.max(0, rewardBalance - mustRemainLamports - feeReserveLamports);
+
+    if (sweepLamports <= 0) throw new Error('Owner surplus is too small to sweep');
+    if (sweepLamports > safelyAvailableLamports) {
+        throw new Error(
+            `Reward wallet has not received enough settled surplus yet. `
+            + `$${liabilityUsd.toFixed(2)} is reserved for players and $${REWARD_OWNER_SURPLUS_BUFFER_USD.toFixed(2)} must remain.`,
+        );
+    }
+    if (!await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, sweepLamports)) {
+        throw new Error('Surplus is still below the Solana rent minimum for an empty owner vault; let it accumulate first');
+    }
+    return { rewardKeypair, solAmount, sweepLamports, liabilityUsd, safelyAvailableLamports };
+}
+
 async function logConfirmedRewardClaim(claim) {
     const existing = claim.signature
         ? await Transaction.findOne({ 'meta.signature': claim.signature, 'meta.event': 'sponsored_rewards_claim' })
@@ -1930,6 +2080,31 @@ async function reconcileRewardClaims() {
             }
         } catch (err) {
             console.error('Reward claim reconciliation error:', err.message);
+        }
+    }
+
+    const surplusState = await RewardPoolState.findOne({
+        key: 'global',
+        'ownerSurplusSweep.status': 'broadcast',
+        'ownerSurplusSweep.signature': { $ne: null },
+    });
+    const surplusSweep = surplusState?.ownerSurplusSweep;
+    if (surplusSweep?.signature) {
+        try {
+            const result = await connection.getSignatureStatuses([surplusSweep.signature], { searchTransactionHistory: true });
+            const status = result.value[0];
+            if (status?.err) {
+                await failAndReleaseRewardOwnerSurplusSweep(
+                    surplusSweep.sweepId,
+                    `On-chain owner surplus sweep failed: ${JSON.stringify(status.err)}`,
+                );
+            } else if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
+                const completed = await completeRewardOwnerSurplusSweep(surplusSweep.sweepId);
+                await logConfirmedRewardOwnerSurplusSweep(completed)
+                    .catch(err => console.error('Owner surplus sweep log error:', err.message));
+            }
+        } catch (err) {
+            console.error('Owner surplus sweep reconciliation error:', err.message);
         }
     }
 }
@@ -1988,8 +2163,18 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
         if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
             throw new Error('Reward wallet address does not match configured secret');
         }
-        await ensureRewardWalletLiquidity(payoutLamports);
         const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+        const [userLamports, rentMinimum] = await Promise.all([
+            connection.getBalance(userPubKey),
+            getSystemAccountRentLamports(),
+        ]);
+        if (userLamports + payoutLamports < rentMinimum) {
+            await failAndReleaseRewardClaim(claim._id, 'Claim is below the Solana account rent minimum');
+            return res.status(409).json({
+                error: 'This claim is too small to activate an empty Solana account. Add a small deposit or let rewards accumulate, then claim again.',
+            });
+        }
+        await ensureRewardWalletLiquidity(payoutLamports);
         const transaction = new solanaWeb3.Transaction().add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: rewardKeypair.publicKey,
@@ -2010,7 +2195,7 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
         await logConfirmedRewardClaim(completed).catch(err => console.error('Claim log error:', err.message));
         return res.json({ success: true, amount: amountUsd, signature: broadcastSignature });
     } catch (err) {
-        console.error('Claim rewards error:', err);
+        await logSolanaTransactionError('Claim rewards error:', err);
         if (reserved?.claim?._id && !broadcastSignature) {
             await failAndReleaseRewardClaim(reserved.claim._id, err.message).catch(() => {});
         }
@@ -2261,6 +2446,7 @@ const OWNER_EARNING_EVENTS = {
     $or: [
         { 'meta.event': 'pool_sweep' },
         { 'meta.event': 'br_owner_sweep' },
+        { 'meta.event': 'reward_owner_surplus_sweep' },
     ],
 };
 
@@ -2318,7 +2504,7 @@ function sortAdminUsers(users, sortKey) {
 function classifyTxActivity(tx) {
     const m = tx.meta || {};
     if (tx.type === 'deposit') return 'deposit';
-    if (m.event === 'pool_sweep' || m.event === 'br_owner_sweep') return 'sweep';
+    if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'].includes(m.event)) return 'sweep';
     if (tx.type === 'game') {
         if (m.event === 'join' || m.event === 'br_join') return 'entry';
         if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated' || m.reason === 'Competitive Slither Death') return 'death';
@@ -2357,7 +2543,7 @@ function buildTxCategoryFilter(category) {
         case 'withdraw':
             return {
                 type: 'withdraw',
-                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
+                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] },
                 'meta.reason': { $not: { $regex: GAME_CASHOUT_REASON_RE } },
             };
         case 'entry':
@@ -2367,7 +2553,7 @@ function buildTxCategoryFilter(category) {
         case 'death':
             return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } };
         case 'sweep':
-            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }] };
+            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }, { 'meta.event': 'reward_owner_surplus_sweep' }] };
         case 'game':
             return { type: 'game' };
         default:
@@ -2434,9 +2620,9 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
         const withdrawMatch = await reportedTxMatch({
             type: 'withdraw',
             status: 'confirmed',
-            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] },
+            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] },
         });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -2464,6 +2650,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                     }
                 }
             ]),
+            RewardPoolState.findOne({ key: 'global' }).lean(),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -2489,6 +2676,11 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
             ownerEarningsBrSol: ownerEarnings.brSweepSol,
             rewardPoolBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
+            rewardOwnerSurplusUsd: Number((rewardPoolState?.ownerSurplusUsd || 0).toFixed(2)),
+            rewardOwnerSurplusReservedUsd: Number((rewardPoolState?.ownerSurplusReservedUsd || 0).toFixed(2)),
+            rewardOwnerSurplusSweptUsd: Number((rewardPoolState?.totalOwnerSurplusSweptUsd || 0).toFixed(2)),
+            rewardOwnerSurplusSweep: rewardPoolState?.ownerSurplusSweep || null,
+            rewardOwnerSurplusBufferUsd: REWARD_OWNER_SURPLUS_BUFFER_USD,
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
@@ -2771,7 +2963,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 totalDepositedSol += tx.amount;
                 depositCount += 1;
             }
-            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep'].includes(tx.meta?.event)) {
+            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'].includes(tx.meta?.event)) {
                 totalWithdrawnUsd += txAmountUsd(tx);
                 withdrawalCount += 1;
             }
@@ -3093,6 +3285,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             $or: [
                 { 'meta.event': 'pool_sweep' },
                 { 'meta.event': 'br_owner_sweep' },
+                { 'meta.event': 'reward_owner_surplus_sweep' },
                 { 'meta.reason': 'Room Reset Wallet Sweep' },
                 { 'meta.reason': 'BR Owner Cut Sweep' },
                 { 'meta.event': 'reset_start' },
@@ -3109,6 +3302,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             const usd = sol != null ? sol * SOL_PRICE_USD : tx.amount;
             let kind = 'sweep';
             if (tx.meta?.event === 'br_owner_sweep') kind = 'br_owner_sweep';
+            else if (tx.meta?.event === 'reward_owner_surplus_sweep') kind = 'reward_owner_surplus_sweep';
             else if (tx.meta?.event === 'reset_start') kind = 'reset_start';
             else if (tx.meta?.event === 'reset_complete') kind = 'reset_complete';
             else if (tx.meta?.reason === 'pool_sweep_failed' || tx.meta?.reason === 'br_owner_sweep_failed') kind = 'sweep_failed';
@@ -3563,6 +3757,83 @@ app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
     } catch (err) {
         console.error('Admin manual sweep failed:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/reward-owner-surplus/sweep', authenticateAdmin, async (req, res) => {
+    let state = null;
+    let broadcastSignature = null;
+    try {
+        state = await reserveRewardOwnerSurplusSweep();
+        if (!state) {
+            const current = await RewardPoolState.findOne({ key: 'global' }).lean();
+            const active = current?.ownerSurplusSweep?.status;
+            if (active === 'reserved' || active === 'broadcast') {
+                return res.status(409).json({ message: 'An owner surplus sweep is already processing.' });
+            }
+            return res.status(400).json({ message: 'There is no tracked reward surplus to sweep.' });
+        }
+
+        const sweep = state.ownerSurplusSweep;
+        const amountUsd = Number(sweep.amountUsd) || 0;
+        if (DEV_FREE_PLAY) {
+            await markRewardOwnerSurplusBroadcast(
+                sweep.sweepId,
+                `simulated_owner_surplus_${sweep.sweepId}`,
+                amountUsd / SOL_PRICE_USD,
+            );
+            const completed = await completeRewardOwnerSurplusSweep(sweep.sweepId);
+            await logConfirmedRewardOwnerSurplusSweep(completed);
+            return res.json({
+                success: true,
+                message: `Simulated $${amountUsd.toFixed(2)} reward surplus sweep.`,
+            });
+        }
+
+        const liquidity = await validateRewardOwnerSurplusLiquidity(amountUsd);
+        const transaction = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: liquidity.rewardKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: liquidity.sweepLamports,
+            })
+        );
+        broadcastSignature = await connection.sendTransaction(transaction, [liquidity.rewardKeypair], { maxRetries: 3 });
+        await markRewardOwnerSurplusBroadcast(
+            sweep.sweepId,
+            broadcastSignature,
+            liquidity.sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+        );
+        const confirmation = await connection.confirmTransaction(broadcastSignature, 'confirmed');
+        if (confirmation.value.err) {
+            await failAndReleaseRewardOwnerSurplusSweep(
+                sweep.sweepId,
+                `On-chain owner surplus sweep failed: ${JSON.stringify(confirmation.value.err)}`,
+            );
+            return res.status(502).json({ message: 'The on-chain surplus sweep failed; the tracked amount was restored.' });
+        }
+
+        const completed = await completeRewardOwnerSurplusSweep(sweep.sweepId);
+        await logConfirmedRewardOwnerSurplusSweep(completed);
+        return res.json({
+            success: true,
+            message: `Swept $${amountUsd.toFixed(2)} reward surplus to the owner vault while retaining the $${REWARD_OWNER_SURPLUS_BUFFER_USD.toFixed(2)} buffer.`,
+            signature: broadcastSignature,
+        });
+    } catch (err) {
+        await logSolanaTransactionError('Manual reward owner surplus sweep failed:', err);
+        if (state?.ownerSurplusSweep?.sweepId && !broadcastSignature) {
+            await failAndReleaseRewardOwnerSurplusSweep(state.ownerSurplusSweep.sweepId, err.message).catch(() => {});
+        }
+        if (broadcastSignature) {
+            return res.status(202).json({
+                success: false,
+                processing: true,
+                message: 'The surplus transfer was submitted and is awaiting confirmation.',
+                signature: broadcastSignature,
+            });
+        }
+        return res.status(409).json({ message: err.message });
     }
 });
 
@@ -4095,7 +4366,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
                     type: 'withdraw',
                     'meta.destination': { $exists: true, $nin: houseWallets },
                     'meta.reason': { $not: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory|BR Refund/i },
-                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep'] }
+                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] }
                 }
             ];
         }
@@ -4669,8 +4940,9 @@ io.on('connection', (socket) => {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    if (currentLamports < (feeLamports + 15000)) { // +15000 lamports for tx fee buffer
-                        socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
+                    const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
+                    if (currentLamports < requiredLamports) {
+                        socket.emit('error', `Insufficient SOL for $${entryFeeUsd} entry plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                         return;
                     }
                     try {
@@ -4697,7 +4969,7 @@ io.on('connection', (socket) => {
                         pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
                         console.log(`🎟️ Competitive Slither Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
-                        console.error('Competitive join transaction failed:', txErr.message);
+                        await logSolanaTransactionError('Competitive join transaction failed:', txErr);
                         socket.emit('error', 'Blockchain transfer failed. Please try again.');
                         return;
                     }
@@ -4819,8 +5091,9 @@ io.on('connection', (socket) => {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    if (currentLamports < (feeLamports + 15000)) {
-                        socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
+                    const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
+                    if (currentLamports < requiredLamports) {
+                        socket.emit('error', `Insufficient SOL for $${entryFeeUsd} entry plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                         return;
                     }
                     try {
@@ -4847,7 +5120,7 @@ io.on('connection', (socket) => {
                         pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
                         console.log(`🎟️ Surviv Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
-                        console.error('Surviv join transaction failed:', txErr.message);
+                        await logSolanaTransactionError('Surviv join transaction failed:', txErr);
                         socket.emit('error', 'Blockchain transfer failed. Please try again.');
                         return;
                     }
@@ -5014,8 +5287,9 @@ io.on('connection', (socket) => {
                 const currentLamports = await connection.getBalance(userPubKey);
                 const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
 
-                if (currentLamports < (feeLamports + 15000)) { // +15000 lamports for tx fee buffer
-                    socket.emit('error', `Insufficient SOL on your account address for $${entryFeeUsd} entry.`);
+                const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
+                if (currentLamports < requiredLamports) {
+                    socket.emit('error', `Insufficient SOL for $${entryFeeUsd} entry plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                     return;
                 }
 
@@ -5044,7 +5318,7 @@ io.on('connection', (socket) => {
                     pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
                     console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                 } catch (txErr) {
-                    console.error("Join transaction failed:", txErr.message);
+                    await logSolanaTransactionError('Join transaction failed:', txErr);
                     socket.emit('error', 'Blockchain transfer failed. Please try again.');
                     return;
                 }
@@ -5687,8 +5961,8 @@ io.on('connection', (socket) => {
                 try {
                     await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
-                    console.error('❌ Surviv cashout error:', err.message);
-                    io.to(activePlayer.id).emit('error', err.message || 'Transfer failed.');
+                    await logSolanaTransactionError('❌ Surviv cashout error:', err);
+                    io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
                 } finally {
                     releaseCashoutLock(playerMongoId);
@@ -5700,8 +5974,8 @@ io.on('connection', (socket) => {
                 try {
                     await executeCompetitiveCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
-                    console.error('❌ Competitive cashout error:', err.message);
-                    io.to(activePlayer.id).emit('error', err.message || 'Transfer failed.');
+                    await logSolanaTransactionError('❌ Competitive cashout error:', err);
+                    io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
                 } finally {
                     releaseCashoutLock(playerMongoId);
@@ -5713,8 +5987,8 @@ io.on('connection', (socket) => {
                 await executeArenaCashout(activePlayer, activeRoom, 'Arena Cashout');
             } catch (err) {
                 releaseArenaCashoutReservation(activeRoom, activePlayer);
-                console.error('❌ Cashout error:', err.message);
-                io.to(activePlayer.id).emit('error', err.message || 'Transfer failed.');
+                await logSolanaTransactionError('❌ Cashout error:', err);
+                io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                 if (activePlayer) activePlayer.isCashingOut = false;
             } finally {
                 releaseCashoutLock(playerMongoId);

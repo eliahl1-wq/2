@@ -5,6 +5,7 @@ import {
     getEconomy,
     getJoinPoolSplit,
     getRewardPoolSplit,
+    getRewardChallengeFundingSummary,
 } from './economy.js';
 
 const populations = [1, 2, 3, 7, 8, 30];
@@ -58,4 +59,19 @@ test('$20 reward pool split routes extra to owner vault', () => {
     assert.equal(split.ownerVaultContribution, 4.0);
     assert.equal(split.food, 10.0);  // includes golden blob ($2.00)
     assert.equal(split.ai, 4.0);
+});
+
+test('challenge funding tracks exact owner surplus below $5 reward', () => {
+    const summary = getRewardChallengeFundingSummary(3, 3, 1);
+    assert.deepEqual(summary, { rewardUsd: 3, fundedUsd: 5, surplusUsd: 2 });
+});
+
+test('challenge funding tracks rounding surplus above $5 reward', () => {
+    const summary = getRewardChallengeFundingSummary(7.25, 6, 2);
+    assert.deepEqual(summary, { rewardUsd: 7.25, fundedUsd: 10, surplusUsd: 2.75 });
+});
+
+test('challenge funding never creates negative owner surplus', () => {
+    const summary = getRewardChallengeFundingSummary(6, 3, 1);
+    assert.deepEqual(summary, { rewardUsd: 6, fundedUsd: 5, surplusUsd: 0 });
 });

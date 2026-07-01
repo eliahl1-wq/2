@@ -7,6 +7,18 @@ const RewardPoolStateSchema = new mongoose.Schema({
     totalFundedUsd: { type: Number, default: 0 },
     totalSweptUsd: { type: Number, default: 0 },
     totalClaimedUsd: { type: Number, default: 0 },
+    ownerSurplusUsd: { type: Number, default: 0 },
+    ownerSurplusReservedUsd: { type: Number, default: 0 },
+    totalOwnerSurplusSweptUsd: { type: Number, default: 0 },
+    ownerSurplusSweep: {
+        sweepId: { type: String, default: null },
+        amountUsd: { type: Number, default: 0 },
+        solAmount: { type: Number, default: null },
+        status: { type: String, enum: ['reserved', 'broadcast', 'confirmed', 'failed'], default: null },
+        signature: { type: String, default: null },
+        error: { type: String, default: null },
+        createdAt: { type: Date, default: null },
+    },
 }, { timestamps: true });
 
 const RewardClaimSchema = new mongoose.Schema({
@@ -119,6 +131,97 @@ export async function reducePendingRewardUsd(amountUsd, { swept = false } = {}) 
     );
     cachedPendingHouseUsd = Math.max(0, Number(state.pendingHouseUsd) || 0);
     return cachedPendingHouseUsd;
+}
+
+export async function addRewardOwnerSurplusUsd(amountUsd) {
+    const amount = Math.max(0, Number(amountUsd) || 0);
+    if (!amount) return hydrateRewardPoolState();
+    return RewardPoolState.findOneAndUpdate(
+        { key: 'global' },
+        { $inc: { ownerSurplusUsd: amount } },
+        { upsert: true, new: true },
+    );
+}
+
+export async function reserveRewardOwnerSurplusSweep() {
+    const sweepId = randomUUID();
+    return RewardPoolState.findOneAndUpdate(
+        {
+            key: 'global',
+            ownerSurplusUsd: { $gt: 0 },
+            'ownerSurplusSweep.status': { $nin: ['reserved', 'broadcast'] },
+        },
+        [{ $set: {
+            ownerSurplusReservedUsd: { $ifNull: ['$ownerSurplusUsd', 0] },
+            ownerSurplusUsd: 0,
+            ownerSurplusSweep: {
+                sweepId,
+                amountUsd: { $ifNull: ['$ownerSurplusUsd', 0] },
+                solAmount: null,
+                status: 'reserved',
+                signature: null,
+                error: null,
+                createdAt: new Date(),
+            },
+        } }],
+        { new: true },
+    );
+}
+
+export async function markRewardOwnerSurplusBroadcast(sweepId, signature, solAmount) {
+    return RewardPoolState.findOneAndUpdate(
+        { key: 'global', 'ownerSurplusSweep.sweepId': sweepId, 'ownerSurplusSweep.status': 'reserved' },
+        { $set: {
+            'ownerSurplusSweep.status': 'broadcast',
+            'ownerSurplusSweep.signature': signature,
+            'ownerSurplusSweep.solAmount': solAmount,
+            'ownerSurplusSweep.error': null,
+        } },
+        { new: true },
+    );
+}
+
+export async function completeRewardOwnerSurplusSweep(sweepId) {
+    let state = await RewardPoolState.findOneAndUpdate(
+        {
+            key: 'global',
+            'ownerSurplusSweep.sweepId': sweepId,
+            'ownerSurplusSweep.status': { $in: ['reserved', 'broadcast'] },
+        },
+        [{ $set: {
+            'ownerSurplusSweep.status': 'confirmed',
+            'ownerSurplusSweep.error': null,
+            totalOwnerSurplusSweptUsd: {
+                $add: [{ $ifNull: ['$totalOwnerSurplusSweptUsd', 0] }, { $ifNull: ['$ownerSurplusReservedUsd', 0] }],
+            },
+            ownerSurplusReservedUsd: 0,
+        } }],
+        { new: true },
+    );
+    if (!state) {
+        state = await RewardPoolState.findOne({ key: 'global', 'ownerSurplusSweep.sweepId': sweepId });
+        if (state?.ownerSurplusSweep?.status !== 'confirmed') throw new Error('Owner surplus sweep not found');
+        await RewardPoolState.updateOne({ _id: state._id }, { $set: { ownerSurplusReservedUsd: 0 } });
+    }
+    return state;
+}
+
+export async function failAndReleaseRewardOwnerSurplusSweep(sweepId, error) {
+    const state = await RewardPoolState.findOneAndUpdate(
+        {
+            key: 'global',
+            'ownerSurplusSweep.sweepId': sweepId,
+            'ownerSurplusSweep.status': { $in: ['reserved', 'broadcast'] },
+        },
+        [{ $set: {
+            ownerSurplusUsd: { $add: [{ $ifNull: ['$ownerSurplusUsd', 0] }, { $ifNull: ['$ownerSurplusReservedUsd', 0] }] },
+            ownerSurplusReservedUsd: 0,
+            'ownerSurplusSweep.status': 'failed',
+            'ownerSurplusSweep.error': String(error || 'Sweep failed'),
+        } }],
+        { new: true },
+    );
+    return state;
 }
 
 export async function reserveRewardClaim(userId) {
