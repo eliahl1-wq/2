@@ -1970,6 +1970,29 @@ async function logConfirmedRewardOwnerSurplusSweep(state) {
     });
 }
 
+async function calculateRewardOwnerSurplus() {
+    if (!REWARD_WALLET_ADDRESS) return { amountUsd: 0, lamports: 0, liabilityUsd: 0 };
+    const rewardPubKey = new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS);
+    const [rewardBalance, liabilityUsd, rentMinimum] = await Promise.all([
+        connection.getBalance(rewardPubKey).catch(() => 0),
+        getRewardWalletLiabilityUsd(),
+        getSystemAccountRentLamports(),
+    ]);
+    const liabilityLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeReserveLamports = 15_000;
+    const mustRemainLamportsBase = Math.max(rentMinimum, liabilityLamports);
+    let grossSurplus = Math.max(0, rewardBalance - mustRemainLamportsBase - feeReserveLamports);
+    
+    const bufferLamports = Math.ceil(grossSurplus * 0.05); // 5% buffer of the available surplus
+    const safelyAvailableLamports = Math.max(0, grossSurplus - bufferLamports);
+    
+    return {
+        amountUsd: (safelyAvailableLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+        lamports: safelyAvailableLamports,
+        liabilityUsd,
+    };
+}
+
 async function validateRewardOwnerSurplusLiquidity() {
     if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
         throw new Error('Reward wallet or owner vault is not configured');
@@ -1981,29 +2004,18 @@ async function validateRewardOwnerSurplusLiquidity() {
         throw new Error('Reward wallet address does not match configured secret');
     }
 
-    const [rewardBalance, liabilityUsd, rentMinimum] = await Promise.all([
-        connection.getBalance(rewardKeypair.publicKey),
-        getRewardWalletLiabilityUsd(),
-        getSystemAccountRentLamports(),
-    ]);
-    const liabilityLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
-    const feeReserveLamports = 15_000;
-    const mustRemainLamportsBase = Math.max(rentMinimum, liabilityLamports);
-    let grossSurplus = Math.max(0, rewardBalance - mustRemainLamportsBase - feeReserveLamports);
-    
-    const bufferLamports = Math.ceil(grossSurplus * 0.05); // 5% buffer of the available surplus
-    const safelyAvailableLamports = Math.max(0, grossSurplus - bufferLamports);
+    const surplus = await calculateRewardOwnerSurplus();
 
-    if (safelyAvailableLamports <= 0) {
+    if (surplus.lamports <= 0) {
         throw new Error(
             `Reward wallet has not received enough settled surplus yet. `
-            + `$${liabilityUsd.toFixed(2)} is reserved for players and a 5% buffer must remain.`
+            + `$${surplus.liabilityUsd.toFixed(2)} is reserved for players and a 5% buffer must remain.`
         );
     }
     
-    const sweepLamports = safelyAvailableLamports;
+    const sweepLamports = surplus.lamports;
     const solAmount = sweepLamports / solanaWeb3.LAMPORTS_PER_SOL;
-    const amountUsd = solAmount * SOL_PRICE_USD;
+    const amountUsd = surplus.amountUsd;
 
     if (!await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, sweepLamports)) {
         throw new Error('Surplus is still below the Solana rent minimum for an empty owner vault; let it accumulate first');
@@ -2610,7 +2622,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             status: 'confirmed',
             'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
         });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState, liveSurplus] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -2639,6 +2651,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                 }
             ]),
             RewardPoolState.findOne({ key: 'global' }).lean(),
+            calculateRewardOwnerSurplus(),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -2664,7 +2677,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
             ownerEarningsBrSol: ownerEarnings.brSweepSol,
             rewardPoolBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
-            rewardOwnerSurplusUsd: Number((rewardPoolState?.ownerSurplusUsd || 0).toFixed(2)),
+            rewardOwnerSurplusUsd: Number(liveSurplus.amountUsd.toFixed(2)),
             rewardOwnerSurplusReservedUsd: Number((rewardPoolState?.ownerSurplusReservedUsd || 0).toFixed(2)),
             rewardOwnerSurplusSweptUsd: Number((rewardPoolState?.totalOwnerSurplusSweptUsd || 0).toFixed(2)),
             rewardOwnerSurplusSweep: rewardPoolState?.ownerSurplusSweep || null,

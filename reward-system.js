@@ -119,17 +119,23 @@ export async function addRewardFundingUsd(amountUsd) {
 export async function reducePendingRewardUsd(amountUsd, { swept = false } = {}) {
     const amount = Math.max(0, Number(amountUsd) || 0);
     if (!amount) return cachedPendingHouseUsd;
-    const state = await RewardPoolState.findOneAndUpdate(
-        { key: 'global' },
-        [{
-            $set: {
-                pendingHouseUsd: { $max: [0, { $subtract: [{ $ifNull: ['$pendingHouseUsd', 0] }, amount] }] },
-                ...(swept ? { totalSweptUsd: { $add: [{ $ifNull: ['$totalSweptUsd', 0] }, amount] } } : {}),
-            },
-        }],
-        { upsert: true, new: true },
-    );
-    cachedPendingHouseUsd = Math.max(0, Number(state.pendingHouseUsd) || 0);
+    
+    // Fetch, update, and save to avoid Mongoose aggregation pipeline limitations
+    let state = await RewardPoolState.findOne({ key: 'global' });
+    if (!state) {
+        state = new RewardPoolState({ key: 'global' });
+    }
+    
+    const currentPending = Number(state.pendingHouseUsd) || 0;
+    const currentSwept = Number(state.totalSweptUsd) || 0;
+    
+    state.pendingHouseUsd = Math.max(0, currentPending - amount);
+    if (swept) {
+        state.totalSweptUsd = currentSwept + amount;
+    }
+    
+    await state.save();
+    cachedPendingHouseUsd = state.pendingHouseUsd;
     return cachedPendingHouseUsd;
 }
 
@@ -145,26 +151,23 @@ export async function addRewardOwnerSurplusUsd(amountUsd) {
 
 export async function reserveRewardOwnerSurplusSweep() {
     const sweepId = randomUUID();
-    return RewardPoolState.findOneAndUpdate(
-        {
-            key: 'global',
-            'ownerSurplusSweep.status': { $nin: ['reserved', 'broadcast'] },
-        },
-        [{ $set: {
-            ownerSurplusReservedUsd: { $ifNull: ['$ownerSurplusUsd', 0] },
-            ownerSurplusUsd: 0,
-            ownerSurplusSweep: {
-                sweepId,
-                amountUsd: 0,
-                solAmount: null,
-                status: 'reserved',
-                signature: null,
-                error: null,
-                createdAt: new Date(),
-            },
-        } }],
-        { new: true },
-    );
+    let state = await RewardPoolState.findOne({ key: 'global' });
+    if (!state) state = new RewardPoolState({ key: 'global' });
+    if (['reserved', 'broadcast'].includes(state.ownerSurplusSweep?.status)) {
+        return null; // Already running
+    }
+    
+    state.ownerSurplusSweep = {
+        sweepId,
+        amountUsd: 0,
+        solAmount: null,
+        status: 'reserved',
+        signature: null,
+        error: null,
+        createdAt: new Date(),
+    };
+    await state.save();
+    return state;
 }
 
 export async function markRewardOwnerSurplusBroadcast(sweepId, signature, solAmount) {
@@ -181,45 +184,25 @@ export async function markRewardOwnerSurplusBroadcast(sweepId, signature, solAmo
 }
 
 export async function completeRewardOwnerSurplusSweep(sweepId) {
-    let state = await RewardPoolState.findOneAndUpdate(
-        {
-            key: 'global',
-            'ownerSurplusSweep.sweepId': sweepId,
-            'ownerSurplusSweep.status': { $in: ['reserved', 'broadcast'] },
-        },
-        [{ $set: {
-            'ownerSurplusSweep.status': 'confirmed',
-            'ownerSurplusSweep.error': null,
-            totalOwnerSurplusSweptUsd: {
-                $add: [{ $ifNull: ['$totalOwnerSurplusSweptUsd', 0] }, { $ifNull: ['$ownerSurplusReservedUsd', 0] }],
-            },
-            ownerSurplusReservedUsd: 0,
-        } }],
-        { new: true },
-    );
-    if (!state) {
-        state = await RewardPoolState.findOne({ key: 'global', 'ownerSurplusSweep.sweepId': sweepId });
-        if (state?.ownerSurplusSweep?.status !== 'confirmed') throw new Error('Owner surplus sweep not found');
-        await RewardPoolState.updateOne({ _id: state._id }, { $set: { ownerSurplusReservedUsd: 0 } });
-    }
+    let state = await RewardPoolState.findOne({ key: 'global' });
+    if (!state || state.ownerSurplusSweep?.sweepId !== sweepId) return null;
+    
+    const amountUsd = state.ownerSurplusSweep.amountUsd || 0;
+    state.ownerSurplusSweep.status = 'confirmed';
+    state.ownerSurplusSweep.error = null;
+    state.totalOwnerSurplusSweptUsd = (state.totalOwnerSurplusSweptUsd || 0) + amountUsd;
+    
+    await state.save();
     return state;
 }
 
 export async function failAndReleaseRewardOwnerSurplusSweep(sweepId, error) {
-    const state = await RewardPoolState.findOneAndUpdate(
-        {
-            key: 'global',
-            'ownerSurplusSweep.sweepId': sweepId,
-            'ownerSurplusSweep.status': { $in: ['reserved', 'broadcast'] },
-        },
-        [{ $set: {
-            ownerSurplusUsd: { $add: [{ $ifNull: ['$ownerSurplusUsd', 0] }, { $ifNull: ['$ownerSurplusReservedUsd', 0] }] },
-            ownerSurplusReservedUsd: 0,
-            'ownerSurplusSweep.status': 'failed',
-            'ownerSurplusSweep.error': String(error || 'Sweep failed'),
-        } }],
-        { new: true },
-    );
+    let state = await RewardPoolState.findOne({ key: 'global' });
+    if (!state || state.ownerSurplusSweep?.sweepId !== sweepId) return null;
+    
+    state.ownerSurplusSweep.status = 'failed';
+    state.ownerSurplusSweep.error = String(error || 'Sweep failed');
+    await state.save();
     return state;
 }
 
