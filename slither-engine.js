@@ -605,7 +605,10 @@ function growSnakeSegments(segments, targetCount, spacing) {
             dx = 1;
             dy = 0;
         }
-        segments.push({ x: tail.x - dx * spacing, y: tail.y - dy * spacing });
+        // tail - prev already points away from the head, so extend in that
+        // direction. Subtracting it spawned the new segment back on top of the
+        // previous body segment until the next movement tick corrected it.
+        segments.push({ x: tail.x + dx * spacing, y: tail.y + dy * spacing });
     }
     while (segments.length > targetCount) {
         segments.pop();
