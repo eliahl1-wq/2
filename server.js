@@ -1946,13 +1946,6 @@ async function getRewardWalletLiabilityUsd() {
         + (liabilities[0]?.reservedUsd || 0));
 }
 
-            signature: sweep.signature,
-            from: REWARD_WALLET_ADDRESS,
-            destination: OWNER_VAULT_ADDRESS,
-        },
-        status: 'confirmed',
-    });
-}
 
 async function logConfirmedRewardClaim(claim) {
     const existing = claim.signature
