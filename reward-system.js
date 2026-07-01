@@ -224,6 +224,33 @@ export async function failAndReleaseRewardOwnerSurplusSweep(sweepId, error) {
     return state;
 }
 
+export async function resetRewardPoolAccounting() {
+    const state = await RewardPoolState.findOneAndUpdate(
+        { key: 'global' },
+        { $set: {
+            pendingHouseUsd: 0,
+            totalFundedUsd: 0,
+            totalSweptUsd: 0,
+            totalClaimedUsd: 0,
+            ownerSurplusUsd: 0,
+            ownerSurplusReservedUsd: 0,
+            totalOwnerSurplusSweptUsd: 0,
+            ownerSurplusSweep: {
+                sweepId: null,
+                amountUsd: 0,
+                solAmount: null,
+                status: null,
+                signature: null,
+                error: null,
+                createdAt: null,
+            },
+        } },
+        { upsert: true, new: true },
+    );
+    cachedPendingHouseUsd = 0;
+    return state;
+}
+
 export async function reserveRewardClaim(userId) {
     const User = mongoose.model('User');
     const claimId = new mongoose.Types.ObjectId();

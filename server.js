@@ -96,6 +96,7 @@ import {
     reducePendingRewardUsd,
     reserveRewardClaim,
     reserveRewardOwnerSurplusSweep,
+    resetRewardPoolAccounting,
     resolveRewardSecurityAlert,
 } from './reward-system.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
@@ -393,7 +394,7 @@ function buildGameCashoutTxFilter() {
         type: 'withdraw',
         'meta.reason': { $regex: GAME_CASHOUT_REASON_RE },
         'meta.destination': { $exists: false },
-        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] },
+        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
     };
 }
 
@@ -426,6 +427,7 @@ const c = {
 
 const CASHOUT_DURATION_MS = 10_000;
 const joiningUsers = new Set();
+let rewardPoolAdminResetting = false;
 
 let GLOBAL_ARENA_START = Date.now();
 let globalArenaResetting = false;
@@ -2123,6 +2125,7 @@ app.get('/api/user/reward-claim-status', authenticateToken, async (req, res) => 
 });
 
 app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+    if (rewardPoolAdminResetting) return res.status(503).json({ error: 'Reward pool maintenance is in progress' });
     let reserved = null;
     let broadcastSignature = null;
     try {
@@ -2447,6 +2450,7 @@ const OWNER_EARNING_EVENTS = {
         { 'meta.event': 'pool_sweep' },
         { 'meta.event': 'br_owner_sweep' },
         { 'meta.event': 'reward_owner_surplus_sweep' },
+        { 'meta.event': 'reward_pool_factory_reset' },
     ],
 };
 
@@ -2504,7 +2508,7 @@ function sortAdminUsers(users, sortKey) {
 function classifyTxActivity(tx) {
     const m = tx.meta || {};
     if (tx.type === 'deposit') return 'deposit';
-    if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'].includes(m.event)) return 'sweep';
+    if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'].includes(m.event)) return 'sweep';
     if (tx.type === 'game') {
         if (m.event === 'join' || m.event === 'br_join') return 'entry';
         if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated' || m.reason === 'Competitive Slither Death') return 'death';
@@ -2543,7 +2547,7 @@ function buildTxCategoryFilter(category) {
         case 'withdraw':
             return {
                 type: 'withdraw',
-                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] },
+                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
                 'meta.reason': { $not: { $regex: GAME_CASHOUT_REASON_RE } },
             };
         case 'entry':
@@ -2553,7 +2557,7 @@ function buildTxCategoryFilter(category) {
         case 'death':
             return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } };
         case 'sweep':
-            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }, { 'meta.event': 'reward_owner_surplus_sweep' }] };
+            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }, { 'meta.event': 'reward_owner_surplus_sweep' }, { 'meta.event': 'reward_pool_factory_reset' }] };
         case 'game':
             return { type: 'game' };
         default:
@@ -2620,7 +2624,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
         const withdrawMatch = await reportedTxMatch({
             type: 'withdraw',
             status: 'confirmed',
-            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] },
+            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
         });
         const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState] = await Promise.all([
             Transaction.aggregate([
@@ -2963,7 +2967,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 totalDepositedSol += tx.amount;
                 depositCount += 1;
             }
-            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'].includes(tx.meta?.event)) {
+            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'].includes(tx.meta?.event)) {
                 totalWithdrawnUsd += txAmountUsd(tx);
                 withdrawalCount += 1;
             }
@@ -3286,6 +3290,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
                 { 'meta.event': 'pool_sweep' },
                 { 'meta.event': 'br_owner_sweep' },
                 { 'meta.event': 'reward_owner_surplus_sweep' },
+                { 'meta.event': 'reward_pool_factory_reset' },
                 { 'meta.reason': 'Room Reset Wallet Sweep' },
                 { 'meta.reason': 'BR Owner Cut Sweep' },
                 { 'meta.event': 'reset_start' },
@@ -3303,6 +3308,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             let kind = 'sweep';
             if (tx.meta?.event === 'br_owner_sweep') kind = 'br_owner_sweep';
             else if (tx.meta?.event === 'reward_owner_surplus_sweep') kind = 'reward_owner_surplus_sweep';
+            else if (tx.meta?.event === 'reward_pool_factory_reset') kind = 'reward_pool_factory_reset';
             else if (tx.meta?.event === 'reset_start') kind = 'reset_start';
             else if (tx.meta?.event === 'reset_complete') kind = 'reset_complete';
             else if (tx.meta?.reason === 'pool_sweep_failed' || tx.meta?.reason === 'br_owner_sweep_failed') kind = 'sweep_failed';
@@ -3760,7 +3766,152 @@ app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
     }
 });
 
+app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, res) => {
+    if (req.body?.confirmation !== 'RESET REWARD POOL') {
+        return res.status(400).json({ message: 'Exact confirmation phrase required.' });
+    }
+    if (rewardPoolAdminResetting) {
+        return res.status(409).json({ message: 'Reward pool maintenance is already running.' });
+    }
+
+    rewardPoolAdminResetting = true;
+    try {
+        if (joiningUsers.size > 0) {
+            return res.status(409).json({ message: 'Wait for current player joins to finish before resetting.' });
+        }
+        const activeHumans = [...rooms, ...competitiveSlitherRooms, ...survivRooms]
+            .reduce((total, room) => total + room.players.filter(player => !player.isBot).length, 0);
+        if (activeHumans > 0) {
+            return res.status(409).json({ message: `Cannot reset while ${activeHumans} human arena player(s) are still active.` });
+        }
+
+        const [liabilities, activeClaims, currentRewardState] = await Promise.all([
+            User.aggregate([{ $group: {
+                _id: null,
+                sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
+                reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
+            } }]),
+            RewardClaim.countDocuments({ status: { $in: ['reserved', 'broadcast'] } }),
+            RewardPoolState.findOne({ key: 'global' }).lean(),
+        ]);
+        const liabilityUsd = Math.max(0,
+            (liabilities[0]?.sponsoredUsd || 0)
+            + (liabilities[0]?.rentFallbackUsd || 0)
+            + (liabilities[0]?.reservedUsd || 0));
+        if (['reserved', 'broadcast'].includes(currentRewardState?.ownerSurplusSweep?.status)) {
+            return res.status(409).json({ message: 'Wait for the active owner-surplus sweep to finish first.' });
+        }
+        if (activeClaims > 0 || liabilityUsd > 0.000001) {
+            return res.status(409).json({
+                message: `Reset blocked: $${liabilityUsd.toFixed(2)} belongs to players and ${activeClaims} claim(s) are active.`,
+            });
+        }
+        if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
+            return res.status(400).json({ message: 'Reward wallet or owner vault is not configured.' });
+        }
+
+        const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
+        );
+        if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
+            return res.status(500).json({ message: 'Reward wallet address does not match configured secret.' });
+        }
+
+        const [walletLamports, rentMinimum, blockhashInfo] = await Promise.all([
+            connection.getBalance(rewardKeypair.publicKey),
+            getSystemAccountRentLamports(),
+            connection.getLatestBlockhash('confirmed'),
+        ]);
+        const halfDollarLamports = Math.ceil(
+            (REWARD_OWNER_SURPLUS_BUFFER_USD / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL
+        );
+        const retainedLamports = Math.max(rentMinimum, halfDollarLamports);
+        let signature = null;
+        let sweptLamports = 0;
+
+        if (walletLamports > retainedLamports) {
+            const feeProbe = new solanaWeb3.Transaction({
+                recentBlockhash: blockhashInfo.blockhash,
+                feePayer: rewardKeypair.publicKey,
+            }).add(solanaWeb3.SystemProgram.transfer({
+                fromPubkey: rewardKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: 1,
+            }));
+            const feeResult = await connection.getFeeForMessage(feeProbe.compileMessage(), 'confirmed');
+            const feeLamports = feeResult.value ?? 5_000;
+            sweptLamports = Math.max(0, walletLamports - retainedLamports - feeLamports);
+
+            if (sweptLamports > 0) {
+                if (!await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, sweptLamports)) {
+                    return res.status(409).json({
+                        message: 'The amount is below Solana rent minimum for an empty owner vault. Let it accumulate first.',
+                    });
+                }
+                const transaction = new solanaWeb3.Transaction({
+                    recentBlockhash: blockhashInfo.blockhash,
+                    feePayer: rewardKeypair.publicKey,
+                }).add(solanaWeb3.SystemProgram.transfer({
+                    fromPubkey: rewardKeypair.publicKey,
+                    toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                    lamports: sweptLamports,
+                }));
+                signature = await solanaWeb3.sendAndConfirmTransaction(
+                    connection,
+                    transaction,
+                    [rewardKeypair],
+                    { commitment: 'confirmed', lastValidBlockHeight: blockhashInfo.lastValidBlockHeight, maxRetries: 3 },
+                );
+            }
+        }
+
+        await User.updateMany({}, { $set: {
+            completedFiveDollarNormalGames: 0,
+            completedTenDollarNormalGames: 0,
+            sponsoredRewardsUnlocked: false,
+            sponsoredRewardsCompleted: false,
+            sponsoredRewardsBalance: 0,
+            rentFallbackBalanceUsd: 0,
+            rewardClaimInProgress: false,
+            rewardClaimReservedUsd: 0,
+            activeRewardClaimId: null,
+        } });
+        await resetRewardPoolAccounting();
+
+        await Transaction.create({
+            userId: req.user.id,
+            type: 'withdraw',
+            amount: sweptLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            currency: 'SOL',
+            meta: {
+                event: 'reward_pool_factory_reset',
+                reason: 'Admin Reward Pool Factory Reset',
+                signature: signature || 'no_transfer_required',
+                solAmount: sweptLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                amountUsd: (sweptLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+                retainedBufferUsd: REWARD_OWNER_SURPLUS_BUFFER_USD,
+                from: REWARD_WALLET_ADDRESS,
+                destination: OWNER_VAULT_ADDRESS,
+            },
+            status: 'confirmed',
+        }).catch(err => console.error('Reward pool reset audit log failed:', err.message));
+
+        return res.json({
+            success: true,
+            message: `Reward pool accounting reset. Swept ${(sweptLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(6)} SOL and retained approximately $${REWARD_OWNER_SURPLUS_BUFFER_USD.toFixed(2)}.`,
+            signature,
+        });
+    } catch (err) {
+        await logSolanaTransactionError('Reward pool factory reset failed:', err);
+        return res.status(500).json({ message: err.message });
+    } finally {
+        rewardPoolAdminResetting = false;
+    }
+});
+
 app.post('/api/admin/reward-owner-surplus/sweep', authenticateAdmin, async (req, res) => {
+    if (rewardPoolAdminResetting) return res.status(409).json({ message: 'Reward pool factory reset is in progress.' });
     let state = null;
     let broadcastSignature = null;
     try {
@@ -4366,7 +4517,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
                     type: 'withdraw',
                     'meta.destination': { $exists: true, $nin: houseWallets },
                     'meta.reason': { $not: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory|BR Refund/i },
-                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep'] }
+                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] }
                 }
             ];
         }
@@ -4845,6 +4996,10 @@ io.on('connection', (socket) => {
     touchSitePresence(socket.request, presenceId);
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, useFreeTicket }) => {
+        if (rewardPoolAdminResetting) {
+            socket.emit('error', 'Reward pool maintenance is in progress. Try again shortly.');
+            return;
+        }
         let userKey = null;
         let pendingPaidJoin = null;
         let pendingTicketUserId = null;
