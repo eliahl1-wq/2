@@ -121,19 +121,6 @@ export function getRewardPoolSplit(entryFeeUsd) {
 }
 
 
-export function getRewardChallengeFundingSummary(sponsoredRewardUsd, completedFiveDollarGames, completedTenDollarGames) {
-    const rewardUsd = Math.max(0, Number(sponsoredRewardUsd) || 0);
-    const fiveDollarContribution = getRewardPoolSplit(5).rewardPoolContribution;
-    const tenDollarContribution = getRewardPoolSplit(10).rewardPoolContribution;
-    const fundedUsd = Math.max(0,
-        (Math.max(0, Number(completedFiveDollarGames) || 0) * fiveDollarContribution)
-        + (Math.max(0, Number(completedTenDollarGames) || 0) * tenDollarContribution));
-    return {
-        rewardUsd,
-        fundedUsd,
-        surplusUsd: Math.max(0, fundedUsd - rewardUsd),
-    };
-}
 
 /**
  * Soft wealth tax: decay scales with excess balance above starting size.

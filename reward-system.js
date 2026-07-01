@@ -139,15 +139,6 @@ export async function reducePendingRewardUsd(amountUsd, { swept = false } = {}) 
     return cachedPendingHouseUsd;
 }
 
-export async function addRewardOwnerSurplusUsd(amountUsd) {
-    const amount = Math.max(0, Number(amountUsd) || 0);
-    if (!amount) return hydrateRewardPoolState();
-    return RewardPoolState.findOneAndUpdate(
-        { key: 'global' },
-        { $inc: { ownerSurplusUsd: amount } },
-        { upsert: true, new: true },
-    );
-}
 
 export async function resetRewardPoolAccounting() {
     const state = await RewardPoolState.findOneAndUpdate(

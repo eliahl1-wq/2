@@ -49,7 +49,6 @@ import {
     getSurvivEconomy,
     getJoinPoolSplit,
     getRewardPoolSplit,
-    getRewardChallengeFundingSummary,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
 } from './economy.js';
@@ -83,19 +82,14 @@ import {
     RewardPoolState,
     RewardSecurityAlert,
     addRewardFundingUsd,
-    addRewardOwnerSurplusUsd,
     completeRewardClaim,
-    completeRewardOwnerSurplusSweep,
     failAndReleaseRewardClaim,
-    failAndReleaseRewardOwnerSurplusSweep,
     getCachedPendingRewardUsd,
     hydrateRewardPoolState,
     markClaimBroadcast,
-    markRewardOwnerSurplusBroadcast,
     recordDepositSource,
     reducePendingRewardUsd,
     reserveRewardClaim,
-    reserveRewardOwnerSurplusSweep,
     resetRewardPoolAccounting,
     resolveRewardSecurityAlert,
 } from './reward-system.js';
@@ -353,29 +347,7 @@ TransactionSchema.post('save', async function(doc) {
         );
         if (!unlocked) return;
 
-        const { fundedUsd: totalContribution, surplusUsd: excess } = getRewardChallengeFundingSummary(
-            unlocked.sponsoredRewardsBalance,
-            unlocked.completedFiveDollarNormalGames,
-            unlocked.completedTenDollarNormalGames,
-        );
-        if (excess > 0) {
-            // The full challenge contribution still moves to the reward wallet.
-            // Only the part above the player's reward becomes manually sweepable owner surplus.
-            await addRewardOwnerSurplusUsd(excess);
-            await TransactionMod.create({
-                userId: unlocked._id,
-                type: 'game',
-                amount: excess / SOL_PRICE_USD,
-                currency: 'SOL',
-                meta: {
-                    event: 'reward_owner_surplus_accrual',
-                    amountUsd: excess,
-                    fundedByChallengesUsd: totalContribution,
-                    playerRewardUsd: unlocked.sponsoredRewardsBalance || 0,
-                },
-                status: 'confirmed',
-            });
-        }
+
         console.log(`[Challenge Unlocked] User ${unlocked.username} completed all sponsored reward challenges!`);
     } catch (err) {
         await TransactionMod.updateOne(
