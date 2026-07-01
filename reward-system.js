@@ -149,63 +149,6 @@ export async function addRewardOwnerSurplusUsd(amountUsd) {
     );
 }
 
-export async function reserveRewardOwnerSurplusSweep() {
-    const sweepId = randomUUID();
-    let state = await RewardPoolState.findOne({ key: 'global' });
-    if (!state) state = new RewardPoolState({ key: 'global' });
-    if (['reserved', 'broadcast'].includes(state.ownerSurplusSweep?.status)) {
-        return null; // Already running
-    }
-    
-    state.ownerSurplusSweep = {
-        sweepId,
-        amountUsd: 0,
-        solAmount: null,
-        status: 'reserved',
-        signature: null,
-        error: null,
-        createdAt: new Date(),
-    };
-    await state.save();
-    return state;
-}
-
-export async function markRewardOwnerSurplusBroadcast(sweepId, signature, solAmount) {
-    return RewardPoolState.findOneAndUpdate(
-        { key: 'global', 'ownerSurplusSweep.sweepId': sweepId, 'ownerSurplusSweep.status': 'reserved' },
-        { $set: {
-            'ownerSurplusSweep.status': 'broadcast',
-            'ownerSurplusSweep.signature': signature,
-            'ownerSurplusSweep.solAmount': solAmount,
-            'ownerSurplusSweep.error': null,
-        } },
-        { new: true },
-    );
-}
-
-export async function completeRewardOwnerSurplusSweep(sweepId) {
-    let state = await RewardPoolState.findOne({ key: 'global' });
-    if (!state || state.ownerSurplusSweep?.sweepId !== sweepId) return null;
-    
-    const amountUsd = state.ownerSurplusSweep.amountUsd || 0;
-    state.ownerSurplusSweep.status = 'confirmed';
-    state.ownerSurplusSweep.error = null;
-    state.totalOwnerSurplusSweptUsd = (state.totalOwnerSurplusSweptUsd || 0) + amountUsd;
-    
-    await state.save();
-    return state;
-}
-
-export async function failAndReleaseRewardOwnerSurplusSweep(sweepId, error) {
-    let state = await RewardPoolState.findOne({ key: 'global' });
-    if (!state || state.ownerSurplusSweep?.sweepId !== sweepId) return null;
-    
-    state.ownerSurplusSweep.status = 'failed';
-    state.ownerSurplusSweep.error = String(error || 'Sweep failed');
-    await state.save();
-    return state;
-}
-
 export async function resetRewardPoolAccounting() {
     const state = await RewardPoolState.findOneAndUpdate(
         { key: 'global' },
@@ -214,18 +157,6 @@ export async function resetRewardPoolAccounting() {
             totalFundedUsd: 0,
             totalSweptUsd: 0,
             totalClaimedUsd: 0,
-            ownerSurplusUsd: 0,
-            ownerSurplusReservedUsd: 0,
-            totalOwnerSurplusSweptUsd: 0,
-            ownerSurplusSweep: {
-                sweepId: null,
-                amountUsd: 0,
-                solAmount: null,
-                status: null,
-                signature: null,
-                error: null,
-                createdAt: null,
-            },
         } },
         { upsert: true, new: true },
     );
@@ -386,6 +317,7 @@ async function snapshotUser(user) {
         sponsoredRewardsUnlocked: !!user.sponsoredRewardsUnlocked,
         sponsoredRewardsCompleted: !!user.sponsoredRewardsCompleted,
         sponsoredRewardsBalance: user.sponsoredRewardsBalance || 0,
+        fundedRewardsUsd: user.fundedRewardsUsd || 0,
     };
 }
 
@@ -453,6 +385,7 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
                     sponsoredRewardsUnlocked: false,
                     sponsoredRewardsCompleted: false,
                     sponsoredRewardsBalance: 0,
+                    fundedRewardsUsd: 0,
                 },
             },
         );
@@ -479,6 +412,7 @@ export async function resolveRewardSecurityAlert(alertId, action, adminUserId, n
                     sponsoredRewardsUnlocked: snapshot.sponsoredRewardsUnlocked,
                     sponsoredRewardsCompleted: snapshot.sponsoredRewardsCompleted,
                     sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, (await User.findById(snapshot.userId).lean())?.sponsoredRewardsBalance || 0),
+                    fundedRewardsUsd: snapshot.fundedRewardsUsd || 0,
                 } },
             );
         }

@@ -258,6 +258,7 @@ const UserSchema = new mongoose.Schema({
     completedTenDollarNormalGames: { type: Number, default: 0 },
     sponsoredRewardsUnlocked: { type: Boolean, default: false },
     sponsoredRewardsBalance: { type: Number, default: 0 }, // USD-denominated promotional reward
+    fundedRewardsUsd: { type: Number, default: 0 }, // Amount of the reward that has been funded by the player's game entries
     rentFallbackBalanceUsd: { type: Number, default: 0 }, // Real cashouts retained because the destination was below rent minimum
     rewardsDisabled: { type: Boolean, default: false },
     rewardsDisabledReason: { type: String, default: '' },
@@ -1945,82 +1946,12 @@ async function getRewardWalletLiabilityUsd() {
         + (liabilities[0]?.reservedUsd || 0));
 }
 
-async function logConfirmedRewardOwnerSurplusSweep(state) {
-    const sweep = state?.ownerSurplusSweep;
-    if (!sweep?.signature) return;
-    const existing = await Transaction.findOne({
-        'meta.event': 'reward_owner_surplus_sweep',
-        'meta.signature': sweep.signature,
-    });
-    if (existing) return;
-    await Transaction.create({
-        type: 'withdraw',
-        amount: sweep.solAmount,
-        currency: 'SOL',
-        meta: {
-            event: 'reward_owner_surplus_sweep',
-            reason: 'Manual Reward Surplus Sweep',
-            amountUsd: sweep.amountUsd,
-            solAmount: sweep.solAmount,
             signature: sweep.signature,
             from: REWARD_WALLET_ADDRESS,
             destination: OWNER_VAULT_ADDRESS,
         },
         status: 'confirmed',
     });
-}
-
-async function calculateRewardOwnerSurplus() {
-    if (!REWARD_WALLET_ADDRESS) return { amountUsd: 0, lamports: 0, liabilityUsd: 0 };
-    const rewardPubKey = new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS);
-    const [rewardBalance, liabilityUsd, rentMinimum] = await Promise.all([
-        connection.getBalance(rewardPubKey).catch(() => 0),
-        getRewardWalletLiabilityUsd(),
-        getSystemAccountRentLamports(),
-    ]);
-    const liabilityLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
-    const feeReserveLamports = 15_000;
-    const mustRemainLamportsBase = Math.max(rentMinimum, liabilityLamports);
-    let grossSurplus = Math.max(0, rewardBalance - mustRemainLamportsBase - feeReserveLamports);
-    
-    const bufferLamports = Math.ceil(grossSurplus * 0.05); // 5% buffer of the available surplus
-    const safelyAvailableLamports = Math.max(0, grossSurplus - bufferLamports);
-    
-    return {
-        amountUsd: (safelyAvailableLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
-        lamports: safelyAvailableLamports,
-        liabilityUsd,
-    };
-}
-
-async function validateRewardOwnerSurplusLiquidity() {
-    if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
-        throw new Error('Reward wallet or owner vault is not configured');
-    }
-    const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
-        Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
-    );
-    if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
-        throw new Error('Reward wallet address does not match configured secret');
-    }
-
-    const surplus = await calculateRewardOwnerSurplus();
-
-    if (surplus.lamports <= 0) {
-        throw new Error(
-            `Reward wallet has not received enough settled surplus yet. `
-            + `$${surplus.liabilityUsd.toFixed(2)} is reserved for players and a 5% buffer must remain.`
-        );
-    }
-    
-    const sweepLamports = surplus.lamports;
-    const solAmount = sweepLamports / solanaWeb3.LAMPORTS_PER_SOL;
-    const amountUsd = surplus.amountUsd;
-
-    if (!await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, sweepLamports)) {
-        throw new Error('Surplus is still below the Solana rent minimum for an empty owner vault; let it accumulate first');
-    }
-    return { rewardKeypair, solAmount, amountUsd, sweepLamports, liabilityUsd, safelyAvailableLamports, bufferUsd: (bufferLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD };
 }
 
 async function logConfirmedRewardClaim(claim) {
@@ -2080,31 +2011,6 @@ async function reconcileRewardClaims() {
             console.error('Reward claim reconciliation error:', err.message);
         }
     }
-
-    const surplusState = await RewardPoolState.findOne({
-        key: 'global',
-        'ownerSurplusSweep.status': 'broadcast',
-        'ownerSurplusSweep.signature': { $ne: null },
-    });
-    const surplusSweep = surplusState?.ownerSurplusSweep;
-    if (surplusSweep?.signature) {
-        try {
-            const result = await connection.getSignatureStatuses([surplusSweep.signature], { searchTransactionHistory: true });
-            const status = result.value[0];
-            if (status?.err) {
-                await failAndReleaseRewardOwnerSurplusSweep(
-                    surplusSweep.sweepId,
-                    `On-chain owner surplus sweep failed: ${JSON.stringify(status.err)}`,
-                );
-            } else if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
-                const completed = await completeRewardOwnerSurplusSweep(surplusSweep.sweepId);
-                await logConfirmedRewardOwnerSurplusSweep(completed)
-                    .catch(err => console.error('Owner surplus sweep log error:', err.message));
-            }
-        } catch (err) {
-            console.error('Owner surplus sweep reconciliation error:', err.message);
-        }
-    }
 }
 setInterval(() => reconcileRewardClaims().catch(err => console.error('Claim reconciliation failed:', err.message)), 30_000);
 
@@ -2142,7 +2048,7 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             const currentSecurity = await User.findById(req.user.id).select('rewardsDisabled').lean();
             if (currentSecurity?.rewardsDisabled) {
                 await failAndReleaseRewardClaim(claim._id, 'Promotional rewards disabled during linked-wallet review');
-                await User.updateOne({ _id: req.user.id }, { $set: { sponsoredRewardsBalance: 0 } });
+                await User.updateOne({ _id: req.user.id }, { $set: { sponsoredRewardsBalance: 0, fundedRewardsUsd: 0 } });
                 return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
             }
         }
@@ -2622,7 +2528,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             status: 'confirmed',
             'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
         });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState, liveSurplus] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -2651,7 +2557,6 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                 }
             ]),
             RewardPoolState.findOne({ key: 'global' }).lean(),
-            calculateRewardOwnerSurplus(),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -2677,10 +2582,6 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
             ownerEarningsBrSol: ownerEarnings.brSweepSol,
             rewardPoolBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
-            rewardOwnerSurplusUsd: Number(liveSurplus.amountUsd.toFixed(2)),
-            rewardOwnerSurplusReservedUsd: Number((rewardPoolState?.ownerSurplusReservedUsd || 0).toFixed(2)),
-            rewardOwnerSurplusSweptUsd: Number((rewardPoolState?.totalOwnerSurplusSweptUsd || 0).toFixed(2)),
-            rewardOwnerSurplusSweep: rewardPoolState?.ownerSurplusSweep || null,
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
@@ -3870,6 +3771,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             sponsoredRewardsUnlocked: false,
             sponsoredRewardsCompleted: false,
             sponsoredRewardsBalance: 0,
+            fundedRewardsUsd: 0,
             rentFallbackBalanceUsd: 0,
             rewardClaimInProgress: false,
             rewardClaimReservedUsd: 0,
@@ -3884,6 +3786,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             sponsoredRewardsUnlocked: false,
             sponsoredRewardsCompleted: false,
             sponsoredRewardsBalance: 0,
+            fundedRewardsUsd: 0,
             rentFallbackBalanceUsd: 0,
             rewardClaimInProgress: false,
             rewardClaimReservedUsd: 0,
@@ -3899,6 +3802,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
                 'snapshots.$[].sponsoredRewardsUnlocked': false,
                 'snapshots.$[].sponsoredRewardsCompleted': false,
                 'snapshots.$[].sponsoredRewardsBalance': 0,
+                'snapshots.$[].fundedRewardsUsd': 0,
             } },
         );
         await resetRewardPoolAccounting();
@@ -3935,91 +3839,6 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
     }
 });
 
-app.post('/api/admin/reward-owner-surplus/sweep', authenticateAdmin, async (req, res) => {
-    if (rewardPoolAdminResetting) return res.status(409).json({ message: 'Reward pool factory reset is in progress.' });
-    let state = null;
-    let broadcastSignature = null;
-    try {
-        state = await reserveRewardOwnerSurplusSweep();
-        if (!state) {
-            const current = await RewardPoolState.findOne({ key: 'global' }).lean();
-            const active = current?.ownerSurplusSweep?.status;
-            if (active === 'reserved' || active === 'broadcast') {
-                return res.status(409).json({ message: 'An owner surplus sweep is already processing.' });
-            }
-            return res.status(400).json({ message: 'There is no tracked reward surplus to sweep.' });
-        }
-
-        const sweep = state.ownerSurplusSweep;
-        let amountUsd = Number(sweep.amountUsd) || 0;
-        if (DEV_FREE_PLAY) {
-            await markRewardOwnerSurplusBroadcast(
-                sweep.sweepId,
-                `simulated_owner_surplus_${sweep.sweepId}`,
-                amountUsd / SOL_PRICE_USD,
-            );
-            const completed = await completeRewardOwnerSurplusSweep(sweep.sweepId);
-            await logConfirmedRewardOwnerSurplusSweep(completed);
-            return res.json({
-                success: true,
-                message: `Simulated $${amountUsd.toFixed(2)} reward surplus sweep.`,
-            });
-        }
-
-        const liquidity = await validateRewardOwnerSurplusLiquidity();
-        amountUsd = liquidity.amountUsd;
-        const transaction = new solanaWeb3.Transaction().add(
-            solanaWeb3.SystemProgram.transfer({
-                fromPubkey: liquidity.rewardKeypair.publicKey,
-                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
-                lamports: liquidity.sweepLamports,
-            })
-        );
-        broadcastSignature = await connection.sendTransaction(transaction, [liquidity.rewardKeypair], { maxRetries: 3 });
-        
-        // Update the state amountUsd now that we know the physical sweep amount
-        await RewardPoolState.updateOne(
-            { key: 'global', 'ownerSurplusSweep.sweepId': sweep.sweepId },
-            { $set: { 'ownerSurplusSweep.amountUsd': amountUsd } }
-        );
-
-        await markRewardOwnerSurplusBroadcast(
-            sweep.sweepId,
-            broadcastSignature,
-            liquidity.sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
-        );
-        const confirmation = await connection.confirmTransaction(broadcastSignature, 'confirmed');
-        if (confirmation.value.err) {
-            await failAndReleaseRewardOwnerSurplusSweep(
-                sweep.sweepId,
-                `On-chain owner surplus sweep failed: ${JSON.stringify(confirmation.value.err)}`,
-            );
-            return res.status(502).json({ message: 'The on-chain surplus sweep failed; the tracked amount was restored.' });
-        }
-
-        const completed = await completeRewardOwnerSurplusSweep(sweep.sweepId);
-        await logConfirmedRewardOwnerSurplusSweep(completed);
-        return res.json({
-            success: true,
-            message: `Swept $${amountUsd.toFixed(2)} reward surplus to the owner vault while retaining a 5% buffer ($${liquidity.bufferUsd.toFixed(2)}).`,
-            signature: broadcastSignature,
-        });
-    } catch (err) {
-        await logSolanaTransactionError('Manual reward owner surplus sweep failed:', err);
-        if (state?.ownerSurplusSweep?.sweepId && !broadcastSignature) {
-            await failAndReleaseRewardOwnerSurplusSweep(state.ownerSurplusSweep.sweepId, err.message).catch(() => {});
-        }
-        if (broadcastSignature) {
-            return res.status(202).json({
-                success: false,
-                processing: true,
-                message: 'The surplus transfer was submitted and is awaiting confirmation.',
-                signature: broadcastSignature,
-            });
-        }
-        return res.status(409).json({ message: err.message });
-    }
-});
 
 // Dev-only reset endpoint (no JWT — uses DEV_RESET_SECRET header)
 app.post('/api/dev/trigger-reset', async (req, res) => {
@@ -5571,8 +5390,10 @@ io.on('connection', (socket) => {
                 const rpSplit = getRewardPoolSplit(entryFeeUsd);
                 foodAlloc = rpSplit.food;
                 aiAlloc = rpSplit.ai;
-                rewardContribution = rpSplit.rewardPoolContribution;
-                ownerContribution = rpSplit.ownerVaultContribution;
+                
+                const remainingToFund = Math.max(0, (user.sponsoredRewardsBalance || 0) - (user.fundedRewardsUsd || 0));
+                rewardContribution = Math.min(rpSplit.rewardPoolContribution, remainingToFund);
+                ownerContribution = rpSplit.ownerVaultContribution + (rpSplit.rewardPoolContribution - rewardContribution);
             } else {
                 const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
                 foodAlloc = stdSplit.food;
@@ -5618,7 +5439,10 @@ io.on('connection', (socket) => {
 
                 // Reward pool / owner vault contributions
                 if (rewardContribution > 0) {
-                    await addRewardFundingUsd(rewardContribution);
+                    await Promise.all([
+                        addRewardFundingUsd(rewardContribution),
+                        User.updateOne({ _id: user._id }, { $inc: { fundedRewardsUsd: rewardContribution } })
+                    ]);
                     pendingJoinEconomy.rewardFundingUsd = rewardContribution;
                     console.log(`🏆 REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${getCachedPendingRewardUsd().toFixed(2)}`);
                     Transaction.create({
