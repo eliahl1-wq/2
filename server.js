@@ -3802,10 +3802,11 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
         if (['reserved', 'broadcast'].includes(currentRewardState?.ownerSurplusSweep?.status)) {
             return res.status(409).json({ message: 'Wait for the active owner-surplus sweep to finish first.' });
         }
-        if (activeClaims > 0 || liabilityUsd > 0.000001) {
-            return res.status(409).json({
-                message: `Reset blocked: $${liabilityUsd.toFixed(2)} belongs to players and ${activeClaims} claim(s) are active.`,
-            });
+        if (activeClaims > 0) {
+            await RewardClaim.updateMany(
+                { status: { $in: ['reserved', 'broadcast'] } },
+                { $set: { status: 'failed', error: 'Cancelled by admin factory reset' } }
+            );
         }
         if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
             return res.status(400).json({ message: 'Reward wallet or owner vault is not configured.' });
@@ -3866,7 +3867,9 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             }
         }
 
-        await User.updateMany({}, { $set: {
+        await User.updateMany({}, [{ $set: {
+            hasFreeTicket: { $cond: [{ $eq: ['$rewardsDisabled', true] }, false, true] },
+            freeTicketUsed: { $cond: [{ $eq: ['$rewardsDisabled', true] }, true, false] },
             completedFiveDollarNormalGames: 0,
             completedTenDollarNormalGames: 0,
             sponsoredRewardsUnlocked: false,
@@ -3876,7 +3879,19 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             rewardClaimInProgress: false,
             rewardClaimReservedUsd: 0,
             activeRewardClaimId: null,
-        } });
+        } }]);
+        await RewardSecurityAlert.updateMany(
+            { 'snapshots.0': { $exists: true } },
+            { $set: {
+                'snapshots.$[].hasFreeTicket': true,
+                'snapshots.$[].freeTicketUsed': false,
+                'snapshots.$[].completedFiveDollarNormalGames': 0,
+                'snapshots.$[].completedTenDollarNormalGames': 0,
+                'snapshots.$[].sponsoredRewardsUnlocked': false,
+                'snapshots.$[].sponsoredRewardsCompleted': false,
+                'snapshots.$[].sponsoredRewardsBalance': 0,
+            } },
+        );
         await resetRewardPoolAccounting();
 
         await Transaction.create({
@@ -3891,6 +3906,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
                 solAmount: sweptLamports / solanaWeb3.LAMPORTS_PER_SOL,
                 amountUsd: (sweptLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
                 retainedBufferUsd: REWARD_OWNER_SURPLUS_BUFFER_USD,
+                discardedPlayerRewardUsd: liabilityUsd,
                 from: REWARD_WALLET_ADDRESS,
                 destination: OWNER_VAULT_ADDRESS,
             },
@@ -3899,7 +3915,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
 
         return res.json({
             success: true,
-            message: `Reward pool accounting reset. Swept ${(sweptLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(6)} SOL and retained approximately $${REWARD_OWNER_SURPLUS_BUFFER_USD.toFixed(2)}.`,
+            message: `Reward pool and all account reward states reset to pre-free-ticket. Swept ${(sweptLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(6)} SOL and retained approximately $${REWARD_OWNER_SURPLUS_BUFFER_USD.toFixed(2)}.`,
             signature,
         });
     } catch (err) {
