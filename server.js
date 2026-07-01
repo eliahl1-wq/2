@@ -3940,7 +3940,7 @@ app.post('/api/admin/reward-owner-surplus/sweep', authenticateAdmin, async (req,
         }
 
         const sweep = state.ownerSurplusSweep;
-        const amountUsd = Number(sweep.amountUsd) || 0;
+        let amountUsd = Number(sweep.amountUsd) || 0;
         if (DEV_FREE_PLAY) {
             await markRewardOwnerSurplusBroadcast(
                 sweep.sweepId,
@@ -3956,7 +3956,7 @@ app.post('/api/admin/reward-owner-surplus/sweep', authenticateAdmin, async (req,
         }
 
         const liquidity = await validateRewardOwnerSurplusLiquidity();
-        const amountUsd = liquidity.amountUsd;
+        amountUsd = liquidity.amountUsd;
         const transaction = new solanaWeb3.Transaction().add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: liquidity.rewardKeypair.publicKey,
