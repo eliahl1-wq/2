@@ -159,40 +159,20 @@ export async function reserveRewardClaim(userId) {
     const User = mongoose.model('User');
     const claimId = new mongoose.Types.ObjectId();
     const claimKey = randomUUID();
-    const claimableSponsoredExpr = {
-        $cond: [
-            { $and: [
-                { $eq: ['$sponsoredRewardsUnlocked', true] },
-                { $eq: ['$sponsoredRewardsCompleted', true] },
-                { $ne: ['$rewardsDisabled', true] },
-            ] },
-            { $ifNull: ['$sponsoredRewardsBalance', 0] },
-            0,
+    // Fetch the user first to calculate the values
+    const user = await User.findOne({
+        _id: userId,
+        rewardClaimInProgress: { $ne: true },
+        $or: [
+            { rentFallbackBalanceUsd: { $gt: 0 } },
+            {
+                sponsoredRewardsUnlocked: true,
+                sponsoredRewardsCompleted: true,
+                sponsoredRewardsBalance: { $gt: 0 },
+                rewardsDisabled: { $ne: true },
+            },
         ],
-    };
-    const user = await User.findOneAndUpdate(
-        {
-            _id: userId,
-            rewardClaimInProgress: { $ne: true },
-            $or: [
-                { rentFallbackBalanceUsd: { $gt: 0 } },
-                {
-                    sponsoredRewardsUnlocked: true,
-                    sponsoredRewardsCompleted: true,
-                    sponsoredRewardsBalance: { $gt: 0 },
-                    rewardsDisabled: { $ne: true },
-                },
-            ],
-        },
-        [{ $set: {
-            activeRewardClaimId: claimId,
-            rewardClaimInProgress: true,
-            rewardClaimReservedUsd: { $add: [claimableSponsoredExpr, { $ifNull: ['$rentFallbackBalanceUsd', 0] }] },
-            sponsoredRewardsBalance: { $subtract: [{ $ifNull: ['$sponsoredRewardsBalance', 0] }, claimableSponsoredExpr] },
-            rentFallbackBalanceUsd: 0,
-        } }],
-        { new: false },
-    );
+    });
     if (!user) return null;
 
     const sponsoredAmountUsd = user.sponsoredRewardsUnlocked && user.sponsoredRewardsCompleted && !user.rewardsDisabled
@@ -200,6 +180,28 @@ export async function reserveRewardClaim(userId) {
         : 0;
     const rentFallbackAmountUsd = Number(user.rentFallbackBalanceUsd) || 0;
     const amountUsd = sponsoredAmountUsd + rentFallbackAmountUsd;
+
+    // Perform the update atomically, matching the expected balances to prevent race conditions
+    const updatedUser = await User.findOneAndUpdate(
+        {
+            _id: userId,
+            rewardClaimInProgress: { $ne: true },
+            sponsoredRewardsBalance: user.sponsoredRewardsBalance,
+            rentFallbackBalanceUsd: user.rentFallbackBalanceUsd,
+        },
+        {
+            $set: {
+                activeRewardClaimId: claimId,
+                rewardClaimInProgress: true,
+                rewardClaimReservedUsd: amountUsd,
+                sponsoredRewardsBalance: user.sponsoredRewardsBalance - sponsoredAmountUsd,
+                rentFallbackBalanceUsd: 0,
+            }
+        },
+        { new: false }, // Return the old (pre-update) document as expected by the rest of the code
+    );
+
+    if (!updatedUser) return null;
     try {
         const claim = await RewardClaim.create({
             _id: claimId,
