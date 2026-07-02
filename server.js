@@ -386,7 +386,7 @@ const c = {
     ejectMass: 0.05,
     ejectMassGain: 0.05,
     massLossRate: 1.0,
-    mergeTimer: 8,
+    mergeTimer: 2,
     speedMult: 1.45,
     houseFee: 0.0,
     targetPopulation: 30,
@@ -4714,8 +4714,8 @@ function resolveAgarOwnCells(player, now, massStart) {
 
             // Once ready, a clear overlap is enough to merge. With many pieces,
             // requiring near-identical centers makes surrounding cells block the pair.
-            const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.55;
-            const pull = Math.min(5, 0.7 + overlap * 0.09);
+            const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.15;
+            const pull = Math.min(6, 0.9 + overlap * 0.11);
             first.x += ux * pull * firstShare;
             first.y += uy * pull * firstShare;
             second.x -= ux * pull * secondShare;
