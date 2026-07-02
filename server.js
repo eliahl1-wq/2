@@ -4712,16 +4712,11 @@ function resolveAgarOwnCells(player, now, massStart) {
                 continue;
             }
 
-            // Once ready, a clear overlap is enough to merge. With many pieces,
-            // requiring near-identical centers makes surrounding cells block the pair.
-            const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.15;
-            const pull = Math.min(6, 0.9 + overlap * 0.11);
-            first.x += ux * pull * firstShare;
-            first.y += uy * pull * firstShare;
-            second.x -= ux * pull * secondShare;
-            second.y -= uy * pull * secondShare;
+            // Ready cells may overlap freely, but touching alone must not trigger
+            // a merge. The player still has to press them visibly into each other.
+            const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.32;
+            if (distance > mergeDistance) continue;
 
-            if (distance - pull > mergeDistance) continue;
 
             const survivor = firstMass >= secondMass ? first : second;
             const absorbed = survivor === first ? second : first;
