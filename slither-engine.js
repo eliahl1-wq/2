@@ -1353,7 +1353,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 }
 
 const MAX_NETWORK_SEGMENTS = 120;
-const MAX_VISIBLE_FOOD = 240;
+const MAX_VISIBLE_FOOD = 800;
 const MAX_SLITHER_FOOD_TOTAL = 700;
 const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
 /** Extra beyond snake viewRange — tuned to client viewport (~W/2/zoom + margin), not whole arena. */
@@ -1582,8 +1582,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
 
 export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const allSnakes = getAllSlitherSnakes(room);
-    const range = SLITHER.viewRange;
-    const foodRange = range + SLITHER_FOOD_VIEW_EXTRA;
+    const range = 1800; // Increased view range for normal slither culling
+    const foodRange = range + 500;
     const now = Date.now();
     const sendLeaderboard = !room._lastLbAt || now - room._lastLbAt >= 500;
     if (sendLeaderboard) room._lastLbAt = now;
@@ -2281,25 +2281,14 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         }
 
         const visibleSnakes = allSnakes
-            .filter(({ entity: s }) => {
-                const h = s.segments[0];
-                return isInView(head.x, head.y, h.x, h.y, range);
-            })
+            .filter(({ entity: s }) => s.segments?.[0])
             .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
 
         let visibleFood = null;
         const refreshFood = sendFoodThisTick
             || !room._lastCompFoodByPlayer?.[socketId];
         if (refreshFood) {
-            visibleFood = collectSlitherFoodInView(
-                room.slitherFood,
-                compFoodGrid,
-                head.x,
-                head.y,
-                foodRange,
-                MAX_VISIBLE_FOOD,
-                COMPETITIVE_SLITHER.foodRadius,
-            );
+            visibleFood = room.slitherFood.map(f => serializeVisibleSlitherFood(f, COMPETITIVE_SLITHER.foodRadius));
             if (!room._lastCompFoodByPlayer) room._lastCompFoodByPlayer = {};
             room._lastCompFoodByPlayer[socketId] = visibleFood;
         }
