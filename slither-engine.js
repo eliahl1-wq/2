@@ -235,7 +235,7 @@ export function randomCoordInRoom(room) {
     };
 }
 
-function isSpawnClear(room, x, y, minDist = 200) {
+export function isSpawnClear(room, x, y, minDist = 200) {
     for (const { entity: s } of getAllSlitherSnakes(room)) {
         const r = headRadiusForBalance(s.balance ?? 1);
         const spacing = segmentSpacingForBalance(s.balance ?? 1);
@@ -250,7 +250,7 @@ function isSpawnClear(room, x, y, minDist = 200) {
     return true;
 }
 
-function pickSlitherSpawn(room) {
+export function pickSlitherSpawn(room) {
     let bestX = 0;
     let bestY = 0;
     let maxMinDist = -1;
@@ -1801,7 +1801,7 @@ function randomCompetitiveSpawnCoord() {
     return { x: Math.cos(a) * r, y: Math.sin(a) * r };
 }
 
-function isCompetitiveSpawnClear(room, x, y, minDist = 120) {
+export function isCompetitiveSpawnClear(room, x, y, minDist = 120) {
     for (const { entity: s } of getCompetitiveSnakes(room)) {
         const r = headRadiusForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
         const spacing = segmentSpacingForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
@@ -2229,7 +2229,7 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
     }
 
     for (const { snake, killer } of toRemove) {
-        const respawnAdminBot = snake.isBot && snake.adminSpawned && !room.isResetting;
+        const respawnAdminBot = false; // Disable infinite automatic respawning of admin-spawned bots
         eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction);
         if (respawnAdminBot) {
             room.players.push(createCompetitiveSlitherAdminBot(room, effectiveRadius));

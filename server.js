@@ -33,6 +33,9 @@ import {
     getCompetitiveZone,
     addSlitherFood,
     createSegments,
+    isSpawnClear,
+    isCompetitiveSpawnClear,
+    pickSlitherSpawn,
 } from './slither-engine.js';
 import {
     ALLOWED_ENTRY_FEES,
@@ -5687,22 +5690,64 @@ io.on('connection', (socket) => {
             const spawnX = p ? ((isSlither || isSurviv ? p.x : p.cells?.[0]?.x) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : isSurviv ? SURVIV.worldHalf * 0.8 : c.worldWidth));
             const spawnY = p ? ((isSlither || isSurviv ? p.y : p.cells?.[0]?.y) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : isSurviv ? SURVIV.worldHalf * 0.8 : c.worldHeight));
 
-            const offsetX = p ? (Math.random() - 0.5) * 600 : 0;
-            const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
-
-            console.log(`[Admin Spawn] Spawning ${isSurviv ? 'Surviv' : isCompSlither ? 'CompetitiveSlither' : isSlither ? 'Slither' : 'Agar'} bot at (${(spawnX + offsetX).toFixed(0)}, ${(spawnY + offsetY).toFixed(0)})`);
+            let finalX = spawnX;
+            let finalY = spawnY;
 
             if (isSurviv) {
-                spawnSurvivBotNear(room, spawnX + offsetX, spawnY + offsetY);
+                const offsetX = p ? (Math.random() - 0.5) * 600 : 0;
+                const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
+                finalX = spawnX + offsetX;
+                finalY = spawnY + offsetY;
+                console.log(`[Admin Spawn] Spawning Surviv bot at (${finalX.toFixed(0)}, ${finalY.toFixed(0)})`);
+                spawnSurvivBotNear(room, finalX, finalY);
             } else if (isCompSlither) {
+                let foundClear = false;
+                for (let attempt = 0; attempt < 50; attempt++) {
+                    const r = 250 + Math.random() * 300;
+                    const angle = Math.random() * Math.PI * 2;
+                    const testX = spawnX + Math.cos(angle) * r;
+                    const testY = spawnY + Math.sin(angle) * r;
+                    const effectiveRadius = getCompetitiveEffectiveRadius(room.startTime + c.roomDuration);
+                    const distToCenter = Math.hypot(testX, testY);
+                    if (distToCenter < effectiveRadius - 100 && isCompetitiveSpawnClear(room, testX, testY, 150)) {
+                        finalX = testX;
+                        finalY = testY;
+                        foundClear = true;
+                        break;
+                    }
+                }
+                if (!foundClear) {
+                    finalX = 0;
+                    finalY = 0;
+                }
+                console.log(`[Admin Spawn] Spawning CompetitiveSlither bot at (${finalX.toFixed(0)}, ${finalY.toFixed(0)})`);
                 const effectiveRadius = getCompetitiveEffectiveRadius(room.startTime + c.roomDuration);
                 room.players.push(createCompetitiveSlitherAdminBot(
                     room,
                     effectiveRadius,
-                    spawnX + offsetX,
-                    spawnY + offsetY,
+                    finalX,
+                    finalY,
                 ));
             } else if (isSlither) {
+                let foundClear = false;
+                for (let attempt = 0; attempt < 50; attempt++) {
+                    const r = 300 + Math.random() * 400;
+                    const angle = Math.random() * Math.PI * 2;
+                    const testX = spawnX + Math.cos(angle) * r;
+                    const testY = spawnY + Math.sin(angle) * r;
+                    if (isSpawnClear(room, testX, testY, 180)) {
+                        finalX = testX;
+                        finalY = testY;
+                        foundClear = true;
+                        break;
+                    }
+                }
+                if (!foundClear) {
+                    const fallback = pickSlitherSpawn(room);
+                    finalX = fallback.x;
+                    finalY = fallback.y;
+                }
+                console.log(`[Admin Spawn] Spawning Slither bot at (${finalX.toFixed(0)}, ${finalY.toFixed(0)})`);
                 const dollarStart = getEconomy(room.entryFeeUsd ?? 0.10).botStartBalance;
                 const angle = Math.random() * Math.PI * 2;
                 room.slitherBots.push({
@@ -5716,14 +5761,14 @@ io.on('connection', (socket) => {
                     entryFeeUsd: room.entryFeeUsd,
                     startTime: Date.now(),
                     color: util.randomSlitherColor(),
-                    x: spawnX + offsetX,
-                    y: spawnY + offsetY,
+                    x: finalX,
+                    y: finalY,
                     inputDx: Math.cos(angle),
                     inputDy: Math.sin(angle),
                     boost: false,
                     angle,
                     fam: 0,
-                    segments: createSegments(spawnX + offsetX, spawnY + offsetY, startMass, angle),
+                    segments: createSegments(finalX, finalY, startMass, angle),
                     screenWidth: 1920,
                     screenHeight: 1080,
                     isBot: true,
