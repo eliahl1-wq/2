@@ -1125,6 +1125,155 @@ function checkSnakeCollisions(snake, allSnakes) {
     return null;
 }
 
+export function resolveAllSnakeCollisions(allSnakes) {
+    const deadSnakes = new Map(); // snakeId -> killerEntity
+    
+    // First phase: collect all hits for each active snake
+    const collisions = new Map(); // snakeId -> { snake, bodyHit: otherEntity, headHit: otherEntity }
+
+    const now = Date.now();
+
+    for (const { entity: snake } of allSnakes) {
+        if (snake.frozen || snake.isStatic) continue;
+        if (snake.spawnGraceUntil && now < snake.spawnGraceUntil) continue;
+
+        const head = snake.segments?.[0];
+        if (!head) continue;
+
+        const r = headRadiusForBalance(snake.balance);
+
+        let bodyHit = null;
+        let headHit = null;
+
+        for (const { entity: other } of allSnakes) {
+            if (other.id === snake.id) continue;
+            if (other.spawnGraceUntil && now < other.spawnGraceUntil) continue;
+
+            // Bounding box check to cull segment collision checks
+            const maxOtherR = headRadiusForBalance(other.balance);
+            const pad = r + maxOtherR + 10;
+            if (other.minX !== undefined && (
+                head.x < other.minX - pad ||
+                head.x > other.maxX + pad ||
+                head.y < other.minY - pad ||
+                head.y > other.maxY + pad
+            )) {
+                continue;
+            }
+
+            for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 2)) {
+                if (i === 1) continue;
+                const seg = other.segments[i];
+                const segR = i === 0 
+                    ? headRadiusForBalance(other.balance) 
+                    : headRadiusForBalance(other.balance) * 0.7;
+                
+                const dx = head.x - seg.x;
+                const dy = head.y - seg.y;
+                
+                // Use a slightly tighter threshold for head-to-head to avoid grazing/false deaths
+                const threshold = i === 0
+                    ? (r + segR) * 0.55
+                    : r * 0.85 + segR * 0.75;
+
+                if (dx * dx + dy * dy < threshold * threshold) {
+                    if (i > 0) {
+                        bodyHit = other;
+                        break; // Body hit takes absolute precedence
+                    } else {
+                        headHit = other;
+                    }
+                }
+            }
+            if (bodyHit) {
+                break; // Found body hit, stop checking other snakes for this one
+            }
+        }
+
+        if (bodyHit || headHit) {
+            collisions.set(snake.id, { snake, bodyHit, headHit });
+        }
+    }
+
+    // Second phase: process collision rules
+    for (const [snakeId, col] of collisions.entries()) {
+        const { snake, bodyHit, headHit } = col;
+
+        // 1. If body hit: snake dies immediately.
+        if (bodyHit) {
+            deadSnakes.set(snakeId, bodyHit);
+            continue;
+        }
+
+        // 2. If head-to-head hit and no body hit:
+        if (headHit) {
+            const other = headHit;
+            const otherCol = collisions.get(other.id);
+
+            // If the other snake also hit a body segment of someone, then the other snake is dead.
+            // In this case, the other snake is the "attacker/loser", so this snake survives.
+            if (otherCol && otherCol.bodyHit) {
+                continue;
+            }
+
+            // Otherwise, we have a head-to-head collision.
+            // Check direction of approach to see who is the active collider.
+            const headA = snake.segments[0];
+            const headB = other.segments[0];
+            if (!headA || !headB) continue;
+
+            const dx = headB.x - headA.x;
+            const dy = headB.y - headA.y;
+
+            // Heading vectors
+            const angleA = snake.angle || 0;
+            const angleB = other.angle || 0;
+            const cosA = Math.cos(angleA);
+            const sinA = Math.sin(angleA);
+            const cosB = Math.cos(angleB);
+            const sinB = Math.sin(angleB);
+
+            // Dot products to determine if they are moving towards each other
+            const dotA = cosA * dx + sinA * dy;
+            const dotB = cosB * (-dx) + sinB * (-dy);
+
+            const A_moving_to_B = dotA > 0;
+            const B_moving_to_A = dotB > 0;
+
+            if (A_moving_to_B && B_moving_to_A) {
+                // True head-on collision. Resolve by balance (size).
+                // Larger snake (by > 10% balance) survives; smaller dies.
+                const balanceA = snake.balance || 1.0;
+                const balanceB = other.balance || 1.0;
+                if (balanceA > balanceB * 1.1) {
+                    // A is larger, B dies (handled when other is processed)
+                    continue;
+                } else if (balanceB > balanceA * 1.1) {
+                    // B is larger, A dies
+                    deadSnakes.set(snakeId, other);
+                } else {
+                    // Similar size, both die
+                    deadSnakes.set(snakeId, other);
+                }
+            } else if (A_moving_to_B) {
+                // Only A is moving towards B (B is moving away or parallel)
+                // A dies, B lives
+                deadSnakes.set(snakeId, other);
+            } else if (B_moving_to_A) {
+                // Only B is moving towards A
+                // A lives (B will die when B is processed)
+                continue;
+            } else {
+                // Both are turning away. Both survive!
+                continue;
+            }
+        }
+    }
+
+    return deadSnakes;
+}
+
+
 const SLITHER_FOOD_CELL = 64;
 
 function buildSlitherFoodGrid(food, existingGrid) {
@@ -1539,6 +1688,15 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             snake.balance = Math.max(minMass, snake.balance);
             if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
         }
+    }
+
+    const deadSnakes = sandboxSkipDeathCollisions ? new Map() : resolveAllSnakeCollisions(allSnakes);
+
+    for (const { entity: snake, isHuman } of allSnakes) {
+        if (snake.frozen || snake.isStatic) continue;
+
+        // Skip check if the snake was already marked for removal (e.g. over-wealthy bot)
+        if (toRemove.some(item => item.snake.id === snake.id)) continue;
 
         if (!sandboxSkipDeathCollisions) {
             if (checkWallCollision(snake) || checkSelfCollision(snake)) {
@@ -1546,9 +1704,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 continue;
             }
 
-            const hit = checkSnakeCollisions(snake, allSnakes);
-            if (hit) {
-                toRemove.push({ snake, isHuman, killer: hit });
+            const killer = deadSnakes.get(snake.id);
+            if (killer) {
+                toRemove.push({ snake, isHuman, killer });
             }
         }
     }
@@ -2216,15 +2374,21 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
         }
         updateCompetitiveSnakeMovement(snake);
         checkCompetitiveFoodCollisions(snake, room);
+    }
+
+    const deadSnakes = resolveAllSnakeCollisions(allSnakes);
+
+    for (const { entity: snake } of allSnakes) {
+        if (toRemove.some(item => item.snake.id === snake.id)) continue;
 
         if (checkCompetitiveBoundary(snake, effectiveRadius) || checkSelfCollision(snake)) {
             toRemove.push({ snake, killer: null });
             continue;
         }
 
-        const hit = checkSnakeCollisions(snake, allSnakes);
-        if (hit) {
-            toRemove.push({ snake, killer: hit });
+        const killer = deadSnakes.get(snake.id);
+        if (killer) {
+            toRemove.push({ snake, killer });
         }
     }
 
