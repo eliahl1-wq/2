@@ -730,6 +730,8 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepCompetitiveCashoutSpectator(room, player);
         user.playtime += (Date.now() - player.startTime);
+        const payoutSol = playerPayout / SOL_PRICE_USD;
+        user.balance = (user.balance || 0) + payoutSol;
         await user.save();
         await Transaction.create({
             userId: user._id,
@@ -861,6 +863,8 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     if (DEV_FREE_PLAY) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
+        const payoutSol = playerPayout / SOL_PRICE_USD;
+        user.balance = (user.balance || 0) + payoutSol;
         await user.save();
         await Transaction.create({
             userId: user._id,
@@ -1019,6 +1023,8 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     if (DEV_FREE_PLAY) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
+        const payoutSol = playerPayout / SOL_PRICE_USD;
+        user.balance = (user.balance || 0) + payoutSol;
         await user.save();
         await Transaction.create({
             userId: user._id,
@@ -1777,7 +1783,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         user = await ensureUserDepositWallet(user);
 
         let solOnChain = 0;
-        if (user.depositAddress) {
+        if (user.depositAddress && !DEV_FREE_PLAY) {
             try {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const lamports = await connection.getBalance(pubKey);
@@ -1789,6 +1795,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
                     await user.save();
                 }
             } catch (e) { console.error("Sync error in /api/me:", e.message); }
+        } else if (DEV_FREE_PLAY) {
+            solOnChain = user.balance || 0;
         }
 
         const userObj = user.toObject();
@@ -5024,7 +5032,7 @@ function getModeFoodBudgets(room, agarActive, slitherActive) {
     if (room.isTournament) {
         // Match the amount of score-food a normal $10 join creates, without
         // treating any pellet or bot balance as a real wallet liability.
-        return { agar: 0, slither: Math.max(0, slitherActive * 9) };
+        return { agar: 0, slither: Math.max(80, slitherActive * 80) };
     }
     const total = agarActive + slitherActive;
     if (total <= 0) {
@@ -5491,6 +5499,10 @@ io.on('connection', (socket) => {
                     tournamentId: tournament._id.toString(),
                     signature,
                 };
+            } else {
+                const feeSol = TOURNAMENT_ENTRY_FEE_USD / SOL_PRICE_USD;
+                user.balance = Math.max(0, user.balance - feeSol);
+                await user.save();
             }
 
             const commonUpdate = {
@@ -5728,6 +5740,8 @@ io.on('connection', (socket) => {
                         return;
                     }
                 } else {
+                    user.balance = Math.max(0, user.balance - entryFeeInSol);
+                    await user.save();
                     console.log(`🎮 [FREE PLAY] ${user.username} joined Competitive Slither (simulated $${entryFeeUsd} entry)`);
                 }
 
@@ -5879,6 +5893,8 @@ io.on('connection', (socket) => {
                         return;
                     }
                 } else {
+                    user.balance = Math.max(0, user.balance - entryFeeInSol);
+                    await user.save();
                     console.log(`🎮 [FREE PLAY] ${user.username} joined Surviv (simulated $${entryFeeUsd} entry)`);
                 }
 
@@ -6080,6 +6096,10 @@ io.on('connection', (socket) => {
                 if (isFreeTicketPlay) {
                     console.log(`[FREE TICKET] ${user.username} joined Slither/Agar normal $10 match using free ticket.`);
                 } else {
+                    if (DEV_FREE_PLAY) {
+                        user.balance = Math.max(0, user.balance - entryFeeInSol);
+                        await user.save();
+                    }
                     console.log(`[FREE PLAY] ${user.username} joined (simulated $${entryFeeUsd} entry)`);
                 }
             }
@@ -7184,7 +7204,9 @@ function processRoom(room) {
                 }
             }
         }
-        syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, foodDensityForRoom(room));
+        const baseDensity = foodDensityForRoom(room);
+        const slitherDensity = room.isTournament ? baseDensity * 4.5 : baseDensity;
+        syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, slitherDensity);
 
         if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
     }

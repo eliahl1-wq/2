@@ -1583,14 +1583,14 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
     if (normalCount < addThreshold) {
         addSlitherFood(
             room,
-            Math.min(12, addThreshold - normalCount),
+            Math.min(room.isTournament ? 60 : 12, addThreshold - normalCount),
             foodBlobValue,
             foodValueTarget + goldenValueOnMap,
         );
     } else if (normalCount > trimThreshold) {
         trimSlitherFood(room, targetFoodCount);
     }
-    enforceSlitherFoodCap(room);
+    enforceSlitherFoodCap(room, room.isTournament ? 2000 : 700);
 }
 
 /**
