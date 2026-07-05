@@ -84,8 +84,12 @@ export function calculateTournamentPrizes(participants, potUsd, potLamports) {
     const winnerCount = Math.min(TOURNAMENT_PRIZE_SPLITS.length, ranked.length);
     if (!winnerCount) return [];
 
+    // Deduct 5% fee from the pot, leaving it in the tournament wallet
+    const prizePotUsd = Number(potUsd) * 0.95;
+    const prizePotLamports = Math.floor(Number(potLamports) * 0.95);
+
     // If fewer than three people entered, normalize the available placement shares
-    // so the full entry pot still belongs to the tournament players.
+    // so the net prize pot still belongs to the tournament players.
     const activeSplits = TOURNAMENT_PRIZE_SPLITS.slice(0, winnerCount);
     const splitTotal = activeSplits.reduce((sum, value) => sum + value, 0);
     let assignedUsd = 0;
@@ -95,11 +99,11 @@ export function calculateTournamentPrizes(participants, potUsd, potLamports) {
         const isLast = index === winnerCount - 1;
         const normalizedShare = activeSplits[index] / splitTotal;
         const winningsUsd = isLast
-            ? Math.max(0, Number(potUsd) - assignedUsd)
-            : Math.max(0, Number((Number(potUsd) * normalizedShare).toFixed(6)));
+            ? Math.max(0, Number(prizePotUsd) - assignedUsd)
+            : Math.max(0, Number((Number(prizePotUsd) * normalizedShare).toFixed(6)));
         const winningsLamports = isLast
-            ? Math.max(0, Math.floor(Number(potLamports) - assignedLamports))
-            : Math.max(0, Math.floor(Number(potLamports) * normalizedShare));
+            ? Math.max(0, Math.floor(Number(prizePotLamports) - assignedLamports))
+            : Math.max(0, Math.floor(Number(prizePotLamports) * normalizedShare));
         assignedUsd += winningsUsd;
         assignedLamports += winningsLamports;
         return {
@@ -137,7 +141,7 @@ export function serializeTournament(doc, userId = null) {
         entryFeeUsd: value.entryFeeUsd,
         maxAttempts: value.maxAttempts,
         prizeSplits: value.prizeSplits,
-        prizePotUsd: Number((value.totalEntryFeesUsd || 0).toFixed(2)),
+        prizePotUsd: Number(((value.totalEntryFeesUsd || 0) * 0.95).toFixed(2)),
         totalAttempts: value.totalAttempts || 0,
         participantCount: participants.length,
         leaderboard: participants.slice(0, 10).map((p, index) => ({

@@ -3687,6 +3687,27 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
                 };
             }
         }
+        let tournamentWallet = null;
+        if (TOURNAMENT_WALLET_ADDRESS) {
+            try {
+                const lamports = await connection.getBalance(new solanaWeb3.PublicKey(TOURNAMENT_WALLET_ADDRESS));
+                tournamentWallet = {
+                    label: 'Tournament Wallet',
+                    address: TOURNAMENT_WALLET_ADDRESS,
+                    balanceSol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    balanceUsd: (lamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD,
+                };
+            } catch (err) {
+                console.error('Failed to fetch tournament wallet balance:', err.message);
+                tournamentWallet = {
+                    label: 'Tournament Wallet',
+                    address: TOURNAMENT_WALLET_ADDRESS,
+                    balanceSol: 0,
+                    balanceUsd: 0,
+                    error: err.message,
+                };
+            }
+        }
 
         const roomPools = rooms.map(r => ({
             entryFeeUsd: r.entryFeeUsd,
@@ -3701,6 +3722,7 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
             brWallets,
             ownerVault,
             rewardWallet,
+            tournamentWallet,
             roomPools,
             solPrice: SOL_PRICE_USD,
             devFreePlay: DEV_FREE_PLAY,
@@ -4191,6 +4213,77 @@ app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
         });
     } catch (err) {
         console.error('Admin manual sweep failed:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+async function sweepTournamentWalletToOwner() {
+    if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
+        throw new Error('Tournament wallet or Owner Vault is not configured');
+    }
+    const tournamentPubKey = new solanaWeb3.PublicKey(TOURNAMENT_WALLET_ADDRESS);
+    const ownerPubKey = new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS);
+    
+    const balanceLamports = await connection.getBalance(tournamentPubKey);
+    const rentExempt = await getSystemAccountRentLamports();
+    const feeBuffer = 15000;
+    
+    const sweepLamports = balanceLamports - rentExempt - feeBuffer;
+    if (sweepLamports <= 0) {
+        throw new Error('Insufficient balance in tournament wallet to sweep (must exceed rent exemption + fee)');
+    }
+    
+    const tournamentKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(TOURNAMENT_WALLET_SECRET, 'hex'))
+    );
+    
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    const sweepTx = new solanaWeb3.Transaction({ recentBlockhash: blockhash, feePayer: tournamentPubKey }).add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: tournamentPubKey,
+            toPubkey: ownerPubKey,
+            lamports: sweepLamports,
+        })
+    );
+    
+    const signature = await solanaWeb3.sendAndConfirmTransaction(
+        connection,
+        sweepTx,
+        [tournamentKeypair],
+        { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
+    );
+    
+    const solAmount = sweepLamports / solanaWeb3.LAMPORTS_PER_SOL;
+    const amountUsd = solAmount * SOL_PRICE_USD;
+    await Transaction.create({
+        type: 'withdraw',
+        amount: amountUsd,
+        status: 'confirmed',
+        user: null,
+        meta: {
+            event: 'tournament_owner_sweep',
+            reason: 'Tournament Wallet Sweep',
+            solAmount,
+            signature,
+            verifiedOnChain: true,
+            sourceWallet: TOURNAMENT_WALLET_ADDRESS,
+            destinationWallet: OWNER_VAULT_ADDRESS
+        }
+    });
+    
+    return { signature, solAmount, amountUsd };
+}
+
+app.post('/api/admin/tournaments/trigger-sweep', authenticateAdmin, async (req, res) => {
+    try {
+        const result = await sweepTournamentWalletToOwner();
+        res.json({
+            success: true,
+            message: `Tournament wallet swept successfully. Sent ${result.solAmount.toFixed(6)} SOL ($${result.amountUsd.toFixed(2)}) to owner vault.`,
+            signature: result.signature,
+        });
+    } catch (err) {
+        console.error('Tournament manual sweep failed:', err);
         res.status(500).json({ error: err.message });
     }
 });
