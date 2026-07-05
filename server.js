@@ -1572,8 +1572,47 @@ async function logPersonalAccountDeposit({
     );
 }
 
+// Helper: get balance with automatic fallback to public RPC on rate-limit
+async function getBalanceWithFallback(pubKey) {
+    try {
+        return await connection.getBalance(pubKey);
+    } catch (e) {
+        if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests') || e.message.includes('rate'))) {
+            const fallback = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+            return await fallback.getBalance(pubKey);
+        }
+        throw e;
+    }
+}
+
+// Helper: get signatures with fallback
+async function getSignaturesWithFallback(pubKey, opts) {
+    try {
+        return await connection.getSignaturesForAddress(pubKey, opts);
+    } catch (e) {
+        if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests') || e.message.includes('rate'))) {
+            const fallback = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+            return await fallback.getSignaturesForAddress(pubKey, opts);
+        }
+        throw e;
+    }
+}
+
+// Helper: get transaction details with fallback
+async function getTransactionWithFallback(signature) {
+    try {
+        return await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+    } catch (e) {
+        if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests') || e.message.includes('rate'))) {
+            const fallback = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+            return await fallback.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        }
+        throw e;
+    }
+}
+
 async function captureRecentDepositSources(user, pubKey) {
-    const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 50 });
+    const signatures = await getSignaturesWithFallback(pubKey, { limit: 50 });
     const previousCursor = user.lastDepositSourceSignature;
     const unseen = [];
     for (const info of signatures) {
@@ -1586,7 +1625,7 @@ async function captureRecentDepositSources(user, pubKey) {
     const signaturesToInspect = user.depositHistoryBackfilledAt ? unseen : signatures;
     for (const info of signaturesToInspect.slice().reverse()) {
         if (info.err) continue;
-        const txDetails = await connection.getTransaction(info.signature, { maxSupportedTransactionVersion: 0 });
+        const txDetails = await getTransactionWithFallback(info.signature);
         const deposit = extractNativeDeposit(txDetails, user.depositAddress);
         if (!deposit) continue;
         await logPersonalAccountDeposit({
@@ -1626,7 +1665,7 @@ async function scanDeposits() {
             if (!user.depositAddress) continue;
             try {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                const lamports = await connection.getBalance(pubKey);
+                const lamports = await getBalanceWithFallback(pubKey);
                 const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
                 // Scan by signature cursor even if the funds were already spent between scans.
@@ -1634,6 +1673,7 @@ async function scanDeposits() {
                 if (Math.abs(user.balance - solOnChain) > 0.00001) {
                     user.balance = solOnChain;
                     await user.save();
+                    console.log(`[scanDeposits] Updated ${user.username}: ${solOnChain.toFixed(6)} SOL`);
                 }
             } catch (e) { console.error(`Sync error for ${user.username}:`, e.message); }
         }
