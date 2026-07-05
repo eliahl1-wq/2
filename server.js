@@ -1684,10 +1684,10 @@ async function scanDeposits() {
     }
 }
 
-// Starta scannern var 15:e sekund
+// Starta scannern var 5:e sekund
 setInterval(async () => {
     if (!isScanningDeposits) await scanDeposits();
-}, 15000);
+}, 5000);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -5662,6 +5662,15 @@ io.on('connection', (socket) => {
                     tournamentId: tournament._id.toString(),
                     signature,
                 };
+                // Immediately sync on-chain balance so the UI updates without
+                // waiting for the background scanner to run
+                try {
+                    const newLamports = await getBalanceWithFallback(userPubKey);
+                    user.balance = newLamports / solanaWeb3.LAMPORTS_PER_SOL;
+                    await user.save();
+                } catch (syncErr) {
+                    console.warn('[tournament join] post-payment balance sync failed:', syncErr.message);
+                }
             } else {
                 const feeSol = TOURNAMENT_ENTRY_FEE_USD / SOL_PRICE_USD;
                 user.balance = Math.max(0, user.balance - feeSol);
