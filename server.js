@@ -97,6 +97,17 @@ import {
     resolveRewardSecurityAlert,
 } from './reward-system.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
+import {
+    Tournament,
+    TournamentRewardClaim,
+    TOURNAMENT_DURATION_MS,
+    TOURNAMENT_ENDED_VISIBLE_MS,
+    TOURNAMENT_ENTRY_FEE_USD,
+    TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD,
+    TOURNAMENT_MAX_ATTEMPTS,
+    calculateTournamentPrizes,
+    serializeTournament,
+} from './tournament-system.js';
 
 // --- SOLANA KONFIGURATION ---
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
@@ -104,6 +115,8 @@ const HOUSE_WALLET_SECRET = process.env.HOUSE_WALLET_SECRET;
 const OWNER_VAULT_ADDRESS = process.env.OWNER_VAULT_ADDRESS; // Din personliga plånbok för vinst
 const REWARD_WALLET_ADDRESS = process.env.REWARD_WALLET_ADDRESS;
 const REWARD_WALLET_SECRET = process.env.REWARD_WALLET_SECRET;
+const TOURNAMENT_WALLET_ADDRESS = process.env.TOURNAMENT_WALLET_ADDRESS;
+const TOURNAMENT_WALLET_SECRET = process.env.TOURNAMENT_WALLET_SECRET;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
@@ -178,6 +191,14 @@ if (REWARD_WALLET_ADDRESS && REWARD_WALLET_SECRET) {
     console.warn('⚠️  Reward Wallet incomplete — set BOTH REWARD_WALLET_ADDRESS and REWARD_WALLET_SECRET.');
 } else {
     console.warn('⚠️  Reward Wallet not configured — reward pool contributions tracked in-memory only (no on-chain transfers).');
+}
+
+if (TOURNAMENT_WALLET_ADDRESS && TOURNAMENT_WALLET_SECRET) {
+    console.log('Tournament Wallet configured:', TOURNAMENT_WALLET_ADDRESS);
+} else if (TOURNAMENT_WALLET_ADDRESS || TOURNAMENT_WALLET_SECRET) {
+    console.warn('Tournament Wallet incomplete - set BOTH TOURNAMENT_WALLET_ADDRESS and TOURNAMENT_WALLET_SECRET.');
+} else {
+    console.warn('Tournament Wallet not configured - real-money tournament entries and claims are disabled.');
 }
 
 const allowedOrigins = [
@@ -262,7 +283,15 @@ const UserSchema = new mongoose.Schema({
     rewardClaimInProgress: { type: Boolean, default: false },
     rewardClaimReservedUsd: { type: Number, default: 0 },
     activeRewardClaimId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    tournamentRewardsBalance: { type: Number, default: 0 },
+    tournamentRewardsLamports: { type: Number, default: 0 },
+    tournamentRewardClaimInProgress: { type: Boolean, default: false },
+    tournamentRewardClaimReservedUsd: { type: Number, default: 0 },
+    tournamentRewardClaimReservedLamports: { type: Number, default: 0 },
+    activeTournamentRewardClaimId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    tournamentRewardCreditIds: { type: [String], default: [] },
     lastDepositSourceSignature: { type: String, default: null },
+    depositHistoryBackfilledAt: { type: Date, default: null },
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -438,6 +467,30 @@ const rooms = [
     Object.assign(createArenaRoom(5), { id: 'arena-free-ticket', isFreeTicketRoom: true })
 ];
 
+const tournamentRooms = new Map();
+
+function createTournamentArenaRoom(tournament) {
+    const room = createArenaRoom(TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD);
+    room.id = `tournament-${tournament._id}`;
+    room.isTournament = true;
+    room.tournamentId = tournament._id.toString();
+    room.tournamentName = tournament.name;
+    room.startTime = new Date(tournament.startedAt || tournament.startAt).getTime();
+    room.endTime = new Date(tournament.endAt).getTime();
+    // Score food and bots are intentionally virtual. Tournament entry fees never
+    // fund this gameplay pool; the complete entry pot stays in the tournament wallet.
+    room.foodPoolBalance = 1_000_000;
+    room.aiBudgetBalance = 20;
+    tournamentRooms.set(room.tournamentId, room);
+    return room;
+}
+
+function getTournamentRoom(tournamentOrId) {
+    const id = tournamentOrId?._id?.toString?.() || tournamentOrId?.toString?.();
+    if (!id) return null;
+    return tournamentRooms.get(id) || null;
+}
+
 function createCompetitiveSlitherRoom(entryFeeUsd) {
     return {
         id: `competitive-slither-${entryFeeUsd}`,
@@ -521,6 +574,64 @@ function arenaCashoutUsd(player) {
     }
     return player?.balance ?? 0;
 }
+async function executeTournamentCashout(player, room) {
+    const scoreUsd = Math.max(0, Number(arenaCashoutUsd(player)) || 0);
+    const playerId = player.id;
+    const mongoId = player.mongoId?.toString();
+    const now = new Date();
+    const tournament = await Tournament.findOneAndUpdate(
+        {
+            _id: room.tournamentId,
+            status: 'live',
+            endAt: { $gt: now },
+            participants: { $elemMatch: { userId: player.mongoId } },
+        },
+        {
+            $inc: { 'participants.$.tournamentBalanceUsd': scoreUsd },
+            $set: { 'participants.$.lastCashoutAt': now },
+        },
+        { new: true },
+    );
+    if (!tournament) throw new Error('Tournament has ended; this run could not be cashed out');
+
+    const participant = tournament.participants.find(p => p.userId.toString() === mongoId);
+    room.players = room.players.filter(p => p !== player);
+    if (!room.spectators) room.spectators = [];
+    const head = player.segments?.[0];
+    room.spectators = room.spectators.filter(s => s.id !== playerId);
+    room.spectators.push({ id: playerId, x: head?.x ?? 0, y: head?.y ?? 0 });
+
+    await Promise.all([
+        User.findByIdAndUpdate(player.mongoId, { $inc: { playtime: Date.now() - player.startTime } }),
+        Transaction.create({
+            userId: player.mongoId,
+            type: 'game',
+            amount: scoreUsd,
+            currency: 'USD',
+            meta: {
+                event: 'tournament_cashout',
+                reason: 'Tournament Cashout',
+                tournamentId: tournament._id.toString(),
+                tournamentName: tournament.name,
+                attempt: player.tournamentAttempt,
+                amountUsd: scoreUsd,
+                tournamentBalanceUsd: participant?.tournamentBalanceUsd || scoreUsd,
+            },
+            status: 'confirmed',
+        }),
+    ]);
+
+    io.to(playerId).emit('cashOutSuccess', {
+        amount: scoreUsd,
+        signature: 'tournament_score_saved',
+        tournament: true,
+        tournamentId: tournament._id.toString(),
+        tournamentBalanceUsd: participant?.tournamentBalanceUsd || scoreUsd,
+        attemptsUsed: participant?.entries || 0,
+    });
+    return { scoreUsd, tournamentBalanceUsd: participant?.tournamentBalanceUsd || scoreUsd };
+}
+
 
 function reserveArenaCashout(room, player, requestedUsd) {
     const requested = Math.max(0, Number(requestedUsd) || 0);
@@ -1407,6 +1518,54 @@ function extractNativeDeposit(txDetails, destinationAddress) {
     };
 }
 
+function isPlatformAccountCredit(sourceWallet) {
+    if (!sourceWallet) return false;
+    const platformPayoutWallets = new Set([
+        HOUSE_WALLET_ADDRESS,
+        REWARD_WALLET_ADDRESS,
+        TOURNAMENT_WALLET_ADDRESS,
+        ...listBRHouseWallets().map(wallet => wallet.address),
+    ].filter(Boolean));
+    return platformPayoutWallets.has(sourceWallet);
+}
+
+async function logPersonalAccountDeposit({
+    signature,
+    userId,
+    sourceWallet,
+    destinationWallet,
+    amountLamports,
+}) {
+    if (!signature || !userId || !sourceWallet || !destinationWallet || !(amountLamports > 0)) return null;
+    // Platform payouts have their own game/reward transaction rows. Logging them
+    // again as deposits would make account history misleading.
+    if (isPlatformAccountCredit(sourceWallet)) return null;
+
+    const solAmount = amountLamports / solanaWeb3.LAMPORTS_PER_SOL;
+    return Transaction.findOneAndUpdate(
+        { userId, type: 'deposit', 'meta.signature': signature },
+        {
+            $setOnInsert: {
+                userId,
+                type: 'deposit',
+                amount: solAmount,
+                currency: 'SOL',
+                meta: {
+                    event: 'account_deposit',
+                    signature,
+                    solAmount,
+                    amountUsd: solAmount * SOL_PRICE_USD,
+                    detectedOnChain: true,
+                    sourceWallet,
+                    destinationWallet,
+                },
+                status: 'confirmed',
+            },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+    );
+}
+
 async function captureRecentDepositSources(user, pubKey) {
     const signatures = await connection.getSignaturesForAddress(pubKey, { limit: 50 });
     const previousCursor = user.lastDepositSourceSignature;
@@ -1416,11 +1575,21 @@ async function captureRecentDepositSources(user, pubKey) {
         unseen.push(info);
     }
 
-    for (const info of unseen.slice().reverse()) {
+    // Existing accounts get one bounded backfill so manual/address-copy deposits
+    // made before this fix also appear in history.
+    const signaturesToInspect = user.depositHistoryBackfilledAt ? unseen : signatures;
+    for (const info of signaturesToInspect.slice().reverse()) {
         if (info.err) continue;
         const txDetails = await connection.getTransaction(info.signature, { maxSupportedTransactionVersion: 0 });
         const deposit = extractNativeDeposit(txDetails, user.depositAddress);
         if (!deposit) continue;
+        await logPersonalAccountDeposit({
+            signature: info.signature,
+            userId: user._id,
+            sourceWallet: deposit.sourceWallet,
+            destinationWallet: user.depositAddress,
+            amountLamports: deposit.creditedLamports,
+        });
         await recordDepositSource({
             signature: info.signature,
             userId: user._id,
@@ -1431,10 +1600,13 @@ async function captureRecentDepositSources(user, pubKey) {
     }
 
     const newestSignature = signatures[0]?.signature;
-    if (newestSignature && newestSignature !== previousCursor) {
-        user.lastDepositSourceSignature = newestSignature;
-        await User.updateOne({ _id: user._id }, { $set: { lastDepositSourceSignature: newestSignature } });
+    const scanState = {
+        depositHistoryBackfilledAt: user.depositHistoryBackfilledAt || new Date(),
+    };
+    if (newestSignature) {
+        scanState.lastDepositSourceSignature = newestSignature;
     }
+    await User.updateOne({ _id: user._id }, { $set: scanState });
 }
 // --- NYTT: AUTOMATISK INSÄTTNINGS-SCANNER ---
 async function scanDeposits() {
@@ -1705,6 +1877,236 @@ const authenticateAdmin = (req, res, next) => {
         } catch (err) { res.sendStatus(500); }
     });
 };
+function optionalAuthenticatedUserId(req) {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return null;
+    try {
+        return jwt.verify(token, JWT_SECRET)?.id || null;
+    } catch {
+        return null;
+    }
+}
+
+async function activateTournament(tournamentId, { forceNow = false } = {}) {
+    const now = new Date();
+    const update = {
+        $set: {
+            status: 'live',
+            startedAt: now,
+            roomId: `tournament-${tournamentId}`,
+            ...(forceNow ? {
+                startAt: now,
+                endAt: new Date(now.getTime() + TOURNAMENT_DURATION_MS),
+            } : {}),
+        },
+    };
+    const tournament = await Tournament.findOneAndUpdate(
+        { _id: tournamentId, status: 'scheduled' },
+        update,
+        { new: true },
+    );
+    if (!tournament) return Tournament.findById(tournamentId);
+    createTournamentArenaRoom(tournament);
+    console.log(`[Tournament] ${tournament.name} is live until ${tournament.endAt.toISOString()}`);
+    return tournament;
+}
+
+async function settleTournament(tournamentId) {
+    let tournament = await Tournament.findOneAndUpdate(
+        { _id: tournamentId, status: 'live' },
+        { $set: { status: 'settling' } },
+        { new: true },
+    );
+    if (!tournament) tournament = await Tournament.findOne({ _id: tournamentId, status: 'settling' });
+    if (!tournament) return null;
+
+    const room = getTournamentRoom(tournament._id);
+    if (room) {
+        for (const player of room.players) {
+            if (!player.isBot && player.id) {
+                io.to(player.id).emit('tournamentEnded', {
+                    tournamentId: tournament._id.toString(),
+                    name: tournament.name,
+                });
+            }
+        }
+        room.players = [];
+        room.bots = [];
+        room.slitherBots = [];
+        room.slitherFood = [];
+        room.spectators = [];
+        room.isResetting = true;
+        tournamentRooms.delete(tournament._id.toString());
+    }
+
+    const ranked = [...tournament.participants].sort((a, b) => {
+        const diff = (b.tournamentBalanceUsd || 0) - (a.tournamentBalanceUsd || 0);
+        if (Math.abs(diff) > 1e-9) return diff;
+        const aTime = a.lastCashoutAt ? a.lastCashoutAt.getTime() : Number.MAX_SAFE_INTEGER;
+        const bTime = b.lastCashoutAt ? b.lastCashoutAt.getTime() : Number.MAX_SAFE_INTEGER;
+        if (aTime !== bTime) return aTime - bTime;
+        return a.username.localeCompare(b.username);
+    });
+    const prizes = calculateTournamentPrizes(
+        ranked,
+        tournament.totalEntryFeesUsd,
+        tournament.totalCollectedLamports,
+    );
+    const prizesByUser = new Map(prizes.map(prize => [prize.userId.toString(), prize]));
+
+    for (let index = 0; index < ranked.length; index++) {
+        const participant = ranked[index];
+        const prize = prizesByUser.get(participant.userId.toString());
+        participant.placement = index + 1;
+        participant.winningsUsd = prize?.winningsUsd || 0;
+        participant.winningsLamports = prize?.winningsLamports || 0;
+
+        if (!prize || prize.winningsLamports <= 0) continue;
+        const creditId = `tournament:${tournament._id}:${participant.userId}`;
+        await User.updateOne(
+            { _id: participant.userId, tournamentRewardCreditIds: { $ne: creditId } },
+            {
+                $inc: {
+                    tournamentRewardsBalance: prize.winningsUsd,
+                    tournamentRewardsLamports: prize.winningsLamports,
+                },
+                $addToSet: { tournamentRewardCreditIds: creditId },
+            },
+        );
+        participant.rewardCredited = true;
+
+        await Transaction.findOneAndUpdate(
+            { 'meta.event': 'tournament_reward', 'meta.creditId': creditId },
+            {
+                $setOnInsert: {
+                    userId: participant.userId,
+                    type: 'game',
+                    amount: prize.winningsUsd,
+                    currency: 'USD',
+                    meta: {
+                        event: 'tournament_reward',
+                        reason: 'Tournament Prize',
+                        tournamentId: tournament._id.toString(),
+                        tournamentName: tournament.name,
+                        placement: prize.placement,
+                        amountUsd: prize.winningsUsd,
+                        lamports: prize.winningsLamports,
+                        creditId,
+                    },
+                    status: 'confirmed',
+                },
+            },
+            { upsert: true, new: true },
+        );
+    }
+
+    tournament.participants = ranked;
+    tournament.status = 'ended';
+    tournament.endedAt = new Date();
+    tournament.displayUntil = new Date(Date.now() + TOURNAMENT_ENDED_VISIBLE_MS);
+    await tournament.save();
+    console.log(`[Tournament] ${tournament.name} settled with $${tournament.totalEntryFeesUsd.toFixed(2)} prize pot.`);
+    return tournament;
+}
+
+async function advanceTournamentLifecycle() {
+    if (mongoose.connection.readyState !== 1) return;
+    const now = new Date();
+    const scheduled = await Tournament.find({ status: 'scheduled', startAt: { $lte: now } }).select('_id').limit(20);
+    for (const tournament of scheduled) await activateTournament(tournament._id);
+
+    const ended = await Tournament.find({ status: 'live', endAt: { $lte: now } }).select('_id').limit(20);
+    for (const tournament of ended) await settleTournament(tournament._id);
+
+    const interrupted = await Tournament.find({ status: 'settling' }).select('_id').limit(20);
+    for (const tournament of interrupted) await settleTournament(tournament._id);
+}
+
+setInterval(() => {
+    advanceTournamentLifecycle().catch(err => console.error('Tournament lifecycle error:', err));
+}, 5_000);
+
+app.get('/api/tournaments', async (req, res) => {
+    try {
+        await advanceTournamentLifecycle();
+        const userId = optionalAuthenticatedUserId(req);
+        const now = new Date();
+        const tournaments = await Tournament.find({
+            $or: [
+                { status: { $in: ['scheduled', 'live'] } },
+                { status: 'ended', displayUntil: { $gt: now } },
+            ],
+        }).sort({ status: 1, startAt: 1 }).lean();
+        res.json({ tournaments: tournaments.map(t => serializeTournament(t, userId)), serverTime: now });
+    } catch (err) {
+        console.error('Tournament list error:', err);
+        res.status(500).json({ error: 'Unable to load tournaments' });
+    }
+});
+
+app.get('/api/tournaments/:tournamentId', async (req, res) => {
+    try {
+        await advanceTournamentLifecycle();
+        const tournament = await Tournament.findById(req.params.tournamentId).lean();
+        if (!tournament) return res.status(404).json({ error: 'Tournament not found' });
+        res.json({ tournament: serializeTournament(tournament, optionalAuthenticatedUserId(req)), serverTime: new Date() });
+    } catch (err) {
+        if (err.name === 'CastError') return res.status(404).json({ error: 'Tournament not found' });
+        res.status(500).json({ error: 'Unable to load tournament' });
+    }
+});
+
+app.get('/api/admin/tournaments', authenticateAdmin, async (req, res) => {
+    await advanceTournamentLifecycle();
+    const tournaments = await Tournament.find().sort({ startAt: -1 }).limit(100).lean();
+    res.json({ tournaments: tournaments.map(t => serializeTournament(t)) });
+});
+
+app.post('/api/admin/tournaments', authenticateAdmin, async (req, res) => {
+    try {
+        const name = String(req.body?.name || '').trim();
+        const startAt = new Date(req.body?.startAt);
+        if (name.length < 3 || name.length > 60) return res.status(400).json({ error: 'Name must be 3-60 characters' });
+        if (Number.isNaN(startAt.getTime())) return res.status(400).json({ error: 'Choose a valid start time' });
+        if (startAt.getTime() < Date.now() - 5_000) return res.status(400).json({ error: 'Start time must be in the future' });
+
+        const tournament = await Tournament.create({
+            name,
+            startAt,
+            endAt: new Date(startAt.getTime() + TOURNAMENT_DURATION_MS),
+            createdBy: req.user.id,
+        });
+        res.status(201).json({ tournament: serializeTournament(tournament, req.user.id) });
+    } catch (err) {
+        res.status(500).json({ error: err.message || 'Unable to schedule tournament' });
+    }
+});
+
+app.post('/api/admin/tournaments/:tournamentId/start', authenticateAdmin, async (req, res) => {
+    try {
+        const tournament = await activateTournament(req.params.tournamentId, { forceNow: true });
+        if (!tournament || tournament.status !== 'live') return res.status(409).json({ error: 'Only scheduled tournaments can be started' });
+        res.json({ tournament: serializeTournament(tournament) });
+    } catch (err) {
+        res.status(500).json({ error: err.message || 'Unable to start tournament' });
+    }
+});
+
+app.post('/api/admin/tournaments/:tournamentId/cancel', authenticateAdmin, async (req, res) => {
+    try {
+        const tournament = await Tournament.findOneAndUpdate(
+            { _id: req.params.tournamentId, status: 'scheduled' },
+            { $set: { status: 'cancelled' } },
+            { new: true },
+        );
+        if (!tournament) return res.status(409).json({ error: 'Only scheduled tournaments can be cancelled' });
+        res.json({ tournament: serializeTournament(tournament) });
+    } catch (err) {
+        res.status(500).json({ error: err.message || 'Unable to cancel tournament' });
+    }
+});
+
 
 // Public config (no auth) — frontend uses this for test-mode UI
 app.get('/api/config', (req, res) => {
@@ -2081,6 +2483,160 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             });
         }
         return res.status(500).json({ error: err.message || 'Internal server error' });
+    }
+});
+async function releaseTournamentRewardClaim(claim, error) {
+    if (!claim) return;
+    await TournamentRewardClaim.updateOne(
+        { _id: claim._id, status: { $in: ['reserving', 'reserved'] } },
+        { $set: { status: 'failed', error: String(error || 'Claim failed') } },
+    );
+    await User.updateOne(
+        { _id: claim.userId, activeTournamentRewardClaimId: claim._id },
+        {
+            $inc: {
+                tournamentRewardsBalance: claim.amountUsd,
+                tournamentRewardsLamports: claim.lamports,
+            },
+            $set: {
+                tournamentRewardClaimInProgress: false,
+                tournamentRewardClaimReservedUsd: 0,
+                tournamentRewardClaimReservedLamports: 0,
+                activeTournamentRewardClaimId: null,
+            },
+        },
+    );
+}
+
+async function completeTournamentRewardClaim(claim, signature) {
+    await TournamentRewardClaim.updateOne(
+        { _id: claim._id },
+        { $set: { status: 'confirmed', signature, solAmount: claim.lamports / solanaWeb3.LAMPORTS_PER_SOL } },
+    );
+    await User.updateOne(
+        { _id: claim.userId, activeTournamentRewardClaimId: claim._id },
+        {
+            $set: {
+                tournamentRewardClaimInProgress: false,
+                tournamentRewardClaimReservedUsd: 0,
+                tournamentRewardClaimReservedLamports: 0,
+                activeTournamentRewardClaimId: null,
+            },
+        },
+    );
+    await Transaction.findOneAndUpdate(
+        { 'meta.event': 'tournament_reward_claim', 'meta.claimId': claim._id.toString() },
+        {
+            $setOnInsert: {
+                userId: claim.userId,
+                type: 'game',
+                amount: claim.lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                currency: 'SOL',
+                meta: {
+                    event: 'tournament_reward_claim',
+                    amountUsd: claim.amountUsd,
+                    lamports: claim.lamports,
+                    signature,
+                    claimId: claim._id.toString(),
+                    ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                },
+                status: 'confirmed',
+            },
+        },
+        { upsert: true, new: true },
+    );
+}
+
+app.get('/api/user/tournament-reward-claim-status', authenticateToken, async (req, res) => {
+    const claim = await TournamentRewardClaim.findOne({ userId: req.user.id }).sort({ createdAt: -1 }).lean();
+    res.json({ claim: claim ? {
+        id: claim._id,
+        status: claim.status,
+        amountUsd: claim.amountUsd,
+        signature: claim.signature,
+        error: claim.error,
+        createdAt: claim.createdAt,
+    } : null });
+});
+
+app.post('/api/user/claim-tournament-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+    let claim = null;
+    let broadcastSignature = null;
+    try {
+        const snapshot = await User.findOne({
+            _id: req.user.id,
+            tournamentRewardsBalance: { $gt: 0 },
+            tournamentRewardsLamports: { $gt: 0 },
+            tournamentRewardClaimInProgress: { $ne: true },
+        }).lean();
+        if (!snapshot) {
+            const current = await User.findById(req.user.id).lean();
+            if (current?.tournamentRewardClaimInProgress) return res.status(409).json({ error: 'A tournament reward claim is already processing' });
+            return res.status(400).json({ error: 'No tournament winnings available to claim' });
+        }
+
+        const amountUsd = Number(snapshot.tournamentRewardsBalance);
+        const lamports = Math.floor(Number(snapshot.tournamentRewardsLamports));
+        claim = await TournamentRewardClaim.create({ userId: snapshot._id, amountUsd, lamports });
+        const reserved = await User.findOneAndUpdate(
+            {
+                _id: snapshot._id,
+                tournamentRewardsBalance: amountUsd,
+                tournamentRewardsLamports: lamports,
+                tournamentRewardClaimInProgress: { $ne: true },
+            },
+            {
+                $set: {
+                    tournamentRewardsBalance: 0,
+                    tournamentRewardsLamports: 0,
+                    tournamentRewardClaimInProgress: true,
+                    tournamentRewardClaimReservedUsd: amountUsd,
+                    tournamentRewardClaimReservedLamports: lamports,
+                    activeTournamentRewardClaimId: claim._id,
+                },
+            },
+            { new: true },
+        );
+        if (!reserved) {
+            await TournamentRewardClaim.updateOne({ _id: claim._id }, { $set: { status: 'failed', error: 'Reward balance changed before reservation' } });
+            return res.status(409).json({ error: 'Reward balance changed. Please try again.' });
+        }
+        await TournamentRewardClaim.updateOne({ _id: claim._id }, { $set: { status: 'reserved' } });
+
+        if (DEV_FREE_PLAY) {
+            await completeTournamentRewardClaim(claim, 'simulated_tournament_claim');
+            return res.json({ success: true, amount: amountUsd, signature: 'simulated_tournament_claim' });
+        }
+        if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET) throw new Error('Tournament wallet not configured');
+        const tournamentKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(TOURNAMENT_WALLET_SECRET, 'hex')),
+        );
+        if (tournamentKeypair.publicKey.toBase58() !== TOURNAMENT_WALLET_ADDRESS) {
+            throw new Error('Tournament wallet address does not match configured secret');
+        }
+        const user = await User.findById(req.user.id).lean();
+        const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+        const walletLamports = await connection.getBalance(tournamentKeypair.publicKey);
+        if (walletLamports < lamports + 15_000) throw new Error('Tournament wallet lacks claim liquidity');
+
+        const transaction = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: tournamentKeypair.publicKey,
+                toPubkey: userPubKey,
+                lamports,
+            }),
+        );
+        broadcastSignature = await connection.sendTransaction(transaction, [tournamentKeypair], { maxRetries: 3 });
+        await TournamentRewardClaim.updateOne({ _id: claim._id }, { $set: { status: 'broadcast', signature: broadcastSignature } });
+        const confirmation = await connection.confirmTransaction(broadcastSignature, 'confirmed');
+        if (confirmation.value.err) throw new Error(`On-chain tournament claim failed: ${JSON.stringify(confirmation.value.err)}`);
+        await completeTournamentRewardClaim(claim, broadcastSignature);
+        return res.json({ success: true, amount: amountUsd, signature: broadcastSignature });
+    } catch (err) {
+        await logSolanaTransactionError('Tournament reward claim error:', err);
+        if (claim && !broadcastSignature) await releaseTournamentRewardClaim(claim, err.message).catch(() => {});
+        if (broadcastSignature) return res.status(202).json({ processing: true, signature: broadcastSignature });
+        return res.status(500).json({ error: err.message || 'Tournament claim failed' });
     }
 });
 // --- NYTT: Endpoint för att verifiera insättning och spara i historik ---
@@ -4320,13 +4876,6 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
         let query = { userId: req.user.id };
 
         if (filter === 'external') {
-            const brAddresses = listBRHouseWallets().map(w => w.address);
-            const houseWallets = [
-                HOUSE_WALLET_ADDRESS,
-                OWNER_VAULT_ADDRESS,
-                ...brAddresses
-            ].filter(Boolean).map(a => a.trim());
-
             query.$or = [
                 {
                     type: 'deposit',
@@ -4335,9 +4884,13 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
                 },
                 {
                     type: 'withdraw',
-                    'meta.destination': { $exists: true, $nin: houseWallets },
+                    'meta.destination': { $exists: true },
                     'meta.reason': { $not: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory|BR Refund/i },
                     'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] }
+                },
+                {
+                    type: 'game',
+                    'meta.event': { $in: ['sponsored_rewards_claim', 'tournament_reward_claim'] }
                 }
             ];
         }
@@ -4468,6 +5021,11 @@ function addViruses(room, n) {
 }
 
 function getModeFoodBudgets(room, agarActive, slitherActive) {
+    if (room.isTournament) {
+        // Match the amount of score-food a normal $10 join creates, without
+        // treating any pellet or bot balance as a real wallet liability.
+        return { agar: 0, slither: Math.max(0, slitherActive * 9) };
+    }
     const total = agarActive + slitherActive;
     if (total <= 0) {
         return { agar: room.foodPoolBalance, slither: room.foodPoolBalance };
@@ -4508,6 +5066,10 @@ function findPlayerInArena(mongoId) {
         if (player) return { room, player };
     }
     for (const room of survivRooms) {
+        const player = room.players.find(p => p.mongoId?.toString() === key);
+        if (player) return { room, player };
+    }
+    for (const room of tournamentRooms.values()) {
         const player = room.players.find(p => p.mongoId?.toString() === key);
         if (player) return { room, player };
     }
@@ -4807,9 +5369,230 @@ async function refundPaidJoin(pending, reason) {
         }).catch(() => {});
     }
 }
+async function refundTournamentJoin(pending, reason) {
+    if (!pending || DEV_FREE_PLAY || !TOURNAMENT_WALLET_SECRET) return;
+    try {
+        const tournamentKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(TOURNAMENT_WALLET_SECRET, 'hex')),
+        );
+        const refundTx = new solanaWeb3.Transaction().add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: tournamentKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(pending.destination),
+                lamports: pending.lamports,
+            }),
+        );
+        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, refundTx, [tournamentKeypair]);
+        await Transaction.create({
+            userId: pending.userId,
+            type: 'withdraw',
+            amount: pending.lamports / solanaWeb3.LAMPORTS_PER_SOL,
+            currency: 'SOL',
+            meta: { event: 'tournament_entry_refund', reason, tournamentId: pending.tournamentId, signature },
+            status: 'confirmed',
+        });
+    } catch (err) {
+        console.error('CRITICAL: tournament entry refund failed:', err.message, pending);
+    }
+}
+
 io.on('connection', (socket) => {
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
+
+    socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
+        let userKey = null;
+        let paidJoin = null;
+        let entryRecorded = false;
+        try {
+            const decoded = jwt.verify(token, JWT_SECRET);
+            let user = await User.findById(decoded.id);
+            if (!user) throw new Error('User not found');
+            user = await ensureUserDepositWallet(user);
+            userKey = `tournament:${tournamentId}:${user._id}`;
+            if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
+            joiningUsers.add(userKey);
+
+            let tournament = await Tournament.findById(tournamentId);
+            const now = Date.now();
+            if (!tournament || tournament.status !== 'live' || new Date(tournament.endAt).getTime() <= now) {
+                throw new Error('This tournament is not live');
+            }
+            let room = getTournamentRoom(tournament._id);
+            if (!room) room = createTournamentArenaRoom(tournament);
+
+            const existingPlayer = room.players.find(p => p.mongoId?.toString() === user._id.toString());
+            if (existingPlayer) {
+                existingPlayer.id = socket.id;
+                existingPlayer.disconnected = false;
+                if (existingPlayer.removeTimeout) {
+                    clearTimeout(existingPlayer.removeTimeout);
+                    delete existingPlayer.removeTimeout;
+                }
+                socket.roomId = room.id;
+                const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
+                socket.emit('welcome', existingPlayer, {
+                    width: SLITHER.worldHalf * 2,
+                    height: SLITHER.worldHalf * 2,
+                    mode: 'slither',
+                    rejoin: true,
+                    entryFeeUsd: TOURNAMENT_ENTRY_FEE_USD,
+                    solPrice: SOL_PRICE_USD,
+                    tournament: true,
+                    tournamentId: tournament._id.toString(),
+                    tournamentName: tournament.name,
+                    tournamentBalanceUsd: participant?.tournamentBalanceUsd || 0,
+                    attemptsUsed: participant?.entries || 0,
+                    maxAttempts: TOURNAMENT_MAX_ATTEMPTS,
+                    tournamentEndAt: tournament.endAt,
+                });
+                return;
+            }
+
+            const activeGame = findPlayerInArena(user._id);
+            if (activeGame) throw new Error('Finish or leave your active game before entering the tournament');
+            const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
+            if ((participant?.entries || 0) >= TOURNAMENT_MAX_ATTEMPTS) {
+                throw new Error('You have used all 5 tournament attempts');
+            }
+
+            const feeLamports = Math.round((TOURNAMENT_ENTRY_FEE_USD / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+            if (!DEV_FREE_PLAY) {
+                if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET) throw new Error('Tournament wallet not configured');
+                const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                const currentLamports = await connection.getBalance(userPubKey);
+                const requiredLamports = feeLamports + 15_000 + await getSystemAccountRentLamports();
+                if (currentLamports < requiredLamports) {
+                    throw new Error('Insufficient SOL for the $1 tournament entry plus the Solana account reserve');
+                }
+                const userKeypair = solanaWeb3.Keypair.fromSecretKey(
+                    Uint8Array.from(Buffer.from(user.depositSecret, 'hex')),
+                );
+                const tournamentPubKey = new solanaWeb3.PublicKey(TOURNAMENT_WALLET_ADDRESS);
+                const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                const joinTx = new solanaWeb3.Transaction({ recentBlockhash: blockhash, feePayer: userPubKey }).add(
+                    solanaWeb3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000_000 }),
+                    solanaWeb3.SystemProgram.transfer({
+                        fromPubkey: userPubKey,
+                        toPubkey: tournamentPubKey,
+                        lamports: feeLamports,
+                    }),
+                );
+                const signature = await solanaWeb3.sendAndConfirmTransaction(
+                    connection,
+                    joinTx,
+                    [userKeypair],
+                    { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight },
+                );
+                paidJoin = {
+                    userId: user._id,
+                    destination: user.depositAddress,
+                    lamports: feeLamports,
+                    tournamentId: tournament._id.toString(),
+                    signature,
+                };
+            }
+
+            const commonUpdate = {
+                $inc: {
+                    totalEntryFeesUsd: TOURNAMENT_ENTRY_FEE_USD,
+                    totalCollectedLamports: feeLamports,
+                    totalAttempts: 1,
+                },
+            };
+            tournament = await Tournament.findOneAndUpdate(
+                {
+                    _id: tournament._id,
+                    status: 'live',
+                    endAt: { $gt: new Date() },
+                    participants: { $elemMatch: { userId: user._id, entries: { $lt: TOURNAMENT_MAX_ATTEMPTS } } },
+                },
+                { ...commonUpdate, $inc: { ...commonUpdate.$inc, 'participants.$.entries': 1 } },
+                { new: true },
+            );
+            if (!tournament) {
+                tournament = await Tournament.findOneAndUpdate(
+                    {
+                        _id: tournamentId,
+                        status: 'live',
+                        endAt: { $gt: new Date() },
+                        'participants.userId': { $ne: user._id },
+                    },
+                    {
+                        ...commonUpdate,
+                        $push: { participants: { userId: user._id, username: user.username, entries: 1 } },
+                    },
+                    { new: true },
+                );
+            }
+            if (!tournament) {
+                await refundTournamentJoin(paidJoin, 'tournament_entry_rejected');
+                paidJoin = null;
+                throw new Error('Tournament entry closed or all 5 attempts have been used');
+            }
+            entryRecorded = true;
+
+            const economy = getEconomy(TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD);
+            const player = createSlitherPlayer(
+                socket.id,
+                user._id,
+                username || user.username,
+                typeof skinColor === 'string' ? skinColor : util.randomSlitherColor(),
+                room,
+                economy.massStartBalance,
+                economy.playerStartBalance,
+            );
+            player.isTournament = true;
+            player.tournamentId = tournament._id.toString();
+            player.tournamentEntryFeeUsd = TOURNAMENT_ENTRY_FEE_USD;
+            player.tournamentAttempt = tournament.participants.find(p => p.userId.toString() === user._id.toString())?.entries || 1;
+            room.players.push(player);
+            socket.roomId = room.id;
+
+            await Transaction.create({
+                userId: user._id,
+                type: 'game',
+                amount: feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                currency: 'SOL',
+                meta: {
+                    event: 'tournament_entry',
+                    reason: 'Tournament Entry',
+                    tournamentId: tournament._id.toString(),
+                    tournamentName: tournament.name,
+                    entryFeeUsd: TOURNAMENT_ENTRY_FEE_USD,
+                    lamports: feeLamports,
+                    attempt: player.tournamentAttempt,
+                    signature: paidJoin?.signature || 'simulated_tournament_entry',
+                    ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                },
+                status: 'confirmed',
+            });
+            paidJoin = null;
+
+            const latestParticipant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
+            socket.emit('welcome', player, {
+                width: SLITHER.worldHalf * 2,
+                height: SLITHER.worldHalf * 2,
+                mode: 'slither',
+                rejoin: false,
+                entryFeeUsd: TOURNAMENT_ENTRY_FEE_USD,
+                solPrice: SOL_PRICE_USD,
+                tournament: true,
+                tournamentId: tournament._id.toString(),
+                tournamentName: tournament.name,
+                tournamentBalanceUsd: latestParticipant?.tournamentBalanceUsd || 0,
+                attemptsUsed: latestParticipant?.entries || 1,
+                maxAttempts: TOURNAMENT_MAX_ATTEMPTS,
+                tournamentEndAt: tournament.endAt,
+            });
+        } catch (err) {
+            if (paidJoin) await refundTournamentJoin(paidJoin, err.message || 'tournament_join_failed');
+            if (entryRecorded) console.error('Tournament entry was recorded before a later join failure:', err);
+            socket.emit('error', err.message || 'Unable to join tournament');
+        } finally {
+            if (userKey) joiningUsers.delete(userKey);
+        }
+    });
 
     socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, useFreeTicket }) => {
         if (rewardPoolAdminResetting) {
@@ -5959,6 +6742,7 @@ io.on('connection', (socket) => {
         const roomId = socket.roomId;
         const isCompetitive = p.mode === 'competitive-slither';
         const isSurviv = p.mode === 'surviv';
+        const isTournament = room.isTournament === true || p.isTournament === true;
 
         // Meddela klienten att timern har börjat
         socket.emit('cashOutStarting', { seconds: duration / 1000 });
@@ -5975,6 +6759,18 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            if (isTournament || activeRoom?.isTournament || activePlayer.isTournament) {
+                try {
+                    await executeTournamentCashout(activePlayer, activeRoom);
+                } catch (err) {
+                    console.error('Tournament cashout error:', err);
+                    io.to(activePlayer.id).emit('error', err.message || 'Tournament cashout failed');
+                    activePlayer.isCashingOut = false;
+                } finally {
+                    releaseCashoutLock(playerMongoId);
+                }
+                return;
+            }
             if (isSurviv || activePlayer.mode === 'surviv') {
                 try {
                     await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
@@ -6131,6 +6927,8 @@ io.on('connection', (socket) => {
 });
 
 function getArenaRoomById(roomId) {
+    const tournamentRoom = [...tournamentRooms.values()].find(room => room.id === roomId);
+    if (tournamentRoom) return tournamentRoom;
     const survivRoom = findSurvivRoomById(roomId);
     if (survivRoom) return survivRoom;
     const compRoom = findCompetitiveSlitherRoomById(roomId);
@@ -6256,6 +7054,13 @@ setInterval(() => {
                 processRoom(room);
             } catch (err) {
                 logGameLoopError(`room ${room?.id || 'unknown'}`, err);
+            }
+        });
+        tournamentRooms.forEach(room => {
+            try {
+                processRoom(room);
+            } catch (err) {
+                logGameLoopError(`tournament room ${room?.id || 'unknown'}`, err);
             }
         });
 

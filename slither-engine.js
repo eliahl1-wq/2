@@ -1485,11 +1485,14 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
                 type: 'game',
                 amount: lostDollars,
                 meta: {
-                    reason: snake.isBattleRoyale ? 'BR Eliminated' : 'Arena Death',
+                    reason: snake.isBattleRoyale
+                        ? 'BR Eliminated'
+                        : snake.isTournament ? 'Tournament Death' : 'Arena Death',
                     event: 'death',
                     mode: 'slither',
-                    entryFeeUsd: snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                    entryFeeUsd: snake.isTournament ? 1 : (snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE),
                     isFreeTicketPlay: !!snake.isFreeTicketPlay,
+                    ...(snake.isTournament ? { tournamentId: snake.tournamentId, attempt: snake.tournamentAttempt } : {}),
                 },
                 status: 'confirmed',
             }).catch(err => console.error('Error logging slither death:', err));
