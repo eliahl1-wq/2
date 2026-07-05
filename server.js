@@ -1794,7 +1794,27 @@ app.get('/api/me', authenticateToken, async (req, res) => {
                     user.balance = solOnChain;
                     await user.save();
                 }
-            } catch (e) { console.error("Sync error in /api/me:", e.message); }
+            } catch (e) {
+                // If Helius is rate-limiting, fall back to the public Solana RPC
+                if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests'))) {
+                    try {
+                        const fallbackConn = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+                        const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
+                        const lamports = await fallbackConn.getBalance(pubKey);
+                        solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+                        if (Math.abs(user.balance - solOnChain) > 0.00001) {
+                            user.balance = solOnChain;
+                            await user.save();
+                        }
+                    } catch (fallbackErr) {
+                        console.error('Sync error in /api/me (fallback):', fallbackErr.message);
+                        solOnChain = user.balance || 0;
+                    }
+                } else {
+                    console.error('Sync error in /api/me:', e.message);
+                    solOnChain = user.balance || 0;
+                }
+            }
         } else if (DEV_FREE_PLAY) {
             solOnChain = user.balance || 0;
         }
@@ -5561,7 +5581,17 @@ io.on('connection', (socket) => {
             if (!DEV_FREE_PLAY) {
                 if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET) throw new Error('Tournament wallet not configured');
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                const currentLamports = await connection.getBalance(userPubKey);
+                let currentLamports;
+                try {
+                    currentLamports = await connection.getBalance(userPubKey);
+                } catch (rpcErr) {
+                    if (rpcErr.message && (rpcErr.message.includes('429') || rpcErr.message.includes('Too Many Requests'))) {
+                        const fallbackConn = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+                        currentLamports = await fallbackConn.getBalance(userPubKey);
+                    } else {
+                        throw rpcErr;
+                    }
+                }
                 const requiredLamports = feeLamports + 15_000 + await getSystemAccountRentLamports();
                 if (currentLamports < requiredLamports) {
                     throw new Error('Insufficient SOL for the $1 tournament entry plus the Solana account reserve');
