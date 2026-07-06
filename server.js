@@ -5614,7 +5614,7 @@ io.on('connection', (socket) => {
             if (activeGame) throw new Error('Finish or leave your active game before entering the tournament');
             const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
             if ((participant?.entries || 0) >= TOURNAMENT_MAX_ATTEMPTS) {
-                throw new Error('You have used all 5 tournament attempts');
+                throw new Error(`You have used all ${TOURNAMENT_MAX_ATTEMPTS} tournament attempts`);
             }
 
             const feeLamports = Math.round((TOURNAMENT_ENTRY_FEE_USD / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
@@ -5712,7 +5712,7 @@ io.on('connection', (socket) => {
             if (!tournament) {
                 await refundTournamentJoin(paidJoin, 'tournament_entry_rejected');
                 paidJoin = null;
-                throw new Error('Tournament entry closed or all 5 attempts have been used');
+                throw new Error(`Tournament entry closed or all ${TOURNAMENT_MAX_ATTEMPTS} attempts have been used`);
             }
             entryRecorded = true;
 

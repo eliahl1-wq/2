@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 export const TOURNAMENT_ENTRY_FEE_USD = 1;
 export const TOURNAMENT_DURATION_MS = 30 * 60 * 1000;
 export const TOURNAMENT_ENDED_VISIBLE_MS = 10 * 60 * 1000;
-export const TOURNAMENT_MAX_ATTEMPTS = 5;
+export const TOURNAMENT_MAX_ATTEMPTS = 3;
 export const TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD = 10;
 export const TOURNAMENT_PRIZE_SPLITS = [0.60, 0.30, 0.10];
 
@@ -127,6 +127,11 @@ export function serializeTournament(doc, userId = null) {
         ? participants.find(p => p.userId?.toString() === key)
         : null;
 
+    const maxAttempts = Math.min(
+        Number(value.maxAttempts) || TOURNAMENT_MAX_ATTEMPTS,
+        TOURNAMENT_MAX_ATTEMPTS,
+    );
+
     return {
         id: value._id?.toString(),
         name: value.name,
@@ -139,7 +144,7 @@ export function serializeTournament(doc, userId = null) {
         displayUntil: value.displayUntil,
         durationMinutes: value.durationMinutes,
         entryFeeUsd: value.entryFeeUsd,
-        maxAttempts: value.maxAttempts,
+        maxAttempts,
         prizeSplits: value.prizeSplits,
         prizePotUsd: Number(((value.totalEntryFeesUsd || 0) * 0.95).toFixed(2)),
         totalAttempts: value.totalAttempts || 0,
@@ -153,14 +158,14 @@ export function serializeTournament(doc, userId = null) {
         })),
         me: me ? {
             entries: me.entries || 0,
-            attemptsRemaining: Math.max(0, (value.maxAttempts || TOURNAMENT_MAX_ATTEMPTS) - (me.entries || 0)),
+            attemptsRemaining: Math.max(0, maxAttempts - (me.entries || 0)),
             balanceUsd: Number((me.tournamentBalanceUsd || 0).toFixed(2)),
             placement: me.placement || null,
             winningsUsd: Number((me.winningsUsd || 0).toFixed(2)),
             rewardCredited: !!me.rewardCredited,
         } : {
             entries: 0,
-            attemptsRemaining: value.maxAttempts || TOURNAMENT_MAX_ATTEMPTS,
+            attemptsRemaining: maxAttempts,
             balanceUsd: 0,
             placement: null,
             winningsUsd: 0,
