@@ -201,6 +201,22 @@ function circleRectCollision(cx, cy, r, rect) {
     return dist(cx, cy, closestX, closestY) < r;
 }
 
+// Check if a position overlaps with any house floor, wall, or solid collidable obstacle.
+// Used to prevent trees/bushes/rocks spawning on top of buildings.
+const BLOCKED_KINDS = new Set(['houseFloor', 'wall', 'interiorWall', 'door', 'furniture', 'container', 'house']);
+function isMapPositionBlocked(obstacles, x, y, radius = 30) {
+    for (const o of obstacles) {
+        if (!BLOCKED_KINDS.has(o.kind)) continue;
+        // Expand the rect by the placement radius so trees don't clip edges
+        const pad = radius + 12;
+        if (x >= o.x - o.w / 2 - pad && x <= o.x + o.w / 2 + pad
+            && y >= o.y - o.h / 2 - pad && y <= o.y + o.h / 2 + pad) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function resolveCircleRect(cx, cy, r, rect) {
     const closestX = clamp(cx, rect.x - rect.w / 2, rect.x + rect.w / 2);
     const closestY = clamp(cy, rect.y - rect.h / 2, rect.y + rect.h / 2);
@@ -458,18 +474,27 @@ function addContainerYard(obstacles, loot, spawnPoints, x, y) {
 
 function addForest(obstacles, loot, spawnPoints, x, y, count = 34, radius = 680) {
     addObstacle(obstacles, 'field', x, y, radius * 1.9, radius * 1.55, { collidable: false, variant: 'woods' });
-    for (let i = 0; i < count; i++) {
-        const a = Math.random() * Math.PI * 2;
-        const r = radius * Math.sqrt(Math.random());
-        const size = 34 + Math.random() * 30;
-        addObstacle(obstacles, 'tree', x + Math.cos(a) * r, y + Math.sin(a) * r, size, size, {
-            hue: 104 + Math.floor(Math.random() * 30),
-            rotation: Math.random() * Math.PI,
-        });
-    }
-    // Forest cabin so chests are inside a building
+    // Place cabin first so collision checks work for tree placement
     if (Math.random() > 0.35) {
         addHouse(obstacles, loot, spawnPoints, x + 90, y - 60, 180, 150, { variant: 'cabin', hue: 18 + Math.floor(Math.random() * 16), tier: Math.random() > 0.5 ? 'rare' : 'common' });
+    }
+    for (let i = 0; i < count; i++) {
+        let placed = false;
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = radius * Math.sqrt(Math.random());
+            const tx = x + Math.cos(a) * r;
+            const ty = y + Math.sin(a) * r;
+            const size = 34 + Math.random() * 30;
+            if (!isMapPositionBlocked(obstacles, tx, ty, size / 2)) {
+                addObstacle(obstacles, 'tree', tx, ty, size, size, {
+                    hue: 104 + Math.floor(Math.random() * 30),
+                    rotation: Math.random() * Math.PI,
+                });
+                placed = true;
+                break;
+            }
+        }
     }
     spawnPoints.push({ x: x - 130, y: y + 150 });
 }
@@ -506,21 +531,37 @@ function addCoverPatch(obstacles, loot, spawnPoints, x, y, opts = {}) {
     addObstacle(obstacles, 'field', x, y, radius * 2.1, radius * 1.6, { collidable: false, variant });
     const trees = 5 + Math.floor(Math.random() * 13);
     for (let i = 0; i < trees; i++) {
-        const a = Math.random() * Math.PI * 2;
-        const r = radius * Math.sqrt(Math.random());
-        addObstacle(obstacles, Math.random() > 0.22 ? 'tree' : 'bush', x + Math.cos(a) * r, y + Math.sin(a) * r, 28 + Math.random() * 44, 28 + Math.random() * 44, {
-            hue: 92 + Math.floor(Math.random() * 38),
-            rotation: Math.random() * Math.PI,
-            collidable: Math.random() > 0.32,
-            variant,
-        });
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = radius * Math.sqrt(Math.random());
+            const tx = x + Math.cos(a) * r;
+            const ty = y + Math.sin(a) * r;
+            const size = 28 + Math.random() * 44;
+            if (!isMapPositionBlocked(obstacles, tx, ty, size / 2)) {
+                addObstacle(obstacles, Math.random() > 0.22 ? 'tree' : 'bush', tx, ty, size, size, {
+                    hue: 92 + Math.floor(Math.random() * 38),
+                    rotation: Math.random() * Math.PI,
+                    collidable: Math.random() > 0.32,
+                    variant,
+                });
+                break;
+            }
+        }
     }
     const rocks = 2 + Math.floor(Math.random() * 5);
     for (let i = 0; i < rocks; i++) {
-        addObstacle(obstacles, 'rock', x - radius * 0.5 + Math.random() * radius, y - radius * 0.5 + Math.random() * radius, 34 + Math.random() * 36, 30 + Math.random() * 34, {
-            hue: 210 + Math.floor(Math.random() * 30),
-            rotation: Math.random() * 0.6,
-        });
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const rx = x - radius * 0.5 + Math.random() * radius;
+            const ry = y - radius * 0.5 + Math.random() * radius;
+            const rw = 34 + Math.random() * 36;
+            if (!isMapPositionBlocked(obstacles, rx, ry, rw / 2)) {
+                addObstacle(obstacles, 'rock', rx, ry, rw, 30 + Math.random() * 34, {
+                    hue: 210 + Math.floor(Math.random() * 30),
+                    rotation: Math.random() * 0.6,
+                });
+                break;
+            }
+        }
     }
     // No ground chests — chests only in buildings
     if (Math.random() > 0.4) spawnPoints.push({ x, y });
@@ -839,10 +880,15 @@ function addStandaloneHouse(obstacles, loot, spawnPoints, x, y) {
         });
     }
     if (Math.random() > 0.5) {
-        addObstacle(obstacles, 'tree', x - w * 0.5 - 50 - Math.random() * 40, y - h * 0.3, 36 + Math.random() * 20, 36 + Math.random() * 20, {
-            hue: 108 + Math.floor(Math.random() * 24),
-            rotation: Math.random() * Math.PI,
-        });
+        const treeX = x - w * 0.5 - 50 - Math.random() * 40;
+        const treeY = y - h * 0.3;
+        const treeS = 36 + Math.random() * 20;
+        if (!isMapPositionBlocked(obstacles, treeX, treeY, treeS / 2)) {
+            addObstacle(obstacles, 'tree', treeX, treeY, treeS, treeS, {
+                hue: 108 + Math.floor(Math.random() * 24),
+                rotation: Math.random() * Math.PI,
+            });
+        }
     }
 }
 
@@ -2096,6 +2142,7 @@ function buildLeaderboard(room) {
     ];
     return all
         .map(p => ({
+            id: p.id,
             username: p.username,
             balance: p.dollarBalance || 0,
             kills: p.kills || 0,
@@ -2123,6 +2170,7 @@ function serializePlayer(p, isYou) {
         reloading: !!p.weapon?.reloading,
         meleeStartedAt: p.meleeStartedAt || 0,
         meleeUntil: p.meleeUntil || 0,
+        meleeRemainingMs: p.meleeUntil > Date.now() ? Math.max(0, p.meleeUntil - Date.now()) : 0,
         reloadEndAt: p.weapon?.reloadEndAt || 0,
         reloadRemainingMs: p.weapon?.reloading ? Math.max(0, (p.weapon.reloadEndAt || 0) - Date.now()) : 0,
         reloadMs: wDef.reloadMs,
