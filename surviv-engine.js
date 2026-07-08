@@ -419,11 +419,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
         addObstacle(obstacles, 'furniture', x + w * 0.33, y + h * 0.27, 48, 34, { collidable: false, variant: 'bed' });
         addObstacle(obstacles, 'furniture', x - w * 0.31, y + h * 0.06, 42, 30, { collidable: false, variant: 'bed' });
     } else {
-        addRoomZone(obstacles, houseId, x - w * 0.24, y - h * 0.08, w * 0.45, h * 0.62, 'living');
-        addRoomZone(obstacles, houseId, x + w * 0.26, y - h * 0.12, w * 0.42, h * 0.54, 'bedroom');
-        addRoomZone(obstacles, houseId, x + w * 0.08, y + h * 0.28, w * 0.72, h * 0.25, 'entry');
-        if (w > 190) addVerticalInteriorWallSegments(obstacles, x + w * 0.03, y - h * 0.08, h * 0.62, wall, [{ center: h * 0.15, size: 70 }], variant);
-        if (h > 180) addHorizontalInteriorWallSegments(obstacles, x + w * 0.12, y + h * 0.16, w * 0.68, wall, [{ center: -w * 0.06, size: 72 }], variant);
+        // Small houses: no rooms, no interior walls — single open space
         addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, { collidable: false, variant: 'table' });
         addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, { collidable: false, variant: 'bed' });
     }
