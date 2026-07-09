@@ -40,10 +40,59 @@ test('surviv map stays dense inside the smaller world', () => {
 
     assert.equal(SURVIV.worldHalf, 10000);
     assert.equal(map.landmarks.length, 17);
-    assert.ok(houses.length >= 70);
+    assert.ok(houses.length >= 90);
     assert.ok(chests.length < houses.length);
     assert.equal(groundLoot.length, 42);
     assert.ok(maxExtent <= SURVIV.worldHalf);
+});
+
+test('surviv town roads stay centered between rows and doors face the road', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const plannedTownRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.variant === 'dirt'
+        && obstacle.w >= 1900
+        && obstacle.h === 120
+    ));
+    const townHouses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.variant === 'town');
+    const doorsByHouse = new Map(map.obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(door => [door.houseId, door]));
+
+    assert.equal(plannedTownRoads.length, 3);
+    assert.ok(townHouses.length >= 20);
+
+    for (const house of townHouses) {
+        const road = plannedTownRoads.find(candidate => (
+            Math.abs(house.x - candidate.x) <= candidate.w / 2
+            && Math.abs(house.y - candidate.y) <= 320
+        ));
+        assert.ok(road, 'town house should belong to a centered town road');
+
+        const door = doorsByHouse.get(house.id);
+        assert.ok(door, 'town house should have a doorway');
+
+        const expectedSide = house.y < road.y ? 'south' : 'north';
+        assert.equal(door.role, expectedSide);
+        assert.ok(Math.abs(door.x - house.x) < 1);
+        if (expectedSide === 'south') {
+            assert.ok(door.y > house.y && door.y < road.y);
+        } else {
+            assert.ok(door.y < house.y && door.y > road.y);
+        }
+    }
+});
+
+test('straight surviv roads do not create extra square asphalt stubs', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const squareAsphaltRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.variant === 'asphalt'
+        && obstacle.w === 120
+        && obstacle.h === 120
+    ));
+
+    assert.equal(squareAsphaltRoads.length, 0);
 });
 
 test('players and automatic bots start with fists and no dollars', () => {

@@ -373,14 +373,24 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
 function addRoad(obstacles, x1, y1, x2, y2, width = 150) {
     const dx = x2 - x1;
     const dy = y2 - y1;
-    addObstacle(obstacles, 'road', x1 + dx / 2, y1 + dy / 2, Math.abs(dx) + width, width, {
-        collidable: false,
-        variant: 'asphalt',
-    });
-    addObstacle(obstacles, 'road', x2, y1 + dy / 2, width, Math.abs(dy) + width, {
-        collidable: false,
-        variant: 'asphalt',
-    });
+    if (Math.abs(dx) > 1) {
+        addObstacle(obstacles, 'road', x1 + dx / 2, y1, Math.abs(dx) + width, width, {
+            collidable: false,
+            variant: 'asphalt',
+        });
+    }
+    if (Math.abs(dy) > 1) {
+        addObstacle(obstacles, 'road', x2, y1 + dy / 2, width, Math.abs(dy) + width, {
+            collidable: false,
+            variant: 'asphalt',
+        });
+    }
+    if (Math.abs(dx) > 1 && Math.abs(dy) > 1) {
+        addObstacle(obstacles, 'road', x2, y1, width, width, {
+            collidable: false,
+            variant: 'asphalt',
+        });
+    }
 }
 
 function addWall(obstacles, x, y, w, h, variant = 'plaster') {
@@ -406,6 +416,28 @@ function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south
         houseId,
         role: side,
     });
+}
+
+function addHorizontalWallWithOpening(obstacles, x, y, w, wall, variant, openingCenterX = x, openingW = 0) {
+    const min = x - w / 2;
+    const max = x + w / 2;
+    const gapMin = clamp(openingCenterX - openingW / 2, min, max);
+    const gapMax = clamp(openingCenterX + openingW / 2, min, max);
+    const leftW = gapMin - min;
+    const rightW = max - gapMax;
+    if (leftW > wall * 2) addWall(obstacles, min + leftW / 2, y, leftW, wall, variant);
+    if (rightW > wall * 2) addWall(obstacles, gapMax + rightW / 2, y, rightW, wall, variant);
+}
+
+function addVerticalWallWithOpening(obstacles, x, y, h, wall, variant, openingCenterY = y, openingH = 0) {
+    const min = y - h / 2;
+    const max = y + h / 2;
+    const gapMin = clamp(openingCenterY - openingH / 2, min, max);
+    const gapMax = clamp(openingCenterY + openingH / 2, min, max);
+    const topH = gapMin - min;
+    const bottomH = max - gapMax;
+    if (topH > wall * 2) addWall(obstacles, x, min + topH / 2, wall, topH, variant);
+    if (bottomH > wall * 2) addWall(obstacles, x, gapMax + bottomH / 2, wall, bottomH, variant);
 }
 
 function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], variant = 'plaster') {
@@ -439,19 +471,38 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const wall = opts.wall || 14;
     const hue = opts.hue ?? 22;
     const variant = opts.variant || 'house';
-    const door = clamp(w * 0.32, 74, variant === 'mansion' || variant === 'warehouse' ? 132 : 104);
+    const doorSide = ['north', 'south', 'east', 'west'].includes(opts.doorSide) ? opts.doorSide : 'south';
+    const horizontalDoor = doorSide === 'north' || doorSide === 'south';
+    const doorSpan = clamp((horizontalDoor ? w : h) * 0.32, 74, variant === 'mansion' || variant === 'warehouse' ? 132 : 104);
+    const doorW = horizontalDoor ? doorSpan : wall * 2.25;
+    const doorH = horizontalDoor ? wall * 2.25 : doorSpan;
+    const doorX = doorSide === 'west'
+        ? x - w / 2 + wall / 2
+        : doorSide === 'east' ? x + w / 2 - wall / 2 : x;
+    const doorY = doorSide === 'north'
+        ? y - h / 2 + wall / 2
+        : doorSide === 'south' ? y + h / 2 - wall / 2 : y;
     const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, { collidable: false, hue, variant });
     const houseId = floor.id;
 
-    addWall(obstacles, x, y - h / 2 + wall / 2, w, wall, variant);
-    addWall(obstacles, x - w / 2 + wall / 2, y, wall, h, variant);
-    addWall(obstacles, x + w / 2 - wall / 2, y, wall, h, variant);
-    const bottomWallW = Math.max(0, (w - door) / 2);
-    if (bottomWallW > wall * 2) {
-        addWall(obstacles, x - (door / 2 + bottomWallW / 2), y + h / 2 - wall / 2, bottomWallW, wall, variant);
-        addWall(obstacles, x + (door / 2 + bottomWallW / 2), y + h / 2 - wall / 2, bottomWallW, wall, variant);
-    }
-    addDoor(obstacles, houseId, x, y + h / 2 - wall / 2, door, wall * 2.25, variant, 'south');
+    const northY = y - h / 2 + wall / 2;
+    const southY = y + h / 2 - wall / 2;
+    const westX = x - w / 2 + wall / 2;
+    const eastX = x + w / 2 - wall / 2;
+
+    if (doorSide === 'north') addHorizontalWallWithOpening(obstacles, x, northY, w, wall, variant, doorX, doorSpan);
+    else addWall(obstacles, x, northY, w, wall, variant);
+
+    if (doorSide === 'south') addHorizontalWallWithOpening(obstacles, x, southY, w, wall, variant, doorX, doorSpan);
+    else addWall(obstacles, x, southY, w, wall, variant);
+
+    if (doorSide === 'west') addVerticalWallWithOpening(obstacles, westX, y, h, wall, variant, doorY, doorSpan);
+    else addWall(obstacles, westX, y, wall, h, variant);
+
+    if (doorSide === 'east') addVerticalWallWithOpening(obstacles, eastX, y, h, wall, variant, doorY, doorSpan);
+    else addWall(obstacles, eastX, y, wall, h, variant);
+
+    addDoor(obstacles, houseId, doorX, doorY, doorW, doorH, variant, doorSide);
 
     const large = w >= 430 || h >= 330 || variant === 'mansion' || variant === 'warehouse';
     if (large) {
@@ -495,7 +546,11 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     if (large && Math.random() < 0.24) {
         loot.push(makeChest(x - w * 0.28, y + h * 0.18, chestTier === 'common' ? 'rare' : chestTier));
     }
-    spawnPoints.push({ x, y: y + h / 2 + 70 });
+    const spawnOffset = 70;
+    if (doorSide === 'north') spawnPoints.push({ x: doorX, y: y - h / 2 - spawnOffset });
+    else if (doorSide === 'south') spawnPoints.push({ x: doorX, y: y + h / 2 + spawnOffset });
+    else if (doorSide === 'west') spawnPoints.push({ x: x - w / 2 - spawnOffset, y: doorY });
+    else spawnPoints.push({ x: x + w / 2 + spawnOffset, y: doorY });
 }
 
 function addMansion(obstacles, loot, spawnPoints, x, y) {
@@ -631,6 +686,7 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
             hue: 18 + Math.floor(Math.random() * 28),
             variant: 'town',
             tier: Math.random() > 0.86 ? 'rare' : 'common',
+            doorSide: 'south',
         });
         
         addWall(obstacles, hx, hy - h / 2 - 20, w + 40, 10, 'stone');
@@ -648,6 +704,7 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
             hue: 18 + Math.floor(Math.random() * 28),
             variant: 'town',
             tier: Math.random() > 0.86 ? 'rare' : 'common',
+            doorSide: 'north',
         });
         
         addWall(obstacles, hx, hy + h / 2 + 20, w + 40, 10, 'stone');
@@ -1387,73 +1444,70 @@ export function generateSurvivMap(worldHalf) {
     // ─────────────────────────────────────────────────────────────────────────
     const placedPositions = [...POI_LIST];
 
-    // NW Pine Forest biome - reduced count and size to avoid soptipp feel
-    for (let i = 0; i < 3; i++) {
+    // NW Pine Forest biome - compact patches that break up empty crossings.
+    for (let i = 0; i < 5; i++) {
         const fx = -6500 + i * 2000 + (Math.random() - 0.5) * 400;
         const fy = -6000 + (Math.random() - 0.5) * 400;
         if (!isAreaOverlapping(fx, fy, 800, 800, 200, POI_LIST)) {
-            addForest(obstacles, loot, spawnPoints, fx, fy, 12, 300);
+            addForest(obstacles, loot, spawnPoints, fx, fy, 16, 340);
             placedPositions.push({ x: fx, y: fy, w: 800, h: 800 });
         }
     }
 
-    // SW Wetlands/Swamp biome - reduced count and size
-    for (let i = 0; i < 3; i++) {
+    // SW Wetlands/Swamp biome.
+    for (let i = 0; i < 5; i++) {
         const sx = -7000 + i * 1500 + (Math.random() - 0.5) * 300;
         const sy = 4500 + (Math.random() - 0.5) * 300;
         if (!isAreaOverlapping(sx, sy, 600, 600, 200, POI_LIST)) {
-            addCoverPatch(obstacles, loot, spawnPoints, sx, sy, { radius: 180, variant: 'wetlands' });
+            addCoverPatch(obstacles, loot, spawnPoints, sx, sy, { radius: 230, variant: 'wetlands' });
             placedPositions.push({ x: sx, y: sy, w: 600, h: 600 });
         }
     }
 
-    // Standalone filler houses, microsites, and cover patches (restricted to outer quadrants, keeping center clear)
-    const fillStep = 3800; // wider step to spread out filler much more
-    const fillMargin = 2200;
+    // Standalone filler houses, microsites, and cover patches.
+    const fillStep = 2750;
+    const fillMargin = 1700;
     for (let gx = -wh + fillMargin; gx <= wh - fillMargin; gx += fillStep) {
         for (let gy = -wh + fillMargin; gy <= wh - fillMargin; gy += fillStep) {
-            const x = clamp(gx + (Math.random() - 0.5) * 1500, -wh + 1500, wh - 1500);
-            const y = clamp(gy + (Math.random() - 0.5) * 1500, -wh + 1500, wh - 1500);
+            const x = clamp(gx + (Math.random() - 0.5) * 1050, -wh + 1200, wh - 1200);
+            const y = clamp(gy + (Math.random() - 0.5) * 1050, -wh + 1200, wh - 1200);
             
-            // Keep central area open (high exposure central valley)
-            if (Math.hypot(x, y) < 2800) continue;
+            if (Math.hypot(x, y) < 2000) continue;
             
-            // Check overlaps with POIs, roads, and rivers with a 350-unit buffer
-            if (isAreaOverlapping(x, y, 700, 700, 350, placedPositions)) continue;
+            if (isAreaOverlapping(x, y, 620, 620, 260, placedPositions)) continue;
             
-            placedPositions.push({ x, y, w: 700, h: 700 });
+            placedPositions.push({ x, y, w: 620, h: 620 });
             const roll = Math.random();
-            if (roll < 0.55) {
+            if (roll < 0.5) {
                 addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-            } else if (roll < 0.85) {
+            } else if (roll < 0.82) {
                 addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
             } else {
-                addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
+                addCoverPatch(obstacles, loot, spawnPoints, x, y, { radius: 260, variant: 'woods' });
             }
         }
     }
 
     // Forests scattered organically in remaining outer areas
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 10; i++) {
         const pos = randomSpawnCoord(wh * 0.88);
-        if (Math.hypot(pos.x, pos.y) < 3200) continue; // Avoid center
-        if (!isAreaOverlapping(pos.x, pos.y, 600, 600, 300, placedPositions)) {
-            addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 14, 300);
+        if (Math.hypot(pos.x, pos.y) < 2400) continue;
+        if (!isAreaOverlapping(pos.x, pos.y, 560, 560, 240, placedPositions)) {
+            addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 16, 320);
             placedPositions.push({ x: pos.x, y: pos.y, w: 600, h: 600 });
         }
     }
 
-    // DYNAMIC AUTO-CORRECTION: Ensures we always hit the test's minimum 70 houses (target 75)
-    // while keeping the layout extremely sparse and spread out.
+    // DYNAMIC AUTO-CORRECTION: Keeps the map populated even when random placement rolls sparse.
     const currentHouses = obstacles.filter(o => o.kind === 'houseFloor').length;
-    if (currentHouses < 75) {
-        const needed = 75 - currentHouses;
+    if (currentHouses < 95) {
+        const needed = 95 - currentHouses;
         for (let i = 0; i < needed; i++) {
             for (let attempt = 0; attempt < 100; attempt++) {
                 const pos = randomSpawnCoord(wh * 0.88);
-                if (Math.hypot(pos.x, pos.y) > 2800 && !isAreaOverlapping(pos.x, pos.y, 600, 600, 350, placedPositions)) {
+                if (Math.hypot(pos.x, pos.y) > 2200 && !isAreaOverlapping(pos.x, pos.y, 560, 560, 240, placedPositions)) {
                     addStandaloneHouse(obstacles, loot, spawnPoints, pos.x, pos.y);
-                    placedPositions.push({ x: pos.x, y: pos.y, w: 600, h: 600 });
+                    placedPositions.push({ x: pos.x, y: pos.y, w: 560, h: 560 });
                     break;
                 }
             }
