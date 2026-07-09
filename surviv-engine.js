@@ -195,6 +195,29 @@ function pointInRect(px, py, rect) {
         && py >= rect.y - rect.h / 2 && py <= rect.y + rect.h / 2;
 }
 
+function lineSegmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
+    const d = (x2 - x1) * (y4 - y3) - (y2 - y1) * (x4 - x3);
+    if (Math.abs(d) < 1e-9) return false;
+    const u = ((x3 - x1) * (y4 - y3) - (y3 - y1) * (x4 - x3)) / d;
+    const v = ((x3 - x1) * (y2 - y1) - (y3 - y1) * (x2 - x1)) / d;
+    return u >= 0 && u <= 1 && v >= 0 && v <= 1;
+}
+
+function lineSegmentRectIntersects(x1, y1, x2, y2, rect) {
+    if (pointInRect(x1, y1, rect) || pointInRect(x2, y2, rect)) {
+        return true;
+    }
+    const rxMin = rect.x - rect.w / 2;
+    const rxMax = rect.x + rect.w / 2;
+    const ryMin = rect.y - rect.h / 2;
+    const ryMax = rect.y + rect.h / 2;
+
+    return lineSegmentsIntersect(x1, y1, x2, y2, rxMin, ryMin, rxMin, ryMax)
+        || lineSegmentsIntersect(x1, y1, x2, y2, rxMax, ryMin, rxMax, ryMax)
+        || lineSegmentsIntersect(x1, y1, x2, y2, rxMin, ryMin, rxMax, ryMin)
+        || lineSegmentsIntersect(x1, y1, x2, y2, rxMin, ryMax, rxMax, ryMax);
+}
+
 function circleRectCollision(cx, cy, r, rect) {
     const closestX = clamp(cx, rect.x - rect.w / 2, rect.x + rect.w / 2);
     const closestY = clamp(cy, rect.y - rect.h / 2, rect.y + rect.h / 2);
@@ -1907,8 +1930,13 @@ function updateBullets(room, now, effectiveRadius) {
         }
 
         let hit = false;
-        for (const o of getNearbyObstacles(room, b.x, b.y, 90)) {
-            if (pointInRect(b.x, b.y, o)) {
+        const midX = (previousX + b.x) / 2;
+        const midY = (previousY + b.y) / 2;
+        const distMoved = Math.hypot(b.vx, b.vy);
+        const queryRange = Math.max(90, distMoved / 2 + 10);
+
+        for (const o of getNearbyObstacles(room, midX, midY, queryRange)) {
+            if (lineSegmentRectIntersects(previousX, previousY, b.x, b.y, o)) {
                 hit = true;
                 break;
             }
