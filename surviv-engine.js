@@ -806,6 +806,37 @@ function addCoverPatch(obstacles, loot, spawnPoints, x, y, opts = {}) {
     if (Math.random() > 0.4) spawnPoints.push({ x, y });
 }
 
+function addOpenFieldScatter(obstacles, x, y, opts = {}) {
+    const radius = opts.radius || (150 + Math.random() * 150);
+    const count = opts.count || (3 + Math.floor(Math.random() * 5));
+    const variant = opts.variant || 'grass';
+    let placedCount = 0;
+
+    for (let i = 0; i < count; i++) {
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const a = Math.random() * Math.PI * 2;
+            const r = radius * Math.sqrt(Math.random());
+            const ox = x + Math.cos(a) * r;
+            const oy = y + Math.sin(a) * r;
+            const size = 28 + Math.random() * 42;
+            if (isMapPositionBlocked(obstacles, ox, oy, size / 2)) continue;
+
+            const kindRoll = Math.random();
+            const kind = kindRoll < 0.68 ? 'tree' : kindRoll < 0.88 ? 'bush' : 'rock';
+            addObstacle(obstacles, kind, ox, oy, size, kind === 'rock' ? 24 + Math.random() * 32 : size, {
+                hue: kind === 'rock' ? 212 + Math.floor(Math.random() * 26) : 94 + Math.floor(Math.random() * 42),
+                rotation: Math.random() * Math.PI,
+                collidable: kind === 'bush' ? Math.random() > 0.35 : true,
+                variant,
+            });
+            placedCount++;
+            break;
+        }
+    }
+
+    return placedCount;
+}
+
 function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
     const roll = Math.random();
     const tier = roll > 0.78 ? 'rare' : 'common';
@@ -1484,6 +1515,36 @@ export function generateSurvivMap(worldHalf) {
                 addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
             } else {
                 addCoverPatch(obstacles, loot, spawnPoints, x, y, { radius: 260, variant: 'woods' });
+            }
+        }
+    }
+
+    // Countryside scatter: loose trees and occasional single houses so the long crossings
+    // still feel natural without turning every open field into a dense compound.
+    let countrysideHouses = 0;
+    const countrysideHouseLimit = 16;
+    const scatterStep = 1550;
+    const scatterMargin = 1100;
+    for (let gx = -wh + scatterMargin; gx <= wh - scatterMargin; gx += scatterStep) {
+        for (let gy = -wh + scatterMargin; gy <= wh - scatterMargin; gy += scatterStep) {
+            if (Math.random() < 0.18) continue;
+            const x = clamp(gx + (Math.random() - 0.5) * 720, -wh + 850, wh - 850);
+            const y = clamp(gy + (Math.random() - 0.5) * 720, -wh + 850, wh - 850);
+
+            if (Math.hypot(x, y) < 1700) continue;
+            if (isAreaOverlapping(x, y, 380, 380, 150, placedPositions)) continue;
+
+            if (countrysideHouses < countrysideHouseLimit && Math.random() < 0.16) {
+                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
+                placedPositions.push({ x, y, w: 560, h: 520 });
+                countrysideHouses++;
+            } else {
+                const placed = addOpenFieldScatter(obstacles, x, y, {
+                    radius: 150 + Math.random() * 180,
+                    count: 3 + Math.floor(Math.random() * 4),
+                    variant: y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
+                });
+                if (placed > 0) placedPositions.push({ x, y, w: 360, h: 360 });
             }
         }
     }

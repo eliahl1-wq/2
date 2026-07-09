@@ -5427,7 +5427,7 @@ function resolveAgarOwnCells(player, now, massStart) {
 
             if (!readyToMerge) {
                 const mergeReadiness = Math.max(0, Math.min(1, Math.min(firstAge, secondAge) / mergeDelayMs));
-                const push = overlap * (0.12 - mergeReadiness * 0.085);
+                const push = overlap * (0.17 - mergeReadiness * 0.11);
                 first.x -= ux * push * firstShare;
                 first.y -= uy * push * firstShare;
                 second.x += ux * push * secondShare;
@@ -5435,10 +5435,17 @@ function resolveAgarOwnCells(player, now, massStart) {
                 continue;
             }
 
-            // Ready cells may overlap freely, but touching alone must not trigger
-            // a merge. The player still has to press them visibly into each other.
-            const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.32;
-            if (distance > mergeDistance) continue;
+            // Ready cells still need a firm press before rejoining, so splits do not
+            // feel magnetized back together as soon as their cooldown expires.
+            const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.42;
+            if (distance > mergeDistance) {
+                const push = overlap * 0.03;
+                first.x -= ux * push * firstShare;
+                first.y -= uy * push * firstShare;
+                second.x += ux * push * secondShare;
+                second.y += uy * push * secondShare;
+                continue;
+            }
 
 
             const survivor = firstMass >= secondMass ? first : second;

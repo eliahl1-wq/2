@@ -46,6 +46,30 @@ test('surviv map stays dense inside the smaller world', () => {
     assert.ok(maxExtent <= SURVIV.worldHalf);
 });
 
+test('surviv open areas keep scattered cover and small houses', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const coverKinds = new Set(['tree', 'bush', 'rock']);
+    const openCover = map.obstacles.filter(obstacle => (
+        coverKinds.has(obstacle.kind)
+        && Math.hypot(obstacle.x, obstacle.y) > 1800
+    ));
+    const coverCells = new Set(openCover.map(obstacle => (
+        Math.floor((obstacle.x + SURVIV.worldHalf) / 1800)
+        + ','
+        + Math.floor((obstacle.y + SURVIV.worldHalf) / 1800)
+    )));
+    const smallHouseVariants = new Set(['cabin', 'house', 'barn']);
+    const smallOpenHouses = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && smallHouseVariants.has(obstacle.variant)
+        && Math.hypot(obstacle.x, obstacle.y) > 1800
+    ));
+
+    assert.ok(openCover.length >= 400);
+    assert.ok(coverCells.size >= 60);
+    assert.ok(smallOpenHouses.length >= 24);
+});
+
 test('surviv town roads stay centered between rows and doors face the road', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const plannedTownRoads = map.obstacles.filter(obstacle => (
