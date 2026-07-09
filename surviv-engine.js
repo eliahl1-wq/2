@@ -495,7 +495,11 @@ function addForest(obstacles, loot, spawnPoints, x, y, count = 34, radius = 680)
     addObstacle(obstacles, 'field', x, y, radius * 1.9, radius * 1.55, { collidable: false, variant: 'woods' });
     // Place cabin first so collision checks work for tree placement
     if (Math.random() > 0.35) {
-        addHouse(obstacles, loot, spawnPoints, x + 90, y - 60, 180, 150, { variant: 'cabin', hue: 18 + Math.floor(Math.random() * 16), tier: Math.random() > 0.5 ? 'rare' : 'common' });
+        const cabinX = x + 90;
+        const cabinY = y - 60;
+        if (!isMapPositionBlocked(obstacles, cabinX, cabinY, 150)) {
+            addHouse(obstacles, loot, spawnPoints, cabinX, cabinY, 180, 150, { variant: 'cabin', hue: 18 + Math.floor(Math.random() * 16), tier: Math.random() > 0.5 ? 'rare' : 'common' });
+        }
     }
     for (let i = 0; i < count; i++) {
         let placed = false;
@@ -537,10 +541,18 @@ function addSettlement(obstacles, loot, spawnPoints, x, y, size = 5, variant = '
         });
     }
     for (let i = 0; i < 3; i++) {
-        addObstacle(obstacles, 'crate', x - fieldW * 0.4 + Math.random() * fieldW * 0.8, y - fieldH * 0.4 + Math.random() * fieldH * 0.8, 44 + Math.random() * 22, 44 + Math.random() * 22, {
-            hue: 28,
-            rotation: (Math.random() - 0.5) * 0.4,
-        });
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const cx = x - fieldW * 0.4 + Math.random() * fieldW * 0.8;
+            const cy = y - fieldH * 0.4 + Math.random() * fieldH * 0.8;
+            const size = 44 + Math.random() * 22;
+            if (!isMapPositionBlocked(obstacles, cx, cy, size / 2)) {
+                addObstacle(obstacles, 'crate', cx, cy, size, size, {
+                    hue: 28,
+                    rotation: (Math.random() - 0.5) * 0.4,
+                });
+                break;
+            }
+        }
     }
 }
 
@@ -1056,10 +1068,10 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, -IR, 0, 0, -IR, roadW);   // W→N
 
     // Radial spokes from inner ring to mid ring
-    addRoad(obstacles, IR * 0.7, -IR * 0.7, diag, -diag, roadW);   // NE
-    addRoad(obstacles, IR * 0.7,  IR * 0.7, diag,  diag, roadW);   // SE
-    addRoad(obstacles, -IR * 0.7, IR * 0.7, -diag, diag, roadW);   // SW
-    addRoad(obstacles, -IR * 0.7, -IR * 0.7, -diag, -diag, roadW); // NW
+    addRoad(obstacles, IR * 0.5, -IR * 0.5, diag, -diag, roadW);   // NE
+    addRoad(obstacles, IR * 0.5,  IR * 0.5, diag,  diag, roadW);   // SE
+    addRoad(obstacles, -IR * 0.5, IR * 0.5, -diag, diag, roadW);   // SW
+    addRoad(obstacles, -IR * 0.5, -IR * 0.5, -diag, -diag, roadW); // NW
 
     // ─────────────────────────────────────────────────────────────────────────
     // RIVERS — one runs roughly E-W, one roughly N-S; they cross near center
