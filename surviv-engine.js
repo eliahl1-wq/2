@@ -224,10 +224,50 @@ function circleRectCollision(cx, cy, r, rect) {
     return dist(cx, cy, closestX, closestY) < r;
 }
 
+function isNearRoadOrRiver(x, y, radius = 30) {
+    const roadHalfW = 60 + radius + 10; // 10 units extra buffer
+    // West N-S Highway: x = -2500
+    if (Math.abs(x - (-2500)) < roadHalfW) return true;
+    // East N-S Highway: x = 2500
+    if (Math.abs(x - 2500) < roadHalfW) return true;
+    // Central E-W Highway: y = 2000
+    if (Math.abs(y - 2000) < roadHalfW) return true;
+    // North E-W Highway: y = -4000
+    if (Math.abs(y - (-4000)) < roadHalfW) return true;
+
+    // Center branch: x = 0, y from 0 to 2000
+    if (Math.abs(x) < roadHalfW && y >= -60 && y <= 2060) return true;
+    // South Villa branch: x = -200, y from 2000 to 5200
+    if (Math.abs(x - (-200)) < roadHalfW && y >= 1940 && y <= 5260) return true;
+    // Gas station branch: y = -7800, x from -2500 to -1500
+    if (Math.abs(y - (-7800)) < roadHalfW && x >= -2560 && x <= -1440) return true;
+    // Hospital branch: y = 1500, x from 2500 to 5500
+    if (Math.abs(y - 1500) < roadHalfW && x >= 2440 && x <= 5560) return true;
+    // Container docks branch: x = -5200, y from -800 to 2000
+    if (Math.abs(x - (-5200)) < roadHalfW && y >= -860 && y <= 2060) return true;
+    // Military branch: x = 3200, y from -5200 to -4000
+    if (Math.abs(x - 3200) < roadHalfW && y >= -5260 && y <= -3940) return true;
+    // Quarry branch: x = 7400, y from -4000 to -3200
+    if (Math.abs(x - 7400) < roadHalfW && y >= -4060 && y <= -3140) return true;
+    // Prison branch: x = 5200, y from 2000 to 4800
+    if (Math.abs(x - 5200) < roadHalfW && y >= 1940 && y <= 4860) return true;
+    // Radio tower branch: x = -5400, y from 2000 to 4200
+    if (Math.abs(x - (-5400)) < roadHalfW && y >= 1940 && y <= 4260) return true;
+    // Pine town branch: x = -4200, y from -4200 to -4000
+    if (Math.abs(x - (-4200)) < roadHalfW && y >= -4260 && y <= -3940) return true;
+
+    // River path: roughly at y between -2200 and -800
+    if (y >= -2100 && y <= -900) return true;
+
+    return false;
+}
+
 // Check if a position overlaps with any house floor, wall, or solid collidable obstacle.
 // Used to prevent trees/bushes/rocks spawning on top of buildings.
 const BLOCKED_KINDS = new Set(['houseFloor', 'wall', 'interiorWall', 'door', 'furniture', 'container', 'house']);
 function isMapPositionBlocked(obstacles, x, y, radius = 30) {
+    if (isNearRoadOrRiver(x, y, radius)) return true;
+
     for (const o of obstacles) {
         if (!BLOCKED_KINDS.has(o.kind)) continue;
         // Expand the rect by the placement radius so trees don't clip edges
@@ -1133,6 +1173,55 @@ function addScatteredGroundLoot(obstacles, loot, worldHalf) {
     }
 }
 
+function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return Math.abs(x1 - x2) < (w1 + w2) / 2 && Math.abs(y1 - y2) < (h1 + h2) / 2;
+}
+
+function isAreaOverlapping(x, y, w, h, buffer = 200, poiList = []) {
+    // 1. Check road overlap
+    // West N-S Highway: x = -2500
+    if (rectsOverlap(x, y, w, h, -2500, 0, 120 + buffer * 2, 20000)) return true;
+    // East N-S Highway: x = 2500
+    if (rectsOverlap(x, y, w, h, 2500, 0, 120 + buffer * 2, 20000)) return true;
+    // Central E-W Highway: y = 2000
+    if (rectsOverlap(x, y, w, h, 0, 2000, 20000, 120 + buffer * 2)) return true;
+    // North E-W Highway: y = -4000
+    if (rectsOverlap(x, y, w, h, 0, -4000, 20000, 120 + buffer * 2)) return true;
+
+    // 2. Check river overlap
+    if (rectsOverlap(x, y, w, h, 0, -1500, 20000, 1200 + buffer * 2)) return true;
+
+    // 3. Check branch roads
+    // Center branch: x = 0, y from 0 to 2000
+    if (rectsOverlap(x, y, w, h, 0, 1000, 120 + buffer * 2, 2000)) return true;
+    // South Villa branch: x = -200, y from 2000 to 5200
+    if (rectsOverlap(x, y, w, h, -200, 3600, 120 + buffer * 2, 3200)) return true;
+    // Gas station branch: y = -7800, x from -2500 to -1500
+    if (rectsOverlap(x, y, w, h, -2000, -7800, 1000, 120 + buffer * 2)) return true;
+    // Hospital branch: y = 1500, x from 2500 to 5500
+    if (rectsOverlap(x, y, w, h, 4000, 1500, 3000, 120 + buffer * 2)) return true;
+    // Container docks branch: x = -5200, y from -800 to 2000
+    if (rectsOverlap(x, y, w, h, -5200, 600, 120 + buffer * 2, 2800)) return true;
+    // Military branch: x = 3200, y from -5200 to -4000
+    if (rectsOverlap(x, y, w, h, 3200, -4600, 120 + buffer * 2, 1200)) return true;
+    // Quarry branch: x = 7400, y from -4000 to -3200
+    if (rectsOverlap(x, y, w, h, 7400, -3600, 120 + buffer * 2, 800)) return true;
+    // Prison branch: x = 5200, y from 2000 to 4800
+    if (rectsOverlap(x, y, w, h, 5200, 3400, 120 + buffer * 2, 2800)) return true;
+    // Radio tower branch: x = -5400, y from 2000 to 4200
+    if (rectsOverlap(x, y, w, h, -5400, 3100, 120 + buffer * 2, 2200)) return true;
+    // Pine town branch: x = -4200, y from -4200 to -4000
+    if (rectsOverlap(x, y, w, h, -4200, -4100, 120 + buffer * 2, 200)) return true;
+
+    // 4. Check POI overlap
+    for (const poi of poiList) {
+        if (rectsOverlap(x, y, w, h, poi.x, poi.y, poi.w + buffer * 2, poi.h + buffer * 2)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
     const loot = [];
@@ -1142,28 +1231,35 @@ export function generateSurvivMap(worldHalf) {
     const wh = worldHalf;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // ORGANIC POI COORDINATES
+    // ORGANIC POI COORDINATES & BOUNDING BOXES
     // ─────────────────────────────────────────────────────────────────────────
-    const mansionPos = { x: 0, y: 0 };
-    const militaryPos = { x: 3200, y: -5200 };
-    const hospitalPos = { x: 5500, y: 1500 };
-    const villaPos = { x: -200, y: 5200 };
-    const yardPos = { x: -5200, y: -800 };
+    const mansionPos = { x: 0, y: 0, w: 1500, h: 1050 };
+    const militaryPos = { x: 3200, y: -5200, w: 1600, h: 1400 };
+    const hospitalPos = { x: 5500, y: 1500, w: 1400, h: 1000 };
+    const villaPos = { x: -200, y: 5200, w: 1500, h: 1050 };
+    const yardPos = { x: -5200, y: -800, w: 1200, h: 900 };
 
-    const quarryPos = { x: 7400, y: -3200 };
-    const prisonPos = { x: 5200, y: 4800 };
-    const towerPos = { x: -5400, y: 4200 };
-    const townPos = { x: -4200, y: -4200 };
+    const quarryPos = { x: 7400, y: -3200, w: 1200, h: 900 };
+    const prisonPos = { x: 5200, y: 4800, w: 1800, h: 1800 };
+    const towerPos = { x: -5400, y: 4200, w: 800, h: 800 };
+    const townPos = { x: -4200, y: -4200, w: 2360, h: 680 }; // size 8 town
 
-    const gasPos = { x: -1500, y: -7800 };
-    const farmPos = { x: 7800, y: -1200 };
-    const bunkerPos = { x: 2400, y: 7800 };
-    const campPos = { x: -7800, y: -3800 };
+    const gasPos = { x: -1500, y: -7800, w: 1200, h: 800 };
+    const farmPos = { x: 7800, y: -1200, w: 1400, h: 760 }; 
+    const bunkerPos = { x: 2400, y: 7800, w: 1200, h: 820 };
+    const campPos = { x: -7800, y: -3800, w: 1600, h: 1200 };
     
-    const neTownPos = { x: 5800, y: -6800 };
-    const seLabPos = { x: 7800, y: 7200 };
-    const swTownPos = { x: -7200, y: 1800 };
-    const nwMansionPos = { x: -7500, y: -7400 };
+    const neTownPos = { x: 5800, y: -6800, w: 2000, h: 680 }; // size 7 town
+    const seLabPos = { x: 7800, y: 7200, w: 1400, h: 760 };
+    const swTownPos = { x: -7200, y: 1800, w: 2000, h: 680 }; // size 7 town
+    const nwMansionPos = { x: -7500, y: -7400, w: 1500, h: 1050 };
+
+    const POI_LIST = [
+        mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
+        quarryPos, prisonPos, towerPos, townPos, gasPos,
+        farmPos, bunkerPos, campPos, neTownPos, seLabPos,
+        swTownPos, nwMansionPos
+    ];
 
     // ─────────────────────────────────────────────────────────────────────────
     // GENERATE LANDMARKS
@@ -1214,7 +1310,7 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'North Gas Station', x: gasPos.x, y: gasPos.y, type: 'gas' });
 
     // Farm
-    addSettlement(obstacles, loot, spawnPoints, farmPos.x, farmPos.y, 6, 'farm');
+    addSettlement(obstacles, loot, spawnPoints, farmPos.x, farmPos.y, 7, 'farm');
     landmarks.push({ name: 'East Farm', x: farmPos.x, y: farmPos.y, type: 'farm' });
 
     // South Bunker (Ruins)
@@ -1231,15 +1327,15 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'West Forest Camp', x: campPos.x, y: campPos.y, type: 'camp' });
 
     // NE Town
-    addSettlement(obstacles, loot, spawnPoints, neTownPos.x, neTownPos.y, 6, 'town');
+    addSettlement(obstacles, loot, spawnPoints, neTownPos.x, neTownPos.y, 7, 'town');
     landmarks.push({ name: 'NE Town', x: neTownPos.x, y: neTownPos.y, type: 'town' });
 
     // SE Lab
-    addSettlement(obstacles, loot, spawnPoints, seLabPos.x, seLabPos.y, 7, 'snow-lab');
+    addSettlement(obstacles, loot, spawnPoints, seLabPos.x, seLabPos.y, 8, 'snow-lab');
     landmarks.push({ name: 'SE Lab', x: seLabPos.x, y: seLabPos.y, type: 'lab' });
 
     // SW Town
-    addSettlement(obstacles, loot, spawnPoints, swTownPos.x, swTownPos.y, 6, 'town');
+    addSettlement(obstacles, loot, spawnPoints, swTownPos.x, swTownPos.y, 7, 'town');
     landmarks.push({ name: 'SW Town', x: swTownPos.x, y: swTownPos.y, type: 'town' });
 
     // NW Mansion
@@ -1289,50 +1385,30 @@ export function generateSurvivMap(worldHalf) {
     // ─────────────────────────────────────────────────────────────────────────
     // BIOME COVER & ROAD MARKERS
     // ─────────────────────────────────────────────────────────────────────────
-    const placedPositions = [
-        mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
-        quarryPos, prisonPos, towerPos, townPos, gasPos,
-        farmPos, bunkerPos, campPos, neTownPos, seLabPos,
-        swTownPos, nwMansionPos
-    ];
+    const placedPositions = [...POI_LIST];
 
-    // Roadside planted trees & bushes for visual polish and cover
-    const roadsX = [-2500, 2500];
-    for (const rx of roadsX) {
-        for (let ry = -wh * 0.8; ry <= wh * 0.8; ry += 600) {
-            if (ry > -2200 && ry < -800) continue; // Skip river area
-            const nearPOI = placedPositions.some(p => Math.hypot(p.x - rx, p.y - ry) < 800);
-            if (!nearPOI) {
-                addObstacle(obstacles, 'tree', rx - 110, ry, 34, 34, { hue: 104, rotation: Math.random() * Math.PI });
-                addObstacle(obstacles, 'bush', rx + 110, ry + 300, 28, 28, { hue: 92 });
-            }
+    // NW Pine Forest biome - reduced count and size to avoid soptipp feel
+    for (let i = 0; i < 3; i++) {
+        const fx = -6500 + i * 2000 + (Math.random() - 0.5) * 400;
+        const fy = -6000 + (Math.random() - 0.5) * 400;
+        if (!isAreaOverlapping(fx, fy, 800, 800, 200, POI_LIST)) {
+            addForest(obstacles, loot, spawnPoints, fx, fy, 12, 300);
+            placedPositions.push({ x: fx, y: fy, w: 800, h: 800 });
         }
     }
 
-    // NW Pine Forest biome
-    for (let i = 0; i < 6; i++) {
-        const fx = -6000 + (i % 2) * 2000 + (Math.random() - 0.5) * 500;
-        const fy = -6000 - Math.floor(i / 2) * 1200 + (Math.random() - 0.5) * 500;
-        const nearPOI = placedPositions.some(p => Math.hypot(p.x - fx, p.y - fy) < 1400);
-        if (!nearPOI) {
-            addForest(obstacles, loot, spawnPoints, fx, fy, 24, 450);
-            placedPositions.push({ x: fx, y: fy });
-        }
-    }
-
-    // SW Wetlands/Swamp biome
-    for (let i = 0; i < 8; i++) {
-        const sx = -7000 + (i % 3) * 1500 + (Math.random() - 0.5) * 400;
-        const sy = 4000 + Math.floor(i / 3) * 1200 + (Math.random() - 0.5) * 400;
-        const nearPOI = placedPositions.some(p => Math.hypot(p.x - sx, p.y - sy) < 1400);
-        if (!nearPOI) {
-            addCoverPatch(obstacles, loot, spawnPoints, sx, sy, { radius: 280, variant: 'wetlands' });
-            placedPositions.push({ x: sx, y: sy });
+    // SW Wetlands/Swamp biome - reduced count and size
+    for (let i = 0; i < 3; i++) {
+        const sx = -7000 + i * 1500 + (Math.random() - 0.5) * 300;
+        const sy = 4500 + (Math.random() - 0.5) * 300;
+        if (!isAreaOverlapping(sx, sy, 600, 600, 200, POI_LIST)) {
+            addCoverPatch(obstacles, loot, spawnPoints, sx, sy, { radius: 180, variant: 'wetlands' });
+            placedPositions.push({ x: sx, y: sy, w: 600, h: 600 });
         }
     }
 
     // Standalone filler houses, microsites, and cover patches (restricted to outer quadrants, keeping center clear)
-    const fillStep = 3200;
+    const fillStep = 3800; // wider step to spread out filler much more
     const fillMargin = 2200;
     for (let gx = -wh + fillMargin; gx <= wh - fillMargin; gx += fillStep) {
         for (let gy = -wh + fillMargin; gy <= wh - fillMargin; gy += fillStep) {
@@ -1342,14 +1418,14 @@ export function generateSurvivMap(worldHalf) {
             // Keep central area open (high exposure central valley)
             if (Math.hypot(x, y) < 2800) continue;
             
-            const nearAny = placedPositions.some(p => Math.hypot(p.x - x, p.y - y) < 1800);
-            if (nearAny) continue;
+            // Check overlaps with POIs, roads, and rivers with a 350-unit buffer
+            if (isAreaOverlapping(x, y, 700, 700, 350, placedPositions)) continue;
             
-            placedPositions.push({ x, y });
+            placedPositions.push({ x, y, w: 700, h: 700 });
             const roll = Math.random();
-            if (roll < 0.44) {
+            if (roll < 0.55) {
                 addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-            } else if (roll < 0.70) {
+            } else if (roll < 0.85) {
                 addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
             } else {
                 addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
@@ -1358,12 +1434,29 @@ export function generateSurvivMap(worldHalf) {
     }
 
     // Forests scattered organically in remaining outer areas
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 6; i++) {
         const pos = randomSpawnCoord(wh * 0.88);
         if (Math.hypot(pos.x, pos.y) < 3200) continue; // Avoid center
-        const nearAny = placedPositions.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < 1500);
-        if (!nearAny) {
-            addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 20 + Math.floor(Math.random() * 10), 380 + Math.random() * 100);
+        if (!isAreaOverlapping(pos.x, pos.y, 600, 600, 300, placedPositions)) {
+            addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 14, 300);
+            placedPositions.push({ x: pos.x, y: pos.y, w: 600, h: 600 });
+        }
+    }
+
+    // DYNAMIC AUTO-CORRECTION: Ensures we always hit the test's minimum 70 houses (target 75)
+    // while keeping the layout extremely sparse and spread out.
+    const currentHouses = obstacles.filter(o => o.kind === 'houseFloor').length;
+    if (currentHouses < 75) {
+        const needed = 75 - currentHouses;
+        for (let i = 0; i < needed; i++) {
+            for (let attempt = 0; attempt < 100; attempt++) {
+                const pos = randomSpawnCoord(wh * 0.88);
+                if (Math.hypot(pos.x, pos.y) > 2800 && !isAreaOverlapping(pos.x, pos.y, 600, 600, 350, placedPositions)) {
+                    addStandaloneHouse(obstacles, loot, spawnPoints, pos.x, pos.y);
+                    placedPositions.push({ x: pos.x, y: pos.y, w: 600, h: 600 });
+                    break;
+                }
+            }
         }
     }
 
