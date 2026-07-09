@@ -1111,12 +1111,14 @@ function checkSnakeCollisions(snake, allSnakes) {
             continue;
         }
 
-        for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 2)) {
+        for (let i = 0; i < other.segments.length; i++) {
             const seg = other.segments[i];
-            const segR = i === 0 ? headRadiusForBalance(other.balance) : headRadiusForBalance(other.balance) * 0.7;
+            const segR = headRadiusForBalance(other.balance);
             const dx = head.x - seg.x;
             const dy = head.y - seg.y;
-            const threshold = r * 0.85 + segR * 0.75;
+            const threshold = i === 0
+                ? (r + segR) * 0.85
+                : (r + segR) * 0.95;
             if (dx * dx + dy * dy < threshold * threshold) {
                 return other;
             }
@@ -1161,20 +1163,16 @@ export function resolveAllSnakeCollisions(allSnakes) {
                 continue;
             }
 
-            for (let i = 0; i < other.segments.length; i += (i === 0 ? 1 : 2)) {
-                if (i === 1) continue;
+            for (let i = 0; i < other.segments.length; i++) {
                 const seg = other.segments[i];
-                const segR = i === 0 
-                    ? headRadiusForBalance(other.balance) 
-                    : headRadiusForBalance(other.balance) * 0.7;
+                const segR = headRadiusForBalance(other.balance);
                 
                 const dx = head.x - seg.x;
                 const dy = head.y - seg.y;
                 
-                // Use a slightly tighter threshold for head-to-head to avoid grazing/false deaths
                 const threshold = i === 0
-                    ? (r + segR) * 0.55
-                    : r * 0.85 + segR * 0.75;
+                    ? (r + segR) * 0.85
+                    : (r + segR) * 0.95;
 
                 if (dx * dx + dy * dy < threshold * threshold) {
                     if (i > 0) {
@@ -1237,8 +1235,8 @@ export function resolveAllSnakeCollisions(allSnakes) {
             const dotA = cosA * dx + sinA * dy;
             const dotB = cosB * (-dx) + sinB * (-dy);
 
-            const A_moving_to_B = dotA > 0;
-            const B_moving_to_A = dotB > 0;
+            const A_moving_to_B = dotA > 1e-5;
+            const B_moving_to_A = dotB > 1e-5;
 
             if (A_moving_to_B && B_moving_to_A) {
                 // True head-on collision. Resolve by balance (size).

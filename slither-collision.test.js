@@ -3,20 +3,22 @@ import assert from 'node:assert/strict';
 import { resolveAllSnakeCollisions } from './slither-engine.js';
 
 test('Side collision: A runs into B body, A dies and B lives', () => {
-    // Snake A (head at 0,0)
+    // Snake A (head at 0,0, tail at -10,0)
     const snakeA = {
         id: 'A',
         balance: 1.0,
         angle: 0,
-        segments: [{ x: 0, y: 0 }, { x: -4, y: 0 }]
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }]
     };
 
-    // Snake B (head at 0, 12, body segment 3 at 0, 0)
+    // Snake B (head at 0, 20, body segment 5 at 0, 0)
+    // Distance from A head to B segment 5 is 0.
+    // Distance from B head to A segments is > 20, well outside any collision range.
     const snakeB = {
         id: 'B',
         balance: 1.0,
         angle: Math.PI / 2,
-        segments: [{ x: 0, y: 12 }, { x: 0, y: 8 }, { x: 0, y: 4 }, { x: 0, y: 0 }]
+        segments: [{ x: 0, y: 20 }, { x: 0, y: 16 }, { x: 0, y: 12 }, { x: 0, y: 8 }, { x: 0, y: 4 }, { x: 0, y: 0 }]
     };
 
     const allSnakes = [
@@ -32,22 +34,24 @@ test('Side collision: A runs into B body, A dies and B lives', () => {
 });
 
 test('Side impact with neck/head overlap: B neck hit by A, only A dies', () => {
-    // Snake A (head at 0,0)
+    // Snake A (head at 0,0, tail at -15,0)
     const snakeA = {
         id: 'A',
         balance: 1.0,
         angle: 0,
-        segments: [{ x: 0, y: 0 }, { x: -4, y: 0 }]
+        segments: [{ x: 0, y: 0 }, { x: -15, y: 0 }]
     };
 
-    // Snake B (head at 4, 4, body segment 1 at 4, 0)
-    // Distance from A head to B segment 1 is 4.
-    // Distance from B head to A head is sqrt(32) ≈ 5.66, within the head-to-head threshold.
+    // Snake B (head at 4, 10, body segment 1 at 4, 0)
+    // Distance from A head to B segment 1 is 4 (triggers body hit for A).
+    // Distance from B head to A head is sqrt(16+100) ≈ 10.77 (within head-to-head threshold 11.53).
+    // B head is far from A tail (21.47 > 12.89 body threshold).
+    // Since B is not moving towards A (B moving up, A moving right), B survives head-to-head.
     const snakeB = {
         id: 'B',
         balance: 1.0,
         angle: Math.PI / 2,
-        segments: [{ x: 4, y: 4 }, { x: 4, y: 0 }]
+        segments: [{ x: 4, y: 10 }, { x: 4, y: 0 }]
     };
 
     const allSnakes = [
@@ -63,19 +67,20 @@ test('Side impact with neck/head overlap: B neck hit by A, only A dies', () => {
 });
 
 test('Head-on collision (same size): both die', () => {
-    // Head distance is 5 (which is < head-head threshold of ~7.46)
+    // Head distance is 10 (which is < head-head threshold of ~11.53)
+    // Tails are at -10 and 20 respectively, so they are far from heads (> 20, no body collision).
     const snakeA = {
         id: 'A',
         balance: 1.0,
         angle: 0,
-        segments: [{ x: 0, y: 0 }, { x: -4, y: 0 }]
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }]
     };
 
     const snakeB = {
         id: 'B',
         balance: 1.0,
         angle: Math.PI,
-        segments: [{ x: 5, y: 0 }, { x: 9, y: 0 }]
+        segments: [{ x: 10, y: 0 }, { x: 20, y: 0 }]
     };
 
     const allSnakes = [
@@ -91,18 +96,20 @@ test('Head-on collision (same size): both die', () => {
 
 test('Head-on collision (different size): larger survives', () => {
     // Snake A is 2x larger than B
+    // Head distance is 10 (which is < head-head threshold of ~11.95)
+    // Tails are far, preventing body collision.
     const snakeA = {
         id: 'A',
         balance: 2.0,
         angle: 0,
-        segments: [{ x: 0, y: 0 }, { x: -4, y: 0 }]
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }]
     };
 
     const snakeB = {
         id: 'B',
         balance: 1.0,
         angle: Math.PI,
-        segments: [{ x: 5, y: 0 }, { x: 9, y: 0 }]
+        segments: [{ x: 10, y: 0 }, { x: 20, y: 0 }]
     };
 
     const allSnakes = [
@@ -118,19 +125,20 @@ test('Head-on collision (different size): larger survives', () => {
 });
 
 test('Grazing / Turning away: both survive', () => {
-    // Heads are close (distance 5), but they are moving away from each other
+    // Heads are close (distance 11 < 11.53), but they are moving away from each other
+    // Tails are at (0, -15) and (11, 15) respectively (distance 18.6 > 12.89, no body collision).
     const snakeA = {
         id: 'A',
         balance: 1.0,
-        angle: 3 * Math.PI / 4, // moving up-left
-        segments: [{ x: 0, y: 0 }, { x: 2.8, y: -2.8 }]
+        angle: Math.PI / 2, // moving up
+        segments: [{ x: 0, y: 0 }, { x: 0, y: -15 }]
     };
 
     const snakeB = {
         id: 'B',
         balance: 1.0,
-        angle: -Math.PI / 4, // moving down-right
-        segments: [{ x: 5, y: 0 }, { x: 2.2, y: 2.8 }]
+        angle: -Math.PI / 2, // moving down
+        segments: [{ x: 11, y: 0 }, { x: 11, y: 15 }]
     };
 
     const allSnakes = [
@@ -142,4 +150,32 @@ test('Grazing / Turning away: both survive', () => {
 
     assert.ok(!dead.has('A'), 'Snake A should survive');
     assert.ok(!dead.has('B'), 'Snake B should survive');
+});
+
+test('Parallel brushing past: moving parallel, both survive', () => {
+    // Heads are at (0, 0) and (10, 14). Distance is 17.2 > 11.53 (no head-to-head collision).
+    // Tail segments are far enough to avoid body collisions (> 14).
+    const snakeA = {
+        id: 'A',
+        balance: 1.0,
+        angle: 0, // moving right
+        segments: [{ x: 0, y: 0 }, { x: -15, y: 0 }]
+    };
+
+    const snakeB = {
+        id: 'B',
+        balance: 1.0,
+        angle: 0, // moving right
+        segments: [{ x: 10, y: 14 }, { x: -5, y: 14 }]
+    };
+
+    const allSnakes = [
+        { entity: snakeA, isHuman: true },
+        { entity: snakeB, isHuman: true }
+    ];
+
+    const dead = resolveAllSnakeCollisions(allSnakes);
+
+    assert.ok(!dead.has('A'), 'Snake A should survive parallel brushing');
+    assert.ok(!dead.has('B'), 'Snake B should survive parallel brushing');
 });

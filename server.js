@@ -6746,6 +6746,8 @@ io.on('connection', (socket) => {
                     adminSpawned: true,
                 });
             } else {
+                const offsetX = p ? (Math.random() - 0.5) * 600 : 0;
+                const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
                 room.bots.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
                     username: botNames[Math.floor(Math.random() * botNames.length)],
