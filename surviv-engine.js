@@ -922,155 +922,203 @@ export function generateSurvivMap(worldHalf) {
     const spawnPoints = [];
     const landmarks = [];
 
-    const scale = worldHalf / 40000;
-    const pois = [
-        { name: 'Old Estate', x: 0, y: 0, type: 'mansion' },
-        { name: 'West Manor', x: Math.round(-13500 * scale), y: Math.round(-8200 * scale), type: 'mansion' },
-        { name: 'South Villa', x: Math.round(7800 * scale), y: Math.round(18200 * scale), type: 'mansion' },
-        { name: 'North Lab', x: 0, y: Math.round(-27500 * scale), type: 'lab' },
-        { name: 'Pine Town', x: Math.round(-16500 * scale), y: Math.round(-12500 * scale), type: 'town' },
-        { name: 'Quarry', x: Math.round(18500 * scale), y: Math.round(-14500 * scale), type: 'quarry' },
-        { name: 'West Village', x: Math.round(-30500 * scale), y: Math.round(1500 * scale), type: 'town' },
-        { name: 'Dry Farm', x: Math.round(-21500 * scale), y: Math.round(15500 * scale), type: 'farm' },
-        { name: 'Container Docks', x: Math.round(22500 * scale), y: Math.round(17500 * scale), type: 'yard' },
-        { name: 'East Depot', x: Math.round(31000 * scale), y: Math.round(-4500 * scale), type: 'yard' },
-        { name: 'River Camp', x: Math.round(8500 * scale), y: Math.round(25500 * scale), type: 'camp' },
-        { name: 'South Bunker', x: Math.round(-4200 * scale), y: Math.round(31500 * scale), type: 'bunker' },
-        { name: 'Military Base', x: Math.round(-25000 * scale), y: Math.round(-25000 * scale), type: 'military' },
-        { name: 'Crossroads Gas', x: Math.round(12000 * scale), y: Math.round(12000 * scale), type: 'gas' },
-        { name: 'State Prison', x: Math.round(28000 * scale), y: Math.round(-25000 * scale), type: 'prison' },
-        { name: 'Central Hospital', x: Math.round(-15000 * scale), y: Math.round(28000 * scale), type: 'hospital' },
-        { name: 'Radio Tower', x: Math.round(28000 * scale), y: Math.round(28000 * scale), type: 'tower' },
-    ];
+    // wh = shorthand for half-map radius, used to scale all positions
+    const wh = worldHalf;
 
-    // --- Place POIs ---
-    const poiPositions = [];
-    for (const poi of pois) {
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZONE 0: CENTER — the main mansion estate (always at origin)
+    // ─────────────────────────────────────────────────────────────────────────
+    addMansion(obstacles, loot, spawnPoints, 0, 0);
+    landmarks.push({ name: 'Old Estate', x: 0, y: 0, type: 'mansion' });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZONE 1: INNER RING — four major landmarks at cardinal directions (~38% radius)
+    // ─────────────────────────────────────────────────────────────────────────
+    const IR = wh * 0.38; // inner ring radius
+    const innerPOIs = [
+        { name: 'North Military Base', x: 0,    y: -IR,  type: 'military' },
+        { name: 'East Hospital',       x: IR,   y: 0,    type: 'hospital' },
+        { name: 'South Villa',         x: 0,    y: IR,   type: 'mansion'  },
+        { name: 'West Container Docks',x: -IR,  y: 0,    type: 'yard'     },
+    ];
+    for (const poi of innerPOIs) {
         landmarks.push({ name: poi.name, x: poi.x, y: poi.y, type: poi.type });
-        addRoad(obstacles, 0, 0, poi.x, poi.y, poi.type === 'mansion' ? 190 : 145);
-        poiPositions.push({ x: poi.x, y: poi.y });
-        if (poi.type === 'mansion') addMansion(obstacles, loot, spawnPoints, poi.x, poi.y);
+        if (poi.type === 'military') addMilitaryBase(obstacles, loot, spawnPoints, poi.x, poi.y);
+        else if (poi.type === 'hospital') addHospital(obstacles, loot, spawnPoints, poi.x, poi.y);
+        else if (poi.type === 'mansion') addMansion(obstacles, loot, spawnPoints, poi.x, poi.y);
         else if (poi.type === 'yard') addContainerYard(obstacles, loot, spawnPoints, poi.x, poi.y);
-        else if (poi.type === 'quarry') {
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZONE 2: MID RING — secondary landmarks at diagonals (~65% radius)
+    // ─────────────────────────────────────────────────────────────────────────
+    const MR = wh * 0.65;
+    const diag = MR * 0.707; // cos(45°) = sin(45°) ≈ 0.707
+    const midPOIs = [
+        { name: 'NE Quarry',      x:  diag, y: -diag, type: 'quarry'   },
+        { name: 'SE State Prison',x:  diag, y:  diag, type: 'prison'   },
+        { name: 'SW Radio Tower', x: -diag, y:  diag, type: 'tower'    },
+        { name: 'NW Pine Town',   x: -diag, y: -diag, type: 'town'     },
+    ];
+    for (const poi of midPOIs) {
+        landmarks.push({ name: poi.name, x: poi.x, y: poi.y, type: poi.type });
+        if (poi.type === 'quarry') {
             addObstacle(obstacles, 'field', poi.x, poi.y, 1200, 900, { collidable: false, variant: 'quarry' });
             for (let i = 0; i < 24; i++) {
                 addObstacle(obstacles, 'rock', poi.x - 520 + Math.random() * 1040, poi.y - 390 + Math.random() * 780, 54 + Math.random() * 48, 48 + Math.random() * 42, { hue: 220, rotation: Math.random() * 0.4 });
             }
-            // Quarry buildings contain all loot
             addHouse(obstacles, loot, spawnPoints, poi.x + 360, poi.y - 260, 300, 230, { variant: 'warehouse', tier: 'military', hue: 205 });
             addHouse(obstacles, loot, spawnPoints, poi.x - 340, poi.y + 200, 280, 210, { variant: 'warehouse', tier: 'military', hue: 200 });
-        } else if (poi.type === 'lab') {
-            addSettlement(obstacles, loot, spawnPoints, poi.x, poi.y, 7, 'snow-lab');
-            addContainerYard(obstacles, loot, spawnPoints, poi.x + 850, poi.y + 300);
-        } else if (poi.type === 'farm') {
-            addSettlement(obstacles, loot, spawnPoints, poi.x, poi.y, 6, 'farm');
-            for (let i = 0; i < 7; i++) addObstacle(obstacles, 'field', poi.x - 780 + i * 260, poi.y + 560, 190, 420, { collidable: false, variant: 'crop' });
-        } else if (poi.type === 'camp') {
-            for (let i = 0; i < 5; i++) addMicroSite(obstacles, loot, spawnPoints, poi.x - 550 + i * 280, poi.y + (i % 2) * 300 - 150, 'wetlands');
-            addForest(obstacles, loot, spawnPoints, poi.x, poi.y - 380, 38, 760);
-        } else if (poi.type === 'bunker') {
-            addObstacle(obstacles, 'field', poi.x, poi.y, 1200, 820, { collidable: false, variant: 'ruins' });
-            // All loot inside bunker buildings
-            addHouse(obstacles, loot, spawnPoints, poi.x, poi.y, 520, 360, { variant: 'warehouse', tier: 'military', hue: 205, wall: 18 });
-            addHouse(obstacles, loot, spawnPoints, poi.x - 380, poi.y - 200, 260, 200, { variant: 'warehouse', tier: 'military', hue: 200 });
-            addHouse(obstacles, loot, spawnPoints, poi.x + 380, poi.y - 200, 260, 200, { variant: 'warehouse', tier: 'rare', hue: 200 });
-        } else if (poi.type === 'hospital') {
-            addHospital(obstacles, loot, spawnPoints, poi.x, poi.y);
         } else if (poi.type === 'prison') {
             addPrison(obstacles, loot, spawnPoints, poi.x, poi.y);
-        } else if (poi.type === 'military') {
-            addMilitaryBase(obstacles, loot, spawnPoints, poi.x, poi.y);
-        } else if (poi.type === 'gas') {
-            addGasStation(obstacles, loot, spawnPoints, poi.x, poi.y);
         } else if (poi.type === 'tower') {
             addRadioTower(obstacles, loot, spawnPoints, poi.x, poi.y);
-        } else {
+        } else if (poi.type === 'town') {
             addSettlement(obstacles, loot, spawnPoints, poi.x, poi.y, 8, 'town');
         }
     }
 
-    // --- Inter-POI roads ---
-    for (let i = 0; i < pois.length - 1; i++) {
-        const a = pois[i];
-        const b = pois[i + 1];
-        if (Math.random() > 0.2) addRoad(obstacles, a.x, a.y, b.x, b.y, 100);
-    }
-
-    // --- Rivers (2-3 crossing the map) ---
-    const rivers = [];
-    rivers.push(addRiver(obstacles, worldHalf,
-        -worldHalf * 0.85, -worldHalf * 0.3,
-        worldHalf * 0.9, worldHalf * 0.5, 200 + Math.random() * 60));
-    rivers.push(addRiver(obstacles, worldHalf,
-        -worldHalf * 0.2, -worldHalf * 0.9,
-        worldHalf * 0.4, worldHalf * 0.85, 180 + Math.random() * 50));
-    if (Math.random() > 0.3) {
-        rivers.push(addRiver(obstacles, worldHalf,
-            -worldHalf * 0.7, worldHalf * 0.6,
-            worldHalf * 0.8, -worldHalf * 0.4, 160 + Math.random() * 40));
-    }
-
-    // --- Bridges where roads cross rivers ---
-    for (const river of rivers) {
-        addBridgesAlongRiver(obstacles, river, poiPositions);
-    }
-
-    // --- Even distribution: grid-based settlement placement ---
-    // Use a grid to evenly spread settlements across the map
-    const settlementStep = 5200;
-    const settlementMargin = 3000;
-    const minPoiDist = 2200;
-    const placedPositions = [...poiPositions];
-
-    for (let gx = -worldHalf + settlementMargin; gx <= worldHalf - settlementMargin; gx += settlementStep) {
-        for (let gy = -worldHalf + settlementMargin; gy <= worldHalf - settlementMargin; gy += settlementStep) {
-            const x = clamp(gx + (Math.random() - 0.5) * 2200, -worldHalf + 1800, worldHalf - 1800);
-            const y = clamp(gy + (Math.random() - 0.5) * 2200, -worldHalf + 1800, worldHalf - 1800);
-            // Skip if too close to a POI or already placed settlement
-            const tooClose = placedPositions.some(p => Math.hypot(p.x - x, p.y - y) < minPoiDist);
-            if (tooClose) continue;
-            placedPositions.push({ x, y });
-
-            const roll = Math.random();
-            if (roll < 0.40) {
-                const size = 3 + Math.floor(Math.random() * 3);
-                const variant = roll < 0.10 ? 'farm' : roll < 0.18 ? 'camp' : 'village';
-                addSettlement(obstacles, loot, spawnPoints, x, y, size, variant);
-            } else if (roll < 0.65) {
-                addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
-            } else {
-                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-            }
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZONE 3: OUTER FILL — gas stations, bunkers, farms along the outer edges
+    // ─────────────────────────────────────────────────────────────────────────
+    const OR = wh * 0.84;
+    const outerPOIs = [
+        { name: 'North Gas Station', x: 0,       y: -OR,    type: 'gas'     },
+        { name: 'East Farm',         x: OR,       y: 0,      type: 'farm'    },
+        { name: 'South Bunker',      x: 0,        y: OR,     type: 'bunker'  },
+        { name: 'West Forest Camp',  x: -OR,      y: 0,      type: 'camp'    },
+        { name: 'NE Town',           x:  OR*0.7,  y: -OR*0.7,type: 'town'    },
+        { name: 'SE Lab',            x:  OR*0.7,  y:  OR*0.7,type: 'lab'     },
+        { name: 'SW Town',           x: -OR*0.7,  y:  OR*0.7,type: 'town'    },
+        { name: 'NW Mansion',        x: -OR*0.7,  y: -OR*0.7,type: 'mansion' },
+    ];
+    for (const poi of outerPOIs) {
+        // Clamp to avoid going past world edge
+        const cx = clamp(poi.x, -wh * 0.92, wh * 0.92);
+        const cy = clamp(poi.y, -wh * 0.92, wh * 0.92);
+        landmarks.push({ name: poi.name, x: cx, y: cy, type: poi.type });
+        if (poi.type === 'gas') addGasStation(obstacles, loot, spawnPoints, cx, cy);
+        else if (poi.type === 'farm') addSettlement(obstacles, loot, spawnPoints, cx, cy, 6, 'farm');
+        else if (poi.type === 'bunker') {
+            addObstacle(obstacles, 'field', cx, cy, 1200, 820, { collidable: false, variant: 'ruins' });
+            addHouse(obstacles, loot, spawnPoints, cx, cy, 520, 360, { variant: 'warehouse', tier: 'military', hue: 205, wall: 18 });
+            addHouse(obstacles, loot, spawnPoints, cx - 380, cy - 200, 260, 200, { variant: 'warehouse', tier: 'military', hue: 200 });
+        } else if (poi.type === 'camp') {
+            for (let i = 0; i < 5; i++) addMicroSite(obstacles, loot, spawnPoints, cx - 550 + i * 280, cy + (i % 2) * 300 - 150, 'wetlands');
+            addForest(obstacles, loot, spawnPoints, cx, cy - 380, 38, 760);
+        } else if (poi.type === 'town') {
+            addSettlement(obstacles, loot, spawnPoints, cx, cy, 6, 'town');
+        } else if (poi.type === 'lab') {
+            addSettlement(obstacles, loot, spawnPoints, cx, cy, 7, 'snow-lab');
+        } else if (poi.type === 'mansion') {
+            addMansion(obstacles, loot, spawnPoints, cx, cy);
         }
     }
 
-    // --- Forests (evenly scattered, fewer than before) ---
-    for (let i = 0; i < 18; i++) {
-        const pos = randomSpawnCoord(worldHalf * 0.88);
-        addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 18 + Math.floor(Math.random() * 22), 360 + Math.random() * 420);
+    // ─────────────────────────────────────────────────────────────────────────
+    // ROAD NETWORK
+    // Main cross: N-S road and E-W road through center, connecting inner ring
+    // ─────────────────────────────────────────────────────────────────────────
+    const roadW = 120;
+    const wideRoadW = 180;
+    // N-S spine
+    addRoad(obstacles, 0, -wh * 0.95, 0, wh * 0.95, wideRoadW);
+    // E-W spine
+    addRoad(obstacles, -wh * 0.95, 0, wh * 0.95, 0, wideRoadW);
+
+    // Inner-ring connector roads (ring road linking inner POIs)
+    addRoad(obstacles, 0, -IR, IR, 0, roadW);    // N→E
+    addRoad(obstacles, IR, 0, 0, IR, roadW);     // E→S
+    addRoad(obstacles, 0, IR, -IR, 0, roadW);    // S→W
+    addRoad(obstacles, -IR, 0, 0, -IR, roadW);   // W→N
+
+    // Radial spokes from inner ring to mid ring
+    addRoad(obstacles, IR * 0.7, -IR * 0.7, diag, -diag, roadW);   // NE
+    addRoad(obstacles, IR * 0.7,  IR * 0.7, diag,  diag, roadW);   // SE
+    addRoad(obstacles, -IR * 0.7, IR * 0.7, -diag, diag, roadW);   // SW
+    addRoad(obstacles, -IR * 0.7, -IR * 0.7, -diag, -diag, roadW); // NW
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // RIVERS — one runs roughly E-W, one roughly N-S; they cross near center
+    // ─────────────────────────────────────────────────────────────────────────
+    // E-W river (crosses north of center)
+    const riverEW = addRiver(obstacles, wh,
+        -wh * 0.9,  -wh * 0.18,
+         wh * 0.9,  -wh * 0.12,
+        210 + Math.random() * 60);
+
+    // N-S river (crosses slightly east of center)
+    const riverNS = addRiver(obstacles, wh,
+        wh * 0.14, -wh * 0.9,
+        wh * 0.08,  wh * 0.9,
+        190 + Math.random() * 50);
+
+    // Bridges where the main roads cross the rivers
+    // N-S road crosses E-W river: find crossing point ~x=0
+    addBridgesAlongRiver(obstacles, riverEW, [{ x: 0, y: 0 }]);
+    // E-W road crosses N-S river: find crossing point ~y=0
+    addBridgesAlongRiver(obstacles, riverNS, [{ x: 0, y: 0 }]);
+    // Also bridge the inner-ring roads at river crossings
+    addBridgesAlongRiver(obstacles, riverEW, [{ x: diag * 0.5, y: -diag * 0.5 }]);
+    addBridgesAlongRiver(obstacles, riverNS, [{ x: diag * 0.5, y: diag * 0.5 }]);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FILLER — micro-sites and houses scattered between the POI rings
+    // Placed along the main road axes for a natural feel
+    // ─────────────────────────────────────────────────────────────────────────
+    const allPoiPositions = [
+        { x: 0, y: 0 },
+        ...innerPOIs.map(p => ({ x: p.x, y: p.y })),
+        ...midPOIs.map(p => ({ x: p.x, y: p.y })),
+        ...outerPOIs.map(p => ({ x: clamp(p.x, -wh * 0.92, wh * 0.92), y: clamp(p.y, -wh * 0.92, wh * 0.92) })),
+    ];
+    const placedPositions = [...allPoiPositions];
+
+    // Place micro-sites every ~2500 units along the main axes between POIs
+    const axisStep = 2500;
+    // Along N-S axis
+    for (let y = -wh * 0.9; y <= wh * 0.9; y += axisStep) {
+        const ox = (Math.random() - 0.5) * 1200;
+        const oy = y + (Math.random() - 0.5) * 600;
+        const tooClose = placedPositions.some(p => Math.hypot(p.x - ox, p.y - oy) < 2000);
+        if (!tooClose) {
+            addMicroSite(obstacles, loot, spawnPoints, ox, oy, 'grass');
+            placedPositions.push({ x: ox, y: oy });
+        }
+    }
+    // Along E-W axis
+    for (let x = -wh * 0.9; x <= wh * 0.9; x += axisStep) {
+        const ox = x + (Math.random() - 0.5) * 600;
+        const oy = (Math.random() - 0.5) * 1200;
+        const tooClose = placedPositions.some(p => Math.hypot(p.x - ox, p.y - oy) < 2000);
+        if (!tooClose) {
+            addMicroSite(obstacles, loot, spawnPoints, ox, oy, 'grass');
+            placedPositions.push({ x: ox, y: oy });
+        }
     }
 
-    // --- Fill remaining grid with cover/sites/houses ---
-    const fillStep = 3200;
-    const fillMargin = 2000;
-    for (let gx = -worldHalf + fillMargin; gx <= worldHalf - fillMargin; gx += fillStep) {
-        for (let gy = -worldHalf + fillMargin; gy <= worldHalf - fillMargin; gy += fillStep) {
-            const x = clamp(gx + (Math.random() - 0.5) * 1600, -worldHalf + 1200, worldHalf - 1200);
-            const y = clamp(gy + (Math.random() - 0.5) * 1600, -worldHalf + 1200, worldHalf - 1200);
+    // Scatter standalone houses in open gaps (grid-based, but tighter)
+    const fillStep = 3000;
+    const fillMargin = 2200;
+    for (let gx = -wh + fillMargin; gx <= wh - fillMargin; gx += fillStep) {
+        for (let gy = -wh + fillMargin; gy <= wh - fillMargin; gy += fillStep) {
+            const x = clamp(gx + (Math.random() - 0.5) * 1400, -wh + 1400, wh - 1400);
+            const y = clamp(gy + (Math.random() - 0.5) * 1400, -wh + 1400, wh - 1400);
             const nearAny = placedPositions.some(p => Math.hypot(p.x - x, p.y - y) < 1800);
             if (nearAny) continue;
-
+            placedPositions.push({ x, y });
             const roll = Math.random();
-            if (roll < 0.35) {
-                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-                placedPositions.push({ x, y });
-            } else if (roll < 0.55) {
-                addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
-                placedPositions.push({ x, y });
-            } else if (roll < 0.80) {
-                addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
-            }
+            if (roll < 0.40) addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
+            else if (roll < 0.65) addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
+            else addCoverPatch(obstacles, loot, spawnPoints, x, y, { variant: 'woods' });
         }
+    }
+
+    // Forests scattered organically
+    for (let i = 0; i < 16; i++) {
+        const pos = randomSpawnCoord(wh * 0.88);
+        const nearAny = placedPositions.some(p => Math.hypot(p.x - pos.x, p.y - pos.y) < 1400);
+        if (!nearAny) addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 18 + Math.floor(Math.random() * 22), 360 + Math.random() * 420);
     }
 
     addScatteredGroundLoot(obstacles, loot, worldHalf);
