@@ -8,6 +8,7 @@ import { getSurvivEconomy } from './economy.js';
 const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
 const MELEE_ANIMATION_MS = 280;
+const SURVIV_MAX_WEAPONS = 2;
 
 export const SURVIV = {
     worldHalf: 10000,
@@ -302,36 +303,53 @@ function resolveCircleRect(cx, cy, r, rect) {
     return { x: cx + nx * overlap, y: cy + ny * overlap };
 }
 
+function randomMoneyAmount(minCents = 20, maxCents = 200) {
+    const min = Math.max(1, Math.round(minCents));
+    const max = Math.max(min, Math.round(maxCents));
+    return Number(((min + Math.floor(Math.random() * (max - min + 1))) / 100).toFixed(2));
+}
+
 function randomChestContents(tier = 'common', options = {}) {
+    const outdoor = options.outdoor === true;
     const contents = { rarity: tier };
-    if (options.includeMoney === true) {
-        const moneyBase = tier === 'rare' ? 0.85 : tier === 'military' ? 1.25 : 0.42;
-        contents.money = Number((moneyBase * (0.55 + Math.random())).toFixed(2));
+
+    const baseMoneyChance = tier === 'military' ? 0.42 : tier === 'rare' ? 0.34 : 0.24;
+    const moneyChance = options.includeMoney === false
+        ? 0
+        : options.includeMoney === true
+            ? 1
+            : baseMoneyChance * (outdoor ? 0.58 : 1);
+    if (Math.random() < moneyChance) {
+        contents.money = randomMoneyAmount(20, outdoor ? 125 : 200);
     }
 
-    const weaponChance = tier === 'military' ? 1 : tier === 'rare' ? 0.82 : 0.48;
+    const weaponChanceBase = tier === 'military' ? 1 : tier === 'rare' ? 0.82 : 0.48;
+    const weaponChance = outdoor ? weaponChanceBase * 0.68 : weaponChanceBase;
     if (Math.random() < weaponChance) contents.weaponType = pickWeaponForTier(tier);
 
     contents.ammoPacks = tier === 'military'
         ? 2 + Math.floor(Math.random() * 2)
         : tier === 'rare' ? 2 : 1;
-    if (Math.random() < (tier === 'military' ? 0.86 : tier === 'rare' ? 0.68 : 0.36)) {
+    const medkitChance = (tier === 'military' ? 0.86 : tier === 'rare' ? 0.68 : 0.36) * (outdoor ? 0.78 : 1);
+    if (Math.random() < medkitChance) {
         contents.medkits = tier === 'military' && Math.random() > 0.55 ? 2 : 1;
     }
-    if (Math.random() < (tier === 'military' ? 0.9 : tier === 'rare' ? 0.62 : 0.24)) {
+    const armorChance = (tier === 'military' ? 0.9 : tier === 'rare' ? 0.62 : 0.24) * (outdoor ? 0.72 : 1);
+    if (Math.random() < armorChance) {
         contents.armor = tier === 'military' ? 60 : 35;
     }
     return contents;
 }
 
-function makeChest(x, y, tier = 'common', contents = randomChestContents(tier), source = 'map') {
+function makeChest(x, y, tier = 'common', contents = null, source = 'map', options = {}) {
+    const chestContents = contents || randomChestContents(tier, options);
     return {
         id: randId(),
         type: source === 'death' ? 'deathCrate' : 'chest',
         x,
         y,
         tier,
-        contents,
+        contents: chestContents,
         source,
     };
 }
@@ -428,6 +446,15 @@ function addRoad(obstacles, x1, y1, x2, y2, width = 150) {
     const dy = y2 - y1;
     if (Math.abs(dx) > 1) addNetworkRoadSegment(obstacles, x1, y1, x2, y1, width);
     if (Math.abs(dy) > 1) addNetworkRoadSegment(obstacles, x2, y1, x2, y2, width);
+}
+
+function removeShortNetworkRoadStubs(obstacles, minLength) {
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+        const road = obstacles[i];
+        if (road.kind !== 'road' || road.role !== 'networkRoad') continue;
+        if (Math.max(road.w, road.h) >= minLength) continue;
+        obstacles.splice(i, 1);
+    }
 }
 
 function addWall(obstacles, x, y, w, h, variant = 'plaster') {
@@ -668,7 +695,7 @@ function addContainerYard(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'barrel', x - 80, y + 100, 36, 36, { hue: 15, variant: 'fuel' });
     addObstacle(obstacles, 'barrel', x + 80, y + 120, 36, 36, { hue: 200, variant: 'water' });
     
-    loot.push(makeChest(x, y + 20, 'rare'));
+    loot.push(makeChest(x, y + 20, 'rare', null, 'map', { outdoor: true }));
 
     addHouse(obstacles, loot, spawnPoints, x + 430, y + 285, 300, 220, { variant: 'warehouse', tier: 'military', hue: 205 });
     addHouse(obstacles, loot, spawnPoints, x - 430, y + 285, 260, 200, { variant: 'warehouse', tier: 'military', hue: 195 });
@@ -1096,10 +1123,10 @@ function addHospital(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'furniture', x + 100, y - 100, 42, 30, { collidable: false, variant: 'table' });
 
     // The hospital is a high-value landmark, but the crates stay sparse and meaningful.
-    loot.push(makeChest(x - 380, y - 240, 'rare'));
-    loot.push(makeChest(x + 380, y + 220, 'rare'));
-    loot.push(makeChest(x - 60, y + 250, 'military'));
-    if (Math.random() < 0.45) loot.push(makeChest(x + 380, y - 220, 'rare'));
+    loot.push(makeChest(x - 380, y - 240, 'rare', null, 'map', { outdoor: true }));
+    loot.push(makeChest(x + 380, y + 220, 'rare', null, 'map', { outdoor: true }));
+    loot.push(makeChest(x - 60, y + 250, 'military', null, 'map', { outdoor: true }));
+    if (Math.random() < 0.45) loot.push(makeChest(x + 380, y - 220, 'rare', null, 'map', { outdoor: true }));
 
     // Guaranteed medical supplies on beds
     loot.push(makeGroundLoot('medkit', x - 400, y - 250, { amount: 1, source: 'hospital-loot' }));
@@ -1496,6 +1523,7 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, prisonPos.x, 2000, prisonPos.x, prisonPos.y, roadW); // State Prison to E-W Highway
     addRoad(obstacles, towerPos.x, 2000, towerPos.x, towerPos.y, roadW); // Radio Tower to E-W Highway
     addRoad(obstacles, townPos.x, -4000, townPos.x, townPos.y, roadW); // Pine Town to North E-W Highway
+    removeShortNetworkRoadStubs(obstacles, roadW * 8.5);
 
     // ─────────────────────────────────────────────────────────────────────────
     // RIVERS & BRIDGES (Aligned with N-S highways)
@@ -1671,7 +1699,7 @@ function ensureInventory(entity) {
     const validWeapons = currentWeapons.filter((weapon, index) => (
         weapon !== 'fists' && WEAPONS[weapon] && currentWeapons.indexOf(weapon) === index
     ));
-    entity.inventory.weapons = ['fists', ...validWeapons].slice(0, 4);
+    entity.inventory.weapons = ['fists', ...validWeapons].slice(0, SURVIV_MAX_WEAPONS);
     entity.inventory.medkits = Number(entity.inventory.medkits) || 0;
     entity.inventory.ammoPacks = Number(entity.inventory.ammoPacks) || 0;
     entity.inventory.chestsOpened = Number(entity.inventory.chestsOpened) || 0;
@@ -1681,10 +1709,10 @@ function ensureInventory(entity) {
 function addWeaponToInventory(entity, weaponType) {
     const inv = ensureInventory(entity);
     if (!weaponType || !WEAPONS[weaponType] || inv.weapons.includes(weaponType)) return false;
-    if (inv.weapons.length < 4) {
+    if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
         inv.weapons.push(weaponType);
     } else {
-        inv.weapons[3] = weaponType;
+        inv.weapons[SURVIV_MAX_WEAPONS - 1] = weaponType;
     }
     return true;
 }
@@ -1990,6 +2018,7 @@ function tryShoot(entity, room, now) {
         w.lastShotAt = now;
         entity.meleeStartedAt = now;
         entity.meleeUntil = now + MELEE_ANIMATION_MS;
+        entity.meleeHand = entity.meleeHand === 'top' ? 'bottom' : 'top';
 
         const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
         const targets = [
@@ -2465,15 +2494,24 @@ export function spawnLootFromPool(room, poolAmount) {
     const poolDollars = centsTotal / 100;
     room.lootPoolBalance = Number(((room.lootPoolBalance || 0) + poolDollars).toFixed(2));
 
-    const moneyCrates = clamp(Math.ceil(centsTotal / 35), 8, 28);
-    const baseCents = Math.floor(centsTotal / moneyCrates);
-    const remainder = centsTotal % moneyCrates;
+    const chunks = [];
+    let remainingCents = centsTotal;
+    while (remainingCents > 0) {
+        const maxChunk = Math.min(200, remainingCents);
+        const minChunk = Math.min(maxChunk, remainingCents <= 40 ? remainingCents : 20);
+        const averageTarget = remainingCents > 800 ? 120 : 75;
+        const softMax = Math.max(minChunk, Math.min(maxChunk, averageTarget + Math.floor(Math.random() * 70)));
+        const amountCents = remainingCents <= 200
+            ? remainingCents
+            : minChunk + Math.floor(Math.random() * (softMax - minChunk + 1));
+        chunks.push(amountCents);
+        remainingCents -= amountCents;
+    }
 
-    for (let i = 0; i < moneyCrates; i++) {
-        const amountCents = baseCents + (i < remainder ? 1 : 0);
+    for (const amountCents of chunks.sort(() => Math.random() - 0.5)) {
         if (amountCents <= 0) continue;
         const pos = randomLootSpawn(room);
-        room.loot.push(makeChest(pos.x, pos.y, 'common', { rarity: 'common', money: amountCents / 100 }, 'join'));
+        room.loot.push(makeChest(pos.x, pos.y, 'common', { rarity: 'common', money: Number((amountCents / 100).toFixed(2)) }, 'join'));
     }
 
     room.lootPoolBalance = Math.max(0, Number((room.lootPoolBalance - poolDollars).toFixed(2)));
@@ -2715,6 +2753,7 @@ function serializePlayer(p, isYou) {
         meleeStartedAt: p.meleeStartedAt || 0,
         meleeUntil: p.meleeUntil || 0,
         meleeRemainingMs: p.meleeUntil > Date.now() ? Math.max(0, p.meleeUntil - Date.now()) : 0,
+        meleeHand: p.meleeHand || 'top',
         reloadEndAt: p.weapon?.reloadEndAt || 0,
         reloadRemainingMs: p.weapon?.reloading ? Math.max(0, (p.weapon.reloadEndAt || 0) - Date.now()) : 0,
         reloadMs: wDef.reloadMs,

@@ -5,8 +5,10 @@ import {
     SURVIV,
     beginSurvivReload,
     createSurvivPlayer,
+    equipSurvivWeaponSlot,
     generateSurvivMap,
     processSurvivRoom,
+    spawnLootFromPool,
     spawnSurvivBotNear,
 } from './surviv-engine.js';
 
@@ -82,6 +84,41 @@ test('surviv open areas keep scattered cover and small houses', () => {
     assert.ok(smallOpenHouses.length >= 24);
 });
 
+test('surviv chests roll varied money across map loot', () => {
+    const moneyAmounts = [];
+    let chestCount = 0;
+    for (let i = 0; i < 8; i++) {
+        const map = generateSurvivMap(SURVIV.worldHalf);
+        const chests = map.loot.filter(item => item.type === 'chest' && item.source === 'map');
+        chestCount += chests.length;
+        for (const chest of chests) {
+            if (chest.contents?.money) moneyAmounts.push(Number(chest.contents.money));
+        }
+    }
+
+    assert.ok(chestCount > 80);
+    assert.ok(moneyAmounts.length >= 12);
+    assert.ok(moneyAmounts.every(amount => amount >= 0.2 && amount <= 2));
+    assert.ok(new Set(moneyAmounts.map(amount => amount.toFixed(2))).size >= 6);
+});
+
+test('surviv join money crates vary amounts while preserving the pool', () => {
+    const room = makeRoom();
+    room.loot = [];
+    spawnLootFromPool(room, 8.25);
+
+    const amounts = room.loot
+        .filter(item => item.type === 'chest' && item.source === 'join')
+        .map(item => Number(item.contents?.money || 0));
+    const total = Number(amounts.reduce((sum, amount) => sum + amount, 0).toFixed(2));
+
+    assert.ok(amounts.length >= 5);
+    assert.equal(total, 8.25);
+    assert.ok(amounts.every(amount => amount >= 0.2 && amount <= 2));
+    assert.ok(new Set(amounts.map(amount => amount.toFixed(2))).size > 1);
+    assert.equal(room.lootPoolBalance, 0);
+});
+
 test('surviv town roads stay centered between rows and doors face the road', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const plannedTownRoads = map.obstacles.filter(obstacle => (
@@ -130,7 +167,7 @@ test('surviv network roads do not run through buildings or walls', () => {
         || obstacle.kind === 'container'
     ) && obstacle.role !== 'bridgeRail');
 
-    assert.ok(roads.length >= 16);
+    assert.ok(roads.length >= 12);
     for (const road of roads) {
         for (const blocker of blockers) {
             assert.equal(
@@ -152,6 +189,42 @@ test('straight surviv roads do not create extra square asphalt stubs', () => {
     ));
 
     assert.equal(squareAsphaltRoads.length, 0);
+});
+
+test('surviv network roads do not leave short dead-end stubs', () => {
+    for (let i = 0; i < 5; i++) {
+        const map = generateSurvivMap(SURVIV.worldHalf);
+        const shortNetworkRoads = map.obstacles.filter(obstacle => (
+            obstacle.kind === 'road'
+            && obstacle.role === 'networkRoad'
+            && Math.max(obstacle.w, obstacle.h) < 1020
+        ));
+
+        assert.equal(shortNetworkRoads.length, 0);
+    }
+});
+
+test('surviv players can carry only two weapons', () => {
+    const room = makeRoom();
+    room.loot = [];
+    const player = createSurvivPlayer('human-weapons', 'mongo-weapons', 'Two Slots', '#fff', room);
+    room.players.push(player);
+
+    for (const weaponType of ['pistol', 'smg', 'shotgun']) {
+        room.loot.push({
+            id: 'loot-' + weaponType,
+            type: 'weapon',
+            x: player.x,
+            y: player.y,
+            weaponType,
+            pickupAfter: 0,
+        });
+        processSurvivRoom(room, silentIo, Date.now() + 600000);
+    }
+
+    assert.deepEqual(player.inventory.weapons, ['fists', 'shotgun']);
+    assert.equal(player.inventory.weapons.length, 2);
+    assert.equal(equipSurvivWeaponSlot(player, 2), false);
 });
 
 test('players and automatic bots start with fists and no dollars', () => {
