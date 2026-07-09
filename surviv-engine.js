@@ -370,27 +370,64 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
     return obstacle;
 }
 
+const NETWORK_ROAD_BLOCKER_KINDS = new Set(['houseFloor', 'wall', 'interiorWall', 'door', 'container']);
+
+function subtractRoadCuts(intervals, cuts) {
+    let remaining = intervals;
+    for (const cut of cuts) {
+        const next = [];
+        for (const span of remaining) {
+            if (cut.max <= span.min || cut.min >= span.max) {
+                next.push(span);
+                continue;
+            }
+            if (cut.min > span.min) next.push({ min: span.min, max: Math.min(cut.min, span.max) });
+            if (cut.max < span.max) next.push({ min: Math.max(cut.max, span.min), max: span.max });
+        }
+        remaining = next;
+        if (!remaining.length) break;
+    }
+    return remaining;
+}
+
+function addNetworkRoadSegment(obstacles, x1, y1, x2, y2, width) {
+    const horizontal = Math.abs(x2 - x1) > Math.abs(y2 - y1);
+    const min = Math.min(horizontal ? x1 : y1, horizontal ? x2 : y2) - width / 2;
+    const max = Math.max(horizontal ? x1 : y1, horizontal ? x2 : y2) + width / 2;
+    const center = horizontal ? y1 : x1;
+    const pad = width * 0.72;
+    const cuts = [];
+
+    for (const o of obstacles) {
+        if (!NETWORK_ROAD_BLOCKER_KINDS.has(o.kind)) continue;
+        const crossMin = (horizontal ? o.y - o.h / 2 : o.x - o.w / 2) - pad;
+        const crossMax = (horizontal ? o.y + o.h / 2 : o.x + o.w / 2) + pad;
+        if (center < crossMin || center > crossMax) continue;
+        cuts.push({
+            min: (horizontal ? o.x - o.w / 2 : o.y - o.h / 2) - pad,
+            max: (horizontal ? o.x + o.w / 2 : o.y + o.h / 2) + pad,
+        });
+    }
+
+    const spans = subtractRoadCuts([{ min, max }], cuts.sort((a, b) => a.min - b.min));
+    for (const span of spans) {
+        const length = span.max - span.min;
+        if (length < width * 0.9) continue;
+        addObstacle(obstacles, 'road',
+            horizontal ? (span.min + span.max) / 2 : center,
+            horizontal ? center : (span.min + span.max) / 2,
+            horizontal ? length : width,
+            horizontal ? width : length,
+            { collidable: false, variant: 'asphalt', role: 'networkRoad' }
+        );
+    }
+}
+
 function addRoad(obstacles, x1, y1, x2, y2, width = 150) {
     const dx = x2 - x1;
     const dy = y2 - y1;
-    if (Math.abs(dx) > 1) {
-        addObstacle(obstacles, 'road', x1 + dx / 2, y1, Math.abs(dx) + width, width, {
-            collidable: false,
-            variant: 'asphalt',
-        });
-    }
-    if (Math.abs(dy) > 1) {
-        addObstacle(obstacles, 'road', x2, y1 + dy / 2, width, Math.abs(dy) + width, {
-            collidable: false,
-            variant: 'asphalt',
-        });
-    }
-    if (Math.abs(dx) > 1 && Math.abs(dy) > 1) {
-        addObstacle(obstacles, 'road', x2, y1, width, width, {
-            collidable: false,
-            variant: 'asphalt',
-        });
-    }
+    if (Math.abs(dx) > 1) addNetworkRoadSegment(obstacles, x1, y1, x2, y1, width);
+    if (Math.abs(dy) > 1) addNetworkRoadSegment(obstacles, x2, y1, x2, y2, width);
 }
 
 function addWall(obstacles, x, y, w, h, variant = 'plaster') {
@@ -807,8 +844,8 @@ function addCoverPatch(obstacles, loot, spawnPoints, x, y, opts = {}) {
 }
 
 function addOpenFieldScatter(obstacles, x, y, opts = {}) {
-    const radius = opts.radius || (150 + Math.random() * 150);
-    const count = opts.count || (3 + Math.floor(Math.random() * 5));
+    const radius = opts.radius || (190 + Math.random() * 190);
+    const count = opts.count || (6 + Math.floor(Math.random() * 6));
     const variant = opts.variant || 'grass';
     let placedCount = 0;
 
@@ -822,7 +859,7 @@ function addOpenFieldScatter(obstacles, x, y, opts = {}) {
             if (isMapPositionBlocked(obstacles, ox, oy, size / 2)) continue;
 
             const kindRoll = Math.random();
-            const kind = kindRoll < 0.68 ? 'tree' : kindRoll < 0.88 ? 'bush' : 'rock';
+            const kind = kindRoll < 0.84 ? 'tree' : kindRoll < 0.94 ? 'bush' : 'rock';
             addObstacle(obstacles, kind, ox, oy, size, kind === 'rock' ? 24 + Math.random() * 32 : size, {
                 hue: kind === 'rock' ? 212 + Math.floor(Math.random() * 26) : 94 + Math.floor(Math.random() * 42),
                 rotation: Math.random() * Math.PI,
@@ -1171,14 +1208,18 @@ function addBridge(obstacles, x, y, width, length, rotation = 0) {
     const sin = Math.sin(rotation);
     const railOffset = width / 2 - 8;
     addObstacle(obstacles, 'wall', x - sin * railOffset, y + cos * railOffset, length, 12, {
+        collidable: false,
         rotation,
         variant: 'stone',
         hue: 210,
+        role: 'bridgeRail',
     });
     addObstacle(obstacles, 'wall', x + sin * railOffset, y - cos * railOffset, length, 12, {
+        collidable: false,
         rotation,
         variant: 'stone',
         hue: 210,
+        role: 'bridgeRail',
     });
 }
 
@@ -1523,16 +1564,16 @@ export function generateSurvivMap(worldHalf) {
     // still feel natural without turning every open field into a dense compound.
     let countrysideHouses = 0;
     const countrysideHouseLimit = 16;
-    const scatterStep = 1550;
-    const scatterMargin = 1100;
+    const scatterStep = 1250;
+    const scatterMargin = 950;
     for (let gx = -wh + scatterMargin; gx <= wh - scatterMargin; gx += scatterStep) {
         for (let gy = -wh + scatterMargin; gy <= wh - scatterMargin; gy += scatterStep) {
-            if (Math.random() < 0.18) continue;
-            const x = clamp(gx + (Math.random() - 0.5) * 720, -wh + 850, wh - 850);
-            const y = clamp(gy + (Math.random() - 0.5) * 720, -wh + 850, wh - 850);
+            if (Math.random() < 0.08) continue;
+            const x = clamp(gx + (Math.random() - 0.5) * 620, -wh + 760, wh - 760);
+            const y = clamp(gy + (Math.random() - 0.5) * 620, -wh + 760, wh - 760);
 
             if (Math.hypot(x, y) < 1700) continue;
-            if (isAreaOverlapping(x, y, 380, 380, 150, placedPositions)) continue;
+            if (isAreaOverlapping(x, y, 330, 330, 115, placedPositions)) continue;
 
             if (countrysideHouses < countrysideHouseLimit && Math.random() < 0.16) {
                 addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
@@ -1540,11 +1581,11 @@ export function generateSurvivMap(worldHalf) {
                 countrysideHouses++;
             } else {
                 const placed = addOpenFieldScatter(obstacles, x, y, {
-                    radius: 150 + Math.random() * 180,
-                    count: 3 + Math.floor(Math.random() * 4),
+                    radius: 190 + Math.random() * 210,
+                    count: 6 + Math.floor(Math.random() * 5),
                     variant: y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
                 });
-                if (placed > 0) placedPositions.push({ x, y, w: 360, h: 360 });
+                if (placed > 0) placedPositions.push({ x, y, w: 300, h: 300 });
             }
         }
     }

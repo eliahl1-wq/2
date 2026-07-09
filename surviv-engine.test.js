@@ -28,6 +28,10 @@ function makeRoom() {
 
 const silentIo = { to: () => ({ emit() {} }) };
 
+function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
+    return Math.abs(x1 - x2) < (w1 + w2) / 2 && Math.abs(y1 - y2) < (h1 + h2) / 2;
+}
+
 test('surviv map stays dense inside the smaller world', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
@@ -53,10 +57,16 @@ test('surviv open areas keep scattered cover and small houses', () => {
         coverKinds.has(obstacle.kind)
         && Math.hypot(obstacle.x, obstacle.y) > 1800
     ));
+    const openTrees = openCover.filter(obstacle => obstacle.kind === 'tree');
     const coverCells = new Set(openCover.map(obstacle => (
         Math.floor((obstacle.x + SURVIV.worldHalf) / 1800)
         + ','
         + Math.floor((obstacle.y + SURVIV.worldHalf) / 1800)
+    )));
+    const treeCells = new Set(openTrees.map(obstacle => (
+        Math.floor((obstacle.x + SURVIV.worldHalf) / 1600)
+        + ','
+        + Math.floor((obstacle.y + SURVIV.worldHalf) / 1600)
     )));
     const smallHouseVariants = new Set(['cabin', 'house', 'barn']);
     const smallOpenHouses = map.obstacles.filter(obstacle => (
@@ -65,8 +75,10 @@ test('surviv open areas keep scattered cover and small houses', () => {
         && Math.hypot(obstacle.x, obstacle.y) > 1800
     ));
 
-    assert.ok(openCover.length >= 400);
-    assert.ok(coverCells.size >= 60);
+    assert.ok(openCover.length >= 900);
+    assert.ok(openTrees.length >= 700);
+    assert.ok(coverCells.size >= 78);
+    assert.ok(treeCells.size >= 90);
     assert.ok(smallOpenHouses.length >= 24);
 });
 
@@ -103,6 +115,29 @@ test('surviv town roads stay centered between rows and doors face the road', () 
             assert.ok(door.y > house.y && door.y < road.y);
         } else {
             assert.ok(door.y < house.y && door.y > road.y);
+        }
+    }
+});
+
+test('surviv network roads do not run through buildings or walls', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad');
+    const blockers = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        || obstacle.kind === 'wall'
+        || obstacle.kind === 'interiorWall'
+        || obstacle.kind === 'door'
+        || obstacle.kind === 'container'
+    ) && obstacle.role !== 'bridgeRail');
+
+    assert.ok(roads.length >= 16);
+    for (const road of roads) {
+        for (const blocker of blockers) {
+            assert.equal(
+                rectsOverlap(road.x, road.y, road.w, road.h, blocker.x, blocker.y, blocker.w, blocker.h),
+                false,
+                'network road should not overlap ' + blocker.kind,
+            );
         }
     }
 });
