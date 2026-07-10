@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
     SURVIV,
     beginSurvivReload,
+    broadcastSurvivState,
     createSurvivPlayer,
     equipSurvivWeaponSlot,
     generateSurvivMap,
@@ -354,4 +355,44 @@ test('surviv bots automatically collect useful ground loot', () => {
 
     assert.equal(bot.inventory.medkits, 1);
     assert.equal(room.loot.some(item => item.id === 'bot-medkit'), false);
+});
+
+test('surviv static terrain payload is retained between periodic sends', () => {
+    const room = makeRoom();
+    const player = createSurvivPlayer('static-viewer', 'mongo-static', 'Viewer', '#fff', room);
+    room.players.push(player);
+    const ticks = [];
+    const io = {
+        to() {
+            return {
+                emit(event, payload) {
+                    if (event === 'survivTick') ticks.push(payload);
+                },
+            };
+        },
+    };
+    const lbData = {
+        leaderboard: [],
+        zone: { x: 0, y: 0, radius: SURVIV.worldHalf },
+    };
+
+    broadcastSurvivState(room, io, lbData, {});
+    broadcastSurvivState(room, io, lbData, {});
+
+    assert.ok(Array.isArray(ticks[0].obstacles));
+    assert.ok(ticks[0].minimap);
+    assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
+    assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
+    assert.ok(Array.isArray(ticks[1].players));
+    assert.ok(Array.isArray(ticks[1].loot));
+
+    room._survivViewerPayloadCache.get(player.id).lastStaticAt = 0;
+    broadcastSurvivState(room, io, lbData, {});
+    assert.ok(Array.isArray(ticks[2].obstacles));
+    assert.ok(ticks[2].minimap);
+
+    player.x += 161;
+    broadcastSurvivState(room, io, lbData, {});
+    assert.ok(Array.isArray(ticks[3].obstacles));
+    assert.ok(ticks[3].minimap);
 });

@@ -151,6 +151,9 @@ const WEAPON_RARITY_POOLS = {
 };
 const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
 const SURVIV_OBSTACLE_CELL = 700;
+const SURVIV_LOOT_CELL = 600;
+const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 250;
+const SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD = 160;
 
 function randId() {
     return Math.random().toString(36).slice(2, 10);
@@ -1813,12 +1816,13 @@ function useInventoryMedkit(entity) {
     entity.hp = Math.min(entity.maxHp, entity.hp + 45);
 }
 
-function equipInventorySlot(entity, slot) {
+export function equipSurvivWeaponSlot(entity, slot) {
     const inv = ensureInventory(entity);
-    const index = clamp(Number(slot) || 0, 0, 3);
+    const index = Number(slot);
+    if (!Number.isInteger(index) || index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
     const weaponType = inv.weapons[index];
-    if (!weaponType || !WEAPONS[weaponType]) return;
-    if (entity.weapon?.type === weaponType) return;
+    if (!weaponType || !WEAPONS[weaponType]) return false;
+    if (entity.weapon?.type === weaponType) return true;
 
     // Save current ammo
     if (entity.weapon) {
@@ -1839,6 +1843,7 @@ function equipInventorySlot(entity, slot) {
         reloadEndAt: 0,
         lastShotAt: 0,
     };
+    return true;
 }
 
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
@@ -1973,6 +1978,90 @@ function queryObstacles(room, x, y, range, collidableOnly = false) {
         }
     }
     return out;
+}
+
+function markSurvivLootChanged(room) {
+    room._survivLootRevision = (room._survivLootRevision || 0) + 1;
+}
+
+function buildSurvivLootIndex(room) {
+    const loot = room.loot || [];
+    const grid = new Map();
+    const byId = new Map();
+    for (let index = 0; index < loot.length; index++) {
+        const item = loot[index];
+        const key = obstacleCellKey(
+            Math.floor(item.x / SURVIV_LOOT_CELL),
+            Math.floor(item.y / SURVIV_LOOT_CELL),
+        );
+        let bucket = grid.get(key);
+        if (!bucket) {
+            bucket = [];
+            grid.set(key, bucket);
+        }
+        const entry = { item, index };
+        bucket.push(entry);
+        if (item.id != null) byId.set(item.id, entry);
+    }
+    room._survivLootIndex = {
+        grid,
+        byId,
+        source: loot,
+        count: loot.length,
+        first: loot[0],
+        last: loot[loot.length - 1],
+        revision: room._survivLootRevision || 0,
+    };
+    return room._survivLootIndex;
+}
+
+function getSurvivLootIndex(room) {
+    const loot = room.loot || [];
+    const index = room._survivLootIndex;
+    if (!index
+        || index.source !== loot
+        || index.count !== loot.length
+        || index.first !== loot[0]
+        || index.last !== loot[loot.length - 1]
+        || index.revision !== (room._survivLootRevision || 0)) {
+        return buildSurvivLootIndex(room);
+    }
+    return index;
+}
+
+function querySurvivLoot(room, x, y, range) {
+    const grid = getSurvivLootIndex(room).grid;
+    const minX = Math.floor((x - range) / SURVIV_LOOT_CELL);
+    const maxX = Math.floor((x + range) / SURVIV_LOOT_CELL);
+    const minY = Math.floor((y - range) / SURVIV_LOOT_CELL);
+    const maxY = Math.floor((y + range) / SURVIV_LOOT_CELL);
+    const out = [];
+    for (let cx = minX; cx <= maxX; cx++) {
+        for (let cy = minY; cy <= maxY; cy++) {
+            const bucket = grid.get(obstacleCellKey(cx, cy));
+            if (!bucket) continue;
+            for (const entry of bucket) {
+                const item = entry.item;
+                if (Math.abs(item.x - x) <= range && Math.abs(item.y - y) <= range) {
+                    out.push(entry);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+function addSurvivLoot(room, item) {
+    room.loot.push(item);
+    markSurvivLootChanged(room);
+    return item;
+}
+
+function removeSurvivLootAt(room, index) {
+    if (index < 0 || index >= room.loot.length) return null;
+    const [removed] = room.loot.splice(index, 1);
+    if (removed) markSurvivLootChanged(room);
+    return removed || null;
 }
 
 function isPositionBlocked(room, x, y, r) {
@@ -2122,7 +2211,7 @@ function dropDeathLoot(room, entity) {
 
     drops.forEach((drop, index) => {
         const pos = scatter(index, drops.length);
-        room.loot.push(makeGroundLoot(drop.type, pos.x, pos.y, {
+        addSurvivLoot(room, makeGroundLoot(drop.type, pos.x, pos.y, {
             ...drop,
             source: 'death',
             pickupAfter: Date.now() + 900,
@@ -2164,9 +2253,9 @@ function eliminateSurvivPlayer(room, player, io) {
 }
 
 function getLootContainer(room, chestId) {
-    const index = room.loot.findIndex(l => l.id === chestId);
-    if (index < 0) return { item: null, index: -1 };
-    const item = room.loot[index];
+    const entry = getSurvivLootIndex(room).byId.get(chestId);
+    if (!entry || room.loot[entry.index] !== entry.item) return { item: null, index: -1 };
+    const { item, index } = entry;
     if (item.type !== 'chest' && item.type !== 'deathCrate') return { item: null, index: -1 };
     return { item, index };
 }
@@ -2254,7 +2343,7 @@ function takeLootContainerItem(entity, room) {
         openedAt: Date.now(),
     };
     if (isContainerEmpty(contents)) {
-        room.loot.splice(index, 1);
+        removeSurvivLootAt(room, index);
         entity.openedContainerId = null;
         entity.openedContainer = null;
     } else {
@@ -2326,7 +2415,7 @@ function dropPlayerItem(entity, room) {
                 if (entity.weapon?.type === weaponType) {
                     entity.weapon = makeWeaponState(inv.weapons[0] || 'fists');
                 }
-                room.loot.push(makeGroundLoot('weapon', dropX, dropY, {
+                addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
                     weaponType,
                     tier: WEAPONS[weaponType]?.rarity || 'common',
                     source: 'player-drop',
@@ -2336,14 +2425,14 @@ function dropPlayerItem(entity, room) {
         }
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
-        room.loot.push(makeGroundLoot('medkit', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
+        addSurvivLoot(room, makeGroundLoot('medkit', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
         inv.ammoPacks -= 1;
-        room.loot.push(makeGroundLoot('ammo', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
+        addSurvivLoot(room, makeGroundLoot('ammo', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     } else if (itemKey === 'armor' && entity.armor > 0) {
         const transfer = Math.min(35, Math.round(entity.armor));
         entity.armor = Math.max(0, entity.armor - transfer);
-        room.loot.push(makeGroundLoot('armor', dropX, dropY, { armorValue: transfer, source: 'player-drop', pickupAfter: Date.now() + 900 }));
+        addSurvivLoot(room, makeGroundLoot('armor', dropX, dropY, { armorValue: transfer, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     }
 }
 
@@ -2365,10 +2454,18 @@ function pickupLoot(entity, room) {
     };
     let pickupCount = 0;
     let pickupTier = 'common';
+    const now = Date.now();
+    const nearbyLoot = querySurvivLoot(room, entity.x, entity.y, SURVIV.lootPickupRadius)
+        .sort((a, b) => b.index - a.index);
 
-    for (let i = room.loot.length - 1; i >= 0; i--) {
-        const item = room.loot[i];
-        if (item.pickupAfter && Date.now() < item.pickupAfter) continue;
+    for (const candidate of nearbyLoot) {
+        const item = candidate.item;
+        let index = candidate.index;
+        if (room.loot[index] !== item) {
+            index = room.loot.indexOf(item);
+            if (index < 0) continue;
+        }
+        if (item.pickupAfter && now < item.pickupAfter) continue;
         if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.lootPickupRadius) continue;
 
         if (item.type === 'chest' || item.type === 'deathCrate') {
@@ -2397,22 +2494,24 @@ function pickupLoot(entity, room) {
         }
         pickupCount += 1;
         pickupTier = item.tier || pickupTier;
-        room.loot.splice(i, 1);
+        removeSurvivLootAt(room, index);
     }
 
     if (pickupCount > 0) {
         entity.lastLoot = {
-            id: `ground:${entity.id}:${Date.now()}:${pickupCount}`,
+            id: `ground:${entity.id}:${now}:${pickupCount}`,
             type: 'ground',
             tier: pickupTier,
             source: 'ground',
             items: pickedUp,
-            pickedAt: Date.now(),
+            pickedAt: now,
         };
     }
 }
 
 function updateBullets(room, now, effectiveRadius) {
+    const allEntities = [...room.players, ...room.bots];
+    const entitiesById = new Map(allEntities.map(entity => [entity.id, entity]));
     for (let i = room.bullets.length - 1; i >= 0; i--) {
         const b = room.bullets[i];
         const previousX = b.x;
@@ -2447,17 +2546,15 @@ function updateBullets(room, now, effectiveRadius) {
             continue;
         }
 
-        const allEntities = [...room.players, ...room.bots];
         for (const ent of allEntities) {
             if (ent.id === b.ownerId || ent.hp <= 0) continue;
             if (distanceToSegment(ent.x, ent.y, previousX, previousY, b.x, b.y) <= SURVIV.playerRadius) {
-                const attacker = allEntities.find(e => e.id === b.ownerId)
-                    || room.bots.find(e => e.id === b.ownerId)
-                    || room.players.find(e => e.id === b.ownerId);
+                const attacker = entitiesById.get(b.ownerId);
                 applyDamage(ent, b.damage, attacker);
                 room.bullets.splice(i, 1);
                 if (ent.hp <= 0) {
                     eliminateSurvivPlayer(room, ent, room._io);
+                    entitiesById.delete(ent.id);
                 }
                 hit = true;
                 break;
@@ -2511,7 +2608,7 @@ export function spawnLootFromPool(room, poolAmount) {
     for (const amountCents of chunks.sort(() => Math.random() - 0.5)) {
         if (amountCents <= 0) continue;
         const pos = randomLootSpawn(room);
-        room.loot.push(makeChest(pos.x, pos.y, 'common', { rarity: 'common', money: Number((amountCents / 100).toFixed(2)) }, 'join'));
+        addSurvivLoot(room, makeChest(pos.x, pos.y, 'common', { rarity: 'common', money: Number((amountCents / 100).toFixed(2)) }, 'join'));
     }
 
     room.lootPoolBalance = Math.max(0, Number((room.lootPoolBalance - poolDollars).toFixed(2)));
@@ -2584,11 +2681,13 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
 }
 
 function getBotLootWaypoint(bot, item, room) {
-    const house = room.obstacles.find(obstacle => (
+    const house = queryObstacles(room, item.x, item.y, 1, false).find(obstacle => (
         obstacle.kind === 'houseFloor' && pointInRect(item.x, item.y, obstacle)
     ));
     if (!house || pointInRect(bot.x, bot.y, house)) return item;
-    const door = room.obstacles.find(obstacle => obstacle.kind === 'door' && obstacle.houseId === house.id);
+    const doorRange = Math.max(house.w || 0, house.h || 0) / 2 + 120;
+    const door = queryObstacles(room, house.x, house.y, doorRange, false)
+        .find(obstacle => obstacle.kind === 'door' && obstacle.houseId === house.id);
     return door || item;
 }
 
@@ -2648,7 +2747,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     } else {
         let nearLoot = null;
         let nearLootDist = Infinity;
-        for (const item of room.loot) {
+        for (const { item } of querySurvivLoot(room, bot.x, bot.y, 1800)) {
             const itemDistance = dist(bot.x, bot.y, item.x, item.y);
             if (itemDistance < nearLootDist && itemDistance < 1800) {
                 nearLoot = item;
@@ -2684,7 +2783,7 @@ function processEntity(entity, room, now, effectiveRadius) {
         entity.useMedkit = false;
     }
     if (!entity.isCashingOut && entity.equipSlotPending != null) {
-        equipInventorySlot(entity, entity.equipSlotPending);
+        equipSurvivWeaponSlot(entity, entity.equipSlotPending);
         entity.equipSlotPending = null;
     }
 
@@ -2779,6 +2878,64 @@ function isObstacleInView(vx, vy, obstacle, range) {
         && Math.abs((obstacle.y || 0) - vy) <= range + (obstacle.h || 0) / 2;
 }
 
+function serializeSurvivObstacle(o) {
+    return {
+        id: o.id,
+        x: o.x,
+        y: o.y,
+        w: o.w,
+        h: o.h,
+        hue: o.hue,
+        kind: o.kind,
+        rotation: o.rotation,
+        collidable: o.collidable !== false,
+        variant: o.variant,
+        biome: o.biome,
+        label: o.label,
+        houseId: o.houseId,
+        roomId: o.roomId,
+        role: o.role,
+    };
+}
+
+function shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now) {
+    if (!(room._survivViewerPayloadCache instanceof Map)) {
+        room._survivViewerPayloadCache = new Map();
+    }
+    const cache = room._survivViewerPayloadCache;
+    const state = cache.get(socketId) || {};
+    const movedPastMargin = state.staticX == null
+        || Math.abs(viewX - state.staticX) > SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD
+        || Math.abs(viewY - state.staticY) > SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD;
+    const obstaclesChanged = state.obstaclesSource !== room.obstacles
+        || state.obstaclesCount !== (room.obstacles?.length || 0);
+    const intervalElapsed = state.lastStaticAt == null
+        || now < state.lastStaticAt
+        || now - state.lastStaticAt >= SURVIV_STATIC_PAYLOAD_INTERVAL_MS;
+    const shouldSend = movedPastMargin || obstaclesChanged || intervalElapsed;
+
+    state.lastSeenAt = now;
+    if (shouldSend) {
+        state.lastStaticAt = now;
+        state.staticX = viewX;
+        state.staticY = viewY;
+        state.obstaclesSource = room.obstacles;
+        state.obstaclesCount = room.obstacles?.length || 0;
+    }
+    cache.set(socketId, state);
+    return shouldSend;
+}
+
+function pruneSurvivViewerPayloadCache(room, now) {
+    if (now < (room._nextSurvivViewerPayloadPruneAt || 0)) return;
+    room._nextSurvivViewerPayloadPruneAt = now + 10000;
+    const cache = room._survivViewerPayloadCache;
+    if (!(cache instanceof Map)) return;
+    for (const [socketId, state] of cache) {
+        if (now - (state.lastSeenAt || 0) > 10000) cache.delete(socketId);
+    }
+}
+
 export function processSurvivRoom(room, io, resetTime) {
     room._io = io;
     const now = Date.now();
@@ -2817,14 +2974,14 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         if (sendLb) {
             io.to(socketId).emit('leaderboard', { leaderboard, surviv: true });
         }
+        const sendStaticPayload = shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now);
 
         const visiblePlayers = allPlayers
             .filter(p => isInView(viewX, viewY, p.x, p.y, range))
             .map(p => serializePlayer(p, p.id === youId));
 
-        const visibleLoot = room.loot
-            .filter(l => isInView(viewX, viewY, l.x, l.y, range))
-            .map(l => ({
+        const visibleLoot = querySurvivLoot(room, viewX, viewY, range)
+            .map(({ item: l }) => ({
                 id: l.id,
                 type: l.type,
                 x: l.x,
@@ -2841,42 +2998,32 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             .filter(b => isInView(viewX, viewY, b.x, b.y, range))
             .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType }));
 
-        const serializeObstacle = (o) => ({
-            id: o.id,
-            x: o.x,
-            y: o.y,
-            w: o.w,
-            h: o.h,
-            hue: o.hue,
-            kind: o.kind,
-            rotation: o.rotation,
-            collidable: o.collidable !== false,
-            variant: o.variant,
-            biome: o.biome,
-            label: o.label,
-            houseId: o.houseId,
-            roomId: o.roomId,
-            role: o.role,
-        });
-
-        const visibleObstacles = queryObstacles(room, viewX, viewY, range + 200, false)
-            .filter(o => isObstacleInView(viewX, viewY, o, range + 200))
-            .map(serializeObstacle);
-
-        const minimapRange = range * 3.35;
-        const minimapObstacleKinds = new Set(['road', 'houseFloor', 'wall', 'interiorWall', 'water', 'container']);
-        const minimapObstacles = queryObstacles(room, viewX, viewY, minimapRange, false)
-            .filter(o => minimapObstacleKinds.has(o.kind))
-            .filter(o => isObstacleInView(viewX, viewY, o, minimapRange))
-            .slice(0, 220)
-            .map(serializeObstacle);
-        const minimapLoot = room.loot
-            .filter(l => (l.type === 'chest' || l.type === 'deathCrate' || l.type === 'money') && isInView(viewX, viewY, l.x, l.y, minimapRange))
-            .slice(0, 90)
-            .map(l => ({ x: l.x, y: l.y, golden: l.type !== 'chest' }));
-        const minimapPlayers = allPlayers
-            .filter(p => isInView(viewX, viewY, p.x, p.y, minimapRange))
-            .map(p => ({ x: p.x, y: p.y, isYou: p.id === youId, isBot: !!p.isBot }));
+        const staticPayload = {};
+        if (sendStaticPayload) {
+            const visibleObstacles = queryObstacles(room, viewX, viewY, range + 200, false)
+                .filter(o => isObstacleInView(viewX, viewY, o, range + 200))
+                .map(serializeSurvivObstacle);
+            const minimapRange = range * 3.35;
+            const minimapObstacleKinds = new Set(['road', 'houseFloor', 'wall', 'interiorWall', 'water', 'container']);
+            const minimapObstacles = queryObstacles(room, viewX, viewY, minimapRange, false)
+                .filter(o => minimapObstacleKinds.has(o.kind))
+                .filter(o => isObstacleInView(viewX, viewY, o, minimapRange))
+                .slice(0, 220)
+                .map(serializeSurvivObstacle);
+            const minimapLoot = querySurvivLoot(room, viewX, viewY, minimapRange)
+                .filter(({ item: l }) => l.type === 'chest' || l.type === 'deathCrate' || l.type === 'money')
+                .slice(0, 90)
+                .map(({ item: l }) => ({ x: l.x, y: l.y, golden: l.type !== 'chest' }));
+            const minimapPlayers = allPlayers
+                .filter(p => isInView(viewX, viewY, p.x, p.y, minimapRange))
+                .map(p => ({ x: p.x, y: p.y, isYou: p.id === youId, isBot: !!p.isBot }));
+            staticPayload.obstacles = visibleObstacles;
+            staticPayload.minimap = {
+                players: minimapPlayers,
+                food: minimapLoot,
+                obstacles: minimapObstacles,
+            };
+        }
 
         io.to(socketId).emit('survivTick', {
             you: youId ? serializePlayer(
@@ -2886,12 +3033,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             players: visiblePlayers,
             loot: visibleLoot,
             bullets: visibleBullets,
-            obstacles: visibleObstacles,
-            minimap: {
-                players: minimapPlayers,
-                food: minimapLoot,
-                obstacles: minimapObstacles,
-            },
+            ...staticPayload,
             zone,
             dollarBalance,
             spectating,
@@ -2906,4 +3048,5 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     for (const spec of room.spectators || []) {
         emitToViewer(spec.id, spec.x, spec.y, null, spec.dollarBalance, true);
     }
+    pruneSurvivViewerPayloadCache(room, now);
 }
