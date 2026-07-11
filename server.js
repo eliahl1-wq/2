@@ -7077,7 +7077,7 @@ io.on('connection', (socket) => {
         p.boost = p.isCashingOut ? false : !!boost;
     });
 
-    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, equipSlot, openChestId, takeChestItem, putChestItem, closeChest, dropItem }) => {
+    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, pickupWeapon, equipSlot, openChestId, takeChestItem, putChestItem, closeChest, dropItem }) => {
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
         if (!p) return;
@@ -7092,6 +7092,7 @@ io.on('connection', (socket) => {
 
         p.shooting = !!shooting;
         if (useMedkit) p.useMedkit = true;
+        if (pickupWeapon) p.pickupWeaponPending = true;
         if (typeof openChestId === 'string' && openChestId.length > 0) p.openChestId = openChestId;
         if (takeChestItem && typeof takeChestItem === 'object') {
             const chestId = typeof takeChestItem.chestId === 'string' ? takeChestItem.chestId : null;

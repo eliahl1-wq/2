@@ -25,6 +25,7 @@ export const SURVIV = {
     bulletLifetimeMs: 800,
     lootPickupRadius: 34,
     chestOpenRadius: 92,
+    medkitUseMs: 2500,
 };
 
 export const WEAPONS = {
@@ -2328,11 +2329,75 @@ function applyLootContents(entity, contents = {}, options = {}) {
     return summary;
 }
 
-function useInventoryMedkit(entity) {
+function beginInventoryMedkit(entity, now) {
     const inv = ensureInventory(entity);
-    if (inv.medkits <= 0 || entity.hp >= entity.maxHp) return;
+    if (entity.medkitUseEndAt > now) return false;
+    if (inv.medkits <= 0 || entity.hp >= entity.maxHp) return false;
+    entity.medkitUseEndAt = now + SURVIV.medkitUseMs;
+    return true;
+}
+
+function updateInventoryMedkit(entity, now) {
+    if (!(entity.medkitUseEndAt > 0) || now < entity.medkitUseEndAt) return false;
+    entity.medkitUseEndAt = 0;
+    const inv = ensureInventory(entity);
+    if (inv.medkits <= 0 || entity.hp >= entity.maxHp) return false;
     inv.medkits -= 1;
     entity.hp = Math.min(entity.maxHp, entity.hp + 45);
+    return true;
+}
+
+function pickupGroundWeapon(entity, room) {
+    if (entity.isBot || entity.isCashingOut) return false;
+    const inv = ensureInventory(entity);
+    const nearby = querySurvivLoot(room, entity.x, entity.y, SURVIV.lootPickupRadius + 24)
+        .filter(({ item }) => item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType])
+        .sort((a, b) => dist(entity.x, entity.y, a.item.x, a.item.y) - dist(entity.x, entity.y, b.item.x, b.item.y));
+    const candidate = nearby[0];
+    if (!candidate) return false;
+    const item = candidate.item;
+    const nextType = item.weaponType;
+    const groundAmmo = Number.isFinite(item.ammo) ? Math.max(0, Number(item.ammo)) : null;
+    if (inv.weapons.includes(nextType)) return equipSurvivWeaponSlot(entity, inv.weapons.indexOf(nextType));
+
+    const currentType = entity.weapon?.type;
+    const currentIndex = inv.weapons.indexOf(currentType);
+    const nextDef = WEAPONS[nextType];
+    if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
+
+    if (currentIndex >= 0) {
+        const oldType = currentType;
+        const oldAmmo = Number(entity.weapon?.ammo) || 0;
+        inv.weapons[currentIndex] = nextType;
+        delete entity.weaponsAmmo[oldType];
+        item.weaponType = oldType;
+        item.ammo = oldAmmo;
+        item.tier = WEAPONS[oldType]?.rarity || 'common';
+    } else if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
+        inv.weapons.push(nextType);
+        removeSurvivLootAt(room, candidate.index);
+    } else {
+        return false;
+    }
+
+    const nextAmmo = groundAmmo ?? nextDef.clipSize;
+    entity.weaponsAmmo[nextType] = nextAmmo;
+    entity.weapon = {
+        type: nextType,
+        ammo: nextAmmo,
+        reloading: false,
+        reloadEndAt: 0,
+        lastShotAt: 0,
+    };
+    entity.lastLoot = {
+        id: `ground-weapon:${entity.id}:${Date.now()}`,
+        type: 'ground',
+        tier: nextDef.rarity || 'common',
+        source: 'ground',
+        items: { weaponType: nextType, weaponLabel: nextDef.label },
+        pickedAt: Date.now(),
+    };
+    return true;
 }
 
 export function equipSurvivWeaponSlot(entity, slot) {
@@ -2408,6 +2473,8 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         botTargetId: null,
         inventory: makeInventory(),
         useMedkit: false,
+        medkitUseEndAt: 0,
+        pickupWeaponPending: false,
         openChestId: null,
         lastLoot: null,
         openedContainerId: null,
@@ -3020,6 +3087,7 @@ function pickupLoot(entity, room) {
         if (item.type === 'chest' || item.type === 'deathCrate') {
             continue;
         } else {
+            if (item.type === 'weapon' && !entity.isBot) continue;
             let requested = null;
             let quantityKey = null;
             if (item.type === 'money') requested = { money: Number(item.dollarValue || item.amount || 0) };
@@ -3225,6 +3293,8 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         isCashingOut: false,
         inventory: makeInventory(),
         useMedkit: false,
+        medkitUseEndAt: 0,
+        pickupWeaponPending: false,
         openChestId: null,
         lastLoot: null,
         openedContainerId: null,
@@ -3336,12 +3406,22 @@ function processEntity(entity, room, now, effectiveRadius) {
     if (entity.isCashingOut) {
         entity.shooting = false;
         entity.useMedkit = false;
+        entity.medkitUseEndAt = 0;
+        entity.pickupWeaponPending = false;
         entity.equipSlotPending = null;
     }
 
     if (!entity.isCashingOut && entity.useMedkit) {
-        useInventoryMedkit(entity);
+        beginInventoryMedkit(entity, now);
         entity.useMedkit = false;
+    }
+    if (entity.medkitUseEndAt > 0) {
+        if (now >= entity.medkitUseEndAt) updateInventoryMedkit(entity, now);
+        else entity.shooting = false;
+    }
+    if (!entity.isCashingOut && entity.pickupWeaponPending) {
+        pickupGroundWeapon(entity, room);
+        entity.pickupWeaponPending = false;
     }
     if (!entity.isCashingOut && entity.equipSlotPending != null) {
         equipSurvivWeaponSlot(entity, entity.equipSlotPending);
@@ -3420,6 +3500,8 @@ function serializePlayer(p, isYou) {
         reloadEndAt: p.weapon?.reloadEndAt || 0,
         reloadRemainingMs: p.weapon?.reloading ? Math.max(0, (p.weapon.reloadEndAt || 0) - Date.now()) : 0,
         reloadMs: wDef.reloadMs,
+        medkitRemainingMs: p.medkitUseEndAt > Date.now() ? Math.max(0, p.medkitUseEndAt - Date.now()) : 0,
+        medkitUseMs: SURVIV.medkitUseMs,
         dollarBalance: p.dollarBalance,
         kills: p.kills || 0,
         isBot: !!p.isBot,

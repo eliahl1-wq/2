@@ -436,33 +436,29 @@ test('river spline metadata survives generation and bridges hit both highways ex
     assert.deepEqual(bridges.map(bridge => Math.round(bridge.x)).sort((a, b) => a - b), [-2500, 2500]);
 });
 
-test('surviv players can carry only two weapons', () => {
+test('ground weapons require F and replace the held slot', () => {
     const room = makeRoom();
+    room.obstacles = [];
     room.loot = [];
     const player = createSurvivPlayer('human-weapons', 'mongo-weapons', 'Two Slots', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.weapons = ['pistol', 'smg'];
+    player.weapon = { type: 'pistol', ammo: 7, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.weaponsAmmo = { pistol: 7, smg: 18 };
     room.players.push(player);
+    room.loot.push({ id: 'loot-shotgun', type: 'weapon', x: 0, y: 0, weaponType: 'shotgun', pickupAfter: 0 });
 
-    for (const weaponType of ['pistol', 'smg', 'shotgun']) {
-        room.loot.push({
-            id: 'loot-' + weaponType,
-            type: 'weapon',
-            x: player.x,
-            y: player.y,
-            weaponType,
-            pickupAfter: 0,
-        });
-        processSurvivRoom(room, silentIo, Date.now() + 600000);
-    }
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.weapon.type, 'pistol', 'walking over a weapon must not auto-pick it up');
+    assert.ok(room.loot.some(item => item.weaponType === 'shotgun'));
 
-    assert.deepEqual(player.inventory.weapons, ['pistol', 'smg']);
-    assert.equal(player.inventory.weapons.length, 2);
-    assert.ok(room.loot.some(item => item.type === 'weapon' && item.weaponType === 'shotgun'));
-    assert.equal(equipSurvivWeaponSlot(player, 0), true);
-    assert.equal(player.weapon.type, 'pistol');
-    assert.equal(equipSurvivWeaponSlot(player, 1), true);
-    assert.equal(player.weapon.type, 'smg');
-    assert.equal(equipSurvivWeaponSlot(player, 2), false);
-    assert.equal(player.weapon.type, 'smg');
+    player.pickupWeaponPending = true;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.deepEqual(player.inventory.weapons, ['shotgun', 'smg']);
+    assert.equal(player.weapon.type, 'shotgun');
+    assert.equal(player.weapon.ammo, 6);
+    assert.ok(room.loot.some(item => item.weaponType === 'pistol'), 'the replaced gun should remain on the ground');
 });
 
 test('chest transfers preserve overflow and reject occupied weapon slots', () => {
@@ -591,6 +587,28 @@ test('ground loot creates a pickup summary for the player', () => {
     assert.equal(player.lastLoot.items.ammoPacks, 2);
     assert.equal(player.lastLoot.items.medkits, 1);
 });
+test('medkits heal only after the server timer completes', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('human-heal', 'mongo-heal', 'Medic', '#fff', room);
+    player.hp = 40;
+    player.inventory.medkits = 1;
+    player.useMedkit = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.hp, 40);
+    assert.equal(player.inventory.medkits, 1);
+    assert.ok(player.medkitUseEndAt > Date.now());
+
+    player.medkitUseEndAt = Date.now() - 1;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.hp, 85);
+    assert.equal(player.inventory.medkits, 0);
+    assert.equal(player.medkitUseEndAt, 0);
+});
+
 test('fast bullets hit and eliminate bots along their full travel path', () => {
     const room = makeRoom();
     room.obstacles = [];
