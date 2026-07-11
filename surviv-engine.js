@@ -2405,7 +2405,15 @@ export function equipSurvivWeaponSlot(entity, slot) {
     const index = Number(slot);
     if (!Number.isInteger(index) || index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
     const weaponType = inv.weapons[index];
-    if (!weaponType || !WEAPONS[weaponType]) return false;
+    if (!weaponType) {
+        if (entity.weapon?.type && entity.weapon.type !== 'fists') {
+            if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
+            entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
+        }
+        entity.weapon = makeWeaponState('fists');
+        return true;
+    }
+    if (!WEAPONS[weaponType]) return false;
     if (entity.weapon?.type === weaponType) return true;
 
     // Save current ammo
@@ -3028,11 +3036,13 @@ function dropPlayerItem(entity, room) {
         if (idx >= 0 && idx < inv.weapons.length) {
             const weaponType = inv.weapons[idx];
             if (weaponType && weaponType !== 'fists') {
+                const droppedAmmo = Number(entity.weaponsAmmo?.[weaponType] ?? (entity.weapon?.type === weaponType ? entity.weapon.ammo : 0)) || 0;
                 inv.weapons.splice(idx, 1);
                 equipFallbackAfterWeaponRemoval(entity, weaponType);
                 if (entity.weaponsAmmo) delete entity.weaponsAmmo[weaponType];
                 addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
                     weaponType,
+                    ammo: droppedAmmo,
                     tier: WEAPONS[weaponType]?.rarity || 'common',
                     source: 'player-drop',
                     pickupAfter: Date.now() + 900,

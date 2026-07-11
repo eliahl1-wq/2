@@ -461,6 +461,32 @@ test('ground weapons require F and replace the held slot', () => {
     assert.ok(room.loot.some(item => item.weaponType === 'pistol'), 'the replaced gun should remain on the ground');
 });
 
+test('empty weapon slots select melee and G drops the held gun', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('human-drop', 'mongo-drop', 'Dropper', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.weapons = ['pistol'];
+    player.weapon = { type: 'pistol', ammo: 9, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.weaponsAmmo = { pistol: 9 };
+    room.players.push(player);
+
+    assert.equal(equipSurvivWeaponSlot(player, 1), true);
+    assert.equal(player.weapon.type, 'fists');
+    assert.equal(equipSurvivWeaponSlot(player, 0), true);
+    assert.equal(player.weapon.type, 'pistol');
+
+    player.dropItemPending = { itemKey: 'weapon', slotIdx: 0 };
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.weapon.type, 'fists');
+    assert.deepEqual(player.inventory.weapons, []);
+    const dropped = room.loot.find(item => item.type === 'weapon' && item.weaponType === 'pistol');
+    assert.ok(dropped);
+    assert.equal(dropped.ammo, 9);
+});
+
 test('chest transfers preserve overflow and reject occupied weapon slots', () => {
     const room = makeRoom();
     room.obstacles = [];
