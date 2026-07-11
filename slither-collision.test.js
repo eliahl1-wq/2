@@ -66,7 +66,7 @@ test('Side impact with neck/head overlap: B neck hit by A, only A dies', () => {
     assert.ok(!dead.has('B'), 'Snake B should survive');
 });
 
-test('Head-on collision (same size): both die', () => {
+test('Head-on collision (same size): head contact alone is non-lethal', () => {
     // Head distance is 10 (which is < head-head threshold of ~11.53)
     // Tails are at -10 and 20 respectively, so they are far from heads (> 20, no body collision).
     const snakeA = {
@@ -90,11 +90,11 @@ test('Head-on collision (same size): both die', () => {
 
     const dead = resolveAllSnakeCollisions(allSnakes);
 
-    assert.ok(dead.has('A'), 'Snake A should die');
-    assert.ok(dead.has('B'), 'Snake B should die');
+    assert.ok(!dead.has('A'), 'Snake A should survive pure head contact');
+    assert.ok(!dead.has('B'), 'Snake B should survive pure head contact');
 });
 
-test('Head-on collision (different size): larger survives', () => {
+test('Head-on collision (different size): head contact alone is non-lethal', () => {
     // Snake A is 2x larger than B
     // Head distance is 10 (which is < head-head threshold of ~11.95)
     // Tails are far, preventing body collision.
@@ -120,8 +120,7 @@ test('Head-on collision (different size): larger survives', () => {
     const dead = resolveAllSnakeCollisions(allSnakes);
 
     assert.ok(!dead.has('A'), 'Larger Snake A should survive');
-    assert.ok(dead.has('B'), 'Smaller Snake B should die');
-    assert.equal(dead.get('B').id, 'A', 'Snake A should be the killer of B');
+    assert.ok(!dead.has('B'), 'Smaller Snake B should also survive pure head contact');
 });
 
 test('Grazing / Turning away: both survive', () => {
@@ -178,4 +177,12 @@ test('Parallel brushing past: moving parallel, both survive', () => {
 
     assert.ok(!dead.has('A'), 'Snake A should survive parallel brushing');
     assert.ok(!dead.has('B'), 'Snake B should survive parallel brushing');
+});
+
+test('Close side pass inside the visible edges survives', () => {
+    const snakeA = { id: 'A', balance: 1.0, angle: 0, segments: [{ x: 0, y: 0 }, { x: -15, y: 0 }] };
+    const snakeB = { id: 'B', balance: 1.0, angle: 0, segments: [{ x: 15, y: 11.3 }, { x: 0, y: 11.3 }, { x: -15, y: 11.3 }] };
+    const dead = resolveAllSnakeCollisions([{ entity: snakeA, isHuman: true }, { entity: snakeB, isHuman: true }]);
+    assert.ok(!dead.has('A'), 'A should be able to skim close to B without dying');
+    assert.ok(!dead.has('B'), 'B should survive the close parallel pass');
 });

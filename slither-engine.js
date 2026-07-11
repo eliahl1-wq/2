@@ -38,6 +38,8 @@ export const SLITHER = {
     minimapRange: 1050,
     minimapThreatRange: 1700,
     selfCollisionSkip: 4,
+    // Slither-style combat: heads are non-lethal; the body core is slightly narrower than the rendered snake.
+    bodyCollisionScale: 0.82,
 };
 
 const BOT_NAMES = [
@@ -1117,8 +1119,8 @@ function checkSnakeCollisions(snake, allSnakes) {
             const dx = head.x - seg.x;
             const dy = head.y - seg.y;
             const threshold = i === 0
-                ? (r + segR) * 0.85
-                : (r + segR) * 0.95;
+                ? 0
+                : (r + segR) * SLITHER.bodyCollisionScale;
             if (dx * dx + dy * dy < threshold * threshold) {
                 return other;
             }
@@ -1171,8 +1173,8 @@ export function resolveAllSnakeCollisions(allSnakes) {
                 const dy = head.y - seg.y;
                 
                 const threshold = i === 0
-                    ? (r + segR) * 0.85
-                    : (r + segR) * 0.95;
+                    ? 0
+                    : (r + segR) * SLITHER.bodyCollisionScale;
 
                 if (dx * dx + dy * dy < threshold * threshold) {
                     if (i > 0) {
