@@ -35,7 +35,20 @@ function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
     return Math.abs(x1 - x2) < (w1 + w2) / 2 && Math.abs(y1 - y2) < (h1 + h2) / 2;
 }
 
-test('surviv map stays dense inside the smaller world', () => {
+function pointInRect(x, y, rect, padding = 0) {
+    return x >= rect.x - rect.w / 2 - padding
+        && x <= rect.x + rect.w / 2 + padding
+        && y >= rect.y - rect.h / 2 - padding
+        && y <= rect.y + rect.h / 2 + padding;
+}
+
+function circleRectCollision(x, y, radius, rect) {
+    const closestX = Math.max(rect.x - rect.w / 2, Math.min(x, rect.x + rect.w / 2));
+    const closestY = Math.max(rect.y - rect.h / 2, Math.min(y, rect.y + rect.h / 2));
+    return Math.hypot(x - closestX, y - closestY) < radius;
+}
+
+test('surviv map keeps its 20k world while concentrating loot inside structures', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
     const chests = map.loot.filter(item => item.type === 'chest');
@@ -46,10 +59,16 @@ test('surviv map stays dense inside the smaller world', () => {
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 17);
-    assert.ok(houses.length >= 90);
+    assert.equal(map.landmarks.length, 18);
+    assert.ok(houses.length >= 100);
     assert.ok(chests.length < houses.length);
-    assert.equal(groundLoot.length, 42);
+    assert.equal(groundLoot.length, 22);
+    for (const item of groundLoot) {
+        const floor = houses.find(house => house.id === item.houseId);
+        assert.ok(floor, 'loose map loot should belong to a building');
+        assert.equal(item.location, 'interior');
+        assert.ok(pointInRect(item.x, item.y, floor, -18));
+    }
     assert.ok(maxExtent <= SURVIV.worldHalf);
 });
 
@@ -78,11 +97,11 @@ test('surviv open areas keep scattered cover and small houses', () => {
         && Math.hypot(obstacle.x, obstacle.y) > 1800
     ));
 
-    assert.ok(openCover.length >= 900);
-    assert.ok(openTrees.length >= 700);
-    assert.ok(coverCells.size >= 78);
-    assert.ok(treeCells.size >= 90);
-    assert.ok(smallOpenHouses.length >= 24);
+    assert.ok(openCover.length >= 700);
+    assert.ok(openTrees.length >= 550);
+    assert.ok(coverCells.size >= 75);
+    assert.ok(treeCells.size >= 88);
+    assert.ok(smallOpenHouses.length >= 45);
 });
 
 test('surviv chests roll varied money across map loot', () => {
@@ -192,17 +211,201 @@ test('straight surviv roads do not create extra square asphalt stubs', () => {
     assert.equal(squareAsphaltRoads.length, 0);
 });
 
-test('surviv network roads do not leave short dead-end stubs', () => {
+test('surviv landmark approaches survive road clipping without tiny fragments', () => {
+    const approachPoints = [
+        { x: 6950, y: -1200, name: 'farm' },
+        { x: 4800, y: -6800, name: 'north-east town' },
+        { x: 6950, y: 7200, name: 'research campus' },
+        { x: -7500, y: -6810, name: 'north-west mansion' },
+        { x: -2500, y: 7300, name: 'ironworks' },
+        { x: -7200, y: 1900, name: 'south-west town' },
+        { x: -7800, y: -3900, name: 'forest camp' },
+        { x: 2400, y: 7310, name: 'bunker' },
+    ];
+
     for (let i = 0; i < 5; i++) {
         const map = generateSurvivMap(SURVIV.worldHalf);
-        const shortNetworkRoads = map.obstacles.filter(obstacle => (
-            obstacle.kind === 'road'
-            && obstacle.role === 'networkRoad'
-            && Math.max(obstacle.w, obstacle.h) < 1020
-        ));
+        const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+        const networkRoads = roads.filter(obstacle => obstacle.role === 'networkRoad');
 
-        assert.equal(shortNetworkRoads.length, 0);
+        assert.ok(networkRoads.every(road => Math.max(road.w, road.h) >= 132));
+        for (const point of approachPoints) {
+            assert.ok(roads.some(road => pointInRect(point.x, point.y, road, 4)), point.name + ' should have a road approach');
+        }
     }
+});
+
+test('Ironworks is a multi-entry indoor combat landmark with loop routes', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmark = map.landmarks.filter(item => item.type === 'ironworks');
+    const floors = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.variant === 'ironworks');
+
+    assert.equal(landmark.length, 1);
+    assert.equal(floors.length, 1);
+    const floor = floors[0];
+    assert.equal(floor.label, 'IRONWORKS');
+    assert.equal(floor.landmarkType, 'ironworks');
+    assert.ok(floor.w >= 1600 && floor.h >= 1100);
+
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door' && obstacle.houseId === floor.id);
+    assert.equal(doors.length, 4);
+    assert.deepEqual(new Set(doors.map(door => door.role)), new Set(['north', 'south', 'east', 'west']));
+    assert.ok(doors.some(door => door.entranceRole === 'mainEntrance'));
+    assert.ok(doors.some(door => door.entranceRole === 'loadingEntrance'));
+
+    const rooms = map.obstacles.filter(obstacle => obstacle.kind === 'roomZone' && obstacle.houseId === floor.id);
+    const roomVariants = new Set(rooms.map(room => room.variant));
+    for (const variant of ['hallway', 'factory-floor', 'workshop', 'control-room', 'storage', 'loading-bay']) {
+        assert.ok(roomVariants.has(variant), 'missing Ironworks room ' + variant);
+    }
+    const hallway = rooms.find(room => room.variant === 'hallway');
+    const factoryLanes = rooms.filter(room => room.variant === 'factory-floor');
+    assert.equal(factoryLanes.length, 2);
+    assert.ok(factoryLanes.every(room => !rectsOverlap(
+        hallway.x, hallway.y, hallway.w, hallway.h,
+        room.x, room.y, room.w, room.h,
+    )));
+
+    const metalWalls = map.obstacles.filter(obstacle => (
+        (obstacle.kind === 'wall' || obstacle.kind === 'interiorWall')
+        && obstacle.variant === 'metal'
+        && obstacle.houseId === floor.id
+    ));
+    assert.ok(metalWalls.length >= 12);
+    assert.ok(metalWalls.every(wall => wall.landmarkType === 'ironworks'));
+
+    const solidMachines = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'furniture'
+        && obstacle.houseId === floor.id
+        && obstacle.variant === 'machine'
+        && obstacle.collidable
+    ));
+    assert.equal(solidMachines.length, 2);
+
+    const chests = map.loot.filter(item => item.houseId === floor.id && item.type === 'chest');
+    assert.equal(chests.length, 5);
+    assert.ok(chests.some(chest => chest.room === 'hallway'));
+
+    const apron = map.obstacles.find(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'driveway'
+        && obstacle.landmarkType === 'ironworks'
+    ));
+    const highway = map.obstacles.find(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'networkRoad'
+        && rectsOverlap(
+            obstacle.x, obstacle.y, obstacle.w, obstacle.h,
+            apron.x, apron.y, apron.w, apron.h,
+        )
+    ));
+    assert.ok(apron);
+    assert.ok(highway, 'Ironworks apron should join the highway');
+});
+
+test('farm, research campus, and hamlets use purposeful road-facing layouts', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const doorsByHouse = new Map(map.obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(door => [door.houseId, door]));
+
+    const farmBuildings = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.landmarkType === 'farm'
+    ));
+    const labBuildings = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.landmarkType === 'lab'
+    ));
+    const hamletHomes = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.role === 'hamletHome'
+    ));
+    const hamletFields = map.obstacles.filter(obstacle => obstacle.kind === 'field' && obstacle.role === 'hamlet');
+
+    assert.equal(farmBuildings.length, 4);
+    assert.deepEqual(new Set(farmBuildings.map(building => building.role)), new Set(['barn', 'farmhouse', 'shed', 'greenhouse']));
+    assert.equal(labBuildings.length, 3);
+    assert.deepEqual(new Set(labBuildings.map(building => building.label)), new Set(['LAB A', 'LAB B', 'POWER']));
+    assert.equal(hamletFields.length, 7);
+    assert.equal(hamletHomes.length, 21);
+    assert.ok([...farmBuildings, ...labBuildings, ...hamletHomes].every(building => doorsByHouse.has(building.id)));
+
+    const farmRoad = map.obstacles.find(obstacle => obstacle.kind === 'road' && obstacle.landmarkType === 'farm' && obstacle.role === 'driveway');
+    const labRoad = map.obstacles.find(obstacle => obstacle.kind === 'road' && obstacle.landmarkType === 'lab' && obstacle.role === 'driveway');
+    assert.ok(farmRoad);
+    assert.ok(labRoad);
+    for (const building of farmBuildings) {
+        const door = doorsByHouse.get(building.id);
+        assert.equal(door.role, building.y < farmRoad.y ? 'south' : 'north');
+    }
+    for (const building of labBuildings) {
+        const door = doorsByHouse.get(building.id);
+        assert.equal(door.role, building.y < labRoad.y ? 'south' : 'north');
+    }
+});
+
+test('generated doors, props, and player spawns keep clear traversal space', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const floors = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door');
+    const propKinds = new Set(['tree', 'bush', 'rock', 'crate', 'barrel', 'container', 'sandbag', 'tent']);
+    const props = map.obstacles.filter(obstacle => propKinds.has(obstacle.kind));
+
+    for (const door of doors) {
+        const horizontal = door.role === 'north' || door.role === 'south';
+        const approach = {
+            x: door.x,
+            y: door.y,
+            w: horizontal ? Math.max(180, door.w + 120) : 190,
+            h: horizontal ? 190 : Math.max(180, door.h + 120),
+        };
+        assert.ok(props.every(prop => !rectsOverlap(
+            prop.x, prop.y, prop.w, prop.h,
+            approach.x, approach.y, approach.w, approach.h,
+        )), 'door approach should stay free of solid props');
+    }
+    for (const prop of props.filter(obstacle => !obstacle.houseId)) {
+        assert.ok(floors.every(floor => !rectsOverlap(
+            prop.x, prop.y, prop.w, prop.h,
+            floor.x, floor.y, floor.w, floor.h,
+        )), 'outdoor props should not be embedded in buildings');
+    }
+
+    const forbidden = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        || obstacle.kind === 'water'
+        || obstacle.kind === 'river'
+        || obstacle.collidable !== false
+    ));
+    assert.ok(map.spawnPoints.length >= 100);
+    assert.ok(map.spawnPoints.every(point => forbidden.every(obstacle => (
+        !circleRectCollision(point.x, point.y, 28, obstacle)
+    ))));
+
+    const room = makeRoom();
+    const runtimeForbidden = room.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        || obstacle.kind === 'water'
+        || obstacle.kind === 'river'
+        || obstacle.collidable !== false
+    ));
+    for (let i = 0; i < 500; i++) {
+        const player = createSurvivPlayer('spawn-' + i, 'mongo-' + i, 'Spawn test', '#fff', room);
+        assert.ok(runtimeForbidden.every(obstacle => !circleRectCollision(
+            player.x, player.y, SURVIV.playerRadius + 10, obstacle,
+        )), 'runtime spawn should stay outside structures and water');
+    }
+});
+
+test('river spline metadata survives generation and bridges hit both highways exactly', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const riverPath = map.obstacles.find(obstacle => obstacle.kind === 'river_path');
+    const bridges = map.obstacles.filter(obstacle => obstacle.kind === 'bridge');
+
+    assert.ok(riverPath);
+    assert.equal(riverPath.points.length, 15);
+    assert.ok(riverPath.width >= 210 && riverPath.width <= 270);
+    assert.ok(riverPath.points.every(point => pointInRect(point.x, point.y, riverPath)));
+    assert.equal(bridges.length, 2);
+    assert.deepEqual(bridges.map(bridge => Math.round(bridge.x)).sort((a, b) => a - b), [-2500, 2500]);
 });
 
 test('surviv players can carry only two weapons', () => {
@@ -361,6 +564,8 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     const room = makeRoom();
     const player = createSurvivPlayer('static-viewer', 'mongo-static', 'Viewer', '#fff', room);
     room.players.push(player);
+    player.x = 0;
+    player.y = -1500;
     const ticks = [];
     const io = {
         to() {
@@ -381,6 +586,10 @@ test('surviv static terrain payload is retained between periodic sends', () => {
 
     assert.ok(Array.isArray(ticks[0].obstacles));
     assert.ok(ticks[0].minimap);
+    const serializedRiver = ticks[0].obstacles.find(obstacle => obstacle.kind === 'river_path');
+    assert.ok(serializedRiver);
+    assert.equal(serializedRiver.points.length, 15);
+    assert.ok(serializedRiver.width >= 210);
     assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
     assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
     assert.ok(Array.isArray(ticks[1].players));
@@ -391,8 +600,20 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.ok(Array.isArray(ticks[2].obstacles));
     assert.ok(ticks[2].minimap);
 
-    player.x += 161;
+    const ironworks = room.landmarks.find(landmark => landmark.type === 'ironworks');
+    player.x = ironworks.x;
+    player.y = ironworks.y;
     broadcastSurvivState(room, io, lbData, {});
     assert.ok(Array.isArray(ticks[3].obstacles));
     assert.ok(ticks[3].minimap);
+    const serializedIronworks = ticks[3].obstacles.find(obstacle => obstacle.kind === 'houseFloor' && obstacle.variant === 'ironworks');
+    const serializedMainDoor = ticks[3].obstacles.find(obstacle => (
+        obstacle.kind === 'door'
+        && obstacle.houseId === serializedIronworks.id
+        && obstacle.entranceRole === 'mainEntrance'
+    ));
+    assert.equal(serializedIronworks.label, 'IRONWORKS');
+    assert.equal(serializedIronworks.landmarkType, 'ironworks');
+    assert.equal(serializedIronworks.orientation, 'east');
+    assert.equal(serializedMainDoor.role, 'east');
 });

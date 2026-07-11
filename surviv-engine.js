@@ -354,6 +354,9 @@ function makeChest(x, y, tier = 'common', contents = null, source = 'map', optio
         tier,
         contents: chestContents,
         source,
+        houseId: options.houseId || null,
+        landmarkType: options.landmarkType || null,
+        room: options.room || null,
     };
 }
 
@@ -386,6 +389,11 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         houseId: options.houseId || null,
         roomId: options.roomId || null,
         role: options.role || null,
+        landmarkType: options.landmarkType || null,
+        entranceRole: options.entranceRole || null,
+        orientation: options.orientation || null,
+        points: Array.isArray(options.points) ? options.points : null,
+        width: Number.isFinite(options.width) ? options.width : null,
     };
     obstacles.push(obstacle);
     return obstacle;
@@ -460,12 +468,12 @@ function removeShortNetworkRoadStubs(obstacles, minLength) {
     }
 }
 
-function addWall(obstacles, x, y, w, h, variant = 'plaster') {
-    addObstacle(obstacles, 'wall', x, y, w, h, { hue: 24, variant });
+function addWall(obstacles, x, y, w, h, variant = 'plaster', opts = {}) {
+    return addObstacle(obstacles, 'wall', x, y, w, h, { hue: opts.hue ?? 24, variant, ...opts });
 }
 
-function addInteriorWall(obstacles, x, y, w, h, variant = 'plaster') {
-    addObstacle(obstacles, 'interiorWall', x, y, w, h, { hue: 24, variant });
+function addInteriorWall(obstacles, x, y, w, h, variant = 'plaster', opts = {}) {
+    return addObstacle(obstacles, 'interiorWall', x, y, w, h, { hue: opts.hue ?? 24, variant, ...opts });
 }
 
 function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
@@ -476,38 +484,40 @@ function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
     });
 }
 
-function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south') {
+function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south', entranceRole = 'mainEntrance') {
     return addObstacle(obstacles, 'door', x, y, w, h, {
         collidable: false,
         variant,
         houseId,
         role: side,
+        entranceRole,
+        orientation: side,
     });
 }
 
-function addHorizontalWallWithOpening(obstacles, x, y, w, wall, variant, openingCenterX = x, openingW = 0) {
+function addHorizontalWallWithOpening(obstacles, x, y, w, wall, variant, openingCenterX = x, openingW = 0, opts = {}) {
     const min = x - w / 2;
     const max = x + w / 2;
     const gapMin = clamp(openingCenterX - openingW / 2, min, max);
     const gapMax = clamp(openingCenterX + openingW / 2, min, max);
     const leftW = gapMin - min;
     const rightW = max - gapMax;
-    if (leftW > wall * 2) addWall(obstacles, min + leftW / 2, y, leftW, wall, variant);
-    if (rightW > wall * 2) addWall(obstacles, gapMax + rightW / 2, y, rightW, wall, variant);
+    if (leftW > wall * 2) addWall(obstacles, min + leftW / 2, y, leftW, wall, variant, opts);
+    if (rightW > wall * 2) addWall(obstacles, gapMax + rightW / 2, y, rightW, wall, variant, opts);
 }
 
-function addVerticalWallWithOpening(obstacles, x, y, h, wall, variant, openingCenterY = y, openingH = 0) {
+function addVerticalWallWithOpening(obstacles, x, y, h, wall, variant, openingCenterY = y, openingH = 0, opts = {}) {
     const min = y - h / 2;
     const max = y + h / 2;
     const gapMin = clamp(openingCenterY - openingH / 2, min, max);
     const gapMax = clamp(openingCenterY + openingH / 2, min, max);
     const topH = gapMin - min;
     const bottomH = max - gapMax;
-    if (topH > wall * 2) addWall(obstacles, x, min + topH / 2, wall, topH, variant);
-    if (bottomH > wall * 2) addWall(obstacles, x, gapMax + bottomH / 2, wall, bottomH, variant);
+    if (topH > wall * 2) addWall(obstacles, x, min + topH / 2, wall, topH, variant, opts);
+    if (bottomH > wall * 2) addWall(obstacles, x, gapMax + bottomH / 2, wall, bottomH, variant, opts);
 }
 
-function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], variant = 'plaster') {
+function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], variant = 'plaster', opts = {}) {
     const min = y - h / 2;
     const max = y + h / 2;
     let cursor = min;
@@ -515,13 +525,13 @@ function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], va
     for (const gap of sorted) {
         const gapMin = clamp(y + gap.center - gap.size / 2, min, max);
         const gapMax = clamp(y + gap.center + gap.size / 2, min, max);
-        if (gapMin - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + gapMin) / 2, wall, gapMin - cursor, variant);
+        if (gapMin - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + gapMin) / 2, wall, gapMin - cursor, variant, opts);
         cursor = Math.max(cursor, gapMax);
     }
-    if (max - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + max) / 2, wall, max - cursor, variant);
+    if (max - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + max) / 2, wall, max - cursor, variant, opts);
 }
 
-function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], variant = 'plaster') {
+function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], variant = 'plaster', opts = {}) {
     const min = x - w / 2;
     const max = x + w / 2;
     let cursor = min;
@@ -529,10 +539,10 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
     for (const gap of sorted) {
         const gapMin = clamp(x + gap.center - gap.size / 2, min, max);
         const gapMax = clamp(x + gap.center + gap.size / 2, min, max);
-        if (gapMin - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + gapMin) / 2, y, gapMin - cursor, wall, variant);
+        if (gapMin - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + gapMin) / 2, y, gapMin - cursor, wall, variant, opts);
         cursor = Math.max(cursor, gapMax);
     }
-    if (max - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + max) / 2, y, max - cursor, wall, variant);
+    if (max - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + max) / 2, y, max - cursor, wall, variant, opts);
 }
 function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const wall = opts.wall || 14;
@@ -549,7 +559,16 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const doorY = doorSide === 'north'
         ? y - h / 2 + wall / 2
         : doorSide === 'south' ? y + h / 2 - wall / 2 : y;
-    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, { collidable: false, hue, variant });
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, {
+        collidable: false,
+        hue,
+        variant,
+        label: opts.label,
+        role: opts.role || (variant === 'town' ? 'residence' : 'building'),
+        landmarkType: opts.landmarkType,
+        orientation: opts.orientation || doorSide,
+        biome: opts.biome,
+    });
     const houseId = floor.id;
 
     const northY = y - h / 2 + wall / 2;
@@ -569,9 +588,9 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     if (doorSide === 'east') addVerticalWallWithOpening(obstacles, eastX, y, h, wall, variant, doorY, doorSpan);
     else addWall(obstacles, eastX, y, wall, h, variant);
 
-    addDoor(obstacles, houseId, doorX, doorY, doorW, doorH, variant, doorSide);
+    addDoor(obstacles, houseId, doorX, doorY, doorW, doorH, variant, doorSide, opts.entranceRole || 'mainEntrance');
 
-    const large = w >= 430 || h >= 330 || variant === 'mansion' || variant === 'warehouse';
+    const large = opts.layout === 'corridor' || (opts.layout !== 'open' && (w >= 430 || h >= 330 || variant === 'mansion'));
     if (large) {
         const hallW = clamp(w * 0.22, 98, 170);
         const wingW = (w - hallW - wall * 4) / 2;
@@ -621,10 +640,31 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
 }
 
 function addMansion(obstacles, loot, spawnPoints, x, y) {
-    addObstacle(obstacles, 'field', x, y, 1500, 1050, { collidable: false, variant: 'estate' });
-    addHouse(obstacles, loot, spawnPoints, x, y, 720, 520, { hue: 32, variant: 'mansion', tier: 'rare', wall: 18 });
-    addHouse(obstacles, loot, spawnPoints, x - 560, y + 240, 320, 260, { hue: 28, variant: 'guesthouse', tier: 'rare' });
-    addHouse(obstacles, loot, spawnPoints, x + 570, y + 250, 300, 250, { hue: 28, variant: 'garage', tier: 'military' });
+    addObstacle(obstacles, 'field', x, y, 1500, 1050, {
+        collidable: false,
+        variant: 'estate',
+        role: 'courtyard',
+        landmarkType: 'estate',
+    });
+    addObstacle(obstacles, 'road', x, y + 425, 180, 330, {
+        collidable: false,
+        variant: 'dirt',
+        role: 'driveway',
+        landmarkType: 'estate',
+    });
+    addHouse(obstacles, loot, spawnPoints, x, y, 720, 520, {
+        hue: 32, variant: 'mansion', tier: 'rare', wall: 18,
+        doorSide: 'south', landmarkType: 'estate', label: 'MANOR', role: 'mainBuilding',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 560, y + 240, 320, 260, {
+        hue: 28, variant: 'guesthouse', tier: 'rare',
+        doorSide: 'east', landmarkType: 'estate', label: 'GUEST', role: 'guesthouse',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 570, y + 250, 300, 250, {
+        hue: 28, variant: 'garage', tier: 'military',
+        doorSide: 'west', landmarkType: 'estate', label: 'GARAGE', role: 'garage',
+        entranceRole: 'garageEntrance',
+    });
     
     // Perimeter walls with gate on North and South sides
     addWall(obstacles, x - 500, y - 590, 500, 18, 'stone'); // North wall left segment
@@ -664,6 +704,126 @@ function addMansion(obstacles, loot, spawnPoints, x, y) {
     // Fairer spawn points at the outskirts of the estate
     spawnPoints.push({ x, y: y + 660 });
     spawnPoints.push({ x, y: y - 660 });
+}
+
+function addIronworks(obstacles, loot, spawnPoints, x, y) {
+    const w = 1800;
+    const h = 1200;
+    const wall = 24;
+    const northY = y - h / 2 + wall / 2;
+    const southY = y + h / 2 - wall / 2;
+    const westX = x - w / 2 + wall / 2;
+    const eastX = x + w / 2 - wall / 2;
+
+    addObstacle(obstacles, 'field', x, y, 2600, 1900, {
+        collidable: false,
+        variant: 'industrial',
+        role: 'compound',
+        landmarkType: 'ironworks',
+        label: 'IRONWORKS',
+    });
+    addObstacle(obstacles, 'field', x, y, 2200, 1550, {
+        collidable: false,
+        variant: 'courtyard',
+        role: 'yard',
+        landmarkType: 'ironworks',
+    });
+
+    // The eastern apron joins the west N-S highway; the other aprons make every
+    // exterior doorway readable and keep combat exits from becoming choke traps.
+    addObstacle(obstacles, 'road', x + w / 2 + 250, y, 500, 170, {
+        collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'road', x - w / 2 - 150, y + 280, 300, 120, {
+        collidable: false, variant: 'dirt', role: 'path', landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'road', x - 430, y - h / 2 - 170, 120, 340, {
+        collidable: false, variant: 'dirt', role: 'path', landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'road', x + 430, y + h / 2 + 170, 120, 340, {
+        collidable: false, variant: 'dirt', role: 'path', landmarkType: 'ironworks',
+    });
+
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, {
+        collidable: false,
+        hue: 205,
+        variant: 'ironworks',
+        label: 'IRONWORKS',
+        role: 'mainBuilding',
+        landmarkType: 'ironworks',
+        orientation: 'east',
+    });
+    const houseId = floor.id;
+    const ironworksMeta = { houseId, landmarkType: 'ironworks' };
+
+    addHorizontalWallWithOpening(obstacles, x, northY, w, wall, 'metal', x - 430, 170, ironworksMeta);
+    addHorizontalWallWithOpening(obstacles, x, southY, w, wall, 'metal', x + 430, 170, ironworksMeta);
+    addVerticalWallWithOpening(obstacles, westX, y, h, wall, 'metal', y + 280, 210, ironworksMeta);
+    addVerticalWallWithOpening(obstacles, eastX, y, h, wall, 'metal', y, 230, ironworksMeta);
+
+    addDoor(obstacles, houseId, x - 430, northY, 170, wall * 2.25, 'metal', 'north', 'serviceEntrance');
+    addDoor(obstacles, houseId, x + 430, southY, 170, wall * 2.25, 'metal', 'south', 'serviceEntrance');
+    addDoor(obstacles, houseId, westX, y + 280, wall * 2.25, 210, 'metal', 'west', 'loadingEntrance');
+    addDoor(obstacles, houseId, eastX, y, wall * 2.25, 230, 'metal', 'east', 'mainEntrance');
+
+    // Two side loops connect through the central factory floor at three points.
+    // Players can rotate around fights instead of being forced through one hall.
+    addRoomZone(obstacles, houseId, x, y, 300, 1060, 'hallway');
+    addRoomZone(obstacles, houseId, x - 255, y, 190, 1060, 'factory-floor');
+    addRoomZone(obstacles, houseId, x + 255, y, 190, 1060, 'factory-floor');
+    addRoomZone(obstacles, houseId, x - 610, y - 265, 500, 430, 'workshop');
+    addRoomZone(obstacles, houseId, x + 610, y - 265, 500, 430, 'control-room');
+    addRoomZone(obstacles, houseId, x - 610, y + 265, 500, 430, 'storage');
+    addRoomZone(obstacles, houseId, x + 610, y + 265, 500, 430, 'loading-bay');
+
+    addVerticalInteriorWallSegments(obstacles, x - 360, y, h - wall * 4, wall, [
+        { center: -400, size: 165 },
+        { center: 0, size: 165 },
+        { center: 400, size: 165 },
+    ], 'metal', ironworksMeta);
+    addVerticalInteriorWallSegments(obstacles, x + 360, y, h - wall * 4, wall, [
+        { center: -400, size: 165 },
+        { center: 0, size: 165 },
+        { center: 400, size: 165 },
+    ], 'metal', ironworksMeta);
+    addHorizontalInteriorWallSegments(obstacles, x - 620, y, 500, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
+    addHorizontalInteriorWallSegments(obstacles, x + 620, y, 500, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
+
+    // Soft cover preserves the wide looping lanes. Loading-bay containers are
+    // tucked against the exterior wall instead of blocking room connections.
+    addObstacle(obstacles, 'furniture', x - 155, y - 245, 110, 170, {
+        collidable: true, variant: 'machine', role: 'machine', houseId, landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'furniture', x + 155, y + 245, 110, 170, {
+        collidable: true, variant: 'machine', role: 'machine', houseId, landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'furniture', x - 610, y - 245, 170, 54, {
+        collidable: false, variant: 'workbench', role: 'workbench', houseId, landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'furniture', x + 610, y - 245, 72, 120, {
+        collidable: false, variant: 'locker', role: 'locker', houseId, landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'container', x + 690, y + 300, 125, 54, {
+        hue: 205, variant: 'blue', role: 'indoorCover', houseId, landmarkType: 'ironworks',
+    });
+    addObstacle(obstacles, 'container', x + 690, y + 390, 125, 54, {
+        hue: 15, variant: 'red', role: 'indoorCover', houseId, landmarkType: 'ironworks',
+    });
+
+    const ironworksLoot = room => ({ houseId, landmarkType: 'ironworks', room });
+    loot.push(makeChest(x - 620, y - 345, 'rare', null, 'map', ironworksLoot('workshop')));
+    loot.push(makeChest(x + 620, y - 345, 'rare', null, 'map', ironworksLoot('control-room')));
+    loot.push(makeChest(x - 620, y + 345, 'rare', null, 'map', ironworksLoot('storage')));
+    loot.push(makeChest(x + 520, y + 345, 'rare', null, 'map', ironworksLoot('loading-bay')));
+    loot.push(makeChest(x, y, 'military', null, 'map', ironworksLoot('hallway')));
+
+    addObstacle(obstacles, 'crate', x - 1040, y - 560, 48, 48, { variant: 'industrial', rotation: 0.08 });
+    addObstacle(obstacles, 'barrel', x + 1050, y + 500, 36, 36, { variant: 'fuel', hue: 15 });
+
+    spawnPoints.push({ x: x + w / 2 + 330, y: y - 320, role: 'ironworks-east' });
+    spawnPoints.push({ x: x + w / 2 + 330, y: y + 320, role: 'ironworks-east' });
+    spawnPoints.push({ x: x - w / 2 - 330, y: y - 360, role: 'ironworks-west' });
+    spawnPoints.push({ x: x - w / 2 - 330, y: y + 430, role: 'ironworks-west' });
 }
 
 function addContainerYard(obstacles, loot, spawnPoints, x, y) {
@@ -953,8 +1113,154 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
     }
 }
 
+function addFarmstead(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1900, 1250, {
+        collidable: false,
+        variant: 'farm',
+        role: 'farmstead',
+        landmarkType: 'farm',
+        label: 'EAST FARM',
+    });
+    addObstacle(obstacles, 'road', x, y, 1700, 110, {
+        collidable: false,
+        variant: 'dirt',
+        role: 'driveway',
+        landmarkType: 'farm',
+    });
+
+    addHouse(obstacles, loot, spawnPoints, x - 470, y - 270, 470, 300, {
+        variant: 'barn', hue: 8, tier: 'rare', doorSide: 'south', layout: 'open',
+        landmarkType: 'farm', label: 'BARN', role: 'barn',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 80, y - 270, 320, 240, {
+        variant: 'house', hue: 25, tier: 'rare', doorSide: 'south',
+        landmarkType: 'farm', label: 'FARMHOUSE', role: 'farmhouse',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 540, y + 230, 280, 210, {
+        variant: 'barn', hue: 12, tier: 'common', doorSide: 'north', layout: 'open',
+        landmarkType: 'farm', label: 'SHED', role: 'shed',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 250, y + 240, 360, 220, {
+        variant: 'warehouse', hue: 122, tier: 'common', doorSide: 'north', layout: 'open',
+        landmarkType: 'farm', label: 'GREENHOUSE', role: 'greenhouse',
+    });
+
+    for (let i = 0; i < 6; i++) {
+        addObstacle(obstacles, 'field', x - 720 + i * 225, y + 500, 170, 230, {
+            collidable: false, variant: 'crop', role: 'cropRow', landmarkType: 'farm',
+        });
+    }
+    addObstacle(obstacles, 'crate', x - 760, y - 50, 54, 54, { hue: 34, variant: 'hay', role: 'farmProp' });
+    addObstacle(obstacles, 'crate', x - 700, y - 50, 54, 54, { hue: 34, variant: 'hay', role: 'farmProp' });
+    addObstacle(obstacles, 'barrel', x + 760, y - 180, 38, 38, { hue: 205, variant: 'water', role: 'farmProp' });
+
+    loot.push(makeChest(x - 560, y - 300, 'rare'));
+    loot.push(makeChest(x + 80, y - 290, 'rare'));
+    spawnPoints.push({ x: x - 900, y, role: 'farm-road' });
+    spawnPoints.push({ x: x + 900, y, role: 'farm-road' });
+}
+
+function addResearchCampus(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1900, 1350, {
+        collidable: false,
+        variant: 'snow-lab',
+        role: 'campus',
+        landmarkType: 'lab',
+        label: 'RESEARCH',
+    });
+    addObstacle(obstacles, 'road', x, y, 1700, 120, {
+        collidable: false,
+        variant: 'asphalt',
+        role: 'driveway',
+        landmarkType: 'lab',
+    });
+    addObstacle(obstacles, 'field', x, y, 760, 420, {
+        collidable: false,
+        variant: 'courtyard',
+        role: 'plaza',
+        landmarkType: 'lab',
+    });
+
+    addHouse(obstacles, loot, spawnPoints, x, y - 350, 650, 310, {
+        variant: 'warehouse', hue: 195, tier: 'military', doorSide: 'south', layout: 'corridor',
+        landmarkType: 'lab', label: 'LAB A', role: 'laboratory',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 480, y + 330, 420, 260, {
+        variant: 'warehouse', hue: 205, tier: 'rare', doorSide: 'north', layout: 'open',
+        landmarkType: 'lab', label: 'LAB B', role: 'laboratory',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 500, y + 330, 340, 240, {
+        variant: 'warehouse', hue: 45, tier: 'military', doorSide: 'north', layout: 'open',
+        landmarkType: 'lab', label: 'POWER', role: 'utility', entranceRole: 'serviceEntrance',
+    });
+
+    addObstacle(obstacles, 'container', x + 760, y - 260, 125, 54, {
+        hue: 205, variant: 'blue', role: 'serviceYard', landmarkType: 'lab',
+    });
+    addObstacle(obstacles, 'barrel', x + 730, y - 360, 36, 36, {
+        hue: 15, variant: 'fuel', role: 'serviceYard', landmarkType: 'lab',
+    });
+    addObstacle(obstacles, 'crate', x - 760, y + 210, 46, 46, {
+        variant: 'medical', role: 'serviceYard', landmarkType: 'lab',
+    });
+
+    loot.push(makeChest(x - 120, y - 390, 'military'));
+    loot.push(makeChest(x - 500, y + 330, 'rare'));
+    loot.push(makeChest(x + 500, y + 330, 'military'));
+    spawnPoints.push({ x: x - 950, y, role: 'lab-road' });
+    spawnPoints.push({ x: x + 950, y, role: 'lab-road' });
+}
+
+function addRoadsideHamlet(obstacles, loot, spawnPoints, x, y, orientation = 'horizontal') {
+    const horizontal = orientation === 'horizontal';
+    addObstacle(obstacles, 'field', x, y, horizontal ? 1040 : 720, horizontal ? 720 : 1040, {
+        collidable: false,
+        variant: 'village',
+        role: 'hamlet',
+        landmarkType: 'hamlet',
+    });
+    addObstacle(obstacles, 'road', x, y, horizontal ? 960 : 90, horizontal ? 90 : 960, {
+        collidable: false,
+        variant: 'dirt',
+        role: 'path',
+        landmarkType: 'hamlet',
+    });
+
+    const homes = horizontal
+        ? [
+            { x: x - 280, y: y - 210, side: 'south' },
+            { x: x + 280, y: y - 210, side: 'south' },
+            { x, y: y + 220, side: 'north' },
+        ]
+        : [
+            { x: x - 220, y: y - 280, side: 'east' },
+            { x: x - 220, y: y + 280, side: 'east' },
+            { x: x + 220, y, side: 'west' },
+        ];
+    for (const [index, home] of homes.entries()) {
+        addHouse(obstacles, loot, spawnPoints, home.x, home.y, 220 + index * 12, 180 + (index % 2) * 22, {
+            variant: index === 2 ? 'cabin' : 'house',
+            hue: 18 + index * 9,
+            tier: index === 2 ? 'rare' : 'common',
+            doorSide: home.side,
+            landmarkType: 'hamlet',
+            role: 'hamletHome',
+        });
+    }
+    addObstacle(obstacles, 'barrel', x + (horizontal ? 390 : 110), y + (horizontal ? 130 : 390), 34, 34, {
+        hue: 205, variant: 'water', role: 'well', landmarkType: 'hamlet',
+    });
+    spawnPoints.push(horizontal ? { x: x - 520, y, role: 'hamlet-road' } : { x, y: y - 520, role: 'hamlet-road' });
+    spawnPoints.push(horizontal ? { x: x + 520, y, role: 'hamlet-road' } : { x, y: y + 520, role: 'hamlet-road' });
+}
+
 function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
-    addObstacle(obstacles, 'field', x, y, 1600, 1400, { collidable: false, variant: 'industrial' });
+    addObstacle(obstacles, 'field', x, y, 1600, 1400, {
+        collidable: false, variant: 'industrial', role: 'compound', landmarkType: 'military',
+    });
+    addObstacle(obstacles, 'road', x, y + 458, 160, 464, {
+        collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'military',
+    });
     
     // Perimeter walls with North and South gates
     addWall(obstacles, x - 500, y - 690, 580, 20, 'stone');
@@ -977,11 +1283,20 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'wall', x + 770, y + 670, 70, 70, 'stone');
 
     // Central Warehouse
-    addHouse(obstacles, loot, spawnPoints, x, y, 600, 450, { variant: 'warehouse', tier: 'military', hue: 205, wall: 16 });
+    addHouse(obstacles, loot, spawnPoints, x, y, 600, 450, {
+        variant: 'warehouse', tier: 'military', hue: 205, wall: 16, doorSide: 'south',
+        landmarkType: 'military', label: 'ARMORY', role: 'armory', layout: 'corridor',
+    });
 
     // Barracks buildings side-by-side
-    addHouse(obstacles, loot, spawnPoints, x - 550, y - 400, 280, 220, { variant: 'warehouse', tier: 'military', hue: 195, wall: 14 });
-    addHouse(obstacles, loot, spawnPoints, x + 550, y - 400, 280, 220, { variant: 'warehouse', tier: 'military', hue: 195, wall: 14 });
+    addHouse(obstacles, loot, spawnPoints, x - 550, y - 400, 280, 220, {
+        variant: 'warehouse', tier: 'military', hue: 195, wall: 14, doorSide: 'east',
+        landmarkType: 'military', label: 'BARRACKS', role: 'barracks',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 550, y - 400, 280, 220, {
+        variant: 'warehouse', tier: 'military', hue: 195, wall: 14, doorSide: 'west',
+        landmarkType: 'military', label: 'BARRACKS', role: 'barracks',
+    });
 
     // Decorative container rows (east and west sides)
     for (let i = 0; i < 6; i++) {
@@ -990,8 +1305,10 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     }
 
     // Sandbags and defensive positions
-    for (let i = 0; i < 6; i++) {
-        addObstacle(obstacles, 'sandbag', x - 200 + i * 80, y + 550, 60, 30, { rotation: 0 });
+    for (const offset of [-300, -220, 220, 300]) {
+        addObstacle(obstacles, 'sandbag', x + offset, y + 550, 60, 30, {
+            rotation: 0, role: 'defense', landmarkType: 'military',
+        });
     }
 
     // Guaranteed military ground loot inside warehouse and barracks
@@ -1196,13 +1513,21 @@ function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12)
 
 function addRiver(obstacles, worldHalf, startX, startY, endX, endY, width = 220) {
     const points = generateRiverPath(worldHalf, startX, startY, endX, endY, 14);
-    
-    // Add a single 'river_path' obstacle for the client to render smoothly
-    addObstacle(obstacles, 'river_path', startX, startY, width, width, {
+    const xs = points.map(point => point.x);
+    const ys = points.map(point => point.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    // A path-sized bounding box keeps the static spline visible to clients near
+    // any part of the river, instead of only near its western start point.
+    addObstacle(obstacles, 'river_path', (minX + maxX) / 2, (minY + maxY) / 2, maxX - minX + width, maxY - minY + width, {
         collidable: false,
         variant: 'river_path',
-        points: points,
-        width: width
+        points,
+        width,
+        role: 'riverSpline',
     });
 
     const riverSegments = [];
@@ -1223,7 +1548,7 @@ function addRiver(obstacles, worldHalf, startX, startY, endX, endY, width = 220)
         });
         riverSegments.push({ x: mx, y: my, w: segLen + width * 0.5, h: segWidth, angle });
     }
-    return { points, segments: riverSegments };
+    return { points, segments: riverSegments, width };
 }
 
 function addBridge(obstacles, x, y, width, length, rotation = 0) {
@@ -1254,20 +1579,35 @@ function addBridge(obstacles, x, y, width, length, rotation = 0) {
 }
 
 function addBridgesAlongRiver(obstacles, riverData, roadPositions) {
-    // Place bridges where roads are closest to the river
+    // Intersect the spline with each vertical highway. Using a segment midpoint
+    // could move a bridge hundreds of units away from the road it should carry.
     for (const rp of roadPositions) {
-        let bestDist = Infinity;
-        let bestSeg = null;
-        for (const seg of riverData.segments) {
-            const d = Math.hypot(rp.x - seg.x, rp.y - seg.y);
-            if (d < bestDist) {
-                bestDist = d;
-                bestSeg = seg;
-            }
+        let crossing = null;
+        for (let i = 0; i < riverData.points.length - 1; i++) {
+            const a = riverData.points[i];
+            const b = riverData.points[i + 1];
+            const dx = b.x - a.x;
+            if (Math.abs(dx) < 1) continue;
+            const t = (rp.x - a.x) / dx;
+            if (t < 0 || t > 1) continue;
+            const crossingY = a.y + (b.y - a.y) * t;
+            const candidate = {
+                x: rp.x,
+                y: crossingY,
+                distance: Math.abs(crossingY - rp.y),
+                angle: Math.atan2(b.y - a.y, dx),
+            };
+            if (!crossing || candidate.distance < crossing.distance) crossing = candidate;
         }
-        if (bestSeg && bestDist < 2000) {
-            const bridgeAngle = bestSeg.angle + Math.PI / 2;
-            addBridge(obstacles, bestSeg.x, bestSeg.y, 140, bestSeg.h + 80, bridgeAngle);
+        if (crossing && crossing.distance < 2200) {
+            addBridge(
+                obstacles,
+                crossing.x,
+                crossing.y,
+                140,
+                riverData.width + 130,
+                crossing.angle + Math.PI / 2,
+            );
         }
     }
 }
@@ -1304,25 +1644,43 @@ function addStandaloneHouse(obstacles, loot, spawnPoints, x, y) {
     }
 }
 
-function addScatteredGroundLoot(obstacles, loot, worldHalf) {
-    const groundItemCount = 42;
+function addScatteredGroundLoot(obstacles, loot) {
+    const groundItemCount = 22;
+    const floors = obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && obstacle.w >= 170
+        && obstacle.h >= 140
+    ));
+    if (!floors.length) return;
+
     for (let i = 0; i < groundItemCount; i++) {
-        for (let attempt = 0; attempt < 40; attempt++) {
-            const pos = randomSpawnCoord(worldHalf * 0.92);
-            const blocked = obstacles.some(o => o.collidable !== false && circleRectCollision(pos.x, pos.y, 24, o));
+        for (let attempt = 0; attempt < 60; attempt++) {
+            const floor = floors[(i * 17 + attempt * 11 + Math.floor(Math.random() * floors.length)) % floors.length];
+            const insetX = Math.min(52, floor.w * 0.24);
+            const insetY = Math.min(52, floor.h * 0.24);
+            const pos = {
+                x: floor.x + (Math.random() - 0.5) * Math.max(10, floor.w - insetX * 2),
+                y: floor.y + (Math.random() - 0.5) * Math.max(10, floor.h - insetY * 2),
+            };
+            const blocked = obstacles.some(obstacle => (
+                obstacle.collidable !== false
+                && circleRectCollision(pos.x, pos.y, 20, obstacle)
+            ));
             if (blocked) continue;
 
             const roll = Math.random();
+            const metadata = { houseId: floor.id, location: 'interior' };
             if (roll < 0.36) {
-                loot.push(makeGroundLoot('ammo', pos.x, pos.y));
+                loot.push(makeGroundLoot('ammo', pos.x, pos.y, metadata));
             } else if (roll < 0.62) {
-                loot.push(makeGroundLoot('medkit', pos.x, pos.y));
+                loot.push(makeGroundLoot('medkit', pos.x, pos.y, metadata));
             } else if (roll < 0.82) {
-                loot.push(makeGroundLoot('armor', pos.x, pos.y, { armorValue: 35 }));
+                loot.push(makeGroundLoot('armor', pos.x, pos.y, { ...metadata, armorValue: 35 }));
             } else {
                 const tier = Math.random() < 0.08 ? 'rare' : 'common';
                 const weaponType = pickWeaponForTier(tier);
                 loot.push(makeGroundLoot('weapon', pos.x, pos.y, {
+                    ...metadata,
                     weaponType,
                     tier: WEAPONS[weaponType]?.rarity || tier,
                 }));
@@ -1334,6 +1692,68 @@ function addScatteredGroundLoot(obstacles, loot, worldHalf) {
 
 function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
     return Math.abs(x1 - x2) < (w1 + w2) / 2 && Math.abs(y1 - y2) < (h1 + h2) / 2;
+}
+
+const CLEARABLE_MAP_PROP_KINDS = new Set([
+    'tree', 'bush', 'rock', 'crate', 'barrel', 'container', 'sandbag', 'tent',
+]);
+
+function getDoorApproachRect(door) {
+    const horizontal = door.role === 'north' || door.role === 'south';
+    return {
+        x: door.x,
+        y: door.y,
+        w: horizontal ? Math.max(180, door.w + 120) : 190,
+        h: horizontal ? 190 : Math.max(180, door.h + 120),
+    };
+}
+
+function clearInvalidBuildingProps(obstacles) {
+    const floors = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const approaches = obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(getDoorApproachRect);
+
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+        const obstacle = obstacles[i];
+        if (!CLEARABLE_MAP_PROP_KINDS.has(obstacle.kind)) continue;
+        const blocksDoor = approaches.some(approach => rectsOverlap(
+            obstacle.x, obstacle.y, obstacle.w, obstacle.h,
+            approach.x, approach.y, approach.w, approach.h,
+        ));
+        const embeddedInBuilding = !obstacle.houseId && floors.some(floor => rectsOverlap(
+            obstacle.x, obstacle.y, obstacle.w, obstacle.h,
+            floor.x, floor.y, floor.w, floor.h,
+        ));
+        if (blocksDoor || embeddedInBuilding) obstacles.splice(i, 1);
+    }
+}
+
+function isGeneratedSpawnPointSafe(obstacles, x, y, radius = 30) {
+    for (const obstacle of obstacles) {
+        const forbiddenSurface = obstacle.kind === 'houseFloor'
+            || obstacle.kind === 'water'
+            || obstacle.kind === 'river';
+        if (!forbiddenSurface && obstacle.collidable === false) continue;
+        if (circleRectCollision(x, y, radius, obstacle)) return false;
+    }
+    return true;
+}
+
+function sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf) {
+    const seen = new Set();
+    const safe = [];
+    for (const point of spawnPoints) {
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) continue;
+        if (Math.abs(point.x) > worldHalf - 80 || Math.abs(point.y) > worldHalf - 80) continue;
+        if (!isGeneratedSpawnPointSafe(obstacles, point.x, point.y, 28)) continue;
+        const key = Math.round(point.x / 40) + ',' + Math.round(point.y / 40);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        safe.push(point);
+    }
+    spawnPoints.length = 0;
+    spawnPoints.push(...safe);
 }
 
 function isAreaOverlapping(x, y, w, h, buffer = 200, poiList = []) {
@@ -1412,12 +1832,13 @@ export function generateSurvivMap(worldHalf) {
     const seLabPos = { x: 7800, y: 7200, w: 1400, h: 760 };
     const swTownPos = { x: -7200, y: 1800, w: 2000, h: 680 }; // size 7 town
     const nwMansionPos = { x: -7500, y: -7400, w: 1500, h: 1050 };
+    const ironworksPos = { x: -3900, y: 7300, w: 2600, h: 1900 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
         quarryPos, prisonPos, towerPos, townPos, gasPos,
         farmPos, bunkerPos, campPos, neTownPos, seLabPos,
-        swTownPos, nwMansionPos
+        swTownPos, nwMansionPos, ironworksPos
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1469,13 +1890,21 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'North Gas Station', x: gasPos.x, y: gasPos.y, type: 'gas' });
 
     // Farm
-    addSettlement(obstacles, loot, spawnPoints, farmPos.x, farmPos.y, 7, 'farm');
+    addFarmstead(obstacles, loot, spawnPoints, farmPos.x, farmPos.y);
     landmarks.push({ name: 'East Farm', x: farmPos.x, y: farmPos.y, type: 'farm' });
 
     // South Bunker (Ruins)
-    addObstacle(obstacles, 'field', bunkerPos.x, bunkerPos.y, 1200, 820, { collidable: false, variant: 'ruins' });
-    addHouse(obstacles, loot, spawnPoints, bunkerPos.x, bunkerPos.y, 520, 360, { variant: 'warehouse', tier: 'military', hue: 205, wall: 18 });
-    addHouse(obstacles, loot, spawnPoints, bunkerPos.x - 380, bunkerPos.y - 200, 260, 200, { variant: 'warehouse', tier: 'military', hue: 200 });
+    addObstacle(obstacles, 'field', bunkerPos.x, bunkerPos.y, 1200, 820, {
+        collidable: false, variant: 'ruins', role: 'compound', landmarkType: 'bunker',
+    });
+    addHouse(obstacles, loot, spawnPoints, bunkerPos.x, bunkerPos.y, 520, 360, {
+        variant: 'warehouse', tier: 'military', hue: 205, wall: 18, doorSide: 'north',
+        landmarkType: 'bunker', label: 'BUNKER', role: 'mainBuilding', layout: 'corridor',
+    });
+    addHouse(obstacles, loot, spawnPoints, bunkerPos.x - 380, bunkerPos.y - 200, 260, 200, {
+        variant: 'warehouse', tier: 'military', hue: 200, doorSide: 'east',
+        landmarkType: 'bunker', label: 'UTILITY', role: 'utility', entranceRole: 'serviceEntrance',
+    });
     landmarks.push({ name: 'South Bunker', x: bunkerPos.x, y: bunkerPos.y, type: 'bunker' });
 
     // West Forest Camp
@@ -1490,7 +1919,7 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'NE Town', x: neTownPos.x, y: neTownPos.y, type: 'town' });
 
     // SE Lab
-    addSettlement(obstacles, loot, spawnPoints, seLabPos.x, seLabPos.y, 8, 'snow-lab');
+    addResearchCampus(obstacles, loot, spawnPoints, seLabPos.x, seLabPos.y);
     landmarks.push({ name: 'SE Lab', x: seLabPos.x, y: seLabPos.y, type: 'lab' });
 
     // SW Town
@@ -1500,6 +1929,10 @@ export function generateSurvivMap(worldHalf) {
     // NW Mansion
     addMansion(obstacles, loot, spawnPoints, nwMansionPos.x, nwMansionPos.y);
     landmarks.push({ name: 'NW Mansion', x: nwMansionPos.x, y: nwMansionPos.y, type: 'mansion' });
+
+    // Large indoor landmark with multiple rotations and a direct highway apron.
+    addIronworks(obstacles, loot, spawnPoints, ironworksPos.x, ironworksPos.y);
+    landmarks.push({ name: 'Ironworks', x: ironworksPos.x, y: ironworksPos.y, type: 'ironworks' });
 
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
@@ -1526,7 +1959,24 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, prisonPos.x, 2000, prisonPos.x, prisonPos.y, roadW); // State Prison to E-W Highway
     addRoad(obstacles, towerPos.x, 2000, towerPos.x, towerPos.y, roadW); // Radio Tower to E-W Highway
     addRoad(obstacles, townPos.x, -4000, townPos.x, townPos.y, roadW); // Pine Town to North E-W Highway
-    removeShortNetworkRoadStubs(obstacles, roadW * 8.5);
+    addRoad(obstacles, 2500, farmPos.y, farmPos.x - 850, farmPos.y, roadW); // East Farm lane
+    addRoad(obstacles, 2500, neTownPos.y, neTownPos.x - 1000, neTownPos.y, roadW); // NE Town main street
+    addRoad(obstacles, 2500, seLabPos.y, seLabPos.x - 850, seLabPos.y, roadW); // Research campus avenue
+    addRoad(obstacles, nwMansionPos.x, -4000, nwMansionPos.x, nwMansionPos.y + 590, roadW); // NW Mansion gate
+
+    addObstacle(obstacles, 'road', swTownPos.x, 1900, roadW, 200, {
+        collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'town',
+    });
+    addObstacle(obstacles, 'road', campPos.x, -3900, roadW, 200, {
+        collidable: false, variant: 'dirt', role: 'path', landmarkType: 'camp',
+    });
+    addObstacle(obstacles, 'road', bunkerPos.x, 7310, roadW, 620, {
+        collidable: false, variant: 'dirt', role: 'driveway', landmarkType: 'bunker',
+    });
+
+    // Only discard tiny clipping fragments. The previous 1020-unit threshold
+    // erased legitimate final approaches to several landmarks.
+    removeShortNetworkRoadStubs(obstacles, roadW * 1.1);
 
     // ─────────────────────────────────────────────────────────────────────────
     // RIVERS & BRIDGES (Aligned with N-S highways)
@@ -1545,13 +1995,35 @@ export function generateSurvivMap(worldHalf) {
     // ─────────────────────────────────────────────────────────────────────────
     // BIOME COVER & ROAD MARKERS
     // ─────────────────────────────────────────────────────────────────────────
-    const placedPositions = [...POI_LIST];
+    const roadReservations = obstacles
+        .filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad')
+        .map(road => ({ x: road.x, y: road.y, w: road.w, h: road.h }));
+    const placedPositions = [...POI_LIST, ...roadReservations];
+    // Curated hamlets create recognizable rotations between major POIs. They
+    // replace the old density fallback that sprinkled isolated houses anywhere.
+    const hamletPlans = [
+        { x: -6500, y: 6800, orientation: 'horizontal' },
+        { x: -1200, y: 7600, orientation: 'vertical' },
+        { x: 1200, y: -6900, orientation: 'horizontal' },
+        { x: 4200, y: -8300, orientation: 'vertical' },
+        { x: 7000, y: 3000, orientation: 'horizontal' },
+        { x: -8400, y: 6500, orientation: 'vertical' },
+        { x: 700, y: 3600, orientation: 'horizontal' },
+    ];
+    for (const plan of hamletPlans) {
+        const w = plan.orientation === 'horizontal' ? 1040 : 720;
+        const h = plan.orientation === 'horizontal' ? 720 : 1040;
+        if (isAreaOverlapping(plan.x, plan.y, w, h, 240, placedPositions)) continue;
+        addRoadsideHamlet(obstacles, loot, spawnPoints, plan.x, plan.y, plan.orientation);
+        placedPositions.push({ x: plan.x, y: plan.y, w, h });
+    }
+
 
     // NW Pine Forest biome - compact patches that break up empty crossings.
     for (let i = 0; i < 5; i++) {
         const fx = -6500 + i * 2000 + (Math.random() - 0.5) * 400;
         const fy = -6000 + (Math.random() - 0.5) * 400;
-        if (!isAreaOverlapping(fx, fy, 800, 800, 200, POI_LIST)) {
+        if (!isAreaOverlapping(fx, fy, 800, 800, 200, placedPositions)) {
             addForest(obstacles, loot, spawnPoints, fx, fy, 16, 340);
             placedPositions.push({ x: fx, y: fy, w: 800, h: 800 });
         }
@@ -1561,7 +2033,7 @@ export function generateSurvivMap(worldHalf) {
     for (let i = 0; i < 5; i++) {
         const sx = -7000 + i * 1500 + (Math.random() - 0.5) * 300;
         const sy = 4500 + (Math.random() - 0.5) * 300;
-        if (!isAreaOverlapping(sx, sy, 600, 600, 200, POI_LIST)) {
+        if (!isAreaOverlapping(sx, sy, 600, 600, 200, placedPositions)) {
             addCoverPatch(obstacles, loot, spawnPoints, sx, sy, { radius: 230, variant: 'wetlands' });
             placedPositions.push({ x: sx, y: sy, w: 600, h: 600 });
         }
@@ -1631,23 +2103,9 @@ export function generateSurvivMap(worldHalf) {
         }
     }
 
-    // DYNAMIC AUTO-CORRECTION: Keeps the map populated even when random placement rolls sparse.
-    const currentHouses = obstacles.filter(o => o.kind === 'houseFloor').length;
-    if (currentHouses < 95) {
-        const needed = 95 - currentHouses;
-        for (let i = 0; i < needed; i++) {
-            for (let attempt = 0; attempt < 100; attempt++) {
-                const pos = randomSpawnCoord(wh * 0.88);
-                if (Math.hypot(pos.x, pos.y) > 2200 && !isAreaOverlapping(pos.x, pos.y, 560, 560, 240, placedPositions)) {
-                    addStandaloneHouse(obstacles, loot, spawnPoints, pos.x, pos.y);
-                    placedPositions.push({ x: pos.x, y: pos.y, w: 560, h: 560 });
-                    break;
-                }
-            }
-        }
-    }
-
-    addScatteredGroundLoot(obstacles, loot, worldHalf);
+    addScatteredGroundLoot(obstacles, loot);
+    clearInvalidBuildingProps(obstacles);
+    sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
 
     return { obstacles, loot, spawnPoints, landmarks };
 }
@@ -1893,17 +2351,23 @@ function pickSurvivSpawn(room) {
         const base = useStructureSpawn
             ? spawnPoints[Math.floor(Math.random() * spawnPoints.length)]
             : randomSpawnCoord(SURVIV.worldHalf * 0.94);
-        const jitter = useStructureSpawn ? 400 : 220;
+        const jitter = useStructureSpawn ? 260 : 220;
         const pos = {
             x: base.x + (Math.random() - 0.5) * jitter,
             y: base.y + (Math.random() - 0.5) * jitter,
         };
-        if (!isPositionBlocked(room, pos.x, pos.y, SURVIV.playerRadius + 10)) {
+        if (isSurvivSpawnPositionSafe(room, pos.x, pos.y, SURVIV.playerRadius + 10)) {
             const clear = [...room.players, ...room.bots].every(p => dist(pos.x, pos.y, p.x, p.y) > 140);
             if (clear) return pos;
         }
     }
-    return randomSpawnCoord(SURVIV.worldHalf * 0.9);
+    for (let i = 0; i < 200; i++) {
+        const fallback = randomSpawnCoord(SURVIV.worldHalf * 0.9);
+        if (isSurvivSpawnPositionSafe(room, fallback.x, fallback.y, SURVIV.playerRadius + 10)) {
+            return fallback;
+        }
+    }
+    return { x: 0, y: -SURVIV.worldHalf + 500 };
 }
 
 function obstacleCellKey(cx, cy) {
@@ -2069,6 +2533,18 @@ function isPositionBlocked(room, x, y, r) {
         if (circleRectCollision(x, y, r, o)) return true;
     }
     return false;
+}
+
+function isSurvivSpawnPositionSafe(room, x, y, radius) {
+    if (Math.abs(x) > SURVIV.worldHalf - radius || Math.abs(y) > SURVIV.worldHalf - radius) return false;
+    for (const obstacle of queryObstacles(room, x, y, radius + 90, false)) {
+        const forbiddenSurface = obstacle.kind === 'houseFloor'
+            || obstacle.kind === 'water'
+            || obstacle.kind === 'river';
+        if (!forbiddenSurface && obstacle.collidable === false) continue;
+        if (circleRectCollision(x, y, radius, obstacle)) return false;
+    }
+    return true;
 }
 
 function getNearbyObstacles(room, x, y, range) {
@@ -2885,16 +3361,21 @@ function serializeSurvivObstacle(o) {
         y: o.y,
         w: o.w,
         h: o.h,
-        hue: o.hue,
         kind: o.kind,
-        rotation: o.rotation,
         collidable: o.collidable !== false,
-        variant: o.variant,
-        biome: o.biome,
-        label: o.label,
-        houseId: o.houseId,
-        roomId: o.roomId,
-        role: o.role,
+        ...(o.hue != null ? { hue: o.hue } : {}),
+        ...(o.rotation ? { rotation: o.rotation } : {}),
+        ...(o.variant ? { variant: o.variant } : {}),
+        ...(o.biome ? { biome: o.biome } : {}),
+        ...(o.label ? { label: o.label } : {}),
+        ...(o.houseId ? { houseId: o.houseId } : {}),
+        ...(o.roomId ? { roomId: o.roomId } : {}),
+        ...(o.role ? { role: o.role } : {}),
+        ...(o.landmarkType ? { landmarkType: o.landmarkType } : {}),
+        ...(o.entranceRole ? { entranceRole: o.entranceRole } : {}),
+        ...(o.orientation ? { orientation: o.orientation } : {}),
+        ...(Array.isArray(o.points) ? { points: o.points } : {}),
+        ...(Number.isFinite(o.width) ? { width: o.width } : {}),
     };
 }
 
