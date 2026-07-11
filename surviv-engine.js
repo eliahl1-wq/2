@@ -9,6 +9,8 @@ const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
 const MELEE_ANIMATION_MS = 280;
 const SURVIV_MAX_WEAPONS = 2;
+const SURVIV_MAX_MEDKITS = 6;
+const SURVIV_MAX_AMMO_PACKS = 9;
 
 export const SURVIV = {
     worldHalf: 10000,
@@ -1254,6 +1256,53 @@ function addRoadsideHamlet(obstacles, loot, spawnPoints, x, y, orientation = 'ho
     spawnPoints.push(horizontal ? { x: x + 520, y, role: 'hamlet-road' } : { x, y: y + 520, role: 'hamlet-road' });
 }
 
+function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1900, 1320, {
+        collidable: false, variant: 'village', role: 'marketVillage', landmarkType: 'market',
+        label: 'GRAND MARKET',
+    });
+    addObstacle(obstacles, 'road', x, y + 390, 1760, 110, {
+        collidable: false, variant: 'dirt', role: 'mainStreet', landmarkType: 'market',
+    });
+    addObstacle(obstacles, 'field', x, y + 250, 680, 330, {
+        collidable: false, variant: 'courtyard', role: 'marketSquare', landmarkType: 'market',
+    });
+
+    // Large central hall creates a dense indoor fight, while the surrounding
+    // shops form a readable village loop with several exits back to the road.
+    addHouse(obstacles, loot, spawnPoints, x, y - 280, 920, 540, {
+        variant: 'warehouse', tier: 'military', hue: 32, wall: 16,
+        doorSide: 'south', layout: 'corridor', landmarkType: 'market',
+        label: 'MARKET HALL', role: 'marketHall', entranceRole: 'mainEntrance',
+    });
+    const shops = [
+        { dx: -720, dy: -350, w: 280, h: 220, side: 'east', hue: 18 },
+        { dx: 720, dy: -350, w: 280, h: 220, side: 'west', hue: 28 },
+        { dx: -650, dy: 360, w: 300, h: 230, side: 'east', hue: 12 },
+        { dx: 650, dy: 360, w: 300, h: 230, side: 'west', hue: 38 },
+    ];
+    for (const [index, shop] of shops.entries()) {
+        addHouse(obstacles, loot, spawnPoints, x + shop.dx, y + shop.dy, shop.w, shop.h, {
+            variant: index % 2 ? 'cabin' : 'house',
+            tier: index === 3 ? 'rare' : 'common',
+            hue: shop.hue,
+            doorSide: shop.side,
+            landmarkType: 'market',
+            label: index === 0 ? 'BAKERY' : index === 1 ? 'TRADER' : index === 2 ? 'WORKSHOP' : 'APOTHECARY',
+            role: 'marketShop',
+        });
+    }
+    for (const dx of [-230, -80, 80, 230]) {
+        addObstacle(obstacles, 'crate', x + dx, y + 245, 46, 46, {
+            hue: 28, variant: 'marketStall', role: 'marketCover', landmarkType: 'market',
+        });
+    }
+    loot.push(makeChest(x - 300, y - 300, 'military'));
+    loot.push(makeChest(x + 300, y - 300, 'rare'));
+    spawnPoints.push({ x: x - 1040, y: y + 390, role: 'market-road' });
+    spawnPoints.push({ x: x + 1040, y: y + 390, role: 'market-road' });
+}
+
 function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1600, 1400, {
         collidable: false, variant: 'industrial', role: 'compound', landmarkType: 'military',
@@ -1833,12 +1882,13 @@ export function generateSurvivMap(worldHalf) {
     const swTownPos = { x: -7200, y: 1800, w: 2000, h: 680 }; // size 7 town
     const nwMansionPos = { x: -7500, y: -7400, w: 1500, h: 1050 };
     const ironworksPos = { x: -3900, y: 7300, w: 2600, h: 1900 };
+    const marketPos = { x: -7600, y: 6500, w: 1900, h: 1320 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
         quarryPos, prisonPos, towerPos, townPos, gasPos,
         farmPos, bunkerPos, campPos, neTownPos, seLabPos,
-        swTownPos, nwMansionPos, ironworksPos
+        swTownPos, nwMansionPos, ironworksPos, marketPos
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1934,6 +1984,9 @@ export function generateSurvivMap(worldHalf) {
     addIronworks(obstacles, loot, spawnPoints, ironworksPos.x, ironworksPos.y);
     landmarks.push({ name: 'Ironworks', x: ironworksPos.x, y: ironworksPos.y, type: 'ironworks' });
 
+    addMarketVillage(obstacles, loot, spawnPoints, marketPos.x, marketPos.y);
+    landmarks.push({ name: 'Grand Market', x: marketPos.x, y: marketPos.y, type: 'market' });
+
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
     // ─────────────────────────────────────────────────────────────────────────
@@ -1963,6 +2016,7 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, 2500, neTownPos.y, neTownPos.x - 1000, neTownPos.y, roadW); // NE Town main street
     addRoad(obstacles, 2500, seLabPos.y, seLabPos.x - 850, seLabPos.y, roadW); // Research campus avenue
     addRoad(obstacles, nwMansionPos.x, -4000, nwMansionPos.x, nwMansionPos.y + 590, roadW); // NW Mansion gate
+    addRoad(obstacles, marketPos.x, 2000, marketPos.x, marketPos.y + 390, roadW); // Grand Market main street
 
     addObstacle(obstacles, 'road', swTownPos.x, 1900, roadW, 200, {
         collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'town',
@@ -2002,12 +2056,10 @@ export function generateSurvivMap(worldHalf) {
     // Curated hamlets create recognizable rotations between major POIs. They
     // replace the old density fallback that sprinkled isolated houses anywhere.
     const hamletPlans = [
-        { x: -6500, y: 6800, orientation: 'horizontal' },
         { x: -1200, y: 7600, orientation: 'vertical' },
         { x: 1200, y: -6900, orientation: 'horizontal' },
         { x: 4200, y: -8300, orientation: 'vertical' },
         { x: 7000, y: 3000, orientation: 'horizontal' },
-        { x: -8400, y: 6500, orientation: 'vertical' },
         { x: 700, y: 3600, orientation: 'horizontal' },
     ];
     for (const plan of hamletPlans) {
@@ -2147,7 +2199,8 @@ export function beginSurvivReload(entity, now = Date.now()) {
 
 function makeInventory() {
     return {
-        weapons: ['fists'],
+        // Firearms only. Fists are an always-available third/melee slot.
+        weapons: [],
         medkits: 0,
         ammoPacks: 0,
         chestsOpened: 0,
@@ -2160,9 +2213,9 @@ function ensureInventory(entity) {
     const validWeapons = currentWeapons.filter((weapon, index) => (
         weapon !== 'fists' && WEAPONS[weapon] && currentWeapons.indexOf(weapon) === index
     ));
-    entity.inventory.weapons = ['fists', ...validWeapons].slice(0, SURVIV_MAX_WEAPONS);
-    entity.inventory.medkits = Number(entity.inventory.medkits) || 0;
-    entity.inventory.ammoPacks = Number(entity.inventory.ammoPacks) || 0;
+    entity.inventory.weapons = validWeapons.slice(0, SURVIV_MAX_WEAPONS);
+    entity.inventory.medkits = Math.max(0, Math.min(SURVIV_MAX_MEDKITS, Number(entity.inventory.medkits) || 0));
+    entity.inventory.ammoPacks = Math.max(0, Math.min(SURVIV_MAX_AMMO_PACKS, Number(entity.inventory.ammoPacks) || 0));
     entity.inventory.chestsOpened = Number(entity.inventory.chestsOpened) || 0;
     return entity.inventory;
 }
@@ -2170,11 +2223,8 @@ function ensureInventory(entity) {
 function addWeaponToInventory(entity, weaponType) {
     const inv = ensureInventory(entity);
     if (!weaponType || !WEAPONS[weaponType] || inv.weapons.includes(weaponType)) return false;
-    if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
-        inv.weapons.push(weaponType);
-    } else {
-        inv.weapons[SURVIV_MAX_WEAPONS - 1] = weaponType;
-    }
+    if (inv.weapons.length >= SURVIV_MAX_WEAPONS) return false;
+    inv.weapons.push(weaponType);
     return true;
 }
 
@@ -2226,23 +2276,23 @@ function applyLootContents(entity, contents = {}, options = {}) {
         entity.dollarBalance = (entity.dollarBalance || 0) + summary.money;
     }
     if (contents.medkits) {
-        summary.medkits = Number(contents.medkits || 0);
-        inv.medkits = Math.min(6, inv.medkits + summary.medkits);
+        summary.medkits = Math.max(0, Math.min(Number(contents.medkits) || 0, SURVIV_MAX_MEDKITS - inv.medkits));
+        inv.medkits += summary.medkits;
     }
     if (contents.armor) {
-        summary.armor = Number(contents.armor || 0);
-        entity.armor = Math.min(entity.maxArmor, (entity.armor || 0) + summary.armor);
+        summary.armor = Math.max(0, Math.min(Number(contents.armor) || 0, entity.maxArmor - (entity.armor || 0)));
+        entity.armor = (entity.armor || 0) + summary.armor;
     }
     if (contents.ammoPacks) {
-        const packs = Number(contents.ammoPacks || 0);
+        const packs = Math.max(0, Math.min(Number(contents.ammoPacks) || 0, SURVIV_MAX_AMMO_PACKS - inv.ammoPacks));
         summary.ammoPacks = packs;
-        inv.ammoPacks = Math.min(9, inv.ammoPacks + packs);
+        inv.ammoPacks += packs;
         const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
         entity.weapon.ammo = Math.min(wDef.clipSize, entity.weapon.ammo + Math.ceil(wDef.clipSize * 0.4 * packs));
     }
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
         const added = addWeaponToInventory(entity, contents.weaponType);
-        if (added || entity.weapon?.type !== contents.weaponType) {
+        if (added) {
             if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
             // Set full clip for the newly acquired weapon
             const def = WEAPONS[contents.weaponType];
@@ -2277,8 +2327,8 @@ function useInventoryMedkit(entity) {
 export function equipSurvivWeaponSlot(entity, slot) {
     const inv = ensureInventory(entity);
     const index = Number(slot);
-    if (!Number.isInteger(index) || index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
-    const weaponType = inv.weapons[index];
+    if (!Number.isInteger(index) || index < 0 || index > SURVIV_MAX_WEAPONS) return false;
+    const weaponType = index === SURVIV_MAX_WEAPONS ? 'fists' : inv.weapons[index];
     if (!weaponType || !WEAPONS[weaponType]) return false;
     if (entity.weapon?.type === weaponType) return true;
 
@@ -2302,6 +2352,17 @@ export function equipSurvivWeaponSlot(entity, slot) {
         lastShotAt: 0,
     };
     return true;
+}
+
+function equipFallbackAfterWeaponRemoval(entity, removedWeaponType) {
+    if (entity.weapon?.type !== removedWeaponType) return;
+    const inv = ensureInventory(entity);
+    const nextType = inv.weapons[0] || 'fists';
+    const next = makeWeaponState(nextType);
+    if (entity.weaponsAmmo?.[nextType] !== undefined) {
+        next.ammo = entity.weaponsAmmo[nextType];
+    }
+    entity.weapon = next;
 }
 
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
@@ -2696,7 +2757,7 @@ function dropDeathLoot(room, entity) {
 
     entity.dollarBalance = 0;
     entity.armor = 0;
-    inventory.weapons = ['fists'];
+    inventory.weapons = [];
     inventory.medkits = 0;
     inventory.ammoPacks = 0;
 }
@@ -2784,31 +2845,34 @@ function takeLootContainerItem(entity, room) {
     const { item, index } = getLootContainer(room, chestId);
     if (!item) return;
     if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius + 44) return;
-    const contents = item.contents || {};
+    const contents = item.contents || (item.contents = {});
     let picked = null;
     if (itemKey === 'weapon' && contents.weaponType) {
-        const inv = ensureInventory(entity);
-        if (inv.weapons.includes(contents.weaponType)) {
-            refreshOpenedContainer(entity, room);
-            return;
-        }
         picked = { weaponType: contents.weaponType, rarity: contents.rarity };
-        delete contents.weaponType;
     } else if (itemKey === 'money' && contents.money) {
         picked = { money: contents.money, rarity: contents.rarity };
-        delete contents.money;
     } else if (itemKey === 'medkits' && contents.medkits) {
         picked = { medkits: contents.medkits, rarity: contents.rarity };
-        delete contents.medkits;
     } else if (itemKey === 'ammoPacks' && contents.ammoPacks) {
         picked = { ammoPacks: contents.ammoPacks, rarity: contents.rarity };
-        delete contents.ammoPacks;
     } else if (itemKey === 'armor' && contents.armor) {
         picked = { armor: contents.armor, rarity: contents.rarity };
-        delete contents.armor;
     }
     if (!picked) return;
     const summary = applyLootContents(entity, picked, { countChest: false });
+    if (summary.weaponType) delete contents.weaponType;
+    if (summary.money > 0) contents.money = Math.max(0, Number(contents.money || 0) - summary.money);
+    if (summary.medkits > 0) contents.medkits = Math.max(0, Number(contents.medkits || 0) - summary.medkits);
+    if (summary.ammoPacks > 0) contents.ammoPacks = Math.max(0, Number(contents.ammoPacks || 0) - summary.ammoPacks);
+    if (summary.armor > 0) contents.armor = Math.max(0, Number(contents.armor || 0) - summary.armor);
+    for (const key of ['money', 'medkits', 'ammoPacks', 'armor']) {
+        if (!(Number(contents[key]) > 0)) delete contents[key];
+    }
+    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoPacks > 0 || summary.armor > 0;
+    if (!accepted) {
+        refreshOpenedContainer(entity, room);
+        return;
+    }
     entity.lastLoot = {
         id: item.id + ':' + itemKey + ':' + Date.now(),
         chestId: item.id,
@@ -2838,18 +2902,17 @@ function putLootContainerItem(entity, room) {
     const { item } = getLootContainer(room, chestId);
     if (!item) return;
     if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius + 44) return;
-    const contents = item.contents || {};
+    const contents = item.contents || (item.contents = {});
     const inv = ensureInventory(entity);
 
     if (itemKey === 'weapon') {
         const weaponType = request.weaponType || (entity.weapon?.type !== 'fists' ? entity.weapon?.type : null);
-        if (weaponType && weaponType !== 'fists' && inv.weapons.includes(weaponType)) {
+        if (!contents.weaponType && weaponType && weaponType !== 'fists' && inv.weapons.includes(weaponType)) {
             // Remove from player inventory
             inv.weapons = inv.weapons.filter(w => w !== weaponType);
             // Switch active weapon if player was holding it
-            if (entity.weapon?.type === weaponType) {
-                entity.weapon = makeWeaponState(inv.weapons[0] || 'fists');
-            }
+            equipFallbackAfterWeaponRemoval(entity, weaponType);
+            if (entity.weaponsAmmo) delete entity.weaponsAmmo[weaponType];
             // Put into chest contents
             contents.weaponType = weaponType;
             contents.rarity = WEAPONS[weaponType]?.rarity || 'common';
@@ -2888,9 +2951,8 @@ function dropPlayerItem(entity, room) {
             const weaponType = inv.weapons[idx];
             if (weaponType && weaponType !== 'fists') {
                 inv.weapons.splice(idx, 1);
-                if (entity.weapon?.type === weaponType) {
-                    entity.weapon = makeWeaponState(inv.weapons[0] || 'fists');
-                }
+                equipFallbackAfterWeaponRemoval(entity, weaponType);
+                if (entity.weaponsAmmo) delete entity.weaponsAmmo[weaponType];
                 addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
                     weaponType,
                     tier: WEAPONS[weaponType]?.rarity || 'common',
@@ -2946,31 +3008,39 @@ function pickupLoot(entity, room) {
 
         if (item.type === 'chest' || item.type === 'deathCrate') {
             continue;
-        } else if (item.type === 'money') {
-            const amount = Number(item.dollarValue || item.amount || 0);
-            entity.dollarBalance = (entity.dollarBalance || 0) + amount;
-            pickedUp.money += amount;
-        } else if (item.type === 'medkit') {
-            const amount = Math.max(1, Number(item.amount) || 1);
-            ensureInventory(entity).medkits = Math.min(6, ensureInventory(entity).medkits + amount);
-            pickedUp.medkits += amount;
-        } else if (item.type === 'armor') {
-            const amount = Math.max(1, Number(item.armorValue) || 35);
-            entity.armor = Math.min(entity.maxArmor, entity.armor + amount);
-            pickedUp.armor += amount;
-        } else if (item.type === 'ammo') {
-            const amount = Math.max(1, Number(item.amount) || 1);
-            applyLootContents(entity, { ammoPacks: amount }, { countChest: false });
-            pickedUp.ammoPacks += amount;
-        } else if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) {
-            if (ensureInventory(entity).weapons.includes(item.weaponType)) continue;
-            applyLootContents(entity, { weaponType: item.weaponType }, { countChest: false });
-            pickedUp.weaponType = item.weaponType;
-            pickedUp.weaponLabel = WEAPONS[item.weaponType].label;
+        } else {
+            let requested = null;
+            let quantityKey = null;
+            if (item.type === 'money') requested = { money: Number(item.dollarValue || item.amount || 0) };
+            if (item.type === 'medkit') { requested = { medkits: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'medkits'; }
+            if (item.type === 'armor') { requested = { armor: Math.max(1, Number(item.armorValue) || 35) }; quantityKey = 'armor'; }
+            if (item.type === 'ammo') { requested = { ammoPacks: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'ammoPacks'; }
+            if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) requested = { weaponType: item.weaponType };
+            if (!requested) continue;
+
+            const accepted = applyLootContents(entity, requested, { countChest: false });
+            const acceptedAmount = accepted.money || accepted.medkits || accepted.armor || accepted.ammoPacks || (accepted.weaponType ? 1 : 0);
+            if (!(acceptedAmount > 0)) continue;
+            pickedUp.money += accepted.money;
+            pickedUp.medkits += accepted.medkits;
+            pickedUp.armor += accepted.armor;
+            pickedUp.ammoPacks += accepted.ammoPacks;
+            if (accepted.weaponType) {
+                pickedUp.weaponType = accepted.weaponType;
+                pickedUp.weaponLabel = accepted.weaponLabel;
+            }
+
+            let remaining = 0;
+            if (quantityKey) remaining = Math.max(0, Number(requested[quantityKey]) - Number(accepted[quantityKey]));
+            if (remaining > 0) {
+                if (item.type === 'medkit' || item.type === 'ammo') item.amount = remaining;
+                if (item.type === 'armor') item.armorValue = remaining;
+            } else {
+                removeSurvivLootAt(room, index);
+            }
+            pickupCount += 1;
+            pickupTier = item.tier || pickupTier;
         }
-        pickupCount += 1;
-        pickupTier = item.tier || pickupTier;
-        removeSurvivLootAt(room, index);
     }
 
     if (pickupCount > 0) {
@@ -3184,11 +3254,15 @@ function updateBotAI(bot, room, now, effectiveRadius) {
 
     if (bot.openedContainer?.items?.length) {
         const inventory = ensureInventory(bot);
-        const wanted = bot.openedContainer.items.find(item => item.kind === 'weapon' && !inventory.weapons.includes(item.weaponType))
+        const wanted = bot.openedContainer.items.find(item => (
+            item.kind === 'weapon'
+            && inventory.weapons.length < SURVIV_MAX_WEAPONS
+            && !inventory.weapons.includes(item.weaponType)
+        ))
             || bot.openedContainer.items.find(item => item.kind === 'money')
             || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
-            || bot.openedContainer.items.find(item => item.kind === 'medkit' && inventory.medkits < 6)
-            || bot.openedContainer.items.find(item => item.kind === 'ammo' && inventory.ammoPacks < 9);
+            || bot.openedContainer.items.find(item => item.kind === 'medkit' && inventory.medkits < SURVIV_MAX_MEDKITS)
+            || bot.openedContainer.items.find(item => item.kind === 'ammo' && inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS);
         if (wanted) bot.takeChestItem = { chestId: bot.openedContainer.id, itemKey: wanted.key };
         bot.inputDx = 0;
         bot.inputDy = 0;

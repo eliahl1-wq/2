@@ -59,7 +59,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 18);
+    assert.equal(map.landmarks.length, 19);
     assert.ok(houses.length >= 100);
     assert.ok(chests.length < houses.length);
     assert.equal(groundLoot.length, 22);
@@ -324,8 +324,8 @@ test('farm, research campus, and hamlets use purposeful road-facing layouts', ()
     assert.deepEqual(new Set(farmBuildings.map(building => building.role)), new Set(['barn', 'farmhouse', 'shed', 'greenhouse']));
     assert.equal(labBuildings.length, 3);
     assert.deepEqual(new Set(labBuildings.map(building => building.label)), new Set(['LAB A', 'LAB B', 'POWER']));
-    assert.equal(hamletFields.length, 7);
-    assert.equal(hamletHomes.length, 21);
+    assert.equal(hamletFields.length, 5);
+    assert.equal(hamletHomes.length, 15);
     assert.ok([...farmBuildings, ...labBuildings, ...hamletHomes].every(building => doorsByHouse.has(building.id)));
 
     const farmRoad = map.obstacles.find(obstacle => obstacle.kind === 'road' && obstacle.landmarkType === 'farm' && obstacle.role === 'driveway');
@@ -340,6 +340,34 @@ test('farm, research campus, and hamlets use purposeful road-facing layouts', ()
         const door = doorsByHouse.get(building.id);
         assert.equal(door.role, building.y < labRoad.y ? 'south' : 'north');
     }
+});
+
+test('Grand Market forms a large indoor village rotation', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmark = map.landmarks.find(item => item.type === 'market');
+    const hall = map.obstacles.find(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.role === 'marketHall'
+    ));
+    const shops = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.role === 'marketShop'
+    ));
+    const square = map.obstacles.find(obstacle => obstacle.role === 'marketSquare');
+    const mainStreet = map.obstacles.find(obstacle => (
+        obstacle.kind === 'road' && obstacle.landmarkType === 'market' && obstacle.role === 'mainStreet'
+    ));
+    const hallDoors = map.obstacles.filter(obstacle => obstacle.kind === 'door' && obstacle.houseId === hall?.id);
+    const marketLoot = map.loot.filter(item => pointInRect(item.x, item.y, {
+        x: landmark?.x || 0, y: landmark?.y || 0, w: 1900, h: 1320,
+    }));
+
+    assert.ok(landmark);
+    assert.ok(hall);
+    assert.ok(hall.w >= 900 && hall.h >= 500);
+    assert.equal(shops.length, 4);
+    assert.ok(square);
+    assert.ok(mainStreet);
+    assert.ok(hallDoors.length >= 1);
+    assert.ok(marketLoot.length >= 2);
 });
 
 test('generated doors, props, and player spawns keep clear traversal space', () => {
@@ -426,9 +454,55 @@ test('surviv players can carry only two weapons', () => {
         processSurvivRoom(room, silentIo, Date.now() + 600000);
     }
 
-    assert.deepEqual(player.inventory.weapons, ['fists', 'shotgun']);
+    assert.deepEqual(player.inventory.weapons, ['pistol', 'smg']);
     assert.equal(player.inventory.weapons.length, 2);
-    assert.equal(equipSurvivWeaponSlot(player, 2), false);
+    assert.ok(room.loot.some(item => item.type === 'weapon' && item.weaponType === 'shotgun'));
+    assert.equal(equipSurvivWeaponSlot(player, 0), true);
+    assert.equal(player.weapon.type, 'pistol');
+    assert.equal(equipSurvivWeaponSlot(player, 1), true);
+    assert.equal(player.weapon.type, 'smg');
+    assert.equal(equipSurvivWeaponSlot(player, 2), true);
+    assert.equal(player.weapon.type, 'fists');
+    assert.equal(equipSurvivWeaponSlot(player, 3), false);
+});
+
+test('chest transfers preserve overflow and reject occupied weapon slots', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    const player = createSurvivPlayer('human-chest', 'mongo-chest', 'Pack Rat', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.medkits = 5;
+    player.inventory.weapons = ['pistol', 'smg'];
+    player.weapon = { type: 'pistol', ammo: 7, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    room.players.push(player);
+
+    const chest = {
+        id: 'transaction-chest',
+        type: 'chest',
+        x: 0,
+        y: 0,
+        contents: { medkits: 4, weaponType: 'shotgun', rarity: 'rare' },
+    };
+    room.loot.push(chest);
+
+    player.takeChestItem = { chestId: chest.id, itemKey: 'medkits' };
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.inventory.medkits, 6);
+    assert.equal(chest.contents.medkits, 3);
+
+    player.takeChestItem = { chestId: chest.id, itemKey: 'weapon' };
+    processSurvivRoom(room, silentIo, Date.now() + 600001);
+    assert.deepEqual(player.inventory.weapons, ['pistol', 'smg']);
+    assert.equal(chest.contents.weaponType, 'shotgun');
+
+    player.putChestItem = { chestId: chest.id, itemKey: 'weapon', weaponType: 'pistol' };
+    processSurvivRoom(room, silentIo, Date.now() + 600002);
+    assert.deepEqual(player.inventory.weapons, ['pistol', 'smg']);
+    assert.equal(chest.contents.weaponType, 'shotgun');
+    assert.equal(player.weapon.type, 'pistol');
 });
 
 test('players and automatic bots start with fists and no dollars', () => {
@@ -439,7 +513,7 @@ test('players and automatic bots start with fists and no dollars', () => {
     processSurvivRoom(room, silentIo, Date.now() + 600000);
 
     assert.equal(player.weapon.type, 'fists');
-    assert.deepEqual(player.inventory.weapons, ['fists']);
+    assert.deepEqual(player.inventory.weapons, []);
     assert.equal(player.dollarBalance, 0);
     assert.equal(room.bots.length, 3);
     assert.ok(room.bots.every(bot => bot.weapon.type === 'fists'));
@@ -468,7 +542,7 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     victim.hp = 1;
     victim.dollarBalance = 2;
     victim.armor = 35;
-    victim.inventory.weapons = ['fists', 'smg'];
+    victim.inventory.weapons = ['smg'];
     victim.inventory.medkits = 1;
     victim.inventory.ammoPacks = 2;
     player.aimAngle = 0;
@@ -528,7 +602,7 @@ test('fast bullets hit and eliminate bots along their full travel path', () => {
     player.y = 0;
     player.aimAngle = 0;
     player.weapon = { type: 'sniper', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
-    player.inventory.weapons = ['fists', 'sniper'];
+    player.inventory.weapons = ['sniper'];
     player.shooting = true;
     room.players.push(player);
     const bot = spawnSurvivBotNear(room, 90, 0, { adminSpawned: true });
