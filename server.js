@@ -3363,7 +3363,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsUnlocked sponsoredRewardsBalance').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
             { $match: depositMatch },
@@ -3392,8 +3392,16 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 freeTicketUsed: !!u.freeTicketUsed,
                 completedFiveDollarNormalGames: u.completedFiveDollarNormalGames ?? 0,
                 completedTenDollarNormalGames: u.completedTenDollarNormalGames ?? 0,
+                sponsoredRewardsCompleted: !!u.sponsoredRewardsCompleted,
                 sponsoredRewardsUnlocked: !!u.sponsoredRewardsUnlocked,
-                sponsoredRewardsBalance: u.sponsoredRewardsBalance ?? 0,
+                sponsoredRewardsBalance: Number((u.sponsoredRewardsBalance ?? 0).toFixed(2)),
+                fundedRewardsUsd: Number((u.fundedRewardsUsd ?? 0).toFixed(2)),
+                retainedRewardsUsd: Number((u.rentFallbackBalanceUsd ?? 0).toFixed(2)),
+                tournamentRewardsBalance: Number((u.tournamentRewardsBalance ?? 0).toFixed(2)),
+                totalRewardsBalance: Number(((u.sponsoredRewardsBalance ?? 0) + (u.rentFallbackBalanceUsd ?? 0) + (u.tournamentRewardsBalance ?? 0)).toFixed(2)),
+                rewardsDisabled: !!u.rewardsDisabled,
+                rewardClaimInProgress: !!u.rewardClaimInProgress,
+                tournamentRewardClaimInProgress: !!u.tournamentRewardClaimInProgress,
             };
         });
 
@@ -3502,6 +3510,47 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
         const losses = gameHistory.filter(g => g.outcome === 'Loss' && !g.excludedFromReports).length;
         const balanceSol = user.balance ?? 0;
 
+        const modeMap = new Map();
+        const ensureMode = (mode) => {
+            const key = String(mode || 'unknown').toLowerCase();
+            if (!modeMap.has(key)) modeMap.set(key, { mode: key, games: 0, deaths: 0, cashouts: 0, entryUsd: 0, payoutUsd: 0 });
+            return modeMap.get(key);
+        };
+        let sponsoredRewardsClaimedUsd = 0;
+        let tournamentRewardsEarnedUsd = 0;
+        let tournamentRewardsClaimedUsd = 0;
+
+        for (const tx of allTxs) {
+            const event = tx.meta?.event;
+            const reason = tx.meta?.reason || '';
+            if (tx.type === 'game' && ['join', 'br_join'].includes(event)) {
+                const mode = event === 'br_join'
+                    ? ('br-' + (tx.meta?.variant || tx.meta?.mode || 'unknown'))
+                    : (tx.meta?.mode || 'agar');
+                const row = ensureMode(mode);
+                row.games += 1;
+                row.entryUsd += Number(tx.meta?.entryFeeUsd ?? txAmountUsd(tx)) || 0;
+            }
+            if (tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(reason)) {
+                const fallbackMode = reason === 'Competitive Slither Death' ? 'competitive-slither' : reason === 'BR Eliminated' ? 'battle-royale' : 'agar';
+                ensureMode(tx.meta?.mode || tx.meta?.variant || fallbackMode).deaths += 1;
+            }
+            if (tx.type === 'withdraw' && /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i.test(reason)) {
+                const fallbackMode = /BR Victory/i.test(reason) ? 'battle-royale' : 'arena';
+                const row = ensureMode(tx.meta?.mode || tx.meta?.variant || fallbackMode);
+                row.cashouts += 1;
+                row.payoutUsd += txAmountUsd(tx);
+            }
+            if (event === 'sponsored_rewards_claim') sponsoredRewardsClaimedUsd += Number(tx.meta?.amountUsd ?? txAmountUsd(tx)) || 0;
+            if (event === 'tournament_reward') tournamentRewardsEarnedUsd += Number(tx.meta?.amountUsd ?? txAmountUsd(tx)) || 0;
+            if (event === 'tournament_reward_claim') tournamentRewardsClaimedUsd += Number(tx.meta?.amountUsd ?? txAmountUsd(tx)) || 0;
+        }
+
+        const modeBreakdown = [...modeMap.values()]
+            .map(row => ({ ...row, entryUsd: Number(row.entryUsd.toFixed(2)), payoutUsd: Number(row.payoutUsd.toFixed(2)) }))
+            .sort((a, b) => b.games - a.games || b.cashouts - a.cashouts);
+        const latestActivityAt = allTxs[0]?.createdAt || objectIdCreatedAt(user._id);
+
         res.json({
             user: {
                 id: user._id,
@@ -3513,7 +3562,31 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
                 playtime: user.playtime ?? 0,
                 createdAt: objectIdCreatedAt(user._id),
+                latestActivityAt,
                 excludedFromReports: !!user.excludedFromReports,
+                rewardsDisabled: !!user.rewardsDisabled,
+                rewardsDisabledReason: user.rewardsDisabledReason || '',
+            },
+            rewards: {
+                hasFreeTicket: !!user.hasFreeTicket,
+                freeTicketUsed: !!user.freeTicketUsed,
+                challengeCompleted: !!user.sponsoredRewardsCompleted,
+                challengeUnlocked: !!user.sponsoredRewardsUnlocked,
+                completedFiveDollarGames: user.completedFiveDollarNormalGames ?? 0,
+                completedTenDollarGames: user.completedTenDollarNormalGames ?? 0,
+                sponsoredBalanceUsd: Number((user.sponsoredRewardsBalance ?? 0).toFixed(2)),
+                fundedUsd: Number((user.fundedRewardsUsd ?? 0).toFixed(2)),
+                retainedWinningsUsd: Number((user.rentFallbackBalanceUsd ?? 0).toFixed(2)),
+                sponsoredClaimedUsd: Number(sponsoredRewardsClaimedUsd.toFixed(2)),
+                claimInProgress: !!user.rewardClaimInProgress,
+                claimReservedUsd: Number((user.rewardClaimReservedUsd ?? 0).toFixed(2)),
+                tournamentBalanceUsd: Number((user.tournamentRewardsBalance ?? 0).toFixed(2)),
+                tournamentBalanceLamports: user.tournamentRewardsLamports ?? 0,
+                tournamentEarnedUsd: Number(tournamentRewardsEarnedUsd.toFixed(2)),
+                tournamentClaimedUsd: Number(tournamentRewardsClaimedUsd.toFixed(2)),
+                tournamentClaimInProgress: !!user.tournamentRewardClaimInProgress,
+                tournamentClaimReservedUsd: Number((user.tournamentRewardClaimReservedUsd ?? 0).toFixed(2)),
+                totalAvailableUsd: Number(((user.sponsoredRewardsBalance ?? 0) + (user.rentFallbackBalanceUsd ?? 0) + (user.tournamentRewardsBalance ?? 0)).toFixed(2)),
             },
             stats: {
                 totalDepositedSol: Number(totalDepositedSol.toFixed(6)),
@@ -3526,6 +3599,8 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 losses,
                 deaths: deathCount,
                 brWins: brWinCount,
+                modeBreakdown,
+                lastActiveAt: latestActivityAt,
                 netGameResultUsd: Number((totalWithdrawnUsd - (totalDepositedSol * SOL_PRICE_USD)).toFixed(2)),
             },
             transactions,
