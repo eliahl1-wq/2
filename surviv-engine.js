@@ -1546,14 +1546,25 @@ function addRadioTower(obstacles, loot, spawnPoints, x, y) {
 
 function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12) {
     const points = [{ x: startX, y: startY }];
+    const dx = endX - startX;
+    const dy = endY - startY;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const normalX = -dy / length;
+    const normalY = dx / length;
+    const phase = Math.random() * Math.PI * 2;
+    const wander = worldHalf * 0.055;
     for (let i = 1; i < segments; i++) {
         const t = i / segments;
         const baseX = startX + (endX - startX) * t;
         const baseY = startY + (endY - startY) * t;
-        const wander = worldHalf * 0.12;
+        const envelope = Math.sin(Math.PI * t);
+        const lateral = (
+            Math.sin(t * Math.PI * 2.4 + phase) * 0.72
+            + Math.sin(t * Math.PI * 5.2 + phase * 0.63) * 0.22
+        ) * wander * envelope;
         points.push({
-            x: baseX + (Math.random() - 0.5) * wander,
-            y: baseY + (Math.random() - 0.5) * wander,
+            x: baseX + normalX * lateral,
+            y: baseY + normalY * lateral,
         });
     }
     points.push({ x: endX, y: endY });
@@ -2327,8 +2338,8 @@ function useInventoryMedkit(entity) {
 export function equipSurvivWeaponSlot(entity, slot) {
     const inv = ensureInventory(entity);
     const index = Number(slot);
-    if (!Number.isInteger(index) || index < 0 || index > SURVIV_MAX_WEAPONS) return false;
-    const weaponType = index === SURVIV_MAX_WEAPONS ? 'fists' : inv.weapons[index];
+    if (!Number.isInteger(index) || index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
+    const weaponType = inv.weapons[index];
     if (!weaponType || !WEAPONS[weaponType]) return false;
     if (entity.weapon?.type === weaponType) return true;
 

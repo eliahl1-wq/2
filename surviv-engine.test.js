@@ -461,9 +461,8 @@ test('surviv players can carry only two weapons', () => {
     assert.equal(player.weapon.type, 'pistol');
     assert.equal(equipSurvivWeaponSlot(player, 1), true);
     assert.equal(player.weapon.type, 'smg');
-    assert.equal(equipSurvivWeaponSlot(player, 2), true);
-    assert.equal(player.weapon.type, 'fists');
-    assert.equal(equipSurvivWeaponSlot(player, 3), false);
+    assert.equal(equipSurvivWeaponSlot(player, 2), false);
+    assert.equal(player.weapon.type, 'smg');
 });
 
 test('chest transfers preserve overflow and reject occupied weapon slots', () => {
