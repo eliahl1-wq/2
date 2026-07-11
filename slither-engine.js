@@ -40,6 +40,8 @@ export const SLITHER = {
     selfCollisionSkip: 4,
     // Slither-style combat: heads are non-lethal; the body core is slightly narrower than the rendered snake.
     bodyCollisionScale: 0.82,
+    // Ignore body points still visually inside the head/neck.
+    lethalBodyStartRadius: 1.8,
 };
 
 const BOT_NAMES = [
@@ -1093,6 +1095,11 @@ function checkSelfCollision(_snake) {
     return false;
 }
 
+function firstLethalBodySegment(snake, radius) {
+    const spacing = segmentSpacingForSegmentCount(snake.segments?.length || SLITHER.spawnSegments);
+    return Math.max(2, Math.ceil((radius * SLITHER.lethalBodyStartRadius) / Math.max(1, spacing)));
+}
+
 function checkSnakeCollisions(snake, allSnakes) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return null;
     const head = snake.segments[0];
@@ -1113,14 +1120,13 @@ function checkSnakeCollisions(snake, allSnakes) {
             continue;
         }
 
-        for (let i = 0; i < other.segments.length; i++) {
+        const firstBodySegment = firstLethalBodySegment(other, maxOtherR);
+        for (let i = firstBodySegment; i < other.segments.length; i++) {
             const seg = other.segments[i];
             const segR = headRadiusForBalance(other.balance);
             const dx = head.x - seg.x;
             const dy = head.y - seg.y;
-            const threshold = i === 0
-                ? 0
-                : (r + segR) * SLITHER.bodyCollisionScale;
+            const threshold = (r + segR) * SLITHER.bodyCollisionScale;
             if (dx * dx + dy * dy < threshold * threshold) {
                 return other;
             }
@@ -1165,24 +1171,19 @@ export function resolveAllSnakeCollisions(allSnakes) {
                 continue;
             }
 
-            for (let i = 0; i < other.segments.length; i++) {
+            const firstBodySegment = firstLethalBodySegment(other, maxOtherR);
+            for (let i = firstBodySegment; i < other.segments.length; i++) {
                 const seg = other.segments[i];
                 const segR = headRadiusForBalance(other.balance);
                 
                 const dx = head.x - seg.x;
                 const dy = head.y - seg.y;
                 
-                const threshold = i === 0
-                    ? 0
-                    : (r + segR) * SLITHER.bodyCollisionScale;
+                const threshold = (r + segR) * SLITHER.bodyCollisionScale;
 
                 if (dx * dx + dy * dy < threshold * threshold) {
-                    if (i > 0) {
-                        bodyHit = other;
-                        break; // Body hit takes absolute precedence
-                    } else {
-                        headHit = other;
-                    }
+                    bodyHit = other;
+                    break; // Body hit takes absolute precedence
                 }
             }
             if (bodyHit) {

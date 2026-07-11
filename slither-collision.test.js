@@ -33,7 +33,7 @@ test('Side collision: A runs into B body, A dies and B lives', () => {
     assert.ok(!dead.has('B'), 'Snake B should survive');
 });
 
-test('Side impact with neck/head overlap: B neck hit by A, only A dies', () => {
+test('Side impact inside the neck area is non-lethal', () => {
     // Snake A (head at 0,0, tail at -15,0)
     const snakeA = {
         id: 'A',
@@ -61,8 +61,7 @@ test('Side impact with neck/head overlap: B neck hit by A, only A dies', () => {
 
     const dead = resolveAllSnakeCollisions(allSnakes);
 
-    assert.ok(dead.has('A'), 'Snake A should be dead');
-    assert.equal(dead.get('A').id, 'B', 'B should be the killer of A');
+    assert.ok(!dead.has('A'), 'Snake A should survive overlap inside B neck area');
     assert.ok(!dead.has('B'), 'Snake B should survive');
 });
 
@@ -185,4 +184,20 @@ test('Close side pass inside the visible edges survives', () => {
     const dead = resolveAllSnakeCollisions([{ entity: snakeA, isHuman: true }, { entity: snakeB, isHuman: true }]);
     assert.ok(!dead.has('A'), 'A should be able to skim close to B without dying');
     assert.ok(!dead.has('B'), 'B should survive the close parallel pass');
+});
+test('Head and neck crossing resolves as a single cut-off death', () => {
+    const snakeA = { id: 'A', balance: 1.0, angle: 0, segments: [{ x: 8, y: 0 }, { x: 4, y: 0 }, { x: 0, y: 0 }, { x: -4, y: 0 }, { x: -8, y: 0 }] };
+    const snakeB = { id: 'B', balance: 1.0, angle: Math.PI / 2, segments: [{ x: 0, y: 0 }, { x: 0, y: 4 }, { x: 0, y: 8 }, { x: 0, y: 12 }, { x: 0, y: 16 }] };
+    const dead = resolveAllSnakeCollisions([{ entity: snakeA, isHuman: true }, { entity: snakeB, isHuman: true }]);
+    assert.equal(dead.size, 1, 'The crossing must not become a double death');
+    assert.ok(dead.has('B'), 'The snake driving into A established body should die');
+    assert.ok(!dead.has('A'), 'The snake making the cut-off should survive');
+});
+
+test('A snake that reaches established body still dies', () => {
+    const cutter = { id: 'cutter', balance: 1.0, angle: 0, segments: [{ x: 20, y: 0 }, { x: 16, y: 0 }, { x: 12, y: 0 }, { x: 8, y: 0 }, { x: 4, y: 0 }, { x: 0, y: 0 }] };
+    const incoming = { id: 'incoming', balance: 1.0, angle: Math.PI / 2, segments: [{ x: 0, y: 2 }, { x: 0, y: 6 }, { x: 0, y: 10 }, { x: 0, y: 14 }, { x: 0, y: 18 }] };
+    const dead = resolveAllSnakeCollisions([{ entity: cutter, isHuman: true }, { entity: incoming, isHuman: true }]);
+    assert.ok(dead.has('incoming'), 'The snake driving into established body should die');
+    assert.ok(!dead.has('cutter'), 'The snake that completed the cut-off should survive');
 });

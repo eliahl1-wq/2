@@ -430,7 +430,7 @@ const c = {
         : 3 * 60 * 60 * 1000,
 };
 
-const CASHOUT_DURATION_MS = 10_000;
+const CASHOUT_DURATION_MS = 5_000;
 const joiningUsers = new Set();
 let rewardPoolAdminResetting = false;
 
