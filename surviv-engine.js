@@ -3377,12 +3377,15 @@ function processEntity(entity, room, now, effectiveRadius) {
     }
 }
 
-function buildLeaderboard(room) {
-    const all = [
-        ...room.players.filter(p => !p.disconnected),
-        ...room.bots,
+function getActiveSurvivEntities(room) {
+    return [
+        ...room.players.filter(p => !p.disconnected && !p._eliminated && p.hp > 0),
+        ...room.bots.filter(b => !b.disconnected && !b._eliminated && b.hp > 0),
     ];
-    return all
+}
+
+function buildLeaderboard(room, activeEntities = getActiveSurvivEntities(room)) {
+    return activeEntities
         .map(p => ({
             id: p.id,
             username: p.username,
@@ -3510,10 +3513,7 @@ export function processSurvivRoom(room, io, resetTime) {
 
     syncSurvivBots(room);
 
-    const entities = [
-        ...room.players.filter(p => !p.disconnected && p.hp > 0),
-        ...room.bots.filter(b => b.hp > 0),
-    ];
+    const entities = getActiveSurvivEntities(room);
 
     for (const ent of entities) {
         processEntity(ent, room, now, effectiveRadius);
@@ -3521,24 +3521,32 @@ export function processSurvivRoom(room, io, resetTime) {
 
     updateBullets(room, now, effectiveRadius);
 
-    return { leaderboard: buildLeaderboard(room), zone };
+    const activeEntities = getActiveSurvivEntities(room);
+    return {
+        leaderboard: buildLeaderboard(room, activeEntities),
+        aliveCount: activeEntities.length,
+        zone,
+    };
 }
 
 export function broadcastSurvivState(room, io, lbData, meta) {
     const { leaderboard, zone } = lbData;
     const range = SURVIV.viewRange;
     const now = Date.now();
-    const sendLb = !room._lastSurvivLbAt || now - room._lastSurvivLbAt >= 500;
-    if (sendLb) room._lastSurvivLbAt = now;
+    const leaderboardSignature = leaderboard.map(entry => entry.id).join('|');
+    const leaderboardChanged = room._survivLeaderboardSignature !== leaderboardSignature;
+    const sendLb = leaderboardChanged || !room._lastSurvivLbAt || now - room._lastSurvivLbAt >= 500;
+    if (sendLb) {
+        room._lastSurvivLbAt = now;
+        room._survivLeaderboardSignature = leaderboardSignature;
+    }
 
-    const allPlayers = [
-        ...room.players.filter(p => !p.disconnected && p.hp > 0),
-        ...room.bots.filter(b => b.hp > 0),
-    ];
+    const allPlayers = getActiveSurvivEntities(room);
+    const aliveCount = Number.isFinite(lbData.aliveCount) ? lbData.aliveCount : allPlayers.length;
 
     const emitToViewer = (socketId, viewX, viewY, youId, dollarBalance, spectating) => {
         if (sendLb) {
-            io.to(socketId).emit('leaderboard', { leaderboard, surviv: true });
+            io.to(socketId).emit('leaderboard', { leaderboard, aliveCount, surviv: true });
         }
         const sendStaticPayload = shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now);
 
@@ -3601,6 +3609,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             bullets: visibleBullets,
             ...staticPayload,
             zone,
+            aliveCount,
             dollarBalance,
             spectating,
             ...meta,

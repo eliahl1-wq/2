@@ -690,3 +690,39 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.equal(serializedIronworks.orientation, 'east');
     assert.equal(serializedMainDoor.role, 'east');
 });
+
+test('surviv alive count and leaderboard use the same active entities', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room._nextSurvivBotSyncAt = Date.now() + 60000;
+    const active = createSurvivPlayer('active-human', 'mongo-active', 'Active', '#fff', room);
+    const disconnected = createSurvivPlayer('disconnected-human', 'mongo-disconnected', 'Gone', '#fff', room);
+    disconnected.disconnected = true;
+    const dead = createSurvivPlayer('dead-human', 'mongo-dead', 'Dead', '#fff', room);
+    dead.hp = 0;
+    room.players.push(active, disconnected, dead);
+
+    const liveBot = spawnSurvivBotNear(room, active.x + 3000, active.y, { adminSpawned: true });
+    const deadBot = spawnSurvivBotNear(room, active.x - 3000, active.y, { adminSpawned: true });
+    deadBot.hp = 0;
+    const lbData = processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(lbData.aliveCount, 2);
+    assert.deepEqual(
+        new Set(lbData.leaderboard.map(entry => entry.id)),
+        new Set([active.id, liveBot.id]),
+    );
+
+    const ticks = [];
+    const io = {
+        to() {
+            return {
+                emit(event, payload) {
+                    if (event === 'survivTick') ticks.push(payload);
+                },
+            };
+        },
+    };
+    broadcastSurvivState(room, io, lbData, {});
+    assert.equal(ticks[0].aliveCount, lbData.aliveCount);
+});
