@@ -2,7 +2,10 @@ import * as util from './utils.js';
 import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy } from './economy.js';
 
 export const SLITHER = {
-    worldHalf: 3000,
+    // A 2400-radius circle is approximately half the playable area of the old
+    // 6000x6000 square while still leaving enough room for long snakes.
+    worldHalf: 2400,
+    speedReferenceHalf: 3000,
     // Slither.io protocol reference (ClitherProject Protocol v11, scaled to our arena)
     slitherGameRadius: 21600,
     spawnSegments: 12,
@@ -207,7 +210,7 @@ export function segmentSpacingForBalance(balance, referenceBalance = 1.0) {
 
 export function speedForBalance(balance, boosting = false, referenceBalance = 1.0) {
     const sc = scaleForSegmentCount(segmentCountForBalance(balance, referenceBalance));
-    const worldScale = (SLITHER.worldHalf * 2) / (SLITHER.slitherGameRadius * 2);
+    const worldScale = (SLITHER.speedReferenceHalf * 2) / (SLITHER.slitherGameRadius * 2);
     const slitherUnitsPerFrame = boosting
         ? SLITHER.nsp3
         : SLITHER.nsp1 + SLITHER.nsp2 * sc;
@@ -242,11 +245,12 @@ export function randomCoordInRoom(room) {
             y: (z.cy ?? 0) + Math.sin(ang) * r,
         };
     }
-    const half = room?.sandboxWorldHalf ?? SLITHER.worldHalf;
-    const h = half * 0.85;
+    const radius = (room?.sandboxWorldHalf ?? SLITHER.worldHalf) * 0.85;
+    const angle = Math.random() * Math.PI * 2;
+    const distance = Math.sqrt(Math.random()) * radius;
     return {
-        x: (Math.random() - 0.5) * 2 * h,
-        y: (Math.random() - 0.5) * 2 * h,
+        x: Math.cos(angle) * distance,
+        y: Math.sin(angle) * distance,
     };
 }
 
@@ -318,10 +322,6 @@ function clampInput(dx, dy) {
     return { dx, dy };
 }
 
-function randomSpawnCoord() {
-    const h = SLITHER.worldHalf * 0.85;
-    return (Math.random() - 0.5) * 2 * h;
-}
 
 export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity) {
     const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
@@ -854,20 +854,18 @@ function updateSnakeMovement(snake, room = null) {
     }
 }
 
-function applyWallAvoidance(snake) {
+function applyWallAvoidance(snake, room) {
     const head = snake.segments[0];
     const r = headRadiusForSnake(snake);
-    const limit = SLITHER.worldHalf - r - 20;
+    const limit = (room?.sandboxWorldHalf ?? SLITHER.worldHalf) - r - 20;
     const margin = 120;
-    let steerX = 0;
-    let steerY = 0;
+    const distance = Math.hypot(head.x, head.y);
+    if (distance < limit - margin || distance < 1e-6) return false;
 
-    if (head.x < -limit + margin) steerX += (-limit + margin - head.x);
-    else if (head.x > limit - margin) steerX += (limit - margin - head.x);
-    if (head.y < -limit + margin) steerY += (-limit + margin - head.y);
-    else if (head.y > limit - margin) steerY += (limit - margin - head.y);
-
-    if (steerX === 0 && steerY === 0) return false;
+    const safeDistance = Math.max(0, limit - margin);
+    const inwardScale = safeDistance / distance;
+    const steerX = head.x * inwardScale - head.x;
+    const steerY = head.y * inwardScale - head.y;
 
     snake.targetX = head.x + steerX * 4;
     snake.targetY = head.y + steerY * 4;
@@ -914,7 +912,7 @@ function findNearestFoodForBot(head, food, foodGrid, minDistFood, predicate = nu
     return nearestFood;
 }
 
-function runSlitherBotAI(snake, allSnakes, food, foodGrid = null) {
+function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = null) {
     const head = snake.segments[0];
     const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
@@ -956,14 +954,15 @@ function runSlitherBotAI(snake, allSnakes, food, foodGrid = null) {
             snake.targetX = nearestFood.x;
             snake.targetY = nearestFood.y;
         } else if (dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
-            snake.targetX = randomSpawnCoord();
-            snake.targetY = randomSpawnCoord();
+            const target = randomCoordInRoom(room);
+            snake.targetX = target.x;
+            snake.targetY = target.y;
         }
         snake.lastTargetUpdate = Date.now();
         snake.boost = false;
     }
 
-    if (!applyWallAvoidance(snake)) {
+    if (!applyWallAvoidance(snake, room)) {
         snake.inputDx = snake.targetX - head.x;
         snake.inputDy = snake.targetY - head.y;
     }
@@ -1063,11 +1062,11 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, pai
     snake.inputDy = snake.targetY - head.y;
 }
 
-function checkWallCollision(snake) {
+function checkWallCollision(snake, room) {
     const head = snake.segments[0];
     const r = headRadiusForSnake(snake);
-    const limit = SLITHER.worldHalf - r;
-    return head.x < -limit || head.x > limit || head.y < -limit || head.y > limit;
+    const limit = (room?.sandboxWorldHalf ?? SLITHER.worldHalf) - r;
+    return Math.hypot(head.x, head.y) > limit;
 }
 
 function distPointToSegment(px, py, ax, ay, bx, by) {
@@ -1524,7 +1523,13 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 
 const MAX_NETWORK_SEGMENTS = 120;
 const MAX_VISIBLE_FOOD = 800;
-const MAX_SLITHER_FOOD_TOTAL = 700;
+// Keep twice as much ambient food available across the arena. The per-player
+// visibility cap stays unchanged so this does not double network/render cost.
+const MAX_SLITHER_FOOD_TOTAL = 1400;
+const TOURNAMENT_SLITHER_FOOD_TOTAL = 4000;
+const SLITHER_FOOD_SYNC_INTERVAL_MS = 375;
+const SLITHER_FOOD_REFILL_BATCH = 24;
+const TOURNAMENT_SLITHER_FOOD_REFILL_BATCH = 120;
 const SLITHER_MINIMAP_BROADCAST_INTERVAL = 4;
 /** Extra beyond snake viewRange — tuned to client viewport (~W/2/zoom + margin), not whole arena. */
 const SLITHER_FOOD_VIEW_EXTRA = 200;
@@ -1582,7 +1587,7 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
 
     const now = Date.now();
     if (!room._lastSlitherFoodSync) room._lastSlitherFoodSync = 0;
-    if (now - room._lastSlitherFoodSync < 750) return;
+    if (now - room._lastSlitherFoodSync < SLITHER_FOOD_SYNC_INTERVAL_MS) return;
     room._lastSlitherFoodSync = now;
 
     const densityScale = slitherFoodDensityScale();
@@ -1601,14 +1606,17 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
     if (normalCount < addThreshold) {
         addSlitherFood(
             room,
-            Math.min(room.isTournament ? 60 : 12, addThreshold - normalCount),
+            Math.min(
+                room.isTournament ? TOURNAMENT_SLITHER_FOOD_REFILL_BATCH : SLITHER_FOOD_REFILL_BATCH,
+                addThreshold - normalCount,
+            ),
             foodBlobValue,
             foodValueTarget + goldenValueOnMap,
         );
     } else if (normalCount > trimThreshold) {
         trimSlitherFood(room, targetFoodCount);
     }
-    enforceSlitherFoodCap(room, room.isTournament ? 2000 : 700);
+    enforceSlitherFoodCap(room, room.isTournament ? TOURNAMENT_SLITHER_FOOD_TOTAL : MAX_SLITHER_FOOD_TOTAL);
 }
 
 /**
@@ -1670,9 +1678,13 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         f.y += driftY;
         
         // Keep inside arena boundaries
-        const limit = SLITHER.worldHalf - 40;
-        f.x = Math.max(-limit, Math.min(limit, f.x));
-        f.y = Math.max(-limit, Math.min(limit, f.y));
+        const limit = (room.sandboxWorldHalf ?? SLITHER.worldHalf) - 40;
+        const distance = Math.hypot(f.x, f.y);
+        if (distance > limit && distance > 1e-6) {
+            const scale = limit / distance;
+            f.x *= scale;
+            f.y *= scale;
+        }
     }
 
     for (const { entity: snake, isHuman } of allSnakes) {
@@ -1687,7 +1699,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                     continue;
                 }
             }
-            runSlitherBotAI(snake, allSnakes, room.slitherFood, foodGrid);
+            runSlitherBotAI(snake, allSnakes, room.slitherFood, foodGrid, room);
         }
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
@@ -1720,7 +1732,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         if (toRemove.some(item => item.snake.id === snake.id)) continue;
 
         if (!sandboxSkipDeathCollisions) {
-            if (checkWallCollision(snake) || checkSelfCollision(snake)) {
+            if (checkWallCollision(snake, room) || checkSelfCollision(snake)) {
                 toRemove.push({ snake, isHuman, killer: null });
                 continue;
             }
@@ -1909,6 +1921,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
             you: r.isSpectator ? null : r.id,
             snakes: visibleSnakes,
             worldHalf: room.sandboxWorldHalf ?? SLITHER.worldHalf,
+            circularMap: true,
             ...meta,
             ...(meta.battleRoyale || r.isSpectator ? {} : { balance: r.playerObj.dollarBalance ?? r.playerObj.balance }),
         };
@@ -2305,15 +2318,15 @@ export function syncCompetitiveSlitherFood(room, playerCount) {
 
     const now = Date.now();
     if (!room._lastCompetitiveFoodSync) room._lastCompetitiveFoodSync = 0;
-    if (now - room._lastCompetitiveFoodSync < 750) return;
+    if (now - room._lastCompetitiveFoodSync < SLITHER_FOOD_SYNC_INTERVAL_MS) return;
     room._lastCompetitiveFoodSync = now;
 
     const densityScale = competitiveFoodDensityScale();
-    const target = Math.max(40, Math.floor(playerCount * COMPETITIVE_SLITHER.foodDensityPerHuman * densityScale));
+    const target = Math.max(80, Math.floor(playerCount * COMPETITIVE_SLITHER.foodDensityPerHuman * densityScale * 2));
     const normalCount = room.slitherFood.filter(f => !f.competitiveDeathDrop).length;
 
     if (normalCount < target * 0.94) {
-        addCompetitiveSlitherFood(room, Math.min(12, Math.floor(target * 0.94) - normalCount));
+        addCompetitiveSlitherFood(room, Math.min(SLITHER_FOOD_REFILL_BATCH, Math.floor(target * 0.94) - normalCount));
     } else if (normalCount > target * 1.12) {
         trimSlitherFood(room, target);
     }

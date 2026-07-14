@@ -1,12 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    randomCoordInRoom,
     radiusScaleForSegmentCount,
     resolveAllSnakeCollisions,
     scangForSegmentCount,
     segmentSpacingForSegmentCount,
+    SLITHER,
 } from './slither-engine.js';
 
+test('Slither uses a half-area circular arena and circular spawn distribution', () => {
+    const oldSquareArea = 6000 * 6000;
+    const circularArea = Math.PI * SLITHER.worldHalf * SLITHER.worldHalf;
+    assert.ok(Math.abs(circularArea / oldSquareArea - 0.5) < 0.01);
+
+    for (let i = 0; i < 500; i++) {
+        const point = randomCoordInRoom({});
+        assert.ok(Math.hypot(point.x, point.y) <= SLITHER.worldHalf * 0.85 + 1e-6);
+    }
+});
 test('Large snakes gain far more length than width and keep useful steering', () => {
     const smallRadiusScale = radiusScaleForSegmentCount(12);
     const hugeRadiusScale = radiusScaleForSegmentCount(1200);
