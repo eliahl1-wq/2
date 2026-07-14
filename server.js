@@ -5917,7 +5917,7 @@ io.on('connection', (socket) => {
                 return;
             }
             let validatedSkinColor = null;
-            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
+            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
             const decoded = jwt.verify(token, JWT_SECRET);
@@ -6060,7 +6060,7 @@ io.on('connection', (socket) => {
                     socket.id,
                     user._id,
                     username || user.username,
-                    validatedSkinColor || util.randomSlitherColor(),
+                    validatedSkinColor === 'random_color' ? util.randomSlitherColor() : (validatedSkinColor || util.randomSlitherColor()),
                     room,
                 );
 
@@ -6209,8 +6209,8 @@ io.on('connection', (socket) => {
                 });
 
                 socket.roomId = room.id;
-                const survivSkinColor = validatedSkinColor === 'random'
-                    ? util.randomSlitherColor()
+                const survivSkinColor = (validatedSkinColor === 'random' || validatedSkinColor === 'random_color')
+                    ? util.randomColor()
                     : (validatedSkinColor || util.randomSlitherColor());
                 const newPlayer = createSurvivPlayer(
                     socket.id,
@@ -6606,6 +6606,19 @@ io.on('connection', (socket) => {
                     color: (() => {
                         if (validatedSkinColor === 'random') {
                             return { fill: 'rainbow', border: 'rainbow' };
+                        }
+                        if (validatedSkinColor === 'random_color') {
+                            const randColor = util.randomColor();
+                            const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(randColor);
+                            if (c) {
+                                const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;
+                                const g = (parseInt(c[2], 16) - 32) > 0 ? (parseInt(c[2], 16) - 32) : 0;
+                                const b = (parseInt(c[3], 16) - 32) > 0 ? (parseInt(c[3], 16) - 32) : 0;
+                                return {
+                                    fill: randColor,
+                                    border: '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)
+                                };
+                            }
                         }
                         if (validatedSkinColor) {
                             const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(validatedSkinColor);
