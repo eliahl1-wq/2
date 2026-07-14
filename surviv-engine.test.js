@@ -9,9 +9,11 @@ import {
     equipSurvivWeaponSlot,
     generateSurvivMap,
     processSurvivRoom,
+    resetSurvivRoomRuntime,
     spawnLootFromPool,
     spawnSurvivBotNear,
 } from './surviv-engine.js';
+import { getSurvivEconomy } from './economy.js';
 
 function makeRoom() {
     const map = generateSurvivMap(SURVIV.worldHalf);
@@ -43,9 +45,16 @@ function pointInRect(x, y, rect, padding = 0) {
 }
 
 function circleRectCollision(x, y, radius, rect) {
-    const closestX = Math.max(rect.x - rect.w / 2, Math.min(x, rect.x + rect.w / 2));
-    const closestY = Math.max(rect.y - rect.h / 2, Math.min(y, rect.y + rect.h / 2));
-    return Math.hypot(x - closestX, y - closestY) < radius;
+    const angle = -(Number(rect.rotation) || 0);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const dx = x - rect.x;
+    const dy = y - rect.y;
+    const localX = dx * cos - dy * sin;
+    const localY = dx * sin + dy * cos;
+    const closestX = Math.max(-rect.w / 2, Math.min(localX, rect.w / 2));
+    const closestY = Math.max(-rect.h / 2, Math.min(localY, rect.h / 2));
+    return Math.hypot(localX - closestX, localY - closestY) < radius;
 }
 
 test('surviv map keeps its 20k world while concentrating loot inside structures', () => {
@@ -164,6 +173,50 @@ test('surviv chests roll varied money across map loot', () => {
     assert.ok(new Set(moneyAmounts.map(amount => amount.toFixed(2))).size >= 6);
 });
 
+test('surviv runtime reset clears old arena state and caches', () => {
+    const room = makeRoom();
+    room.players.push({ id: 'old-player' });
+    room.bots.push({ id: 'old-bot' });
+    room.bullets.push({ id: 'old-bullet' });
+    room.spectators.push({ id: 'old-spectator' });
+    room.deathMarkers = [{ id: 'old-grave' }];
+    room.lootPoolBalance = 5;
+    room._survivObstacleIndex = { stale: true };
+    room._survivLootIndex = { stale: true };
+    room._survivViewerPayloadCache = new Map([['viewer', { stale: true }]]);
+    room._survivLeaderboardSignature = 'stale';
+    room._lastSurvivLbAt = 123;
+    room._nextSurvivBotSyncAt = 456;
+    const nextMap = {
+        loot: [{ id: 'fresh-loot' }],
+        obstacles: [{ id: 'fresh-obstacle' }],
+        spawnPoints: [{ x: 1, y: 2 }],
+        landmarks: [{ id: 'fresh-landmark' }],
+    };
+
+    resetSurvivRoomRuntime(room, nextMap);
+
+    assert.deepEqual(room.players, []);
+    assert.deepEqual(room.bots, []);
+    assert.deepEqual(room.bullets, []);
+    assert.deepEqual(room.spectators, []);
+    assert.deepEqual(room.deathMarkers, []);
+    assert.equal(room.lootPoolBalance, 0);
+    assert.equal(room.loot[0].id, 'fresh-loot');
+    assert.equal(room.obstacles[0].id, 'fresh-obstacle');
+    assert.equal(room._survivObstacleIndex, null);
+    assert.equal(room._survivLootIndex, null);
+    assert.equal(room._survivViewerPayloadCache.size, 0);
+    assert.equal(room._nextSurvivBotSyncAt, 0);
+});
+test('surviv economy conserves the full entry and applies only the cashout fee', () => {
+    const economy = getSurvivEconomy(5);
+    assert.equal(economy.entryFeeUsd, 5);
+    assert.equal(economy.playerStartBalance, 0);
+    assert.equal(economy.lootPoolOnJoin, 5);
+    assert.equal(economy.cashoutFeePct, 0.035);
+    assert.equal(economy.cashoutPlayerPct + economy.cashoutFeePct, 1);
+});
 test('surviv join money crates vary amounts while preserving the pool', () => {
     const room = makeRoom();
     room.loot = [];
@@ -655,7 +708,7 @@ test('players and automatic bots start with fists and no dollars', () => {
     assert.equal(player.weapon.type, 'fists');
     assert.deepEqual(player.inventory.weapons, []);
     assert.equal(player.dollarBalance, 0);
-    assert.equal(room.bots.length, 3);
+    assert.equal(room.bots.length, 2);
     assert.ok(room.bots.every(bot => bot.weapon.type === 'fists'));
     assert.ok(room.bots.every(bot => bot.dollarBalance === 0));
 });
@@ -875,6 +928,79 @@ test('generated cover and small props have server-authoritative durability', () 
     assert.ok(structuralWalls.every(obstacle => !obstacle.destructible), 'house walls must stay indestructible');
 });
 
+test('rotated props use their visible shape for bullet collision', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'rotated-container', kind: 'container', x: 100, y: 0, w: 120, h: 30,
+        rotation: Math.PI / 2, collidable: true, destructible: false,
+    }];
+    const player = createSurvivPlayer('rotation-shot', 'rotation-mongo', 'Rotation', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'sniper', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['sniper'];
+    player.shooting = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(room.bullets.length, 1, 'the round must not hit the invisible unrotated bounds');
+
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(room.bullets.length, 0, 'the next segment should hit the visible rotated container');
+});
+
+test('surviv bots prioritize useful chests and loot their contents', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [
+        { id: 'near-medkit', type: 'medkit', x: 0, y: 80, amount: 1, tier: 'common' },
+        { id: 'priority-chest', type: 'chest', x: 120, y: 0, tier: 'rare', contents: { weaponType: 'assault', money: 1, rarity: 'rare' } },
+    ];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('loot-observer', 'loot-observer-mongo', 'Observer', '#fff', room);
+    player.x = 1800;
+    player.y = 1800;
+    room.players.push(player);
+    const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
+
+    for (let tick = 0; tick < 32; tick++) {
+        bot.botThinkAt = 0;
+        processSurvivRoom(room, silentIo, Date.now() + 600000);
+    }
+
+    assert.ok(bot.inventory.weapons.includes('assault'), 'bot should open and take the chest weapon');
+    assert.ok(bot.dollarBalance >= 1, 'bot should continue looting money from the opened chest');
+});
+
+test('armed surviv bots aggressively engage and lead distant players', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('combat-target', 'combat-target-mongo', 'Target', '#fff', room);
+    player.x = 760;
+    player.y = 0;
+    player.inputDy = 1;
+    room.players.push(player);
+    const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
+    bot.inventory.weapons = ['assault'];
+    bot.activeWeaponSlot = 0;
+    bot.weaponSlotAmmo = [22];
+    bot.weapon = { type: 'assault', ammo: 22, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(bot.botTargetId, player.id);
+    assert.ok(bot.inputDx > 0.8, 'bot should push toward a distant target');
+    assert.ok(bot.aimAngle > 0, 'bot should lead the moving target instead of aiming at the old position');
+    assert.ok(room.bullets.some(bullet => bullet.ownerId === bot.id), 'bot should fire at combat range');
+});
 test('surviv bots automatically collect useful ground loot', () => {
     const room = makeRoom();
     room.obstacles = [];

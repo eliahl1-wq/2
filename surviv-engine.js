@@ -19,7 +19,7 @@ export const SURVIV = {
     playerRadius: 14,
     playerSpeed: 5.2,
     viewRange: 1200,
-    botMinCount: 3,
+    botMinCount: 2,
     botMaxCount: 8,
     zoneDamagePerTick: 0,
     bulletLifetimeMs: 1800,
@@ -208,9 +208,31 @@ function pickWeaponForTier(tier = 'common') {
     return pool[Math.floor(Math.random() * pool.length)];
 }
 
+function toRectLocal(px, py, rect) {
+    const angle = -(Number(rect.rotation) || 0);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const dx = px - rect.x;
+    const dy = py - rect.y;
+    return {
+        x: dx * cos - dy * sin,
+        y: dx * sin + dy * cos,
+    };
+}
+
+function fromRectLocal(px, py, rect) {
+    const angle = Number(rect.rotation) || 0;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    return {
+        x: rect.x + px * cos - py * sin,
+        y: rect.y + px * sin + py * cos,
+    };
+}
+
 function pointInRect(px, py, rect) {
-    return px >= rect.x - rect.w / 2 && px <= rect.x + rect.w / 2
-        && py >= rect.y - rect.h / 2 && py <= rect.y + rect.h / 2;
+    const local = toRectLocal(px, py, rect);
+    return Math.abs(local.x) <= rect.w / 2 && Math.abs(local.y) <= rect.h / 2;
 }
 
 function lineSegmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
@@ -222,26 +244,28 @@ function lineSegmentsIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
 }
 
 function lineSegmentRectIntersects(x1, y1, x2, y2, rect) {
-    if (pointInRect(x1, y1, rect) || pointInRect(x2, y2, rect)) {
-        return true;
-    }
-    const rxMin = rect.x - rect.w / 2;
-    const rxMax = rect.x + rect.w / 2;
-    const ryMin = rect.y - rect.h / 2;
-    const ryMax = rect.y + rect.h / 2;
+    const start = toRectLocal(x1, y1, rect);
+    const end = toRectLocal(x2, y2, rect);
+    const rxMin = -rect.w / 2;
+    const rxMax = rect.w / 2;
+    const ryMin = -rect.h / 2;
+    const ryMax = rect.h / 2;
+    const startInside = start.x >= rxMin && start.x <= rxMax && start.y >= ryMin && start.y <= ryMax;
+    const endInside = end.x >= rxMin && end.x <= rxMax && end.y >= ryMin && end.y <= ryMax;
+    if (startInside || endInside) return true;
 
-    return lineSegmentsIntersect(x1, y1, x2, y2, rxMin, ryMin, rxMin, ryMax)
-        || lineSegmentsIntersect(x1, y1, x2, y2, rxMax, ryMin, rxMax, ryMax)
-        || lineSegmentsIntersect(x1, y1, x2, y2, rxMin, ryMin, rxMax, ryMin)
-        || lineSegmentsIntersect(x1, y1, x2, y2, rxMin, ryMax, rxMax, ryMax);
+    return lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMin, ryMin, rxMin, ryMax)
+        || lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMax, ryMin, rxMax, ryMax)
+        || lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMin, ryMin, rxMax, ryMin)
+        || lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMin, ryMax, rxMax, ryMax);
 }
 
 function circleRectCollision(cx, cy, r, rect) {
-    const closestX = clamp(cx, rect.x - rect.w / 2, rect.x + rect.w / 2);
-    const closestY = clamp(cy, rect.y - rect.h / 2, rect.y + rect.h / 2);
-    return dist(cx, cy, closestX, closestY) < r;
+    const local = toRectLocal(cx, cy, rect);
+    const closestX = clamp(local.x, -rect.w / 2, rect.w / 2);
+    const closestY = clamp(local.y, -rect.h / 2, rect.h / 2);
+    return Math.hypot(local.x - closestX, local.y - closestY) < r;
 }
-
 function isNearRoadOrRiver(x, y, radius = 30) {
     const roadHalfW = 60 + radius + 10; // 10 units extra buffer
     // West N-S Highway: x = -2500
@@ -303,27 +327,35 @@ function isMapPositionBlocked(obstacles, x, y, radius = 30) {
 }
 
 function resolveCircleRect(cx, cy, r, rect) {
-    const closestX = clamp(cx, rect.x - rect.w / 2, rect.x + rect.w / 2);
-    const closestY = clamp(cy, rect.y - rect.h / 2, rect.y + rect.h / 2);
-    const d = dist(cx, cy, closestX, closestY);
-    if (d >= r) return { x: cx, y: cy };
-    if (d < 1e-6) {
-        const left = Math.abs(cx - (rect.x - rect.w / 2));
-        const right = Math.abs((rect.x + rect.w / 2) - cx);
-        const top = Math.abs(cy - (rect.y - rect.h / 2));
-        const bottom = Math.abs((rect.y + rect.h / 2) - cy);
-        const min = Math.min(left, right, top, bottom);
-        if (min === left) return { x: rect.x - rect.w / 2 - r, y: cy };
-        if (min === right) return { x: rect.x + rect.w / 2 + r, y: cy };
-        if (min === top) return { x: cx, y: rect.y - rect.h / 2 - r };
-        return { x: cx, y: rect.y + rect.h / 2 + r };
-    }
-    const overlap = r - d;
-    const nx = (cx - closestX) / d;
-    const ny = (cy - closestY) / d;
-    return { x: cx + nx * overlap, y: cy + ny * overlap };
-}
+    const local = toRectLocal(cx, cy, rect);
+    const halfW = rect.w / 2;
+    const halfH = rect.h / 2;
+    const closestX = clamp(local.x, -halfW, halfW);
+    const closestY = clamp(local.y, -halfH, halfH);
+    const dx = local.x - closestX;
+    const dy = local.y - closestY;
+    const distance = Math.hypot(dx, dy);
+    if (distance >= r) return { x: cx, y: cy };
 
+    let resolvedX = local.x;
+    let resolvedY = local.y;
+    if (distance < 1e-6) {
+        const left = Math.abs(local.x + halfW);
+        const right = Math.abs(halfW - local.x);
+        const top = Math.abs(local.y + halfH);
+        const bottom = Math.abs(halfH - local.y);
+        const nearestEdge = Math.min(left, right, top, bottom);
+        if (nearestEdge === left) resolvedX = -halfW - r;
+        else if (nearestEdge === right) resolvedX = halfW + r;
+        else if (nearestEdge === top) resolvedY = -halfH - r;
+        else resolvedY = halfH + r;
+    } else {
+        const overlap = r - distance;
+        resolvedX += (dx / distance) * overlap;
+        resolvedY += (dy / distance) * overlap;
+    }
+    return fromRectLocal(resolvedX, resolvedY, rect);
+}
 function randomMoneyAmount(minCents = 20, maxCents = 200) {
     const min = Math.max(1, Math.round(minCents));
     const max = Math.max(min, Math.round(maxCents));
@@ -2555,6 +2587,27 @@ function removeWeaponSlot(entity, index) {
     }
     return { weaponType, ammo };
 }
+export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.worldHalf)) {
+    room.players = [];
+    room.bots = [];
+    room.bullets = [];
+    room.spectators = [];
+    room.deathMarkers = [];
+    room.lootPoolBalance = 0;
+    room.loot = [...(nextMap.loot || [])];
+    room.obstacles = nextMap.obstacles || [];
+    room.spawnPoints = nextMap.spawnPoints || [];
+    room.landmarks = nextMap.landmarks || [];
+    room._survivObstacleIndex = null;
+    room._survivLootIndex = null;
+    room._survivObstacleRevision = 0;
+    room._survivLootRevision = 0;
+    room._survivViewerPayloadCache = new Map();
+    room._survivLeaderboardSignature = null;
+    room._lastSurvivLbAt = 0;
+    room._nextSurvivBotSyncAt = 0;
+    return room;
+}
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
     const eco = getSurvivEconomy(room.entryFeeUsd);
     const spawn = pickSurvivSpawn(room);
@@ -3498,26 +3551,91 @@ function getBotLootWaypoint(bot, item, room) {
     return door || item;
 }
 
+function getBotLootScore(bot, item, itemDistance) {
+    const inventory = ensureInventory(bot);
+    const distancePenalty = itemDistance * 0.24;
+    if (item.type === 'chest' || item.type === 'deathCrate') {
+        const contents = item.contents || {};
+        const useful = (contents.weaponType && inventory.weapons.length < SURVIV_MAX_WEAPONS)
+            || Number(contents.money) > 0
+            || (Number(contents.armor) > 0 && bot.armor < bot.maxArmor)
+            || (Number(contents.medkits) > 0 && inventory.medkits < SURVIV_MAX_MEDKITS)
+            || (Number(contents.ammoPacks) > 0 && inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS);
+        return useful ? 1120 - distancePenalty : -Infinity;
+    }
+    if (item.type === 'weapon') {
+        return inventory.weapons.length < SURVIV_MAX_WEAPONS ? 980 - distancePenalty : -Infinity;
+    }
+    if (item.type === 'money') return 820 - distancePenalty;
+    if (item.type === 'armor') return bot.armor < bot.maxArmor - 2 ? 760 - distancePenalty : -Infinity;
+    if (item.type === 'medkit') return inventory.medkits < SURVIV_MAX_MEDKITS ? 700 - distancePenalty : -Infinity;
+    if (item.type === 'ammo') return inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS ? 640 - distancePenalty : -Infinity;
+    return -Infinity;
+}
+
+function findBestBotLoot(bot, room, range = 2400) {
+    let best = null;
+    let bestScore = -Infinity;
+    for (const { item } of querySurvivLoot(room, bot.x, bot.y, range)) {
+        if (item.pickupAfter && Date.now() < item.pickupAfter) continue;
+        const itemDistance = dist(bot.x, bot.y, item.x, item.y);
+        const score = getBotLootScore(bot, item, itemDistance);
+        if (score > bestScore) {
+            best = { item, distance: itemDistance };
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+function getBotCombatProfile(weaponType) {
+    if (weaponType === 'shotgun') return { preferredMin: 120, preferredMax: 250, fireRange: 390 };
+    if (weaponType === 'sniper' || weaponType === 'dmr') return { preferredMin: 420, preferredMax: 650, fireRange: 1050 };
+    if (weaponType === 'assault' || weaponType === 'lmg') return { preferredMin: 250, preferredMax: 440, fireRange: 900 };
+    if (weaponType === 'smg') return { preferredMin: 150, preferredMax: 310, fireRange: 680 };
+    if (weaponType === 'pistol' || weaponType === 'revolver') return { preferredMin: 180, preferredMax: 350, fireRange: 760 };
+    return { preferredMin: 20, preferredMax: 54, fireRange: 76 };
+}
+
 function updateBotAI(bot, room, now, effectiveRadius) {
     if (now < bot.botThinkAt) return;
-    bot.botThinkAt = now + 200 + Math.random() * 300;
+    bot.botThinkAt = now + 90 + Math.random() * 100;
 
-    const allTargets = [...room.players.filter(p => !p.disconnected), ...room.bots.filter(b => b.id !== bot.id && b.hp > 0)];
+    const allTargets = [
+        ...room.players.filter(player => !player.disconnected && player.hp > 0),
+        ...room.bots.filter(candidate => candidate.id !== bot.id && candidate.hp > 0),
+    ];
     let nearest = null;
     let nearestDist = Infinity;
-    for (const t of allTargets) {
-        const d = dist(bot.x, bot.y, t.x, t.y);
-        if (d < nearestDist) {
-            nearestDist = d;
-            nearest = t;
+    let bestTargetScore = Infinity;
+    for (const target of allTargets) {
+        const targetDistance = dist(bot.x, bot.y, target.x, target.y);
+        const targetScore = targetDistance - (target.isBot ? 0 : 140);
+        if (targetScore < bestTargetScore) {
+            nearest = target;
+            nearestDist = targetDistance;
+            bestTargetScore = targetScore;
         }
     }
 
+    const inventory = ensureInventory(bot);
+    if (bot.medkitUseEndAt > now) {
+        bot.inputDx = 0;
+        bot.inputDy = 0;
+        bot.shooting = false;
+        return;
+    }
+    if (bot.hp <= 48 && inventory.medkits > 0 && (!nearest || nearestDist > 430)) {
+        bot.useMedkit = true;
+        bot.inputDx = 0;
+        bot.inputDy = 0;
+        bot.shooting = false;
+        return;
+    }
+
     if (bot.openedContainer?.items?.length) {
-        const inventory = ensureInventory(bot);
         const wanted = bot.openedContainer.items.find(item => (
-            item.kind === 'weapon'
-            && inventory.weapons.length < SURVIV_MAX_WEAPONS
+            item.kind === 'weapon' && inventory.weapons.length < SURVIV_MAX_WEAPONS
         ))
             || bot.openedContainer.items.find(item => item.kind === 'money')
             || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
@@ -3531,55 +3649,61 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     }
 
     const distFromCenter = Math.hypot(bot.x, bot.y);
-    if (distFromCenter > effectiveRadius * 0.75) {
-        const { dx, dy } = normalize(-bot.x, -bot.y);
-        bot.inputDx = dx;
-        bot.inputDy = dy;
-    } else if (nearest && nearestDist < 500) {
-        bot.botTargetId = nearest.id;
-        const melee = !!WEAPONS[bot.weapon?.type]?.melee;
-        const preferredMax = melee ? 55 : 180;
-        const preferredMin = melee ? 25 : 100;
-        if (nearestDist > preferredMax) {
-            const { dx, dy } = normalize(nearest.x - bot.x, nearest.y - bot.y);
-            bot.inputDx = dx;
-            bot.inputDy = dy;
-        } else if (nearestDist < preferredMin) {
-            const { dx, dy } = normalize(bot.x - nearest.x, bot.y - nearest.y);
-            bot.inputDx = dx * (melee ? 0.2 : 1);
-            bot.inputDy = dy * (melee ? 0.2 : 1);
-        } else {
-            bot.inputDx = 0;
-            bot.inputDy = 0;
-        }
-        bot.aimAngle = Math.atan2(nearest.y - bot.y, nearest.x - bot.x);
-        bot.shooting = nearestDist < (melee ? 74 : 420);
-    } else {
-        let nearLoot = null;
-        let nearLootDist = Infinity;
-        for (const { item } of querySurvivLoot(room, bot.x, bot.y, 1800)) {
-            const itemDistance = dist(bot.x, bot.y, item.x, item.y);
-            if (itemDistance < nearLootDist && itemDistance < 1800) {
-                nearLoot = item;
-                nearLootDist = itemDistance;
-            }
-        }
-        if (nearLoot) {
-            if ((nearLoot.type === 'chest' || nearLoot.type === 'deathCrate') && nearLootDist < SURVIV.chestOpenRadius) {
-                bot.openChestId = nearLoot.id;
-            }
-            const waypoint = getBotLootWaypoint(bot, nearLoot, room);
-            const { dx, dy } = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
-            bot.inputDx = dx * 0.82;
-            bot.inputDy = dy * 0.82;
-        } else {
-            bot.inputDx = (Math.random() - 0.5) * 2;
-            bot.inputDy = (Math.random() - 0.5) * 2;
-        }
+    if (distFromCenter > effectiveRadius * 0.82) {
+        const direction = normalize(-bot.x, -bot.y);
+        bot.inputDx = direction.dx;
+        bot.inputDy = direction.dy;
         bot.shooting = false;
+        return;
     }
-}
 
+    const bestLoot = findBestBotLoot(bot, room);
+    const melee = !!WEAPONS[bot.weapon?.type]?.melee;
+    const shouldFight = nearest && nearestDist < 1100 && (!melee || !bestLoot || nearestDist < 260);
+    if (shouldFight) {
+        bot.botTargetId = nearest.id;
+        const weaponDef = WEAPONS[bot.weapon?.type] || WEAPONS.fists;
+        const profile = getBotCombatProfile(weaponDef.id);
+        const leadTicks = weaponDef.bulletSpeed > 0 ? clamp(nearestDist / weaponDef.bulletSpeed, 0, 18) : 0;
+        const aimX = nearest.x + (nearest.inputDx || 0) * SURVIV.playerSpeed * leadTicks * 0.65;
+        const aimY = nearest.y + (nearest.inputDy || 0) * SURVIV.playerSpeed * leadTicks * 0.65;
+        const direction = normalize(nearest.x - bot.x, nearest.y - bot.y);
+        if (nearestDist > profile.preferredMax) {
+            bot.inputDx = direction.dx;
+            bot.inputDy = direction.dy;
+        } else if (nearestDist < profile.preferredMin) {
+            bot.inputDx = -direction.dx * (melee ? 0.15 : 0.9);
+            bot.inputDy = -direction.dy * (melee ? 0.15 : 0.9);
+        } else {
+            const strafeSide = Math.sin(now / 420 + bot.id.length) >= 0 ? 1 : -1;
+            bot.inputDx = -direction.dy * 0.72 * strafeSide;
+            bot.inputDy = direction.dx * 0.72 * strafeSide;
+        }
+        bot.aimAngle = Math.atan2(aimY - bot.y, aimX - bot.x);
+        bot.shooting = nearestDist <= profile.fireRange;
+        return;
+    }
+
+    bot.botTargetId = null;
+    if (bestLoot) {
+        const { item, distance: lootDistance } = bestLoot;
+        if ((item.type === 'chest' || item.type === 'deathCrate') && lootDistance < SURVIV.chestOpenRadius) {
+            bot.openChestId = item.id;
+        }
+        const waypoint = getBotLootWaypoint(bot, item, room);
+        const direction = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
+        bot.inputDx = direction.dx;
+        bot.inputDy = direction.dy;
+    } else if (nearest) {
+        const direction = normalize(nearest.x - bot.x, nearest.y - bot.y);
+        bot.inputDx = direction.dx * 0.78;
+        bot.inputDy = direction.dy * 0.78;
+    } else {
+        bot.inputDx = (Math.random() - 0.5) * 2;
+        bot.inputDy = (Math.random() - 0.5) * 2;
+    }
+    bot.shooting = false;
+}
 function processEntity(entity, room, now, effectiveRadius) {
     if (entity.hp <= 0) return;
     if (entity.isCashingOut) {

@@ -62,6 +62,7 @@ import {
     generateSurvivMap,
     getSurvivZone,
     processSurvivRoom,
+    resetSurvivRoomRuntime,
     broadcastSurvivState,
     spawnLootFromPool,
     spawnSurvivBotNear,
@@ -521,6 +522,7 @@ function createSurvivRoom(entryFeeUsd) {
         landmarks: map.landmarks,
         lootPoolBalance: 0,
         spectators: [],
+        deathMarkers: [],
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
     };
@@ -1441,15 +1443,7 @@ async function performGlobalArenaReset() {
             room.competitiveSpectators = [];
         }
         for (const room of survivRooms) {
-            room.players = [];
-            room.bots = [];
-            room.bullets = [];
-            const map = generateSurvivMap(SURVIV.worldHalf);
-            room.loot = [...map.loot];
-            room.spectators = [];
-            room.obstacles = map.obstacles;
-            room.spawnPoints = map.spawnPoints;
-            room.landmarks = map.landmarks;
+            resetSurvivRoomRuntime(room);
         }
 
         GLOBAL_ARENA_START = Date.now();
@@ -4965,10 +4959,16 @@ app.get('/api/stats', (req, res) => {
             (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
             0,
         );
-        playersByGamemode.surviv = survivRooms.reduce(
-            (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
+        const survivHumanCount = survivRooms.reduce(
+            (sum, room) => sum + room.players.filter(p => !p.disconnected && p.hp > 0).length,
             0,
         );
+        const survivBotCount = survivRooms.reduce(
+            (sum, room) => sum + room.bots.filter(bot => bot.hp > 0).length,
+            0,
+        );
+        playersByGamemode.surviv = survivHumanCount + survivBotCount;
+        totalBotsOnline += survivBotCount;
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
             + playersByGamemode.brAgar + playersByGamemode.brSlither
