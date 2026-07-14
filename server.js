@@ -7506,6 +7506,32 @@ function processRoom(room) {
                 return;
             }
 
+            // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
+            const isFreePlay = room.isSandbox || process.env.DEV_FREE_PLAY === 'true';
+            if (!isFreePlay) {
+                if (player.isCashingOut) {
+                    if (Date.now() >= player.cashOutEndTime) {
+                        room.aiBudgetBalance += botWealth;
+                        console.log(`🤖 Agar Bot ${player.username} successfully cashed out $${botWealth.toFixed(2)} to AI budget.`);
+                        room.bots = room.bots.filter(b => b.id !== player.id);
+                        const currentHumans = effectiveHumanCountForBots(room, 'agar');
+                        const autoBotsCount = room.bots.filter(b => !b.adminSpawned).length;
+                        if (autoBotsCount < getTargetBots(currentHumans)) addBots(room, 1);
+                        return;
+                    }
+                } else {
+                    if (player.cashOutThreshold === undefined) {
+                        const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
+                        player.cashOutThreshold = entryFee * (1.0 + Math.random() * 0.8);
+                    }
+                    if (botWealth >= player.cashOutThreshold) {
+                        player.isCashingOut = true;
+                        player.cashOutEndTime = Date.now() + CASHOUT_DURATION_MS;
+                        console.log(`⏱️ Agar Bot ${player.username} started cashout timer (threshold: $${player.cashOutThreshold.toFixed(2)})`);
+                    }
+                }
+            }
+
             const head = botCells[0];
             let threat = null;
             let targetPrey = null;

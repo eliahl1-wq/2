@@ -42,6 +42,10 @@ export const SLITHER = {
     foodBlobValue: 0.04, // legacy doc; use getEconomy(entryFee).foodBlobValue per room
     botStartBalance: 1.0,
     botMaxBalance: 500.0,
+    // Fast human-like reactions. Decisions are intentionally not made every
+    // 25 ms server tick, which made several bots move in perfect lockstep.
+    botReactionMinMs: 140,
+    botReactionMaxMs: 220,
     viewRange: 520,
     minimapRange: 1050,
     minimapThreatRange: 1700,
@@ -65,7 +69,8 @@ const AGAR_BOT_THREAT_RANGE = 800;
 const AGAR_BOT_PREY_RANGE = 500;
 const AGAR_BOT_FOOD_RANGE = 500;
 const AGAR_BOT_FLEE_DISTANCE = 500;
-const AGAR_BOT_TARGET_INTERVAL_MS = 1000;
+const BOT_FOOD_SCAN_MIN_MS = 280;
+const BOT_FOOD_SCAN_MAX_MS = 460;
 
 function slitherFoodDensityScale() {
     const slitherSide = SLITHER.worldHalf * 2;
@@ -876,9 +881,10 @@ function applyWallAvoidance(snake, room) {
 }
 
 /** Bot AI aligned with agar mode: flee → chase → food → wander, plus wall avoidance. */
-function findNearestFoodForBot(head, food, foodGrid, minDistFood, predicate = null) {
+function findNearestFoodForBot(head, food, foodGrid, minDistFood, predicate = null, scoreFood = null) {
     let nearestFood = null;
-    let nearestFoodDist2 = minDistFood * minDistFood;
+    const maxFoodDist2 = minDistFood * minDistFood;
+    let bestScore = Infinity;
 
     const tryFood = (f) => {
         if (predicate && !predicate(f)) return;
@@ -887,8 +893,9 @@ function findNearestFoodForBot(head, food, foodGrid, minDistFood, predicate = nu
         const fdy = head.y - f.y;
         if (fdy > minDistFood || fdy < -minDistFood) return;
         const d2 = fdx * fdx + fdy * fdy;
-        if (d2 < nearestFoodDist2) {
-            nearestFoodDist2 = d2;
+        const score = scoreFood ? scoreFood(f, d2) : d2;
+        if (d2 < maxFoodDist2 && score < bestScore) {
+            bestScore = score;
             nearestFood = f;
         }
     };
@@ -912,8 +919,102 @@ function findNearestFoodForBot(head, food, foodGrid, minDistFood, predicate = nu
     return nearestFood;
 }
 
-function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = null) {
+function ensureSlitherBotBrain(snake) {
+    if (snake._botBrain) return snake._botBrain;
+
+    const reactionRange = SLITHER.botReactionMaxMs - SLITHER.botReactionMinMs;
+    snake._botBrain = {
+        reactionMs: SLITHER.botReactionMinMs + Math.random() * reactionRange,
+        foodScanMs: BOT_FOOD_SCAN_MIN_MS + Math.random() * (BOT_FOOD_SCAN_MAX_MS - BOT_FOOD_SCAN_MIN_MS),
+        foodValueBias: 0.7 + Math.random() * 0.8,
+        preyChance: 0.02 + Math.random() * 0.08,
+        caution: 0.86 + Math.random() * 0.24,
+        aimOffset: 4 + Math.random() * 13,
+        weaveSpeed: 0.0025 + Math.random() * 0.0025,
+        phase: Math.random() * Math.PI * 2,
+        wanderDirection: Math.random() < 0.5 ? -1 : 1,
+        wanderTurn: 0.3 + Math.random() * 0.85,
+        wanderDistance: 240 + Math.random() * 260,
+        boostGreed: Math.random(),
+        nextDecisionAt: 0,
+        nextFoodScanAt: 0,
+        foodTarget: null,
+    };
+    return snake._botBrain;
+}
+
+function scheduleNextBotDecision(brain, now) {
+    brain.nextDecisionAt = now + brain.reactionMs * (0.88 + Math.random() * 0.24);
+}
+
+function stableBotFoodNoise(snakeId, foodId) {
+    const key = String(snakeId) + ':' + String(foodId ?? '');
+    let hash = 2166136261;
+    for (let i = 0; i < key.length; i++) {
+        hash ^= key.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return ((hash >>> 0) % 1000) / 1000;
+}
+
+function preferredFoodScore(snake, brain, foodItem, distance2) {
+    const value = Math.max(0.001, Number(foodItem.dollarValue ?? foodItem.balance) || 0.001);
+    let valueWeight = 1 + Math.log1p(value * 18) * brain.foodValueBias;
+    if (foodItem.deathDrop || foodItem.competitiveDeathDrop) valueWeight *= 2.8;
+    if (foodItem.golden) valueWeight *= 1.9;
+
+    // A small stable per-bot preference prevents every bot from selecting the
+    // exact same pellet while still keeping distance and value dominant.
+    const individuality = 0.86 + stableBotFoodNoise(snake.id, foodItem.id) * 0.28;
+    return (distance2 * individuality) / valueWeight;
+}
+
+function aimBotAtFood(snake, head, target, brain, now) {
+    const dx = target.x - head.x;
+    const dy = target.y - head.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance < 1e-6) {
+        snake.targetX = target.x;
+        snake.targetY = target.y;
+        return;
+    }
+
+    // Individual, gentle approach arcs make bots look less scripted without
+    // steering far enough away to miss the pellet.
+    const offset = Math.min(brain.aimOffset, distance * 0.11)
+        * Math.sin(now * brain.weaveSpeed + brain.phase);
+    snake.targetX = target.x - (dy / distance) * offset;
+    snake.targetY = target.y + (dx / distance) * offset;
+}
+
+function chooseBotWanderTarget(snake, head, brain) {
+    if (Math.random() < 0.18) brain.wanderDirection *= -1;
+    const currentAngle = Number.isFinite(snake.angle)
+        ? snake.angle
+        : Math.atan2(snake.inputDy || 0, snake.inputDx || 1);
+    const angle = currentAngle
+        + brain.wanderDirection * brain.wanderTurn
+        + (Math.random() - 0.5) * 0.38;
+    snake.targetX = head.x + Math.cos(angle) * brain.wanderDistance;
+    snake.targetY = head.y + Math.sin(angle) * brain.wanderDistance;
+}
+
+function keepBotSteering(snake, head, room) {
+    if (!applyWallAvoidance(snake, room)) {
+        snake.inputDx = snake.targetX - head.x;
+        snake.inputDy = snake.targetY - head.y;
+    }
+}
+
+export function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = null, now = Date.now()) {
     const head = snake.segments[0];
+    const brain = ensureSlitherBotBrain(snake);
+    if (now < brain.nextDecisionAt) {
+        keepBotSteering(snake, head, room);
+        return;
+    }
+    scheduleNextBotDecision(brain, now);
+
     const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
     const minDistFood = scaleAgarBotDistance(AGAR_BOT_FOOD_RANGE);
@@ -921,7 +1022,7 @@ function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = null) {
 
     let threat = null;
     let targetPrey = null;
-    let nearestThreatDist = minDistThreat;
+    let nearestThreatDist = minDistThreat * brain.caution;
     let nearestPreyDist = minDistPrey;
 
     for (const { entity: other } of allSnakes) {
@@ -943,29 +1044,39 @@ function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = null) {
         snake.targetX = head.x + Math.cos(angle) * fleeDistance;
         snake.targetY = head.y + Math.sin(angle) * fleeDistance;
         snake.boost = nearestThreatDist < fleeDistance * 0.3;
-    } else if (targetPrey) {
-        snake.targetX = targetPrey.x;
-        snake.targetY = targetPrey.y;
-        snake.boost = nearestPreyDist < fleeDistance * 0.25;
-    } else if (Date.now() - (snake.lastTargetUpdate || 0) > AGAR_BOT_TARGET_INTERVAL_MS) {
-        const nearestFood = findNearestFoodForBot(head, food, foodGrid, minDistFood);
-
-        if (nearestFood) {
-            snake.targetX = nearestFood.x;
-            snake.targetY = nearestFood.y;
-        } else if (dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
-            const target = randomCoordInRoom(room);
-            snake.targetX = target.x;
-            snake.targetY = target.y;
+    } else {
+        const targetReached = brain.foodTarget
+            && dist(head.x, head.y, brain.foodTarget.x, brain.foodTarget.y) < 34;
+        if (!brain.foodTarget || targetReached || now >= brain.nextFoodScanAt) {
+            brain.foodTarget = findNearestFoodForBot(
+                head,
+                food,
+                foodGrid,
+                minDistFood,
+                null,
+                (f, d2) => preferredFoodScore(snake, brain, f, d2),
+            );
+            brain.nextFoodScanAt = now + brain.foodScanMs;
         }
-        snake.lastTargetUpdate = Date.now();
-        snake.boost = false;
+
+        // Food is the default goal. Hunting is now an occasional personality
+        // trait instead of the shared second step in every bot's decision tree.
+        if (brain.foodTarget && (!targetPrey || Math.random() >= brain.preyChance)) {
+            aimBotAtFood(snake, head, brain.foodTarget, brain, now);
+            snake.boost = false;
+        } else if (targetPrey) {
+            snake.targetX = targetPrey.x;
+            snake.targetY = targetPrey.y;
+            snake.boost = brain.boostGreed > 0.72 && nearestPreyDist < fleeDistance * 0.25;
+        } else if (!Number.isFinite(snake.targetX)
+            || dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
+            chooseBotWanderTarget(snake, head, brain);
+            snake.boost = false;
+        }
+        snake.lastTargetUpdate = now;
     }
 
-    if (!applyWallAvoidance(snake, room)) {
-        snake.inputDx = snake.targetX - head.x;
-        snake.inputDy = snake.targetY - head.y;
-    }
+    keepBotSteering(snake, head, room);
 }
 
 function applyCompetitiveZoneAvoidance(snake, effectiveRadius) {
@@ -989,9 +1100,25 @@ function applyCompetitiveZoneAvoidance(snake, effectiveRadius) {
     return true;
 }
 
-function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, paidDeathDrops, paidDeathDropIds) {
+export function runCompetitiveSlitherBotAI(
+    snake,
+    allSnakes,
+    food,
+    effectiveRadius,
+    paidDeathDrops,
+    paidDeathDropIds,
+    now = Date.now(),
+) {
     const head = snake.segments[0];
     if (applyCompetitiveZoneAvoidance(snake, effectiveRadius)) return;
+
+    const brain = ensureSlitherBotBrain(snake);
+    if (now < brain.nextDecisionAt) {
+        snake.inputDx = snake.targetX - head.x;
+        snake.inputDy = snake.targetY - head.y;
+        return;
+    }
+    scheduleNextBotDecision(brain, now);
 
     const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
@@ -999,7 +1126,7 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, pai
     const fleeDistance = scaleAgarBotDistance(AGAR_BOT_FLEE_DISTANCE);
     let threat = null;
     let targetPrey = null;
-    let nearestThreatDist = minDistThreat;
+    let nearestThreatDist = minDistThreat * brain.caution;
     let nearestPreyDist = minDistPrey;
 
     for (const { entity: other } of allSnakes) {
@@ -1015,14 +1142,20 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, pai
         }
     }
 
-    // Paid death drops are scanned across the whole active zone and beat prey,
-    // wandering and ordinary food. Immediate survival and zone safety still win.
+    // Paid death drops stay the strongest food target in arena mode. Scanning is
+    // cached, while each bot's route and boost appetite remain individual.
     const deathDropRange = Math.max(minDistFood, effectiveRadius * 2);
-    const now = Date.now();
     let paidDeathDrop = snake._paidDeathDropTarget;
     const targetStillExists = paidDeathDrop?.id != null && paidDeathDropIds.has(paidDeathDrop.id);
     if (!targetStillExists || now - (snake._lastPaidDeathDropScan || 0) >= 250) {
-        paidDeathDrop = findNearestFoodForBot(head, paidDeathDrops, null, deathDropRange);
+        paidDeathDrop = findNearestFoodForBot(
+            head,
+            paidDeathDrops,
+            null,
+            deathDropRange,
+            null,
+            (f, d2) => preferredFoodScore(snake, brain, f, d2),
+        );
         snake._paidDeathDropTarget = paidDeathDrop;
         snake._lastPaidDeathDropScan = now;
     }
@@ -1033,29 +1166,44 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, pai
         snake.targetY = head.y + Math.sin(angle) * fleeDistance;
         snake.boost = nearestThreatDist < fleeDistance * 0.3;
     } else if (paidDeathDrop) {
-        snake.targetX = paidDeathDrop.x;
-        snake.targetY = paidDeathDrop.y;
-        snake.lastTargetUpdate = Date.now();
-        snake.boost = dist(head.x, head.y, paidDeathDrop.x, paidDeathDrop.y) > 80;
-    } else if (targetPrey) {
-        snake.targetX = targetPrey.x;
-        snake.targetY = targetPrey.y;
-        snake.boost = nearestPreyDist < fleeDistance * 0.25;
-    } else if (Date.now() - (snake.lastTargetUpdate || 0) > AGAR_BOT_TARGET_INTERVAL_MS) {
-        const nearestFood = findNearestFoodForBot(head, food, null, minDistFood);
-        if (nearestFood) {
-            snake.targetX = nearestFood.x;
-            snake.targetY = nearestFood.y;
+        aimBotAtFood(snake, head, paidDeathDrop, brain, now);
+        snake.lastTargetUpdate = now;
+        snake.boost = brain.boostGreed > 0.2
+            && dist(head.x, head.y, paidDeathDrop.x, paidDeathDrop.y) > 80;
+    } else {
+        const targetReached = brain.foodTarget
+            && dist(head.x, head.y, brain.foodTarget.x, brain.foodTarget.y) < 34;
+        if (!brain.foodTarget || targetReached || now >= brain.nextFoodScanAt) {
+            brain.foodTarget = findNearestFoodForBot(
+                head,
+                food,
+                null,
+                minDistFood,
+                f => !f.competitiveDeathDrop,
+                (f, d2) => preferredFoodScore(snake, brain, f, d2),
+            );
+            brain.nextFoodScanAt = now + brain.foodScanMs;
+        }
+
+        if (brain.foodTarget && (!targetPrey || Math.random() >= brain.preyChance)) {
+            aimBotAtFood(snake, head, brain.foodTarget, brain, now);
+            snake.boost = false;
+        } else if (targetPrey) {
+            snake.targetX = targetPrey.x;
+            snake.targetY = targetPrey.y;
+            snake.boost = brain.boostGreed > 0.72 && nearestPreyDist < fleeDistance * 0.25;
         } else if (!Number.isFinite(snake.targetX)
             || dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
             const maxTargetRadius = Math.max(0, effectiveRadius - 220);
-            const angle = Math.random() * Math.PI * 2;
-            const radius = Math.sqrt(Math.random()) * maxTargetRadius;
-            snake.targetX = Math.cos(angle) * radius;
-            snake.targetY = Math.sin(angle) * radius;
+            chooseBotWanderTarget(snake, head, brain);
+            const targetDistance = Math.hypot(snake.targetX, snake.targetY);
+            if (targetDistance > maxTargetRadius && targetDistance > 1e-6) {
+                snake.targetX *= maxTargetRadius / targetDistance;
+                snake.targetY *= maxTargetRadius / targetDistance;
+            }
+            snake.boost = false;
         }
-        snake.lastTargetUpdate = Date.now();
-        snake.boost = false;
+        snake.lastTargetUpdate = now;
     }
 
     snake.inputDx = snake.targetX - head.x;
@@ -1571,6 +1719,8 @@ function serializeSnake(snake, isYou) {
         wsep: SLITHER.segmentSepFactor * lengthSc,
         radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
+        isCashingOut: !!snake.isCashingOut,
+        cashOutEndTime: snake.cashOutEndTime || 0,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
     };
 }
@@ -1581,6 +1731,12 @@ function isInView(cx, cy, x, y, range) {
 
 export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, densityPerHuman = 250.0) {
     if (humansInArena <= 0) {
+        // A dead player remains in this room as a spectator. Keep the current
+        // pellets visible until the room is genuinely empty.
+        if ((room.spectators?.length || 0) > 0) {
+            enforceSlitherFoodCap(room);
+            return;
+        }
         clearSlitherFood(room);
         return;
     }
@@ -1698,6 +1854,27 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                     toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
                     continue;
                 }
+
+                // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
+                const isFreePlay = room.isSandbox || process.env.DEV_FREE_PLAY === 'true';
+                if (!isFreePlay) {
+                    if (snake.isCashingOut) {
+                        if (Date.now() >= snake.cashOutEndTime) {
+                            toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: false, botCashedOut: true });
+                            continue;
+                        }
+                    } else {
+                        if (snake.cashOutThreshold === undefined) {
+                            const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
+                            snake.cashOutThreshold = entryFee * (1.0 + Math.random() * 0.8);
+                        }
+                        if (botWealth >= snake.cashOutThreshold) {
+                            snake.isCashingOut = true;
+                            snake.cashOutEndTime = Date.now() + 5000;
+                            console.log(`⏱️ Slither Bot ${snake.username} started cashout timer (threshold: $${snake.cashOutThreshold.toFixed(2)})`);
+                        }
+                    }
+                }
             }
             runSlitherBotAI(snake, allSnakes, room.slitherFood, foodGrid, room);
         }
@@ -1744,8 +1921,12 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         }
     }
 
-    for (const { snake, isHuman, killer, respawnBot, returnToPool = true } of toRemove) {
-        eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
+    for (const { snake, isHuman, killer, respawnBot, returnToPool = true, botCashedOut } of toRemove) {
+        const lostDollars = eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
+        if (botCashedOut) {
+            room.aiBudgetBalance += lostDollars;
+            console.log(`🤖 Slither Bot ${snake.username} successfully cashed out $${lostDollars.toFixed(2)} to AI budget.`);
+        }
         if (!isBR && respawnBot) {
             const humansInArena = room.players.filter(p => p.mode === 'slither').length;
             const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
@@ -2311,6 +2492,8 @@ export function addCompetitiveSlitherFood(room, n) {
 
 export function syncCompetitiveSlitherFood(room, playerCount) {
     if (playerCount <= 0) {
+        // Spectators still need the existing arena state after the last snake dies.
+        if ((room.competitiveSpectators?.length || 0) > 0) return;
         const protectedFood = room.slitherFood.filter(f => f.competitiveDeathDrop);
         room.slitherFood = protectedFood;
         return;
@@ -2382,6 +2565,8 @@ function serializeCompetitiveSnake(snake, isYou) {
         wsep: SLITHER.segmentSepFactor * lengthSc,
         radius: SLITHER.baseRadius * sc,
         boost: !!snake.boost,
+        isCashingOut: !!snake.isCashingOut,
+        cashOutEndTime: snake.cashOutEndTime || 0,
         ...(isYou ? { kills: snake.kills || 0 } : {}),
     };
 }

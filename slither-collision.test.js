@@ -6,7 +6,10 @@ import {
     resolveAllSnakeCollisions,
     scangForSegmentCount,
     segmentSpacingForSegmentCount,
+    runSlitherBotAI,
     SLITHER,
+    syncCompetitiveSlitherFood,
+    syncSlitherFood,
 } from './slither-engine.js';
 
 test('Slither uses a half-area circular arena and circular spawn distribution', () => {
@@ -18,6 +21,38 @@ test('Slither uses a half-area circular arena and circular spawn distribution', 
         const point = randomCoordInRoom({});
         assert.ok(Math.hypot(point.x, point.y) <= SLITHER.worldHalf * 0.85 + 1e-6);
     }
+});
+test('spectators keep food after the last Slither player dies', () => {
+    const normalRoom = {
+        slitherFood: [{ id: 'food', balance: 0.04, dollarValue: 0.04 }],
+        foodPoolBalance: 0,
+        spectators: [{ id: 'viewer' }],
+        players: [],
+        slitherBots: [],
+    };
+    syncSlitherFood(normalRoom, 0.04, 10, 0);
+    assert.equal(normalRoom.slitherFood.length, 1);
+    assert.equal(normalRoom.foodPoolBalance, 0);
+
+    const competitiveRoom = {
+        slitherFood: [{ id: 'food', balance: 1 }],
+        competitiveSpectators: [{ id: 'viewer' }],
+    };
+    syncCompetitiveSlitherFood(competitiveRoom, 0);
+    assert.equal(competitiveRoom.slitherFood.length, 1);
+});
+
+test('food is cleared only when a Slither room is genuinely empty', () => {
+    const room = {
+        slitherFood: [{ id: 'food', balance: 0.04, dollarValue: 0.04 }],
+        foodPoolBalance: 0,
+        spectators: [],
+        players: [],
+        slitherBots: [],
+    };
+    syncSlitherFood(room, 0.04, 10, 0);
+    assert.equal(room.slitherFood.length, 0);
+    assert.equal(room.foodPoolBalance, 0.04);
 });
 test('Large snakes gain far more length than width and keep useful steering', () => {
     const smallRadiusScale = radiusScaleForSegmentCount(12);
@@ -247,4 +282,99 @@ test('A snake that reaches established body still dies', () => {
     const dead = resolveAllSnakeCollisions([{ entity: cutter, isHuman: true }, { entity: incoming, isHuman: true }]);
     assert.ok(dead.has('incoming'), 'The snake driving into established body should die');
     assert.ok(!dead.has('cutter'), 'The snake that completed the cut-off should survive');
+});
+test('Slither bots strongly prefer food over weaker prey and keep individual approach arcs', () => {
+    const snake = {
+        id: 'food-first-bot',
+        balance: 10,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 0,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            caution: 1,
+            aimOffset: 12,
+            weaveSpeed: 0.003,
+            phase: 1,
+            wanderDirection: 1,
+            wanderTurn: 0.6,
+            wanderDistance: 300,
+            boostGreed: 0.5,
+            nextDecisionAt: 0,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+        },
+    };
+    const prey = {
+        id: 'prey',
+        balance: 1,
+        segments: [{ x: 90, y: 0 }],
+    };
+    const food = [{ id: 'pellet', x: 0, y: 110, balance: 0.02, dollarValue: 0.02 }];
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }, { entity: prey }],
+        food,
+        null,
+        { sandboxWorldHalf: SLITHER.worldHalf },
+        1000,
+    );
+
+    assert.ok(snake.targetY > 90, 'food should beat an available prey target');
+    assert.notEqual(snake.targetX, 0, 'personality should add a subtle individual approach arc');
+});
+
+test('Slither bots react quickly but not on every server tick', () => {
+    const snake = {
+        id: 'reaction-bot',
+        balance: 5,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 0,
+        targetY: 100,
+        inputDx: 0,
+        inputDy: 100,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            caution: 1,
+            aimOffset: 8,
+            weaveSpeed: 0.003,
+            phase: 0.5,
+            wanderDirection: -1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0.5,
+            nextDecisionAt: 1180,
+            nextFoodScanAt: 1300,
+            foodTarget: { id: 'pellet', x: 0, y: 100, balance: 0.02 },
+        },
+    };
+    const threat = {
+        id: 'threat',
+        balance: 20,
+        segments: [{ x: 40, y: 0 }],
+    };
+    const allSnakes = [{ entity: snake }, { entity: threat }];
+    const room = { sandboxWorldHalf: SLITHER.worldHalf };
+
+    runSlitherBotAI(snake, allSnakes, [], null, room, 1179);
+    assert.equal(snake.targetX, 0, 'the bot should not react before its decision window');
+    assert.equal(snake.targetY, 100);
+
+    runSlitherBotAI(snake, allSnakes, [], null, room, 1180);
+    assert.ok(snake.targetX < 0, 'the bot should flee once the human-like reaction delay expires');
+    assert.ok(snake._botBrain.nextDecisionAt >= 1303);
+    assert.ok(snake._botBrain.nextDecisionAt <= 1382);
 });
