@@ -1202,27 +1202,69 @@ export function runSlitherBotAI(
     keepBotSteering(snake, head, room);
 }
 
-function applyCompetitiveZoneAvoidance(snake, effectiveRadius) {
+function applyCompetitiveZoneAvoidance(snake, effectiveRadius, brain, now) {
     const head = snake.segments[0];
     const headDistance = Math.hypot(head.x, head.y);
-    if (headDistance < 1e-6) return false;
+    if (headDistance < 1e-6) {
+        brain.zoneAvoiding = false;
+        return false;
+    }
 
     const snakeRadius = headRadiusForSnake(snake);
-    const safetyMargin = Math.min(220, Math.max(70, effectiveRadius * 0.24));
-    const safeRadius = Math.max(0, effectiveRadius - snakeRadius - safetyMargin);
-    if (headDistance < safeRadius) return false;
+    const radialAngle = Math.atan2(head.y, head.x);
+    const inwardAngle = radialAngle + Math.PI;
+    const currentAngle = Number.isFinite(snake.angle) ? snake.angle : inwardAngle;
+    const maxTurn = (SLITHER.turnRate * scangForSegmentCount(snake.segments.length))
+        / SLITHER.serverTickRate;
+    const turnDelta = Math.abs(Math.atan2(
+        Math.sin(inwardAngle - currentAngle),
+        Math.cos(inwardAngle - currentAngle),
+    ));
+    const turnTravel = speedForBalance(
+        snake.balance,
+        false,
+        competitiveMinMass(snake.entryFeeUsd),
+    ) * Math.min(20, turnDelta / Math.max(0.01, maxTurn));
 
-    // Zone safety always wins over food, prey and wandering. Aim well inside the
-    // circle so the snake has enough room to complete its gradual turn.
-    const inwardDistance = Math.max(180, safetyMargin * 1.5);
-    snake.targetX = head.x - (head.x / headDistance) * inwardDistance;
-    snake.targetY = head.y - (head.y / headDistance) * inwardDistance;
+    // Start the rescue early enough to finish a human-speed turn. Keep extra
+    // room while the zone shrinks, but scale down gracefully near the reset.
+    const baseMargin = Math.max(110, effectiveRadius * 0.3);
+    const maxUsefulMargin = Math.max(35, effectiveRadius * 0.58);
+    const safetyMargin = Math.min(260, maxUsefulMargin, baseMargin + turnTravel + 22);
+    const safeRadius = Math.max(0, effectiveRadius - snakeRadius - safetyMargin);
+    const releaseRadius = Math.max(0, safeRadius - Math.min(55, safetyMargin * 0.28));
+
+    if (!brain.zoneAvoiding && headDistance < safeRadius) return false;
+    if (brain.zoneAvoiding && headDistance <= releaseRadius) {
+        brain.zoneAvoiding = false;
+        brain.zoneTurnDirection = 0;
+        return false;
+    }
+
+    if (!brain.zoneAvoiding) {
+        let delta = Math.atan2(
+            Math.sin(inwardAngle - currentAngle),
+            Math.cos(inwardAngle - currentAngle),
+        );
+        if (Math.abs(delta) > Math.PI - 0.08) {
+            delta = (brain.wanderDirection || 1) * Math.PI;
+        }
+        brain.zoneTurnDirection = Math.sign(delta) || brain.wanderDirection || 1;
+    }
+    brain.zoneAvoiding = true;
+    brain.zoneAvoidingSince = brain.zoneAvoidingSince || now;
+
+    // A slight personal tangent prevents every arena bot from stacking on the
+    // same radial line, while retaining a very strong inward component.
+    const rescueAngle = inwardAngle + brain.zoneTurnDirection * 0.16;
+    const rescueDistance = Math.max(260, safetyMargin * 1.8);
+    snake.targetX = head.x + Math.cos(rescueAngle) * rescueDistance;
+    snake.targetY = head.y + Math.sin(rescueAngle) * rescueDistance;
     snake.inputDx = snake.targetX - head.x;
     snake.inputDy = snake.targetY - head.y;
     snake.boost = false;
     return true;
 }
-
 export function runCompetitiveSlitherBotAI(
     snake,
     allSnakes,
@@ -1234,8 +1276,7 @@ export function runCompetitiveSlitherBotAI(
 ) {
     const head = snake.segments[0];
     const brain = ensureSlitherBotBrain(snake);
-    if (applyCompetitiveZoneAvoidance(snake, effectiveRadius)) {
-        applyBotBodyAvoidance(snake, allSnakes, brain, now);
+    if (applyCompetitiveZoneAvoidance(snake, effectiveRadius, brain, now)) {
         snake.inputDx = snake.targetX - head.x;
         snake.inputDy = snake.targetY - head.y;
         return;

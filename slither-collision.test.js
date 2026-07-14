@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    COMPETITIVE_SLITHER,
     randomCoordInRoom,
     radiusScaleForSegmentCount,
     resolveAllSnakeCollisions,
     scangForSegmentCount,
     segmentSpacingForSegmentCount,
     runSlitherBotAI,
+    runCompetitiveSlitherBotAI,
     SLITHER,
     syncCompetitiveSlitherFood,
     syncSlitherFood,
@@ -511,4 +513,53 @@ test('Slither bots plan around a body wall instead of driving straight into it',
     assert.ok(Math.abs(snake.targetY) > 100, 'the bot should commit to a clear side route');
     assert.equal(snake.boost, false, 'the bot should stop boosting while escaping a body trap');
     assert.notEqual(snake._botBrain.avoidDirection, 0);
+});
+
+test('Competitive Slither zone rescue cannot be overridden by body avoidance', () => {
+    const snake = {
+        id: 'arena-edge-bot',
+        entryFeeUsd: 5,
+        balance: 5,
+        dollarBalance: 5,
+        segments: Array.from({ length: 12 }, (_, i) => ({ x: 650 - i * 8, y: 0 })),
+        targetX: 900,
+        targetY: 0,
+        inputDx: 250,
+        inputDy: 0,
+        angle: 0,
+        boost: true,
+    };
+    const blockingSnake = {
+        id: 'inner-wall',
+        balance: 5,
+        segments: [
+            { x: 560, y: -160 },
+            { x: 560, y: -140 },
+            { x: 560, y: -120 },
+            { x: 560, y: -90 },
+            { x: 560, y: -60 },
+            { x: 560, y: -30 },
+            { x: 560, y: 0 },
+            { x: 560, y: 30 },
+            { x: 560, y: 60 },
+            { x: 560, y: 90 },
+        ],
+    };
+
+    runCompetitiveSlitherBotAI(
+        snake,
+        [{ entity: snake }, { entity: blockingSnake }],
+        [],
+        COMPETITIVE_SLITHER.worldHalf,
+        [],
+        new Set(),
+        4000,
+    );
+
+    const head = snake.segments[0];
+    const inwardDot = snake.inputDx * -head.x + snake.inputDy * -head.y;
+    assert.ok(inwardDot > 0, 'arena rescue must retain a strong inward direction');
+    assert.ok(snake.targetX < head.x, 'the bot must turn away from the arena edge');
+    assert.equal(snake.boost, false, 'boost must stop during an arena-edge rescue');
+    assert.equal(snake._botBrain.zoneAvoiding, true);
 });
