@@ -8,9 +8,14 @@ export const SLITHER = {
     spawnSegments: 12,
     maxSegments: 1200,
     segmentsPerCent: 0.125,
-    maxScale: 6,
+    // Length comes mainly from more body points. Width and point spacing flatten
+    // out instead of growing linearly until the snake is huge.
+    maxScale: 1.65,
+    maxRadiusScale: 3.15,
     scaleDivisor: 106,
-    radiusScaleDivisor: 150,
+    radiusScaleDivisor: 90,
+    radiusGrowthLogFactor: 0.56,
+    spacingGrowthFactor: 0.32,
     baseRadius: 6.2,
     segmentSepFactor: 3.6,
     nsp1: 5.39,
@@ -151,7 +156,8 @@ export function segmentCountForBalance(balance, referenceBalance = 1.0) {
 }
 
 export function scaleForSegmentCount(sct) {
-    return Math.min(SLITHER.maxScale, 1 + (Math.max(2, sct) - 2) / SLITHER.scaleDivisor);
+    const radiusSc = radiusScaleForSegmentCount(sct);
+    return Math.min(SLITHER.maxScale, 1 + (radiusSc - 1) * SLITHER.spacingGrowthFactor);
 }
 
 /** Width grows more slowly than body length as segment count increases. */
@@ -160,16 +166,16 @@ export function radiusScaleForSegmentCount(sct) {
     const baseSegments = Math.min(normalized, SLITHER.spawnSegments);
     const extraSegments = Math.max(0, normalized - SLITHER.spawnSegments);
     return Math.min(
-        SLITHER.maxScale,
-        1 + (baseSegments - 2) / SLITHER.scaleDivisor + extraSegments / SLITHER.radiusScaleDivisor,
+        SLITHER.maxRadiusScale,
+        1 + (baseSegments - 2) / SLITHER.scaleDivisor
+            + Math.log1p(extraSegments / SLITHER.radiusScaleDivisor) * SLITHER.radiusGrowthLogFactor,
     );
 }
 
 /** Slither.io angular speed scale - thick snakes turn slower, but not too sluggishly. */
 export function scangForSegmentCount(sct) {
-    const sc = scaleForSegmentCount(sct);
-    const sizeT = Math.max(0, Math.min(1, (7 - sc) / 6));
-    return Math.max(0.045, (0.22 + 0.78 * Math.pow(sizeT, 1.35)) * (1.0 / Math.pow(sc, 0.25)));
+    const sc = radiusScaleForSegmentCount(sct);
+    return Math.max(0.34, 1 / Math.pow(sc, 0.78));
 }
 
 export function balanceToSegmentCount(balance, referenceBalance = 1.0) {
@@ -187,6 +193,11 @@ export function segmentSpacingForSegmentCount(sct) {
 
 export function headRadiusForSegmentCount(sct) {
     return SLITHER.baseRadius * radiusScaleForSegmentCount(sct);
+}
+
+function headRadiusForSnake(snake) {
+    const visualSegments = (snake?.segments?.length || SLITHER.spawnSegments) + Math.max(0, snake?.fam || 0);
+    return headRadiusForSegmentCount(visualSegments);
 }
 
 export function segmentSpacingForBalance(balance, referenceBalance = 1.0) {
@@ -241,8 +252,8 @@ export function randomCoordInRoom(room) {
 
 export function isSpawnClear(room, x, y, minDist = 200) {
     for (const { entity: s } of getAllSlitherSnakes(room)) {
-        const r = headRadiusForBalance(s.balance ?? 1);
-        const spacing = segmentSpacingForBalance(s.balance ?? 1);
+        const r = headRadiusForSnake(s);
+        const spacing = segmentSpacingForSegmentCount(s.segments?.length || SLITHER.spawnSegments);
         const bodyLen = (s.segments?.length ?? 1) * spacing;
         for (let i = 0; i < (s.segments?.length ?? 0); i++) {
             const seg = s.segments[i];
@@ -264,7 +275,7 @@ export function pickSlitherSpawn(room) {
         let minDistToAnySegment = Infinity;
 
         for (const { entity: s } of getAllSlitherSnakes(room)) {
-            const r = headRadiusForBalance(s.balance ?? 1);
+            const r = headRadiusForSnake(s);
             for (let j = 0; j < (s.segments?.length ?? 0); j += (j === 0 ? 1 : 8)) {
                 const seg = s.segments[j];
                 const segR = j === 0 ? r : r * 0.75;
@@ -543,8 +554,8 @@ function pathArcLength(path) {
     return arc;
 }
 
-const MAX_SNAKE_PATH_POINTS = 420;
-const MIN_HEAD_PATH_DIST = 0.14;
+const MAX_SNAKE_PATH_POINTS = 3600;
+const MIN_HEAD_PATH_DIST = 0.38;
 
 /** Trim oldest path points once the trail is longer than we need for the spine. */
 function trimSnakePath(path, maxArcLength) {
@@ -634,7 +645,7 @@ function updateSnakeBodyFromPath(snake, spacing) {
         snake.path = path;
     }
 
-    const minRecord = Math.max(0.12, spacing * MIN_HEAD_PATH_DIST * 0.55);
+    const minRecord = Math.max(0.4, spacing * MIN_HEAD_PATH_DIST);
     if (dist(path[0].x, path[0].y, head.x, head.y) > minRecord) {
         path.unshift({ x: head.x, y: head.y });
     } else {
@@ -681,9 +692,21 @@ function updateSnakeBodyFromPath(snake, spacing) {
         }
 
         if (!placed) {
-            const tail = path[path.length - 1];
-            segments[i].x = tail.x;
-            segments[i].y = tail.y;
+            // Never stack an uncovered tail at one point. Besides looking rigid,
+            // that produced an invisible lethal collision pile on very long snakes.
+            const pathTail = path[path.length - 1];
+            const pathPrev = path[Math.max(0, path.length - 2)];
+            let dx = pathTail.x - pathPrev.x;
+            let dy = pathTail.y - pathPrev.y;
+            let d = Math.hypot(dx, dy);
+            if (d < 1e-6) {
+                dx = -Math.cos(snake.angle || 0);
+                dy = -Math.sin(snake.angle || 0);
+                d = 1;
+            }
+            const prev = segments[i - 1];
+            segments[i].x = prev.x + (dx / d) * spacing;
+            segments[i].y = prev.y + (dy / d) * spacing;
         }
     }
 
@@ -833,7 +856,7 @@ function updateSnakeMovement(snake, room = null) {
 
 function applyWallAvoidance(snake) {
     const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
+    const r = headRadiusForSnake(snake);
     const limit = SLITHER.worldHalf - r - 20;
     const margin = 120;
     let steerX = 0;
@@ -951,7 +974,7 @@ function applyCompetitiveZoneAvoidance(snake, effectiveRadius) {
     const headDistance = Math.hypot(head.x, head.y);
     if (headDistance < 1e-6) return false;
 
-    const snakeRadius = headRadiusForBalance(snake.balance);
+    const snakeRadius = headRadiusForSnake(snake);
     const safetyMargin = Math.min(220, Math.max(70, effectiveRadius * 0.24));
     const safeRadius = Math.max(0, effectiveRadius - snakeRadius - safetyMargin);
     if (headDistance < safeRadius) return false;
@@ -1042,7 +1065,7 @@ function runCompetitiveSlitherBotAI(snake, allSnakes, food, effectiveRadius, pai
 
 function checkWallCollision(snake) {
     const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
+    const r = headRadiusForSnake(snake);
     const limit = SLITHER.worldHalf - r;
     return head.x < -limit || head.x > limit || head.y < -limit || head.y > limit;
 }
@@ -1059,7 +1082,7 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
 
 function snakeMouthPoint(snake) {
     const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
+    const r = headRadiusForSnake(snake);
     const angle = snake.angle ?? 0;
     const fwd = r * SLITHER.foodMouthForward;
     return {
@@ -1100,16 +1123,32 @@ function firstLethalBodySegment(snake, radius) {
     return Math.max(2, Math.ceil((radius * SLITHER.lethalBodyStartRadius) / Math.max(1, spacing)));
 }
 
+function headHitsSnakeBody(head, headRadius, other, otherRadius) {
+    const segments = other.segments || [];
+    const first = firstLethalBodySegment(other, otherRadius);
+    const threshold = (headRadius + otherRadius) * SLITHER.bodyCollisionScale;
+    // Long snakes are sampled densely. Test short swept body chords instead of
+    // every individual point: this keeps the hitbox continuous and halves the
+    // hot collision loop without creating gaps between segments.
+    const stride = segments.length > 180 ? 2 : 1;
+    for (let i = first; i < segments.length; i += stride) {
+        const a = segments[i];
+        const b = segments[Math.min(segments.length - 1, i + stride)];
+        if (distPointToSegment(head.x, head.y, a.x, a.y, b.x, b.y) < threshold) return true;
+    }
+    return false;
+}
+
 function checkSnakeCollisions(snake, allSnakes) {
     if (snake.spawnGraceUntil && Date.now() < snake.spawnGraceUntil) return null;
     const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
+    const r = headRadiusForSnake(snake);
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
         if (other.spawnGraceUntil && Date.now() < other.spawnGraceUntil) continue;
 
         // Bounding box check to cull segment collision checks
-        const maxOtherR = headRadiusForBalance(other.balance);
+        const maxOtherR = headRadiusForSnake(other);
         const pad = r + maxOtherR + 10;
         if (other.minX !== undefined && (
             head.x < other.minX - pad ||
@@ -1120,17 +1159,7 @@ function checkSnakeCollisions(snake, allSnakes) {
             continue;
         }
 
-        const firstBodySegment = firstLethalBodySegment(other, maxOtherR);
-        for (let i = firstBodySegment; i < other.segments.length; i++) {
-            const seg = other.segments[i];
-            const segR = headRadiusForBalance(other.balance);
-            const dx = head.x - seg.x;
-            const dy = head.y - seg.y;
-            const threshold = (r + segR) * SLITHER.bodyCollisionScale;
-            if (dx * dx + dy * dy < threshold * threshold) {
-                return other;
-            }
-        }
+        if (headHitsSnakeBody(head, r, other, maxOtherR)) return other;
     }
     return null;
 }
@@ -1150,7 +1179,7 @@ export function resolveAllSnakeCollisions(allSnakes) {
         const head = snake.segments?.[0];
         if (!head) continue;
 
-        const r = headRadiusForBalance(snake.balance);
+        const r = headRadiusForSnake(snake);
 
         let bodyHit = null;
         let headHit = null;
@@ -1160,7 +1189,7 @@ export function resolveAllSnakeCollisions(allSnakes) {
             if (other.spawnGraceUntil && now < other.spawnGraceUntil) continue;
 
             // Bounding box check to cull segment collision checks
-            const maxOtherR = headRadiusForBalance(other.balance);
+            const maxOtherR = headRadiusForSnake(other);
             const pad = r + maxOtherR + 10;
             if (other.minX !== undefined && (
                 head.x < other.minX - pad ||
@@ -1171,20 +1200,8 @@ export function resolveAllSnakeCollisions(allSnakes) {
                 continue;
             }
 
-            const firstBodySegment = firstLethalBodySegment(other, maxOtherR);
-            for (let i = firstBodySegment; i < other.segments.length; i++) {
-                const seg = other.segments[i];
-                const segR = headRadiusForBalance(other.balance);
-                
-                const dx = head.x - seg.x;
-                const dy = head.y - seg.y;
-                
-                const threshold = (r + segR) * SLITHER.bodyCollisionScale;
-
-                if (dx * dx + dy * dy < threshold * threshold) {
-                    bodyHit = other;
-                    break; // Body hit takes absolute precedence
-                }
+            if (headHitsSnakeBody(head, r, other, maxOtherR)) {
+                bodyHit = other;
             }
             if (bodyHit) {
                 break; // Found body hit, stop checking other snakes for this one
@@ -1965,8 +1982,8 @@ function randomCompetitiveSpawnCoord() {
 
 export function isCompetitiveSpawnClear(room, x, y, minDist = 120) {
     for (const { entity: s } of getCompetitiveSnakes(room)) {
-        const r = headRadiusForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
-        const spacing = segmentSpacingForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
+        const r = headRadiusForSnake(s);
+        const spacing = segmentSpacingForSegmentCount(s.segments?.length || SLITHER.spawnSegments);
         const bodyLen = (s.segments?.length ?? 1) * spacing;
         for (let i = 0; i < (s.segments?.length ?? 0); i++) {
             const seg = s.segments[i];
@@ -1988,7 +2005,7 @@ function pickCompetitiveSpawn(room) {
         let minDistToAnySegment = Infinity;
 
         for (const { entity: s } of getCompetitiveSnakes(room)) {
-            const r = headRadiusForBalance(s.balance ?? competitiveMinMass(room.entryFeeUsd));
+            const r = headRadiusForSnake(s);
             for (let j = 0; j < (s.segments?.length ?? 0); j += (j === 0 ? 1 : 8)) {
                 const seg = s.segments[j];
                 const segR = j === 0 ? r : r * 0.75;
@@ -2149,7 +2166,7 @@ function updateCompetitiveSnakeMovement(snake) {
 
 function checkCompetitiveBoundary(snake, effectiveRadius) {
     const head = snake.segments[0];
-    const r = headRadiusForBalance(snake.balance);
+    const r = headRadiusForSnake(snake);
     return Math.hypot(head.x, head.y) + r > effectiveRadius;
 }
 

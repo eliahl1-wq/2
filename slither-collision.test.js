@@ -1,6 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveAllSnakeCollisions } from './slither-engine.js';
+import {
+    radiusScaleForSegmentCount,
+    resolveAllSnakeCollisions,
+    scangForSegmentCount,
+    segmentSpacingForSegmentCount,
+} from './slither-engine.js';
+
+test('Large snakes gain far more length than width and keep useful steering', () => {
+    const smallRadiusScale = radiusScaleForSegmentCount(12);
+    const hugeRadiusScale = radiusScaleForSegmentCount(1200);
+    const hugeSpacing = segmentSpacingForSegmentCount(1200);
+
+    assert.ok(hugeRadiusScale < 3, 'maximum-length snake should stay below 3x spawn width');
+    assert.ok(hugeRadiusScale > smallRadiusScale, 'width should still grow gradually');
+    assert.ok(hugeSpacing < 6, 'large body points must stay dense enough for round turns');
+    assert.ok(scangForSegmentCount(1200) >= 0.34, 'large snakes must retain useful turning speed');
+});
+
+test('Collision radius follows visible segments instead of future balance growth', () => {
+    const growing = {
+        id: 'growing', balance: 100, angle: 0,
+        segments: [{ x: 0, y: 0 }, { x: -15, y: 0 }],
+    };
+    const passing = {
+        id: 'passing', balance: 1, angle: 0,
+        segments: [
+            { x: 30, y: 11.3 }, { x: 20, y: 11.3 }, { x: 10, y: 11.3 },
+            { x: 0, y: 11.3 }, { x: -10, y: 11.3 }, { x: -20, y: 11.3 },
+        ],
+    };
+    const dead = resolveAllSnakeCollisions([
+        { entity: growing, isHuman: true },
+        { entity: passing, isHuman: true },
+    ]);
+    assert.ok(!dead.has('growing'), 'unrendered future growth must not create an oversized hitbox');
+});
 
 test('Side collision: A runs into B body, A dies and B lives', () => {
     // Snake A (head at 0,0, tail at -10,0)
