@@ -493,6 +493,33 @@ function addWall(obstacles, x, y, w, h, variant = 'plaster', opts = {}) {
     return addObstacle(obstacles, 'wall', x, y, w, h, { hue: opts.hue ?? 24, variant, ...opts });
 }
 
+function addDestructibleBarrier(obstacles, x, y, w, h, variant = 'stone', opts = {}) {
+    const horizontal = w >= h;
+    const length = horizontal ? w : h;
+    const segmentCount = Math.max(1, Math.ceil(length / (opts.segmentLength || 120)));
+    const segmentLength = length / segmentCount;
+    const maxHp = opts.maxHp || (Math.min(w, h) <= 12 ? 54 : 90);
+    const segments = [];
+    for (let index = 0; index < segmentCount; index++) {
+        const offset = -length / 2 + segmentLength * (index + 0.5);
+        segments.push(addWall(
+            obstacles,
+            horizontal ? x + offset : x,
+            horizontal ? y : y + offset,
+            horizontal ? segmentLength : w,
+            horizontal ? h : segmentLength,
+            variant,
+            {
+                ...opts,
+                role: opts.role || 'breakableBarrier',
+                destructible: true,
+                maxHp,
+            },
+        ));
+    }
+    return segments;
+}
+
 function addInteriorWall(obstacles, x, y, w, h, variant = 'plaster', opts = {}) {
     return addObstacle(obstacles, 'interiorWall', x, y, w, h, { hue: opts.hue ?? 24, variant, ...opts });
 }
@@ -688,12 +715,12 @@ function addMansion(obstacles, loot, spawnPoints, x, y) {
     });
     
     // Perimeter walls with gate on North and South sides
-    addWall(obstacles, x - 500, y - 590, 500, 18, 'stone'); // North wall left segment
-    addWall(obstacles, x + 500, y - 590, 500, 18, 'stone'); // North wall right segment
-    addWall(obstacles, x - 750, y, 18, 1180, 'stone');
-    addWall(obstacles, x + 750, y, 18, 1180, 'stone');
-    addWall(obstacles, x - 500, y + 590, 500, 18, 'stone'); // South wall left segment
-    addWall(obstacles, x + 500, y + 590, 500, 18, 'stone'); // South wall right segment
+    addDestructibleBarrier(obstacles, x - 500, y - 590, 500, 18, 'stone'); // North wall left segment
+    addDestructibleBarrier(obstacles, x + 500, y - 590, 500, 18, 'stone'); // North wall right segment
+    addDestructibleBarrier(obstacles, x - 750, y, 18, 1180, 'stone');
+    addDestructibleBarrier(obstacles, x + 750, y, 18, 1180, 'stone');
+    addDestructibleBarrier(obstacles, x - 500, y + 590, 500, 18, 'stone'); // South wall left segment
+    addDestructibleBarrier(obstacles, x + 500, y + 590, 500, 18, 'stone'); // South wall right segment
     
     // Gate pillars South
     addObstacle(obstacles, 'wall', x - 240, y + 590, 40, 40, 'stone');
@@ -937,9 +964,9 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
             doorSide: 'south',
         });
         
-        addWall(obstacles, hx, hy - h / 2 - 20, w + 40, 10, 'stone');
-        addWall(obstacles, hx - w / 2 - 20, hy, 10, h + 40, 'stone');
-        addWall(obstacles, hx + w / 2 + 20, hy, 10, h + 40, 'stone');
+        addDestructibleBarrier(obstacles, hx, hy - h / 2 - 20, w + 40, 10, 'stone');
+        addDestructibleBarrier(obstacles, hx - w / 2 - 20, hy, 10, h + 40, 'stone');
+        addDestructibleBarrier(obstacles, hx + w / 2 + 20, hy, 10, h + 40, 'stone');
     }
     
     const spacingS = roadLength / (housesSouth + 1);
@@ -955,9 +982,9 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
             doorSide: 'north',
         });
         
-        addWall(obstacles, hx, hy + h / 2 + 20, w + 40, 10, 'stone');
-        addWall(obstacles, hx - w / 2 - 20, hy, 10, h + 40, 'stone');
-        addWall(obstacles, hx + w / 2 + 20, hy, 10, h + 40, 'stone');
+        addDestructibleBarrier(obstacles, hx, hy + h / 2 + 20, w + 40, 10, 'stone');
+        addDestructibleBarrier(obstacles, hx - w / 2 - 20, hy, 10, h + 40, 'stone');
+        addDestructibleBarrier(obstacles, hx + w / 2 + 20, hy, 10, h + 40, 'stone');
     }
     
     for (let i = 0; i < size; i++) {
@@ -1125,9 +1152,9 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
     } else {
         // Ruins with shelter
         addObstacle(obstacles, 'field', x, y, 760, 560, { collidable: false, variant: 'ruins' });
-        addWall(obstacles, x - 180, y - 90, 260, 16, 'stone');
-        addWall(obstacles, x - 300, y + 20, 16, 210, 'stone');
-        addWall(obstacles, x + 120, y + 105, 300, 16, 'stone');
+        addDestructibleBarrier(obstacles, x - 180, y - 90, 260, 16, 'stone');
+        addDestructibleBarrier(obstacles, x - 300, y + 20, 16, 210, 'stone');
+        addDestructibleBarrier(obstacles, x + 120, y + 105, 300, 16, 'stone');
         addObstacle(obstacles, 'barrel', x + 160, y - 130, 36, 36, { hue: 210, variant: 'water' });
         addHouse(obstacles, loot, spawnPoints, x - 60, y + 50, 190, 160, { variant: 'cabin', hue: 20, tier: Math.random() > 0.4 ? 'rare' : 'common' });
         spawnPoints.push({ x: x + 230, y: y + 160 });
@@ -1331,12 +1358,12 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     });
     
     // Perimeter walls with North and South gates
-    addWall(obstacles, x - 500, y - 690, 580, 20, 'stone');
-    addWall(obstacles, x + 500, y - 690, 580, 20, 'stone');
-    addWall(obstacles, x - 790, y, 20, 1400, 'stone');
-    addWall(obstacles, x + 790, y, 20, 1400, 'stone');
-    addWall(obstacles, x - 500, y + 690, 580, 20, 'stone');
-    addWall(obstacles, x + 500, y + 690, 580, 20, 'stone');
+    addDestructibleBarrier(obstacles, x - 500, y - 690, 580, 20, 'stone');
+    addDestructibleBarrier(obstacles, x + 500, y - 690, 580, 20, 'stone');
+    addDestructibleBarrier(obstacles, x - 790, y, 20, 1400, 'stone');
+    addDestructibleBarrier(obstacles, x + 790, y, 20, 1400, 'stone');
+    addDestructibleBarrier(obstacles, x - 500, y + 690, 580, 20, 'stone');
+    addDestructibleBarrier(obstacles, x + 500, y + 690, 580, 20, 'stone');
     
     // Gate pillars
     addObstacle(obstacles, 'wall', x - 200, y + 690, 36, 36, 'stone');
@@ -1421,12 +1448,12 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1800, 1800, { collidable: false, variant: 'quarry' });
 
     // High walls with North and South gates
-    addWall(obstacles, x - 500, y - 890, 780, 24, 'stone');
-    addWall(obstacles, x + 500, y - 890, 780, 24, 'stone');
-    addWall(obstacles, x - 500, y + 890, 780, 24, 'stone');
-    addWall(obstacles, x + 500, y + 890, 780, 24, 'stone');
-    addWall(obstacles, x - 890, y, 24, 1800, 'stone');
-    addWall(obstacles, x + 890, y, 24, 1800, 'stone');
+    addDestructibleBarrier(obstacles, x - 500, y - 890, 780, 24, 'stone');
+    addDestructibleBarrier(obstacles, x + 500, y - 890, 780, 24, 'stone');
+    addDestructibleBarrier(obstacles, x - 500, y + 890, 780, 24, 'stone');
+    addDestructibleBarrier(obstacles, x + 500, y + 890, 780, 24, 'stone');
+    addDestructibleBarrier(obstacles, x - 890, y, 24, 1800, 'stone');
+    addDestructibleBarrier(obstacles, x + 890, y, 24, 1800, 'stone');
     
     // Gate pillars
     addObstacle(obstacles, 'wall', x - 100, y + 890, 50, 50, 'stone');
@@ -1529,12 +1556,12 @@ function addRadioTower(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 800, 800, { collidable: false, variant: 'industrial' });
 
     // Fence with gate on North and South sides
-    addWall(obstacles, x - 250, y - 390, 280, 10, 'stone');
-    addWall(obstacles, x + 250, y - 390, 280, 10, 'stone');
-    addWall(obstacles, x - 250, y + 390, 280, 10, 'stone');
-    addWall(obstacles, x + 250, y + 390, 280, 10, 'stone');
-    addWall(obstacles, x - 390, y, 10, 800, 'stone');
-    addWall(obstacles, x + 390, y, 10, 800, 'stone');
+    addDestructibleBarrier(obstacles, x - 250, y - 390, 280, 10, 'stone');
+    addDestructibleBarrier(obstacles, x + 250, y - 390, 280, 10, 'stone');
+    addDestructibleBarrier(obstacles, x - 250, y + 390, 280, 10, 'stone');
+    addDestructibleBarrier(obstacles, x + 250, y + 390, 280, 10, 'stone');
+    addDestructibleBarrier(obstacles, x - 390, y, 10, 800, 'stone');
+    addDestructibleBarrier(obstacles, x + 390, y, 10, 800, 'stone');
 
     // Fence gate posts
     addObstacle(obstacles, 'wall', x - 100, y + 390, 20, 20, 'stone');
@@ -2240,24 +2267,67 @@ function makeInventory() {
 function ensureInventory(entity) {
     if (!entity.inventory) entity.inventory = makeInventory();
     const currentWeapons = Array.isArray(entity.inventory.weapons) ? entity.inventory.weapons : [];
-    const validWeapons = currentWeapons.filter((weapon, index) => (
-        weapon !== 'fists' && WEAPONS[weapon] && currentWeapons.indexOf(weapon) === index
-    ));
-    entity.inventory.weapons = validWeapons.slice(0, SURVIV_MAX_WEAPONS);
+    const currentSlotAmmo = Array.isArray(entity.weaponSlotAmmo) ? entity.weaponSlotAmmo : [];
+    const validWeapons = [];
+    const validSlotAmmo = [];
+    for (let index = 0; index < currentWeapons.length && validWeapons.length < SURVIV_MAX_WEAPONS; index++) {
+        const weapon = currentWeapons[index];
+        if (weapon === 'fists' || !WEAPONS[weapon]) continue;
+        validWeapons.push(weapon);
+        validSlotAmmo.push(currentSlotAmmo[index]);
+    }
+    entity.inventory.weapons = validWeapons;
+    if (Array.isArray(entity.weaponSlotAmmo)) entity.weaponSlotAmmo = validSlotAmmo;
     entity.inventory.medkits = Math.max(0, Math.min(SURVIV_MAX_MEDKITS, Number(entity.inventory.medkits) || 0));
     entity.inventory.ammoPacks = Math.max(0, Math.min(SURVIV_MAX_AMMO_PACKS, Number(entity.inventory.ammoPacks) || 0));
     entity.inventory.chestsOpened = Number(entity.inventory.chestsOpened) || 0;
     return entity.inventory;
 }
 
-function addWeaponToInventory(entity, weaponType) {
+function ensureWeaponSlotAmmo(entity) {
     const inv = ensureInventory(entity);
-    if (!weaponType || !WEAPONS[weaponType] || inv.weapons.includes(weaponType)) return false;
-    if (inv.weapons.length >= SURVIV_MAX_WEAPONS) return false;
-    inv.weapons.push(weaponType);
-    return true;
+    const existing = Array.isArray(entity.weaponSlotAmmo) ? entity.weaponSlotAmmo : [];
+    entity.weaponSlotAmmo = inv.weapons.map((weaponType, index) => {
+        let ammo = existing[index];
+        if (!Number.isFinite(ammo)) ammo = entity.weaponsAmmo?.[weaponType];
+        if (entity.activeWeaponSlot === index && entity.weapon?.type === weaponType) ammo = entity.weapon.ammo;
+        return Number.isFinite(ammo) ? Math.max(0, Number(ammo)) : WEAPONS[weaponType].clipSize;
+    });
+    return entity.weaponSlotAmmo;
 }
 
+function syncLegacyWeaponAmmo(entity) {
+    const inv = ensureInventory(entity);
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const legacy = {};
+    inv.weapons.forEach((weaponType, index) => {
+        if (legacy[weaponType] === undefined || entity.activeWeaponSlot === index) legacy[weaponType] = slotAmmo[index];
+    });
+    entity.weaponsAmmo = legacy;
+    return legacy;
+}
+
+function saveActiveWeaponAmmo(entity) {
+    const inv = ensureInventory(entity);
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    if (!entity.weapon || entity.weapon.type === 'fists') return;
+    let index = Number(entity.activeWeaponSlot);
+    if (!Number.isInteger(index) || inv.weapons[index] !== entity.weapon.type) index = inv.weapons.indexOf(entity.weapon.type);
+    if (index < 0) return;
+    entity.activeWeaponSlot = index;
+    slotAmmo[index] = Math.max(0, Number(entity.weapon.ammo) || 0);
+    syncLegacyWeaponAmmo(entity);
+}
+
+function addWeaponToInventory(entity, weaponType, ammo = null) {
+    const inv = ensureInventory(entity);
+    if (!weaponType || !WEAPONS[weaponType] || inv.weapons.length >= SURVIV_MAX_WEAPONS) return false;
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    inv.weapons.push(weaponType);
+    slotAmmo.push(Number.isFinite(ammo) ? Math.max(0, Number(ammo)) : WEAPONS[weaponType].clipSize);
+    syncLegacyWeaponAmmo(entity);
+    return true;
+}
 function describeContainerItems(contents = {}) {
     const items = [];
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
@@ -2321,27 +2391,15 @@ function applyLootContents(entity, contents = {}, options = {}) {
         entity.weapon.ammo = Math.min(wDef.clipSize, entity.weapon.ammo + Math.ceil(wDef.clipSize * 0.4 * packs));
     }
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
-        const added = addWeaponToInventory(entity, contents.weaponType);
+        const def = WEAPONS[contents.weaponType];
+        const pickupAmmo = Number.isFinite(contents.ammo) ? Math.max(0, Number(contents.ammo)) : def.clipSize;
+        saveActiveWeaponAmmo(entity);
+        const added = addWeaponToInventory(entity, contents.weaponType, pickupAmmo);
         if (added) {
-            if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
-            // Set full clip for the newly acquired weapon
-            const def = WEAPONS[contents.weaponType];
-            entity.weaponsAmmo[contents.weaponType] = def.clipSize;
-
-            // Save old weapon's ammo
-            if (entity.weapon) {
-                entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
-            }
-
-            entity.weapon = {
-                type: def.id,
-                ammo: def.clipSize,
-                reloading: false,
-                reloadEndAt: 0,
-                lastShotAt: 0,
-            };
+            const newSlot = ensureInventory(entity).weapons.length - 1;
+            equipSurvivWeaponSlot(entity, newSlot);
             summary.weaponType = contents.weaponType;
-            summary.weaponLabel = WEAPONS[contents.weaponType].label;
+            summary.weaponLabel = def.label;
         }
     }
     return summary;
@@ -2373,38 +2431,33 @@ function pickupGroundWeapon(entity, room) {
         .sort((a, b) => dist(entity.x, entity.y, a.item.x, a.item.y) - dist(entity.x, entity.y, b.item.x, b.item.y));
     const candidate = nearby[0];
     if (!candidate) return false;
+
     const item = candidate.item;
     const nextType = item.weaponType;
-    const groundAmmo = Number.isFinite(item.ammo) ? Math.max(0, Number(item.ammo)) : null;
-    if (inv.weapons.includes(nextType)) return equipSurvivWeaponSlot(entity, inv.weapons.indexOf(nextType));
-
-    const currentType = entity.weapon?.type;
-    const currentIndex = inv.weapons.indexOf(currentType);
     const nextDef = WEAPONS[nextType];
-    if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
-
-    // Save current ammo before swapping/picking up
-    if (entity.weapon && entity.weapon.type !== 'fists') {
-        entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
-    }
+    const nextAmmo = Number.isFinite(item.ammo) ? Math.max(0, Number(item.ammo)) : nextDef.clipSize;
+    saveActiveWeaponAmmo(entity);
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    let nextSlot;
 
     if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
+        nextSlot = inv.weapons.length;
         inv.weapons.push(nextType);
+        slotAmmo.push(nextAmmo);
         removeSurvivLootAt(room, candidate.index);
-    } else if (currentIndex >= 0) {
-        const oldType = currentType;
-        const oldAmmo = Number(entity.weapon?.ammo) || 0;
-        inv.weapons[currentIndex] = nextType;
-        delete entity.weaponsAmmo[oldType];
+    } else {
+        nextSlot = Number.isInteger(entity.activeWeaponSlot) ? entity.activeWeaponSlot : inv.weapons.indexOf(entity.weapon?.type);
+        if (nextSlot < 0 || nextSlot >= inv.weapons.length) return false;
+        const oldType = inv.weapons[nextSlot];
+        const oldAmmo = slotAmmo[nextSlot] ?? 0;
+        inv.weapons[nextSlot] = nextType;
+        slotAmmo[nextSlot] = nextAmmo;
         item.weaponType = oldType;
         item.ammo = oldAmmo;
         item.tier = WEAPONS[oldType]?.rarity || 'common';
-    } else {
-        return false;
     }
 
-    const nextAmmo = groundAmmo ?? nextDef.clipSize;
-    entity.weaponsAmmo[nextType] = nextAmmo;
+    entity.activeWeaponSlot = nextSlot;
     entity.weapon = {
         type: nextType,
         ammo: nextAmmo,
@@ -2412,6 +2465,7 @@ function pickupGroundWeapon(entity, room) {
         reloadEndAt: 0,
         lastShotAt: 0,
     };
+    syncLegacyWeaponAmmo(entity);
     entity.lastLoot = {
         id: `ground-weapon:${entity.id}:${Date.now()}`,
         type: 'ground',
@@ -2427,30 +2481,18 @@ export function equipSurvivWeaponSlot(entity, slot) {
     const inv = ensureInventory(entity);
     const index = Number(slot);
     if (!Number.isInteger(index) || index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
+    saveActiveWeaponAmmo(entity);
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
     const weaponType = inv.weapons[index];
+    entity.activeWeaponSlot = index;
     if (!weaponType) {
-        if (entity.weapon?.type && entity.weapon.type !== 'fists') {
-            if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
-            entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
-        }
         entity.weapon = makeWeaponState('fists');
+        syncLegacyWeaponAmmo(entity);
         return true;
     }
     if (!WEAPONS[weaponType]) return false;
-    if (entity.weapon?.type === weaponType) return true;
 
-    // Save current ammo
-    if (entity.weapon) {
-        if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
-        entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
-    }
-
-    // Load target ammo
-    if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
-    const targetAmmo = entity.weaponsAmmo[weaponType] !== undefined 
-        ? entity.weaponsAmmo[weaponType] 
-        : WEAPONS[weaponType].clipSize;
-
+    const targetAmmo = slotAmmo[index] ?? WEAPONS[weaponType].clipSize;
     entity.weapon = {
         type: weaponType,
         ammo: targetAmmo,
@@ -2458,20 +2500,40 @@ export function equipSurvivWeaponSlot(entity, slot) {
         reloadEndAt: 0,
         lastShotAt: 0,
     };
+    syncLegacyWeaponAmmo(entity);
     return true;
 }
 
-function equipFallbackAfterWeaponRemoval(entity, removedWeaponType) {
-    if (entity.weapon?.type !== removedWeaponType) return;
+function removeWeaponSlot(entity, index) {
     const inv = ensureInventory(entity);
-    const nextType = inv.weapons[0] || 'fists';
-    const next = makeWeaponState(nextType);
-    if (entity.weaponsAmmo?.[nextType] !== undefined) {
-        next.ammo = entity.weaponsAmmo[nextType];
-    }
-    entity.weapon = next;
-}
+    if (!Number.isInteger(index) || index < 0 || index >= inv.weapons.length) return null;
+    saveActiveWeaponAmmo(entity);
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const weaponType = inv.weapons[index];
+    const ammo = slotAmmo[index] ?? 0;
+    const wasActive = entity.activeWeaponSlot === index;
+    inv.weapons.splice(index, 1);
+    slotAmmo.splice(index, 1);
 
+    if (wasActive) {
+        if (inv.weapons.length > 0) {
+            const nextIndex = Math.min(index, inv.weapons.length - 1);
+            const nextType = inv.weapons[nextIndex];
+            entity.activeWeaponSlot = nextIndex;
+            entity.weapon = makeWeaponState(nextType);
+            entity.weapon.ammo = slotAmmo[nextIndex] ?? WEAPONS[nextType].clipSize;
+            syncLegacyWeaponAmmo(entity);
+        } else {
+            entity.activeWeaponSlot = 0;
+            entity.weapon = makeWeaponState('fists');
+            syncLegacyWeaponAmmo(entity);
+        }
+    } else {
+        if (Number.isInteger(entity.activeWeaponSlot) && entity.activeWeaponSlot > index) entity.activeWeaponSlot -= 1;
+        syncLegacyWeaponAmmo(entity);
+    }
+    return { weaponType, ammo };
+}
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
     const eco = getSurvivEconomy(room.entryFeeUsd);
     const spawn = pickSurvivSpawn(room);
@@ -2503,6 +2565,9 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         botThinkAt: 0,
         botTargetId: null,
         inventory: makeInventory(),
+        activeWeaponSlot: 0,
+        weaponSlotAmmo: [],
+        weaponsAmmo: {},
         useMedkit: false,
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
@@ -2819,7 +2884,7 @@ function tryShoot(entity, room, now) {
             damageSurvivObstacle(room, closestObstacle, wDef.damage);
         } else if (closest) {
             applyDamage(closest, wDef.damage, entity);
-            if (closest.hp <= 0) eliminateSurvivPlayer(room, closest, room._io);
+            if (closest.hp <= 0) eliminateSurvivPlayer(room, closest, room._io, entity);
         }
         return;
     }
@@ -2890,11 +2955,18 @@ function dropDeathLoot(room, entity) {
     const drops = [];
     const money = Math.max(0, Number(entity.dollarBalance || 0));
     if (money > 0) drops.push({ type: 'money', dollarValue: money });
-    for (const weaponType of inventory.weapons) {
+    saveActiveWeaponAmmo(entity);
+    const weaponSlotAmmo = ensureWeaponSlotAmmo(entity);
+    inventory.weapons.forEach((weaponType, index) => {
         if (weaponType !== 'fists' && WEAPONS[weaponType]) {
-            drops.push({ type: 'weapon', weaponType, tier: WEAPONS[weaponType].rarity || 'common' });
+            drops.push({
+                type: 'weapon',
+                weaponType,
+                ammo: weaponSlotAmmo[index] ?? WEAPONS[weaponType].clipSize,
+                tier: WEAPONS[weaponType].rarity || 'common',
+            });
         }
-    }
+    });
     if (inventory.medkits > 0) drops.push({ type: 'medkit', amount: inventory.medkits });
     if (inventory.ammoPacks > 0) drops.push({ type: 'ammo', amount: inventory.ammoPacks });
     if (entity.armor > 0) drops.push({ type: 'armor', armorValue: Math.round(entity.armor) });
@@ -2911,13 +2983,27 @@ function dropDeathLoot(room, entity) {
     entity.dollarBalance = 0;
     entity.armor = 0;
     inventory.weapons = [];
+    entity.weaponSlotAmmo = [];
+    entity.weaponsAmmo = {};
     inventory.medkits = 0;
     inventory.ammoPacks = 0;
 }
 
-function eliminateSurvivPlayer(room, player, io) {
+function eliminateSurvivPlayer(room, player, io, attacker = null) {
     if (player._eliminated) return;
     player._eliminated = true;
+    if (!Array.isArray(room.deathMarkers)) room.deathMarkers = [];
+    room.deathMarkers.push({
+        id: `grave:${player.id}:${Date.now()}:${randId()}`,
+        x: player.x,
+        y: player.y,
+        victimId: player.id,
+        victimName: player.username || (player.isBot ? 'Bot' : 'Player'),
+        killerId: attacker?.id || null,
+        killerName: attacker?.username || null,
+        weaponType: attacker?.weapon?.type || 'fists',
+        createdAt: Date.now(),
+    });
     dropDeathLoot(room, player);
     const socketId = player.id;
     if (!room.spectators) room.spectators = [];
@@ -3059,16 +3145,14 @@ function putLootContainerItem(entity, room) {
     const inv = ensureInventory(entity);
 
     if (itemKey === 'weapon') {
-        const weaponType = request.weaponType || (entity.weapon?.type !== 'fists' ? entity.weapon?.type : null);
-        if (!contents.weaponType && weaponType && weaponType !== 'fists' && inv.weapons.includes(weaponType)) {
-            // Remove from player inventory
-            inv.weapons = inv.weapons.filter(w => w !== weaponType);
-            // Switch active weapon if player was holding it
-            equipFallbackAfterWeaponRemoval(entity, weaponType);
-            if (entity.weaponsAmmo) delete entity.weaponsAmmo[weaponType];
-            // Put into chest contents
-            contents.weaponType = weaponType;
-            contents.rarity = WEAPONS[weaponType]?.rarity || 'common';
+        const requestedSlot = Number.isInteger(request.slotIdx) ? request.slotIdx : -1;
+        const fallbackType = request.weaponType || (entity.weapon?.type !== 'fists' ? entity.weapon?.type : null);
+        const slotIndex = requestedSlot >= 0 ? requestedSlot : inv.weapons.indexOf(fallbackType);
+        const removed = !contents.weaponType ? removeWeaponSlot(entity, slotIndex) : null;
+        if (removed?.weaponType) {
+            contents.weaponType = removed.weaponType;
+            contents.ammo = removed.ammo;
+            contents.rarity = WEAPONS[removed.weaponType]?.rarity || 'common';
         }
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
@@ -3099,22 +3183,16 @@ function dropPlayerItem(entity, room) {
     const dropY = entity.y + offset();
 
     if (itemKey === 'weapon') {
-        const idx = Number.isInteger(slotIdx) ? slotIdx : inv.weapons.indexOf(entity.weapon?.type);
-        if (idx >= 0 && idx < inv.weapons.length) {
-            const weaponType = inv.weapons[idx];
-            if (weaponType && weaponType !== 'fists') {
-                const droppedAmmo = Number(entity.weaponsAmmo?.[weaponType] ?? (entity.weapon?.type === weaponType ? entity.weapon.ammo : 0)) || 0;
-                inv.weapons.splice(idx, 1);
-                equipFallbackAfterWeaponRemoval(entity, weaponType);
-                if (entity.weaponsAmmo) delete entity.weaponsAmmo[weaponType];
-                addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
-                    weaponType,
-                    ammo: droppedAmmo,
-                    tier: WEAPONS[weaponType]?.rarity || 'common',
-                    source: 'player-drop',
-                    pickupAfter: Date.now() + 900,
-                }));
-            }
+        const idx = Number.isInteger(slotIdx) ? slotIdx : entity.activeWeaponSlot;
+        const removed = removeWeaponSlot(entity, idx);
+        if (removed?.weaponType) {
+            addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
+                weaponType: removed.weaponType,
+                ammo: removed.ammo,
+                tier: WEAPONS[removed.weaponType]?.rarity || 'common',
+                source: 'player-drop',
+                pickupAfter: Date.now() + 900,
+            }));
         }
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
@@ -3253,7 +3331,7 @@ function updateBullets(room, now, effectiveRadius) {
                 applyDamage(ent, b.damage, attacker);
                 room.bullets.splice(i, 1);
                 if (ent.hp <= 0) {
-                    eliminateSurvivPlayer(room, ent, room._io);
+                    eliminateSurvivPlayer(room, ent, room._io, attacker);
                     entitiesById.delete(ent.id);
                 }
                 hit = true;
@@ -3367,6 +3445,9 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         botTargetId: null,
         isCashingOut: false,
         inventory: makeInventory(),
+        activeWeaponSlot: 0,
+        weaponSlotAmmo: [],
+        weaponsAmmo: {},
         useMedkit: false,
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
@@ -3413,7 +3494,6 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         const wanted = bot.openedContainer.items.find(item => (
             item.kind === 'weapon'
             && inventory.weapons.length < SURVIV_MAX_WEAPONS
-            && !inventory.weapons.includes(item.weaponType)
         ))
             || bot.openedContainer.items.find(item => item.kind === 'money')
             || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
@@ -3583,7 +3663,9 @@ function serializePlayer(p, isYou) {
         isYou,
         isCashingOut: !!p.isCashingOut,
 
-        weaponsAmmo: p.weaponsAmmo || {},
+        activeWeaponSlot: Number.isInteger(p.activeWeaponSlot) ? p.activeWeaponSlot : 0,
+        weaponSlotAmmo: ensureWeaponSlotAmmo(p),
+        weaponsAmmo: syncLegacyWeaponAmmo(p),
         inventory: ensureInventory(p),
         lastLoot: isYou ? (p.lastLoot || null) : null,
         openedContainer: isYou ? (p.openedContainer || null) : null,
@@ -3703,6 +3785,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
 
     const allPlayers = getActiveSurvivEntities(room);
     const aliveCount = Number.isFinite(lbData.aliveCount) ? lbData.aliveCount : allPlayers.length;
+    room.deathMarkers = (room.deathMarkers || []).filter(marker => now - marker.createdAt < 30000).slice(-40);
 
     const emitToViewer = (socketId, viewX, viewY, youId, dollarBalance, spectating) => {
         if (sendLb) {
@@ -3731,6 +3814,9 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         const visibleBullets = room.bullets
             .filter(b => isInView(viewX, viewY, b.x, b.y, range))
             .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType }));
+        const visibleDeathMarkers = room.deathMarkers
+            .filter(marker => isInView(viewX, viewY, marker.x, marker.y, range))
+            .map(marker => ({ ...marker }));
 
         const staticPayload = {};
         if (sendStaticPayload) {
@@ -3767,6 +3853,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             players: visiblePlayers,
             loot: visibleLoot,
             bullets: visibleBullets,
+            deathMarkers: visibleDeathMarkers,
             ...staticPayload,
             zone,
             aliveCount,

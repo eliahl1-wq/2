@@ -483,6 +483,33 @@ test('ground weapons fill empty slot first without swapping', () => {
     assert.ok(!room.loot.some(item => item.weaponType === 'pistol'), 'pistol should NOT be on the ground');
 });
 
+test('players can carry two identical guns with independent magazines', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('human-duplicates', 'mongo-duplicates', 'Double Pistols', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.weapons = ['pistol'];
+    player.activeWeaponSlot = 0;
+    player.weaponSlotAmmo = [7];
+    player.weapon = { type: 'pistol', ammo: 7, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    room.players.push(player);
+    room.loot.push({ id: 'loot-second-pistol', type: 'weapon', x: 0, y: 0, weaponType: 'pistol', ammo: 3, pickupAfter: 0 });
+
+    player.pickupWeaponPending = true;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.deepEqual(player.inventory.weapons, ['pistol', 'pistol']);
+    assert.equal(player.activeWeaponSlot, 1);
+    assert.equal(player.weapon.ammo, 3);
+
+    assert.equal(equipSurvivWeaponSlot(player, 0), true);
+    assert.equal(player.weapon.ammo, 7);
+    player.weapon.ammo = 5;
+    assert.equal(equipSurvivWeaponSlot(player, 1), true);
+    assert.equal(player.weapon.ammo, 3);
+    assert.deepEqual(player.weaponSlotAmmo, [5, 3]);
+});
 test('empty weapon slots select melee and G drops the held gun', () => {
     const room = makeRoom();
     room.obstacles = [];
@@ -680,6 +707,9 @@ test('fast bullets hit and eliminate bots along their full travel path', () => {
 
     assert.equal(room.bots.some(candidate => candidate.id === bot.id), false);
     assert.equal(player.kills, 1);
+    const grave = room.deathMarkers?.find(marker => marker.victimId === bot.id);
+    assert.ok(grave, 'eliminations should create a synchronized grave marker');
+    assert.equal(grave.killerId, player.id);
 });
 
 test('melee attacks destroy weak Surviv obstacles', () => {
@@ -737,7 +767,20 @@ test('generated cover and small props have server-authoritative durability', () 
         assert.ok(obstacle.hp > 0);
         assert.equal(obstacle.hp, obstacle.maxHp);
     }
-    assert.ok(map.obstacles.filter(obstacle => obstacle.kind === 'wall').every(obstacle => !obstacle.destructible));
+    const breakableBarriers = map.obstacles.filter(obstacle => obstacle.role === 'breakableBarrier');
+    assert.ok(breakableBarriers.length >= 80, 'expected segmented outdoor walls and fences');
+    assert.ok(breakableBarriers.every(obstacle => (
+        obstacle.kind === 'wall'
+        && obstacle.destructible
+        && obstacle.hp === obstacle.maxHp
+        && Math.max(obstacle.w, obstacle.h) <= 120.01
+    )));
+    const structuralWalls = map.obstacles.filter(obstacle => (
+        (obstacle.kind === 'wall' || obstacle.kind === 'interiorWall')
+        && obstacle.role !== 'breakableBarrier'
+    ));
+    assert.ok(structuralWalls.length > 0);
+    assert.ok(structuralWalls.every(obstacle => !obstacle.destructible), 'house walls must stay indestructible');
 });
 
 test('surviv bots automatically collect useful ground loot', () => {

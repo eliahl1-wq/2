@@ -7178,7 +7178,8 @@ io.on('connection', (socket) => {
             const chestId = typeof putChestItem.chestId === 'string' ? putChestItem.chestId : null;
             const itemKey = typeof putChestItem.itemKey === 'string' ? putChestItem.itemKey : null;
             const weaponType = typeof putChestItem.weaponType === 'string' ? putChestItem.weaponType : null;
-            if (chestId && itemKey) p.putChestItem = { chestId, itemKey, weaponType };
+            const slotIdx = Number.isInteger(putChestItem.slotIdx) ? putChestItem.slotIdx : null;
+            if (chestId && itemKey) p.putChestItem = { chestId, itemKey, weaponType, slotIdx };
         }
         if (dropItem && typeof dropItem === 'object') {
             const itemKey = typeof dropItem.itemKey === 'string' ? dropItem.itemKey : null;
