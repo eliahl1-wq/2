@@ -1006,7 +1006,16 @@ function keepBotSteering(snake, head, room) {
     }
 }
 
-export function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = null, now = Date.now()) {
+export function runSlitherBotAI(
+    snake,
+    allSnakes,
+    food,
+    foodGrid = null,
+    room = null,
+    now = Date.now(),
+    deathDrops = null,
+    deathDropIds = null,
+) {
     const head = snake.segments[0];
     const brain = ensureSlitherBotBrain(snake);
     if (now < brain.nextDecisionAt) {
@@ -1019,6 +1028,8 @@ export function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = 
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
     const minDistFood = scaleAgarBotDistance(AGAR_BOT_FOOD_RANGE);
     const fleeDistance = scaleAgarBotDistance(AGAR_BOT_FLEE_DISTANCE);
+    const availableDeathDrops = deathDrops ?? food.filter(f => f.deathDrop);
+    const availableDeathDropIds = deathDropIds ?? new Set(availableDeathDrops.map(f => f.id));
 
     let threat = null;
     let targetPrey = null;
@@ -1039,11 +1050,32 @@ export function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = 
         }
     }
 
+    // Death food is scanned across the full map and always beats ambient food
+    // and prey. The short cache avoids a full food scan on every server tick.
+    let deathDrop = snake._deathDropTarget;
+    const deathDropStillExists = deathDrop?.id != null && availableDeathDropIds.has(deathDrop.id);
+    if (!deathDropStillExists || now - (snake._lastDeathDropScan || 0) >= 220) {
+        deathDrop = findNearestFoodForBot(
+            head,
+            availableDeathDrops,
+            null,
+            (room?.sandboxWorldHalf ?? SLITHER.worldHalf) * 2,
+            null,
+            (f, d2) => preferredFoodScore(snake, brain, f, d2),
+        );
+        snake._deathDropTarget = deathDrop;
+        snake._lastDeathDropScan = now;
+    }
+
     if (threat) {
         const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
         snake.targetX = head.x + Math.cos(angle) * fleeDistance;
         snake.targetY = head.y + Math.sin(angle) * fleeDistance;
         snake.boost = nearestThreatDist < fleeDistance * 0.3;
+    } else if (deathDrop) {
+        aimBotAtFood(snake, head, deathDrop, brain, now);
+        snake.lastTargetUpdate = now;
+        snake.boost = dist(head.x, head.y, deathDrop.x, deathDrop.y) > 70;
     } else {
         const targetReached = brain.foodTarget
             && dist(head.x, head.y, brain.foodTarget.x, brain.foodTarget.y) < 34;
@@ -1053,14 +1085,13 @@ export function runSlitherBotAI(snake, allSnakes, food, foodGrid = null, room = 
                 food,
                 foodGrid,
                 minDistFood,
-                null,
+                f => !f.deathDrop,
                 (f, d2) => preferredFoodScore(snake, brain, f, d2),
             );
             brain.nextFoodScanAt = now + brain.foodScanMs;
         }
 
-        // Food is the default goal. Hunting is now an occasional personality
-        // trait instead of the shared second step in every bot's decision tree.
+        // Ambient food is still preferred over hunting, but never over death food.
         if (brain.foodTarget && (!targetPrey || Math.random() >= brain.preyChance)) {
             aimBotAtFood(snake, head, brain.foodTarget, brain, now);
             snake.boost = false;
@@ -1789,6 +1820,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     const sandboxSkipFoodCollisions = sandboxSkipDeathCollisions && !room.sandboxBotAi;
     room._sharedFoodGrid = room.slitherFood.length > 80 ? buildSlitherFoodGrid(room.slitherFood, room._sharedFoodGrid) : null;
     const foodGrid = room._sharedFoodGrid;
+    const deathDrops = room.slitherFood.filter(f => f.deathDrop);
+    const deathDropIds = new Set(deathDrops.map(f => f.id));
 
     // Update golden food blobs movement: float gently and flee from nearby snakes
     const nowTicks = room._slitherBroadcastTick || 0;
@@ -1876,7 +1909,16 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                     }
                 }
             }
-            runSlitherBotAI(snake, allSnakes, room.slitherFood, foodGrid, room);
+            runSlitherBotAI(
+                snake,
+                allSnakes,
+                room.slitherFood,
+                foodGrid,
+                room,
+                Date.now(),
+                deathDrops,
+                deathDropIds,
+            );
         }
 
         // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
@@ -1924,15 +1966,34 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     for (const { snake, isHuman, killer, respawnBot, returnToPool = true, botCashedOut } of toRemove) {
         const lostDollars = eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
         if (botCashedOut) {
-            room.aiBudgetBalance += lostDollars;
-            console.log(`🤖 Slither Bot ${snake.username} successfully cashed out $${lostDollars.toFixed(2)} to AI budget.`);
-        }
-        if (!isBR && respawnBot) {
+            const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
+            const botStart = getEconomy(entryFee).botStartBalance;
+            const remaining = Math.max(0, lostDollars - botStart);
+
+            // Resten delas 50/50 till owner och food pool
+            room.ownerBalance = (room.ownerBalance || 0) + remaining * 0.5;
+            room.foodPoolBalance += remaining * 0.5;
+
+            // 1 bot går till AI budget (som spawnas efter 3 sekunder) endast om det finns riktiga spelare
+            const humansInArena = room.players.filter(p => p.mode === 'slither').length;
+            if (humansInArena > 0) {
+                room.aiBudgetBalance += botStart;
+                room.pendingSlitherBotSpawns = (room.pendingSlitherBotSpawns || 0) + 1;
+                setTimeout(() => {
+                    room.pendingSlitherBotSpawns = Math.max(0, (room.pendingSlitherBotSpawns || 0) - 1);
+                }, 3000);
+            } else {
+                room.ownerBalance = (room.ownerBalance || 0) + botStart;
+            }
+
+            console.log(`🤖 Slither Bot ${snake.username} successfully cashed out $${lostDollars.toFixed(2)}. remaining: $${remaining.toFixed(2)} (50/50 split), botStart: $${botStart.toFixed(2)} (delayed spawn: ${humansInArena > 0})`);
+        } else if (!isBR && respawnBot) {
             const humansInArena = room.players.filter(p => p.mode === 'slither').length;
             const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
             const targetBots = getSlitherTargetBots(effectiveHumans);
-            if (room.slitherBots.length < targetBots) {
-                addSlitherBots(room, 1, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
+            const activeSlitherBots = room.slitherBots.length + (room.pendingSlitherBotSpawns || 0);
+            if (activeSlitherBots < targetBots) {
+                addSlitherBots(room, targetBots - activeSlitherBots, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
             }
         }
     }

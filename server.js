@@ -7418,8 +7418,9 @@ function processRoom(room) {
         const agarBotStake = botStakeForRoom(room);
         const slitherBotStake = botStakeForRoom(room);
 
-        if (room.bots.length < agarTargetBots) {
-            addBots(room, agarTargetBots - room.bots.length, agarBotStake);
+        const activeBotCount = room.bots.length + (room.pendingBotSpawns || 0);
+        if (activeBotCount < agarTargetBots) {
+            addBots(room, agarTargetBots - activeBotCount, agarBotStake);
         } else if (room.bots.length > agarTargetBots) {
             trimAgarBots(room, agarTargetBots);
         }
@@ -7429,8 +7430,9 @@ function processRoom(room) {
         else slitherTargetBots = room.savedSlitherTarget || 0;
         slitherTargetBots += room.slitherBots.filter(b => b.adminSpawned).length;
 
-        if (room.slitherBots.length < slitherTargetBots) {
-            addSlitherBots(room, slitherTargetBots - room.slitherBots.length, slitherBotStake);
+        const activeSlitherBotCount = room.slitherBots.length + (room.pendingSlitherBotSpawns || 0);
+        if (activeSlitherBotCount < slitherTargetBots) {
+            addSlitherBots(room, slitherTargetBots - activeSlitherBotCount, slitherBotStake);
         } else if (room.slitherBots.length > slitherTargetBots) {
             trimSlitherBots(room, slitherTargetBots);
         }
@@ -7511,12 +7513,28 @@ function processRoom(room) {
             if (!isFreePlay) {
                 if (player.isCashingOut) {
                     if (Date.now() >= player.cashOutEndTime) {
-                        room.aiBudgetBalance += botWealth;
-                        console.log(`🤖 Agar Bot ${player.username} successfully cashed out $${botWealth.toFixed(2)} to AI budget.`);
-                        room.bots = room.bots.filter(b => b.id !== player.id);
+                        const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
+                        const botStart = getEconomy(entryFee).botStartBalance;
+                        const remaining = Math.max(0, botWealth - botStart);
+
+                        // Resten delas 50/50 till owner och food pool
+                        room.ownerBalance = (room.ownerBalance || 0) + remaining * 0.5;
+                        room.foodPoolBalance += remaining * 0.5;
+
+                        // 1 bot går till AI budget (som spawnas efter 3 sekunder) endast om det finns riktiga spelare
                         const currentHumans = effectiveHumanCountForBots(room, 'agar');
-                        const autoBotsCount = room.bots.filter(b => !b.adminSpawned).length;
-                        if (autoBotsCount < getTargetBots(currentHumans)) addBots(room, 1);
+                        if (currentHumans > 0) {
+                            room.aiBudgetBalance += botStart;
+                            room.pendingBotSpawns = (room.pendingBotSpawns || 0) + 1;
+                            setTimeout(() => {
+                                room.pendingBotSpawns = Math.max(0, (room.pendingBotSpawns || 0) - 1);
+                            }, 3000);
+                        } else {
+                            room.ownerBalance = (room.ownerBalance || 0) + botStart;
+                        }
+
+                        console.log(`🤖 Agar Bot ${player.username} successfully cashed out $${botWealth.toFixed(2)}. remaining: $${remaining.toFixed(2)} (50/50 split), botStart: $${botStart.toFixed(2)} (delayed spawn: ${currentHumans > 0})`);
+                        room.bots = room.bots.filter(b => b.id !== player.id);
                         return;
                     }
                 } else {

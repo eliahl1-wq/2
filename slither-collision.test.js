@@ -378,3 +378,73 @@ test('Slither bots react quickly but not on every server tick', () => {
     assert.ok(snake._botBrain.nextDecisionAt >= 1303);
     assert.ok(snake._botBrain.nextDecisionAt <= 1382);
 });
+
+test('Slither bots immediately boost toward death food before ambient food', () => {
+    const snake = {
+        id: 'death-food-bot',
+        balance: 10,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 0,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            caution: 1,
+            aimOffset: 8,
+            weaveSpeed: 0.003,
+            phase: 0.5,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0.5,
+            nextDecisionAt: 0,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+        },
+    };
+    const ambientFood = { id: 'ambient', x: 0, y: 100, balance: 0.02, dollarValue: 0.02 };
+    const deathFood = {
+        id: 'death-food',
+        x: 1400,
+        y: 0,
+        balance: 0.02,
+        dollarValue: 0.02,
+        deathDrop: true,
+    };
+    const room = { sandboxWorldHalf: SLITHER.worldHalf };
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }],
+        [ambientFood, deathFood],
+        null,
+        room,
+        2000,
+        [deathFood],
+        new Set([deathFood.id]),
+    );
+
+    assert.ok(snake.targetX > 1300, 'death food should beat much closer ambient food');
+    assert.equal(snake.boost, true, 'the bot should hurry toward distant death food');
+
+    snake._botBrain.nextDecisionAt = 0;
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }],
+        [ambientFood],
+        null,
+        room,
+        2300,
+        [],
+        new Set(),
+    );
+
+    assert.ok(snake.targetY > 80, 'the bot should return to ambient food after death food is gone');
+    assert.equal(snake.boost, false);
+});
