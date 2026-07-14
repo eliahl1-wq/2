@@ -22,7 +22,7 @@ export const SURVIV = {
     botMinCount: 3,
     botMaxCount: 8,
     zoneDamagePerTick: 0,
-    bulletLifetimeMs: 800,
+    bulletLifetimeMs: 1800,
     lootPickupRadius: 34,
     chestOpenRadius: 92,
     medkitUseMs: 2500,
@@ -280,9 +280,13 @@ function isNearRoadOrRiver(x, y, radius = 30) {
     return false;
 }
 
-// Check if a position overlaps with any house floor, wall, or solid collidable obstacle.
-// Used to prevent trees/bushes/rocks spawning on top of buildings.
-const BLOCKED_KINDS = new Set(['houseFloor', 'wall', 'interiorWall', 'door', 'furniture', 'container', 'house']);
+// Prevent generated cover from piling onto structures, terrain, roads, or other solid props.
+// This is intentionally broader than player collision: it keeps map composition readable.
+const BLOCKED_KINDS = new Set([
+    'houseFloor', 'wall', 'interiorWall', 'door', 'furniture', 'container', 'house',
+    'road', 'water', 'river', 'bridge',
+    'tree', 'rock', 'crate', 'barrel', 'sandbag', 'tent',
+]);
 function isMapPositionBlocked(obstacles, x, y, radius = 30) {
     if (isNearRoadOrRiver(x, y, radius)) return true;
 
@@ -1145,10 +1149,20 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
         for (let i = 0; i < 5; i++) addObstacle(obstacles, 'field', x - 300 + i * 145, y + 210, 110, 240, { collidable: false, variant: 'crop' });
         addObstacle(obstacles, 'crate', x + 190, y - 80, 54, 54, { hue: 34, variant: 'hay' });
     } else if (roll < 0.9) {
-        // Pond with fishing shack
-        addObstacle(obstacles, 'water', x, y, 420 + Math.random() * 220, 250 + Math.random() * 140, { collidable: false, variant: 'pond', rotation: Math.random() * 0.25 });
-        addHouse(obstacles, loot, spawnPoints, x + 280, y - 180, 180, 150, { variant: 'cabin', hue: 22, tier: 'common' });
-        addCoverPatch(obstacles, loot, spawnPoints, x - 200, y + 100, { radius: 300, variant: 'wetlands' });
+        // Pond with a clear shoreline and a fishing shack outside the water footprint.
+        const pondW = 460 + Math.random() * 140;
+        const pondH = 280 + Math.random() * 90;
+        addObstacle(obstacles, 'water', x, y, pondW, pondH, {
+            collidable: false, variant: 'pond', rotation: Math.random() * 0.18,
+        });
+        addHouse(obstacles, loot, spawnPoints, x + pondW / 2 + 155, y - pondH * 0.22, 180, 150, {
+            variant: 'cabin', hue: 22, tier: 'common', doorSide: 'west',
+        });
+        addOpenFieldScatter(obstacles, x - 40, y + 35, {
+            radius: Math.max(pondW, pondH) * 0.72,
+            count: 8,
+            variant: 'wetlands',
+        });
     } else {
         // Ruins with shelter
         addObstacle(obstacles, 'field', x, y, 760, 560, { collidable: false, variant: 'ruins' });
@@ -1932,7 +1946,7 @@ export function generateSurvivMap(worldHalf) {
     const gasPos = { x: -1500, y: -7800, w: 1200, h: 800 };
     const farmPos = { x: 7800, y: -1200, w: 1400, h: 760 }; 
     const bunkerPos = { x: 2400, y: 7800, w: 1200, h: 820 };
-    const campPos = { x: -7800, y: -3800, w: 1600, h: 1200 };
+    const campPos = { x: -7800, y: -3800, w: 2600, h: 2200 };
     
     const neTownPos = { x: 5800, y: -6800, w: 2000, h: 680 }; // size 7 town
     const seLabPos = { x: 7800, y: 7200, w: 1400, h: 760 };
@@ -2014,11 +2028,18 @@ export function generateSurvivMap(worldHalf) {
     });
     landmarks.push({ name: 'South Bunker', x: bunkerPos.x, y: bunkerPos.y, type: 'bunker' });
 
-    // West Forest Camp
-    for (let i = 0; i < 5; i++) {
-        addMicroSite(obstacles, loot, spawnPoints, campPos.x - 550 + i * 280, campPos.y + (i % 2) * 300 - 150, 'wetlands');
+    // West Forest Camp: three distinct clearings around a central access lane.
+    // The old five-site row used 280-unit spacing for 600-800-unit sites, which
+    // caused ponds, roads, houses, and cover to stack on top of each other.
+    const forestCampSites = [
+        { x: campPos.x - 900, y: campPos.y - 650 },
+        { x: campPos.x + 900, y: campPos.y - 650 },
+        { x: campPos.x, y: campPos.y + 720 },
+    ];
+    for (const site of forestCampSites) {
+        addMicroSite(obstacles, loot, spawnPoints, site.x, site.y, 'wetlands');
     }
-    addForest(obstacles, loot, spawnPoints, campPos.x, campPos.y - 380, 38, 760);
+    addForest(obstacles, loot, spawnPoints, campPos.x, campPos.y, 24, 1050);
     landmarks.push({ name: 'West Forest Camp', x: campPos.x, y: campPos.y, type: 'camp' });
 
     // NE Town
@@ -2158,9 +2179,9 @@ export function generateSurvivMap(worldHalf) {
             
             if (Math.hypot(x, y) < 2000) continue;
             
-            if (isAreaOverlapping(x, y, 620, 620, 260, placedPositions)) continue;
+            if (isAreaOverlapping(x, y, 1000, 820, 320, placedPositions)) continue;
             
-            placedPositions.push({ x, y, w: 620, h: 620 });
+            placedPositions.push({ x, y, w: 1000, h: 820 });
             const roll = Math.random();
             if (roll < 0.5) {
                 addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
@@ -3087,7 +3108,7 @@ function takeLootContainerItem(entity, room) {
     const contents = item.contents || (item.contents = {});
     let picked = null;
     if (itemKey === 'weapon' && contents.weaponType) {
-        picked = { weaponType: contents.weaponType, rarity: contents.rarity };
+        picked = { weaponType: contents.weaponType, ammo: contents.ammo, rarity: contents.rarity };
     } else if (itemKey === 'money' && contents.money) {
         picked = { money: contents.money, rarity: contents.rarity };
     } else if (itemKey === 'medkits' && contents.medkits) {
@@ -3099,7 +3120,10 @@ function takeLootContainerItem(entity, room) {
     }
     if (!picked) return;
     const summary = applyLootContents(entity, picked, { countChest: false });
-    if (summary.weaponType) delete contents.weaponType;
+    if (summary.weaponType) {
+        delete contents.weaponType;
+        delete contents.ammo;
+    }
     if (summary.money > 0) contents.money = Math.max(0, Number(contents.money || 0) - summary.money);
     if (summary.medkits > 0) contents.medkits = Math.max(0, Number(contents.medkits || 0) - summary.medkits);
     if (summary.ammoPacks > 0) contents.ammoPacks = Math.max(0, Number(contents.ammoPacks || 0) - summary.ammoPacks);

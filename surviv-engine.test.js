@@ -104,6 +104,48 @@ test('surviv open areas keep scattered cover and small houses', () => {
     assert.ok(smallOpenHouses.length >= 45);
 });
 
+test('pond sites and the west forest camp keep readable spacing', () => {
+    let pondCount = 0;
+    for (let sample = 0; sample < 8 && pondCount < 3; sample++) {
+        const map = generateSurvivMap(SURVIV.worldHalf);
+        const ponds = map.obstacles.filter(obstacle => obstacle.kind === 'water' && obstacle.variant === 'pond');
+        const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+        const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+        const looseProps = map.obstacles.filter(obstacle => (
+            obstacle.kind === 'tree'
+            || obstacle.kind === 'rock'
+            || obstacle.kind === 'bush'
+            || obstacle.kind === 'crate'
+            || obstacle.kind === 'barrel'
+            || obstacle.kind === 'tent'
+            || obstacle.kind === 'sandbag'
+        ));
+
+        for (const pond of ponds) {
+            pondCount++;
+            assert.ok(roads.every(road => !rectsOverlap(
+                pond.x, pond.y, pond.w, pond.h,
+                road.x, road.y, road.w, road.h,
+            )), 'roads must not cut through ponds');
+            assert.ok(houses.every(house => !rectsOverlap(
+                pond.x, pond.y, pond.w, pond.h,
+                house.x, house.y, house.w, house.h,
+            )), 'houses must stay outside pond water');
+            assert.ok(looseProps.every(prop => !pointInRect(prop.x, prop.y, pond, 4)), 'loose props must stay out of ponds');
+        }
+
+        const campProps = map.obstacles.filter(obstacle => (
+            Math.abs(obstacle.x + 7800) < 1400
+            && Math.abs(obstacle.y + 3800) < 1200
+            && obstacle.kind !== 'field'
+        ));
+        const campHouses = campProps.filter(obstacle => obstacle.kind === 'houseFloor');
+        assert.ok(campProps.length < 120, `west forest camp is too crowded: ${campProps.length} props`);
+        assert.ok(campHouses.length <= 4, `west forest camp has too many stacked buildings: ${campHouses.length}`);
+    }
+    assert.ok(pondCount > 0, 'expected at least one sampled pond site');
+});
+
 test('surviv chests roll varied money across map loot', () => {
     const moneyAmounts = [];
     let chestCount = 0;
@@ -575,6 +617,34 @@ test('chest transfers preserve overflow and reject occupied weapon slots', () =>
     assert.equal(player.weapon.type, 'pistol');
 });
 
+test('chest weapon transfers retain the gun magazine and selected duplicate slot', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('human-chest-ammo', 'mongo-chest-ammo', 'Ammo Keeper', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.weapons = ['pistol', 'pistol'];
+    player.activeWeaponSlot = 1;
+    player.weaponSlotAmmo = [7, 2];
+    player.weapon = { type: 'pistol', ammo: 2, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    room.players.push(player);
+    const chest = { id: 'ammo-chest', type: 'chest', x: 0, y: 0, contents: {} };
+    room.loot.push(chest);
+
+    player.putChestItem = { chestId: chest.id, itemKey: 'weapon', weaponType: 'pistol', slotIdx: 1 };
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.deepEqual(player.inventory.weapons, ['pistol']);
+    assert.equal(chest.contents.weaponType, 'pistol');
+    assert.equal(chest.contents.ammo, 2);
+
+    player.takeChestItem = { chestId: chest.id, itemKey: 'weapon' };
+    processSurvivRoom(room, silentIo, Date.now() + 600001);
+    assert.deepEqual(player.inventory.weapons, ['pistol', 'pistol']);
+    assert.equal(player.weapon.ammo, 2);
+    assert.equal(player.weaponSlotAmmo[1], 2);
+    assert.equal(chest.contents.ammo, undefined);
+});
 test('players and automatic bots start with fists and no dollars', () => {
     const room = makeRoom();
     const player = createSurvivPlayer('human-1', 'mongo-1', 'Tester', '#fff', room);
@@ -712,6 +782,28 @@ test('fast bullets hit and eliminate bots along their full travel path', () => {
     assert.equal(grave.killerId, player.id);
 });
 
+test('firearms retain enough range to damage destructible trees', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.obstacles = [{
+        id: 'tree-shot', kind: 'tree', x: 68, y: 0, w: 46, h: 46,
+        collidable: true, destructible: true, hp: 84, maxHp: 84,
+    }];
+    const player = createSurvivPlayer('human-tree-shot', 'mongo-tree-shot', 'Lumberjack', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['pistol'];
+    player.shooting = true;
+    room.players.push(player);
+
+    assert.ok(SURVIV.bulletLifetimeMs >= 1600, 'ordinary bullets should have a practical combat range');
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.obstacles[0].hp, 73, 'a pistol round should damage a destructible tree');
+});
 test('melee attacks destroy weak Surviv obstacles', () => {
     const room = makeRoom();
     room.loot = [];
