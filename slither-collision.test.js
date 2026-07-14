@@ -60,6 +60,7 @@ test('Large snakes gain far more length than width and keep useful steering', ()
     const hugeSpacing = segmentSpacingForSegmentCount(1200);
 
     assert.ok(hugeRadiusScale < 3, 'maximum-length snake should stay below 3x spawn width');
+    assert.ok(hugeRadiusScale > 2.6, 'maximum-length snake should retain a little more body width');
     assert.ok(hugeRadiusScale > smallRadiusScale, 'width should still grow gradually');
     assert.ok(hugeSpacing < 6, 'large body points must stay dense enough for round turns');
     assert.ok(scangForSegmentCount(1200) >= 0.34, 'large snakes must retain useful turning speed');
@@ -447,4 +448,67 @@ test('Slither bots immediately boost toward death food before ambient food', () 
 
     assert.ok(snake.targetY > 80, 'the bot should return to ambient food after death food is gone');
     assert.equal(snake.boost, false);
+});
+
+test('Slither bots plan around a body wall instead of driving straight into it', () => {
+    const snake = {
+        id: 'planner-bot',
+        balance: 5,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 300,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: true,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            caution: 1,
+            aimOffset: 0,
+            weaveSpeed: 0.003,
+            phase: 0,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0.5,
+            nextDecisionAt: 0,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+            avoidDirection: 0,
+            avoidBodyUntil: 0,
+        },
+    };
+    const wall = {
+        id: 'wall-snake',
+        balance: 5,
+        segments: [
+            { x: 80, y: -160 },
+            { x: 80, y: -140 },
+            { x: 80, y: -120 },
+            { x: 80, y: -90 },
+            { x: 80, y: -60 },
+            { x: 80, y: -30 },
+            { x: 80, y: 0 },
+            { x: 80, y: 30 },
+            { x: 80, y: 60 },
+            { x: 80, y: 90 },
+        ],
+    };
+    const food = [{ id: 'behind-wall', x: 300, y: 0, balance: 0.02, dollarValue: 0.02 }];
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }, { entity: wall }],
+        food,
+        null,
+        { sandboxWorldHalf: SLITHER.worldHalf },
+        3000,
+    );
+
+    assert.ok(Math.abs(snake.targetY) > 100, 'the bot should commit to a clear side route');
+    assert.equal(snake.boost, false, 'the bot should stop boosting while escaping a body trap');
+    assert.notEqual(snake._botBrain.avoidDirection, 0);
 });

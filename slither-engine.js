@@ -17,7 +17,7 @@ export const SLITHER = {
     maxRadiusScale: 3.15,
     scaleDivisor: 106,
     radiusScaleDivisor: 90,
-    radiusGrowthLogFactor: 0.56,
+    radiusGrowthLogFactor: 0.59,
     spacingGrowthFactor: 0.32,
     baseRadius: 6.2,
     segmentSepFactor: 3.6,
@@ -1006,6 +1006,97 @@ function keepBotSteering(snake, head, room) {
     }
 }
 
+
+function botRouteClearance(snake, allSnakes, angle, lookAhead) {
+    const head = snake.segments[0];
+    const ownRadius = headRadiusForSnake(snake);
+    const samples = [0.28, 0.5, 0.72, 0.9, 1];
+    let minClearance = lookAhead;
+
+    for (const { entity: other } of allSnakes) {
+        if (other.id === snake.id || !other.segments?.length) continue;
+
+        const otherRadius = headRadiusForSnake(other);
+        const collisionPadding = (ownRadius + otherRadius) * SLITHER.bodyCollisionScale + 7;
+        const first = firstLethalBodySegment(other, otherRadius);
+        const stride = other.segments.length > 180 ? 3 : 2;
+
+        for (let i = first; i < other.segments.length; i += stride) {
+            const a = other.segments[i];
+            const b = other.segments[Math.min(other.segments.length - 1, i + stride)];
+            const midX = (a.x + b.x) * 0.5;
+            const midY = (a.y + b.y) * 0.5;
+            const halfChord = dist(a.x, a.y, b.x, b.y) * 0.5;
+            if (dist(head.x, head.y, midX, midY) > lookAhead + collisionPadding + halfChord) continue;
+
+            for (const fraction of samples) {
+                const px = head.x + Math.cos(angle) * lookAhead * fraction;
+                const py = head.y + Math.sin(angle) * lookAhead * fraction;
+                const clearance = distPointToSegment(px, py, a.x, a.y, b.x, b.y)
+                    - collisionPadding;
+                if (clearance < minClearance) minClearance = clearance;
+                if (minClearance < -collisionPadding * 0.5) return minClearance;
+            }
+        }
+    }
+
+    return minClearance;
+}
+
+function applyBotBodyAvoidance(snake, allSnakes, brain, now) {
+    const head = snake.segments[0];
+    const currentAngle = Number.isFinite(snake.angle)
+        ? snake.angle
+        : Math.atan2(snake.inputDy || 0, snake.inputDx || 1);
+    const desiredAngle = Math.atan2(snake.targetY - head.y, snake.targetX - head.x);
+    let desiredDelta = Math.atan2(
+        Math.sin(desiredAngle - currentAngle),
+        Math.cos(desiredAngle - currentAngle),
+    );
+
+    const turnPerTick = (SLITHER.turnRate * scangForSegmentCount(snake.segments.length))
+        / SLITHER.serverTickRate;
+    const planningTurn = Math.min(0.82, Math.max(0.34, turnPerTick * 4.5));
+    desiredDelta = Math.max(-planningTurn, Math.min(planningTurn, desiredDelta));
+
+    const lookAhead = Math.min(210, 112 + Math.sqrt(snake.segments.length) * 2.9);
+    const plannedAngle = currentAngle + desiredDelta;
+    const plannedClearance = botRouteClearance(snake, allSnakes, plannedAngle, lookAhead);
+    if (plannedClearance > 24) {
+        if ((brain.avoidBodyUntil || 0) <= now) brain.avoidDirection = 0;
+        return false;
+    }
+
+    const wideTurn = Math.min(1.18, planningTurn * 1.75);
+    const candidates = [
+        { angle: currentAngle - planningTurn, direction: -1 },
+        { angle: currentAngle + planningTurn, direction: 1 },
+        { angle: currentAngle - wideTurn, direction: -1 },
+        { angle: currentAngle + wideTurn, direction: 1 },
+    ];
+
+    let best = null;
+    for (const candidate of candidates) {
+        const clearance = botRouteClearance(snake, allSnakes, candidate.angle, lookAhead);
+        const continuityBonus = brain.avoidDirection === candidate.direction
+            && (brain.avoidBodyUntil || 0) > now
+            ? 10
+            : 0;
+        const score = clearance + continuityBonus;
+        if (!best || score > best.score) best = { ...candidate, clearance, score };
+    }
+
+    if (!best) return false;
+
+    brain.avoidDirection = best.direction;
+    brain.avoidBodyUntil = now + 420;
+    snake.targetX = head.x + Math.cos(best.angle) * lookAhead * 2.4;
+    snake.targetY = head.y + Math.sin(best.angle) * lookAhead * 2.4;
+    snake.inputDx = snake.targetX - head.x;
+    snake.inputDy = snake.targetY - head.y;
+    snake.boost = false;
+    return true;
+}
 export function runSlitherBotAI(
     snake,
     allSnakes,
@@ -1107,6 +1198,7 @@ export function runSlitherBotAI(
         snake.lastTargetUpdate = now;
     }
 
+    applyBotBodyAvoidance(snake, allSnakes, brain, now);
     keepBotSteering(snake, head, room);
 }
 
@@ -1141,9 +1233,14 @@ export function runCompetitiveSlitherBotAI(
     now = Date.now(),
 ) {
     const head = snake.segments[0];
-    if (applyCompetitiveZoneAvoidance(snake, effectiveRadius)) return;
-
     const brain = ensureSlitherBotBrain(snake);
+    if (applyCompetitiveZoneAvoidance(snake, effectiveRadius)) {
+        applyBotBodyAvoidance(snake, allSnakes, brain, now);
+        snake.inputDx = snake.targetX - head.x;
+        snake.inputDy = snake.targetY - head.y;
+        return;
+    }
+
     if (now < brain.nextDecisionAt) {
         snake.inputDx = snake.targetX - head.x;
         snake.inputDy = snake.targetY - head.y;
@@ -1237,6 +1334,7 @@ export function runCompetitiveSlitherBotAI(
         snake.lastTargetUpdate = now;
     }
 
+    applyBotBodyAvoidance(snake, allSnakes, brain, now);
     snake.inputDx = snake.targetX - head.x;
     snake.inputDy = snake.targetY - head.y;
 }

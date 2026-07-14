@@ -7593,70 +7593,97 @@ function processRoom(room) {
             }
 
             const head = botCells[0];
-            let threat = null;
-            let targetPrey = null;
-            let minDistThreat = 800; // Bottar ser faror på långt håll
-            let minDistPrey = 500;
 
-            // 1. SKANNA OMGIVNING (Hot och Byte)
-            allUsers.forEach(u => {
-                if (u.id === player.id) return;
-                u.cells.forEach(c2 => {
-                    const d = Math.hypot(c2.x - head.x, c2.y - head.y);
-                    const otherTotalMass = playerTotalMass(u);
+            if (!player.lastDecisionTime) player.lastDecisionTime = 0;
+            if (!player.decisionDelay) player.decisionDelay = 250 + Math.random() * 300; // Human-like reaction time (250-550ms)
 
-                    // HOT: Om någon är 10% större (enligt tidigare önskemål)
-                    if (otherTotalMass > totalBotMass * 1.10 && d < minDistThreat) {
-                        minDistThreat = d;
-                        threat = c2;
-                    }
-                    // BYTE: Om någon är liten nog att ätas
-                    else if (totalBotMass > otherTotalMass * 1.10 && d < minDistPrey) {
-                        minDistPrey = d;
-                        targetPrey = c2;
-                    }
-                });
-            });
+            // Uppdatera mål och beslut endast med jämna mellanrum (reaktionstid)
+            if (Date.now() - player.lastDecisionTime > player.decisionDelay) {
+                player.lastDecisionTime = Date.now();
+                player.decisionDelay = 250 + Math.random() * 300;
 
-            // VIRUS: Undvik om vi är stora nog att sprängas
-            if (totalBotMass > 5.0) {
-                room.viruses.forEach(v => {
-                    const d = Math.hypot(v.x - head.x, v.y - head.y);
-                    if (d < head.radius + 150 && d < minDistThreat) {
-                        minDistThreat = d;
-                        threat = v;
-                    }
-                });
-            }
+                let threat = null;
+                let targetPrey = null;
+                let minDistThreat = 900; // Se faror på lite längre håll
+                let minDistPrey = 600;
 
-            // 2. BESLUTSFATTANDE (Prioritering)
-            if (threat) {
-                // FLY! Rör oss i rakt motsatt riktning från faran
-                const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
-                player.targetX = head.x + Math.cos(angle) * 500;
-                player.targetY = head.y + Math.sin(angle) * 500;
-            } else if (targetPrey) {
-                // JAGA! Spring mot bytet
-                player.targetX = targetPrey.x;
-                player.targetY = targetPrey.y;
-            } else if (Date.now() - player.lastTargetUpdate > 1000) {
-                // MAT: Om inget annat händer, leta efter närmaste matbit
-                let nearestFood = null;
-                let minDistFood = 500;
-                room.food.forEach(f => {
-                    const d = Math.hypot(f.x - head.x, f.y - head.y);
-                    if (d < minDistFood) { minDistFood = d; nearestFood = f; }
+                // 1. SKANNA OMGIVNING (Hot och Byte)
+                allUsers.forEach(u => {
+                    if (u.id === player.id) return;
+                    u.cells.forEach(c2 => {
+                        const d = Math.hypot(c2.x - head.x, c2.y - head.y);
+                        const otherTotalMass = playerTotalMass(u);
+
+                        // HOT: Om någon är 10% större
+                        if (otherTotalMass > totalBotMass * 1.10 && d < minDistThreat) {
+                            minDistThreat = d;
+                            threat = c2;
+                        }
+                        // BYTE: Om någon är liten nog att ätas
+                        else if (totalBotMass > otherTotalMass * 1.10 && d < minDistPrey) {
+                            minDistPrey = d;
+                            targetPrey = c2;
+                        }
+                    });
                 });
 
-                if (nearestFood) {
-                    player.targetX = nearestFood.x;
-                    player.targetY = nearestFood.y;
-                } else if (Math.hypot(player.targetX - head.x, player.targetY - head.y) < 50) {
-                    // Vandra slumpmässigt om ingen mat hittas i närheten
-                    player.targetX = Math.random() * c.worldWidth;
-                    player.targetY = Math.random() * c.worldHeight;
+                // VIRUS: Undvik om vi är stora nog att sprängas
+                if (totalBotMass > 5.0) {
+                    room.viruses.forEach(v => {
+                        const d = Math.hypot(v.x - head.x, v.y - head.y);
+                        if (d < head.radius + 150 && d < minDistThreat) {
+                            minDistThreat = d;
+                            threat = v;
+                        }
+                    });
                 }
-                player.lastTargetUpdate = Date.now();
+
+                // 2. BESLUTSFATTANDE (Prioritering)
+                if (threat) {
+                    // FLY! Beräkna flyktvektor
+                    let fleeX = head.x - threat.x;
+                    let fleeY = head.y - threat.y;
+                    const dist = Math.hypot(fleeX, fleeY) || 1;
+                    fleeX /= dist;
+                    fleeY /= dist;
+
+                    // Wall avoidance (undvik att fastna i väggar)
+                    const wallMargin = 400 + head.radius; // Börja svänga innan väggen
+                    if (head.x < wallMargin) fleeX += (wallMargin - head.x) / wallMargin * 1.5;
+                    if (head.x > c.worldWidth - wallMargin) fleeX -= (head.x - (c.worldWidth - wallMargin)) / wallMargin * 1.5;
+                    if (head.y < wallMargin) fleeY += (wallMargin - head.y) / wallMargin * 1.5;
+                    if (head.y > c.worldHeight - wallMargin) fleeY -= (head.y - (c.worldHeight - wallMargin)) / wallMargin * 1.5;
+
+                    const fleeAngle = Math.atan2(fleeY, fleeX);
+                    // Lägg till lite "panik-brus" i rörelsen (+- 15 grader)
+                    const panicAngle = fleeAngle + (Math.random() - 0.5) * 0.5;
+                    player.targetX = head.x + Math.cos(panicAngle) * 600;
+                    player.targetY = head.y + Math.sin(panicAngle) * 600;
+
+                } else if (targetPrey) {
+                    // JAGA! Spring mot bytet med lite felmarginal för att simulera mänsklighet
+                    const preyAngle = Math.atan2(targetPrey.y - head.y, targetPrey.x - head.x) + (Math.random() - 0.5) * 0.2;
+                    player.targetX = head.x + Math.cos(preyAngle) * 500;
+                    player.targetY = head.y + Math.sin(preyAngle) * 500;
+
+                } else {
+                    // MAT: Hitta närmaste matbit
+                    let nearestFood = null;
+                    let minDistFood = 700;
+                    room.food.forEach(f => {
+                        const d = Math.hypot(f.x - head.x, f.y - head.y);
+                        if (d < minDistFood) { minDistFood = d; nearestFood = f; }
+                    });
+
+                    if (nearestFood) {
+                        player.targetX = nearestFood.x;
+                        player.targetY = nearestFood.y;
+                    } else if (Math.hypot((player.targetX || head.x) - head.x, (player.targetY || head.y) - head.y) < 100) {
+                        // Vandra slumpmässigt
+                        player.targetX = Math.max(200, Math.min(c.worldWidth - 200, head.x + (Math.random() - 0.5) * 1500));
+                        player.targetY = Math.max(200, Math.min(c.worldHeight - 200, head.y + (Math.random() - 0.5) * 1500));
+                    }
+                }
             }
 
             // Simulera input för fysikmotorn
