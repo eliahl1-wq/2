@@ -96,6 +96,7 @@ import {
     reserveRewardClaim,
     resetRewardPoolAccounting,
     resolveRewardSecurityAlert,
+    setOwnerAccountStatus,
 } from './reward-system.js';
 import { validateBRWalletsOnStartup, listBRHouseWallets } from './br-wallets.js';
 import {
@@ -270,6 +271,7 @@ const UserSchema = new mongoose.Schema({
     depositSecret: { type: String },
     playtime: { type: Number, default: 0 },
     excludedFromReports: { type: Boolean, default: false },
+    isOwnerAccount: { type: Boolean, default: false, index: true },
     sponsoredRewardsCompleted: { type: Boolean, default: false },
     hasFreeTicket: { type: Boolean, default: true },
     freeTicketUsed: { type: Boolean, default: false },
@@ -3114,7 +3116,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             status: 'confirmed',
             'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
         });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, rewardPoolState] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, ownerAccountAgg, rewardPoolState] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -3142,6 +3144,16 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                     }
                 }
             ]),
+            User.aggregate([
+                { $match: { isOwnerAccount: true } },
+                {
+                    $group: {
+                        _id: null,
+                        totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } },
+                        accountCount: { $sum: 1 },
+                    }
+                }
+            ]),
             RewardPoolState.findOne({ key: 'global' }).lean(),
         ]);
 
@@ -3155,6 +3167,8 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
 
         const totalUserBalanceSol = userBalanceAgg[0]?.totalBalanceSol ?? 0;
         const totalAccounts = userBalanceAgg[0]?.accountCount ?? 0;
+        const ownerAccountBalanceSol = ownerAccountAgg[0]?.totalBalanceSol ?? 0;
+        const ownerAccountCount = ownerAccountAgg[0]?.accountCount ?? 0;
 
         res.json({
             totalDepositsUsd: Number(totalDepositsUsd.toFixed(2)),
@@ -3171,6 +3185,9 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
+            ownerAccountCount,
+            ownerAccountBalanceSol: Number(ownerAccountBalanceSol.toFixed(6)),
+            ownerAccountBalanceUsd: Number((ownerAccountBalanceSol * SOL_PRICE_USD).toFixed(2)),
             totalSponsoredRewards: userBalanceAgg[0]?.totalSponsoredRewards ?? 0,
             totalRetainedWinnings: userBalanceAgg[0]?.totalRetainedWinnings ?? 0,
             activeSponsoredPlayers: userBalanceAgg[0]?.activeSponsoredPlayers ?? 0,
@@ -3357,7 +3374,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports isOwnerAccount playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
             { $match: depositMatch },
@@ -3382,6 +3399,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 playtime: u.playtime ?? 0,
                 createdAt: objectIdCreatedAt(u._id),
                 excludedFromReports: !!u.excludedFromReports,
+                isOwnerAccount: !!u.isOwnerAccount,
                 hasFreeTicket: !!u.hasFreeTicket,
                 freeTicketUsed: !!u.freeTicketUsed,
                 completedFiveDollarNormalGames: u.completedFiveDollarNormalGames ?? 0,
@@ -3558,6 +3576,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 createdAt: objectIdCreatedAt(user._id),
                 latestActivityAt,
                 excludedFromReports: !!user.excludedFromReports,
+                isOwnerAccount: !!user.isOwnerAccount,
                 rewardsDisabled: !!user.rewardsDisabled,
                 rewardsDisabledReason: user.rewardsDisabledReason || '',
             },
@@ -4148,6 +4167,29 @@ app.post('/api/admin/transactions/restore', authenticateAdmin, async (req, res) 
     }
 });
 
+app.post('/api/admin/users/owner-status', authenticateAdmin, async (req, res) => {
+    try {
+        const { ids, isOwnerAccount } = req.body;
+        if (!Array.isArray(ids) || ids.length === 0 || typeof isOwnerAccount !== 'boolean') {
+            return res.status(400).json({ message: 'ids array and isOwnerAccount boolean required' });
+        }
+        const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+        if (objectIds.length === 0) return res.status(400).json({ message: 'No valid user ids' });
+
+        const result = await setOwnerAccountStatus(objectIds, isOwnerAccount);
+        res.json({
+            success: true,
+            modified: result.modifiedCount,
+            alertsRemoved: result.alertsRemoved,
+            message: isOwnerAccount
+                ? `${objectIds.length} account(s) marked as yours and exempted from shared-wallet reward alerts.`
+                : `${objectIds.length} account(s) removed from your accounts and checked against shared-wallet rules.`,
+        });
+    } catch (err) {
+        console.error('Admin owner account update error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
 app.post('/api/admin/users/exclude', authenticateAdmin, async (req, res) => {
     try {
         const { ids } = req.body;
@@ -5510,15 +5552,15 @@ function resolveAgarOwnCells(player, now, massStart) {
                 continue;
             }
 
-            // Ready cells still need a firm press before rejoining, so splits do not
-            // feel magnetized back together as soon as their cooldown expires.
+            // Ready cells should pull together slightly to create the squishy 'snap' effect
+            // when merging, rather than pushing apart.
             const mergeDistance = combinedRadius - Math.min(first.radius, second.radius) * 0.42;
             if (distance > mergeDistance) {
-                const push = overlap * 0.03;
-                first.x -= ux * push * firstShare;
-                first.y -= uy * push * firstShare;
-                second.x += ux * push * secondShare;
-                second.y += uy * push * secondShare;
+                const pull = 1.5; // Attraction force
+                first.x += ux * pull * secondShare;
+                first.y += uy * pull * secondShare;
+                second.x -= ux * pull * firstShare;
+                second.y -= uy * pull * firstShare;
                 continue;
             }
 
@@ -7681,7 +7723,8 @@ function processRoom(room) {
                 if (cellsToDelete.has(cell.id)) break;
 
                 if (item.type === 'food') {
-                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                    const foodRadius = item.data.radius || 5;
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r + foodRadius * 0.5) {
                         // Quadtree entries are a tick snapshot; another cell may
                         // already have consumed this exact blob.
                         if (!room.food.some(f => f.id === item.data.id)) continue;
@@ -7695,7 +7738,8 @@ function processRoom(room) {
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
-                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r) {
+                    const ejectRadius = item.data.radius || 10;
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r + ejectRadius * 0.5) {
                         if (!room.ejected.some(e => e.id === item.data.id)) continue;
                         cell.balance += item.data.balance;
                         const s = playerDollarStart(player);
@@ -7713,7 +7757,8 @@ function processRoom(room) {
                     }
                 } else if (item.type === 'virus') {
                     // Virusexplosion baserat på massa
-                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r && cell.balance > massStart * 2) {
+                    const virusRadius = item.data.radius || 35;
+                    if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r + virusRadius * 0.3 && cell.balance > massStart * 2) {
                         if (player.cells.length < c.maxCells) {
                             cell.balance /= 2;
                             cell.radius = calculateCellRadius(

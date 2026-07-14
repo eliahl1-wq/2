@@ -320,7 +320,10 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
     if (userIds.length < 2) return null;
 
     const User = mongoose.model('User');
-    const users = await User.find({ _id: { $in: userIds } });
+    // Admin-owned accounts are trusted and do not count as separate players
+    // when detecting a shared external deposit wallet.
+    const users = await User.find({ _id: { $in: userIds }, isOwnerAccount: { $ne: true } });
+    if (users.length < 2) return null;
     let alert = await RewardSecurityAlert.findOne({ sourceWallet });
 
     // Migrate alerts created before approvals were scoped per account.
@@ -384,6 +387,75 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
         );
     }
     return alert;
+}
+async function restoreSharedWalletSnapshot(User, alert, snapshot) {
+    const reason = `shared_wallet:${alert.sourceWallet}`;
+    const current = await User.findById(snapshot.userId).lean();
+    if (!current || current.rewardsDisabledReason !== reason) return;
+    await User.updateOne(
+        { _id: snapshot.userId, rewardsDisabledReason: reason },
+        { $set: {
+            rewardsDisabled: false,
+            rewardsDisabledReason: '',
+            hasFreeTicket: snapshot.hasFreeTicket,
+            freeTicketUsed: snapshot.freeTicketUsed,
+            completedFiveDollarNormalGames: snapshot.completedFiveDollarNormalGames,
+            completedTenDollarNormalGames: snapshot.completedTenDollarNormalGames,
+            sponsoredRewardsUnlocked: snapshot.sponsoredRewardsUnlocked,
+            sponsoredRewardsCompleted: snapshot.sponsoredRewardsCompleted,
+            sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, current.sponsoredRewardsBalance || 0),
+        } },
+    );
+}
+
+export async function setOwnerAccountStatus(userIds, isOwnerAccount) {
+    const User = mongoose.model('User');
+    const ids = [...new Set((userIds || []).map(id => id.toString()))]
+        .filter(id => mongoose.Types.ObjectId.isValid(id));
+    if (ids.length === 0) return { modifiedCount: 0, alertsRemoved: 0 };
+
+    const update = await User.updateMany(
+        { _id: { $in: ids } },
+        { $set: { isOwnerAccount: !!isOwnerAccount } },
+    );
+
+    let alertsRemoved = 0;
+    if (isOwnerAccount) {
+        const ownerIdSet = new Set(ids);
+        const alerts = await RewardSecurityAlert.find({ userIds: { $in: ids } });
+        for (const alert of alerts) {
+            const remainingIds = alert.userIds.filter(id => !ownerIdSet.has(id.toString()));
+            const removedSnapshots = alert.snapshots.filter(snapshot => ownerIdSet.has(snapshot.userId.toString()));
+            for (const snapshot of removedSnapshots) {
+                await restoreSharedWalletSnapshot(User, alert, snapshot);
+            }
+
+            if (remainingIds.length < 2) {
+                // Once trusted accounts are removed there is no shared-player
+                // condition left, so restore any remaining blocked player too.
+                for (const snapshot of alert.snapshots) {
+                    await restoreSharedWalletSnapshot(User, alert, snapshot);
+                }
+                await RewardSecurityAlert.deleteOne({ _id: alert._id });
+                alertsRemoved += 1;
+                continue;
+            }
+
+            alert.userIds = remainingIds;
+            alert.approvedUserIds = alert.approvedUserIds.filter(id => !ownerIdSet.has(id.toString()));
+            alert.snapshots = alert.snapshots.filter(snapshot => !ownerIdSet.has(snapshot.userId.toString()));
+            await alert.save();
+        }
+    } else {
+        // Re-check historical funding wallets when an account loses its trusted
+        // owner status, instead of waiting for its next deposit.
+        const sourceWallets = await DepositSource.distinct('sourceWallet', { userId: { $in: ids } });
+        for (const sourceWallet of sourceWallets) {
+            await evaluateSharedDepositWallet(sourceWallet);
+        }
+    }
+
+    return { modifiedCount: update.modifiedCount, alertsRemoved };
 }
 export async function resolveRewardSecurityAlert(alertId, action, adminUserId, note = '') {
     const alert = await RewardSecurityAlert.findById(alertId);
