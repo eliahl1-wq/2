@@ -461,6 +461,28 @@ test('ground weapons require F and replace the held slot', () => {
     assert.ok(room.loot.some(item => item.weaponType === 'pistol'), 'the replaced gun should remain on the ground');
 });
 
+test('ground weapons fill empty slot first without swapping', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('human-weapons-fill', 'mongo-weapons-fill', 'One Slot', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.weapons = ['pistol'];
+    player.weapon = { type: 'pistol', ammo: 7, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.weaponsAmmo = { pistol: 7 };
+    room.players.push(player);
+    room.loot.push({ id: 'loot-shotgun', type: 'weapon', x: 0, y: 0, weaponType: 'shotgun', pickupAfter: 0 });
+
+    player.pickupWeaponPending = true;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    
+    assert.deepEqual(player.inventory.weapons, ['pistol', 'shotgun']);
+    assert.equal(player.weapon.type, 'shotgun');
+    assert.equal(player.weaponsAmmo.pistol, 7);
+    assert.ok(!room.loot.some(item => item.weaponType === 'pistol'), 'pistol should NOT be on the ground');
+});
+
 test('empty weapon slots select melee and G drops the held gun', () => {
     const room = makeRoom();
     room.obstacles = [];
@@ -658,6 +680,64 @@ test('fast bullets hit and eliminate bots along their full travel path', () => {
 
     assert.equal(room.bots.some(candidate => candidate.id === bot.id), false);
     assert.equal(player.kills, 1);
+});
+
+test('melee attacks destroy weak Surviv obstacles', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.obstacles = [{
+        id: 'breakable-bush', kind: 'bush', x: 48, y: 0, w: 30, h: 30,
+        collidable: true, destructible: true, hp: 18, maxHp: 18,
+    }];
+    const player = createSurvivPlayer('human-melee-prop', 'mongo-melee-prop', 'Chopper', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.shooting = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.obstacles.some(obstacle => obstacle.id === 'breakable-bush'), false);
+    assert.ok(room._survivObstacleRevision > 0);
+});
+
+test('bullets damage and eventually destroy durable Surviv obstacles', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.obstacles = [{
+        id: 'breakable-rock', kind: 'rock', x: 68, y: 0, w: 34, h: 34,
+        collidable: true, destructible: true, hp: 60, maxHp: 60,
+    }];
+    const player = createSurvivPlayer('human-prop-shot', 'mongo-prop-shot', 'Miner', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'sniper', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['sniper'];
+    player.shooting = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(room.obstacles[0].hp, 12, 'the first shot should chip the rock');
+
+    player.weapon.lastShotAt = 0;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(room.obstacles.some(obstacle => obstacle.id === 'breakable-rock'), false);
+});
+
+test('generated cover and small props have server-authoritative durability', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    for (const kind of ['tree', 'rock', 'bush', 'crate', 'barrel']) {
+        const obstacle = map.obstacles.find(candidate => candidate.kind === kind && candidate.collidable !== false);
+        assert.ok(obstacle, `expected a generated ${kind}`);
+        assert.equal(obstacle.destructible, true);
+        assert.ok(obstacle.hp > 0);
+        assert.equal(obstacle.hp, obstacle.maxHp);
+    }
+    assert.ok(map.obstacles.filter(obstacle => obstacle.kind === 'wall').every(obstacle => !obstacle.destructible));
 });
 
 test('surviv bots automatically collect useful ground loot', () => {

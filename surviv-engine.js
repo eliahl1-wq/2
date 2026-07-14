@@ -157,6 +157,17 @@ const SURVIV_OBSTACLE_CELL = 700;
 const SURVIV_LOOT_CELL = 600;
 const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 250;
 const SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD = 160;
+const SURVIV_DESTRUCTIBLE_OBSTACLE_HP = Object.freeze({
+    bush: 18,
+    furniture: 28,
+    crate: 36,
+    barrel: 42,
+    tent: 54,
+    door: 60,
+    tree: 84,
+    sandbag: 96,
+    rock: 132,
+});
 
 function randId() {
     return Math.random().toString(36).slice(2, 10);
@@ -376,6 +387,8 @@ function makeGroundLoot(type, x, y, extra = {}) {
 
 function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
     const options = typeof opts === 'string' ? { variant: opts } : (opts || {});
+    const defaultHp = options.collidable === false ? null : SURVIV_DESTRUCTIBLE_OBSTACLE_HP[kind];
+    const maxHp = Number.isFinite(options.maxHp) ? Math.max(1, options.maxHp) : defaultHp;
     const obstacle = {
         id: randId(),
         kind,
@@ -397,6 +410,11 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         orientation: options.orientation || null,
         points: Array.isArray(options.points) ? options.points : null,
         width: Number.isFinite(options.width) ? options.width : null,
+        ...(Number.isFinite(maxHp) ? {
+            destructible: options.destructible !== false,
+            hp: Number.isFinite(options.hp) ? clamp(options.hp, 0, maxHp) : maxHp,
+            maxHp,
+        } : {}),
     };
     obstacles.push(obstacle);
     return obstacle;
@@ -2365,7 +2383,15 @@ function pickupGroundWeapon(entity, room) {
     const nextDef = WEAPONS[nextType];
     if (!entity.weaponsAmmo) entity.weaponsAmmo = {};
 
-    if (currentIndex >= 0) {
+    // Save current ammo before swapping/picking up
+    if (entity.weapon && entity.weapon.type !== 'fists') {
+        entity.weaponsAmmo[entity.weapon.type] = entity.weapon.ammo;
+    }
+
+    if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
+        inv.weapons.push(nextType);
+        removeSurvivLootAt(room, candidate.index);
+    } else if (currentIndex >= 0) {
         const oldType = currentType;
         const oldAmmo = Number(entity.weapon?.ammo) || 0;
         inv.weapons[currentIndex] = nextType;
@@ -2373,9 +2399,6 @@ function pickupGroundWeapon(entity, room) {
         item.weaponType = oldType;
         item.ammo = oldAmmo;
         item.tier = WEAPONS[oldType]?.rarity || 'common';
-    } else if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
-        inv.weapons.push(nextType);
-        removeSurvivLootAt(room, candidate.index);
     } else {
         return false;
     }
@@ -2591,6 +2614,33 @@ function queryObstacles(room, x, y, range, collidableOnly = false) {
     return out;
 }
 
+function getDestructibleObstacleHp(obstacle) {
+    if (!obstacle || obstacle.collidable === false || obstacle.destructible === false) return null;
+    const defaultHp = SURVIV_DESTRUCTIBLE_OBSTACLE_HP[obstacle.kind];
+    const maxHp = Number.isFinite(obstacle.maxHp) ? Math.max(1, obstacle.maxHp) : defaultHp;
+    if (!Number.isFinite(maxHp)) return null;
+    if (!Number.isFinite(obstacle.maxHp)) obstacle.maxHp = maxHp;
+    if (!Number.isFinite(obstacle.hp)) obstacle.hp = maxHp;
+    obstacle.destructible = true;
+    return { hp: obstacle.hp, maxHp };
+}
+
+function markSurvivObstaclesChanged(room) {
+    room._survivObstacleRevision = (room._survivObstacleRevision || 0) + 1;
+}
+
+function damageSurvivObstacle(room, obstacle, damage) {
+    const durability = getDestructibleObstacleHp(obstacle);
+    if (!durability || !(damage > 0)) return false;
+    obstacle.hp = Math.max(0, durability.hp - damage);
+    markSurvivObstaclesChanged(room);
+    if (obstacle.hp > 0) return false;
+
+    const index = room.obstacles.indexOf(obstacle);
+    if (index >= 0) room.obstacles.splice(index, 1);
+    return index >= 0;
+}
+
 function markSurvivLootChanged(room) {
     room._survivLootRevision = (room._survivLootRevision || 0) + 1;
 }
@@ -2750,7 +2800,24 @@ function tryShoot(entity, room, now) {
                 closestDistance = targetDistance;
             }
         }
-        if (closest) {
+        let closestObstacle = null;
+        for (const obstacle of queryObstacles(room, entity.x, entity.y, wDef.meleeReach + 120, true)) {
+            if (!getDestructibleObstacleHp(obstacle)) continue;
+            const halfExtent = Math.max(obstacle.w || 0, obstacle.h || 0) / 2;
+            const obstacleDistance = Math.max(0, dist(entity.x, entity.y, obstacle.x, obstacle.y) - halfExtent);
+            if (obstacleDistance > wDef.meleeReach) continue;
+            const obstacleAngle = Math.atan2(obstacle.y - entity.y, obstacle.x - entity.x);
+            const angleDelta = Math.abs(Math.atan2(Math.sin(obstacleAngle - baseAngle), Math.cos(obstacleAngle - baseAngle)));
+            if (angleDelta > wDef.meleeArc) continue;
+            if (obstacleDistance < closestDistance) {
+                closest = null;
+                closestObstacle = obstacle;
+                closestDistance = obstacleDistance;
+            }
+        }
+        if (closestObstacle) {
+            damageSurvivObstacle(room, closestObstacle, wDef.damage);
+        } else if (closest) {
             applyDamage(closest, wDef.damage, entity);
             if (closest.hp <= 0) eliminateSurvivPlayer(room, closest, room._io);
         }
@@ -3170,13 +3237,11 @@ function updateBullets(room, now, effectiveRadius) {
         const distMoved = Math.hypot(b.vx, b.vy);
         const queryRange = Math.max(90, distMoved / 2 + 10);
 
-        for (const o of getNearbyObstacles(room, midX, midY, queryRange)) {
-            if (lineSegmentRectIntersects(previousX, previousY, b.x, b.y, o)) {
-                hit = true;
-                break;
-            }
-        }
-        if (hit) {
+        const hitObstacle = getNearbyObstacles(room, midX, midY, queryRange)
+            .filter(o => lineSegmentRectIntersects(previousX, previousY, b.x, b.y, o))
+            .sort((a, c) => dist(previousX, previousY, a.x, a.y) - dist(previousX, previousY, c.x, c.y))[0];
+        if (hitObstacle) {
+            damageSurvivObstacle(room, hitObstacle, b.damage);
             room.bullets.splice(i, 1);
             continue;
         }
@@ -3556,6 +3621,7 @@ function serializeSurvivObstacle(o) {
         ...(o.orientation ? { orientation: o.orientation } : {}),
         ...(Array.isArray(o.points) ? { points: o.points } : {}),
         ...(Number.isFinite(o.width) ? { width: o.width } : {}),
+        ...(o.destructible ? { destructible: true, hp: o.hp, maxHp: o.maxHp } : {}),
     };
 }
 
@@ -3569,7 +3635,8 @@ function shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now) {
         || Math.abs(viewX - state.staticX) > SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD
         || Math.abs(viewY - state.staticY) > SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD;
     const obstaclesChanged = state.obstaclesSource !== room.obstacles
-        || state.obstaclesCount !== (room.obstacles?.length || 0);
+        || state.obstaclesCount !== (room.obstacles?.length || 0)
+        || state.obstaclesRevision !== (room._survivObstacleRevision || 0);
     const intervalElapsed = state.lastStaticAt == null
         || now < state.lastStaticAt
         || now - state.lastStaticAt >= SURVIV_STATIC_PAYLOAD_INTERVAL_MS;
@@ -3582,6 +3649,7 @@ function shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now) {
         state.staticY = viewY;
         state.obstaclesSource = room.obstacles;
         state.obstaclesCount = room.obstacles?.length || 0;
+        state.obstaclesRevision = room._survivObstacleRevision || 0;
     }
     cache.set(socketId, state);
     return shouldSend;
