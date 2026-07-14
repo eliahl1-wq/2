@@ -5946,7 +5946,7 @@ io.on('connection', (socket) => {
             if (joiningUsers.has(userKey)) return;
             joiningUsers.add(userKey);
 
-            // ── Competitive Slither ($2 / $5 separate pools) ──
+            // ── Competitive Slither ($1 / $2 / $5 separate pools) ──
             if (mode === 'competitive-slither') {
                 const entryFeeUsd = normalizeCompetitiveEntryFee(rawEntryFee);
                 const room = getCompetitiveSlitherRoom(entryFeeUsd);

@@ -1,5 +1,5 @@
 /** Normal-mode entry tiers (USD). Battle Royale uses its own economy. */
-export const ALLOWED_ENTRY_FEES = [5, 10, 20];
+export const ALLOWED_ENTRY_FEES = [2, 5, 10, 20];
 export const DEFAULT_ENTRY_FEE = 10;
 
 /** Share of entry fee converted to one Golden Blob (deducted from food pool allocation). */
@@ -150,7 +150,7 @@ export function botStakeForMode(players, mode) {
 }
 
 /** Slither Arena entry tiers (USD) — separate pools from normal mode. */
-export const COMPETITIVE_SLITHER_ENTRY_FEES = [2, 5];
+export const COMPETITIVE_SLITHER_ENTRY_FEES = [1, 2, 5];
 export const DEFAULT_COMPETITIVE_ENTRY_FEE = 5;
 
 /** Surviv entry tier (USD) — separate pool. */
@@ -159,6 +159,7 @@ export const DEFAULT_SURVIV_ENTRY_FEE = 5;
 
 /** Platform cut on Slither Arena cashouts by entry tier ($5 keeps legacy 3.5%). */
 const COMPETITIVE_CASHOUT_FEE_PCT = {
+    1: 0.05,
     2: 0.05,
     5: 0.035,
 };

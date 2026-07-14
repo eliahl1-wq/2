@@ -2,12 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     ALLOWED_ENTRY_FEES,
+    COMPETITIVE_SLITHER_ENTRY_FEES,
+    getCompetitiveEconomy,
     getEconomy,
     getJoinPoolSplit,
     getRewardPoolSplit,
 } from './economy.js';
 
 const populations = [1, 2, 3, 7, 8, 30];
+
+test('Competitive Slither exposes separate $1, $2, and $5 economies', () => {
+    assert.deepEqual(COMPETITIVE_SLITHER_ENTRY_FEES, [1, 2, 5]);
+    for (const entryFeeUsd of COMPETITIVE_SLITHER_ENTRY_FEES) {
+        const eco = getCompetitiveEconomy(entryFeeUsd);
+        assert.equal(eco.entryFeeUsd, entryFeeUsd);
+        assert.equal(eco.dollarStart, entryFeeUsd);
+        assert.equal(eco.cashoutPlayerPct + eco.cashoutFeePct, 1);
+    }
+    const oneDollar = getCompetitiveEconomy(1);
+    assert.equal(oneDollar.cashoutFeePct, 0.05);
+    assert.equal(oneDollar.dollarStart * oneDollar.cashoutPlayerPct, 0.95);
+});
 
 for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
     for (const population of populations) {
