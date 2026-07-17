@@ -266,6 +266,7 @@ const UserSchema = new mongoose.Schema({
     googleId: { type: String, unique: true, sparse: true },
     password: { type: String, required: true },
     balance: { type: Number, default: 0 }, // Tracked in raw SOL
+    visualBalanceOverrideUsd: { type: Number, default: null }, // UI-only admin override; never used for payments or gameplay
     walletAddress: { type: String },
     depositAddress: { type: String },
     depositSecret: { type: String },
@@ -1861,8 +1862,14 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.onChainBalance = solOnChain;
 
         // Map the internal raw SOL balance to what the frontend expects
-        userObj.balanceSol = user.balance;
-        userObj.balanceUsd = user.balance * SOL_PRICE_USD;
+        const realBalanceSol = user.balance;
+        const realBalanceUsd = realBalanceSol * SOL_PRICE_USD;
+        const hasVisualOverride = Number.isFinite(user.visualBalanceOverrideUsd);
+        userObj.realBalanceSol = realBalanceSol;
+        userObj.realBalanceUsd = realBalanceUsd;
+        userObj.visualBalanceOverrideUsd = hasVisualOverride ? user.visualBalanceOverrideUsd : null;
+        userObj.balanceUsd = hasVisualOverride ? user.visualBalanceOverrideUsd : realBalanceUsd;
+        userObj.balanceSol = hasVisualOverride ? userObj.balanceUsd / SOL_PRICE_USD : realBalanceSol;
         userObj.solPrice = SOL_PRICE_USD;
         userObj.freePlay = DEV_FREE_PLAY;
         userObj.isAdmin = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
@@ -3391,7 +3398,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance excludedFromReports isOwnerAccount playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
             { $match: depositMatch },
@@ -3410,6 +3417,8 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 depositAddress: u.depositAddress || '—',
                 balanceSol: Number(balanceSol.toFixed(6)),
                 balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
+                visualBalanceOverrideUsd: Number.isFinite(u.visualBalanceOverrideUsd) ? Number(u.visualBalanceOverrideUsd.toFixed(2)) : null,
+                displayBalanceUsd: Number((Number.isFinite(u.visualBalanceOverrideUsd) ? u.visualBalanceOverrideUsd : balanceSol * SOL_PRICE_USD).toFixed(2)),
                 totalDepositedSol: Number((dep?.totalDepositedSol ?? 0).toFixed(6)),
                 totalDepositedUsd: Number(((dep?.totalDepositedSol ?? 0) * SOL_PRICE_USD).toFixed(2)),
                 depositCount: dep?.depositCount ?? 0,
@@ -3440,6 +3449,40 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
     } catch (err) {
         console.error('Admin users error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/admin/users/:userId/visual-balance', authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const reset = req.body?.reset === true || req.body?.balanceUsd === null;
+        if (reset) {
+            user.visualBalanceOverrideUsd = null;
+        } else {
+            const balanceUsd = Number(req.body?.balanceUsd);
+            if (!Number.isFinite(balanceUsd) || balanceUsd < 0 || balanceUsd > 1000000000) {
+                return res.status(400).json({ message: 'Visual balance must be between $0 and $1,000,000,000' });
+            }
+            user.visualBalanceOverrideUsd = Math.round(balanceUsd * 100) / 100;
+        }
+        await user.save();
+
+        const realBalanceUsd = (user.balance || 0) * SOL_PRICE_USD;
+        const visualBalanceOverrideUsd = Number.isFinite(user.visualBalanceOverrideUsd) ? user.visualBalanceOverrideUsd : null;
+        res.json({
+            success: true,
+            userId: user._id,
+            realBalanceUsd: Number(realBalanceUsd.toFixed(2)),
+            visualBalanceOverrideUsd,
+            displayBalanceUsd: visualBalanceOverrideUsd ?? Number(realBalanceUsd.toFixed(2)),
+        });
+    } catch (err) {
+        console.error('Admin visual balance error:', err);
+        res.status(500).json({ message: err.message || 'Could not update visual balance' });
     }
 });
 
@@ -3589,6 +3632,8 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 depositAddress: user.depositAddress || '—',
                 balanceSol: Number(balanceSol.toFixed(6)),
                 balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
+                visualBalanceOverrideUsd: Number.isFinite(user.visualBalanceOverrideUsd) ? Number(user.visualBalanceOverrideUsd.toFixed(2)) : null,
+                displayBalanceUsd: Number((Number.isFinite(user.visualBalanceOverrideUsd) ? user.visualBalanceOverrideUsd : balanceSol * SOL_PRICE_USD).toFixed(2)),
                 playtime: user.playtime ?? 0,
                 createdAt: objectIdCreatedAt(user._id),
                 latestActivityAt,
