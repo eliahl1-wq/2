@@ -593,6 +593,22 @@ export function applySandboxAction(mode, action, params = {}) {
             return { id: entity.id, balance: size };
         }
 
+        case 'clearEntities':
+            room.bots = [];
+            room.slitherBots = [];
+            room.sandboxStaticWorms = [];
+            room.food = [];
+            room.slitherFood = [];
+            room.ejected = [];
+            room.foodPoolBalance = SANDBOX_POOL;
+            room.aiBudgetBalance = SANDBOX_POOL;
+            room.sandboxZone = defaultZone(room.sandboxWorldHalf);
+            for (const player of room.players) {
+                player.sandboxZoneHealth = 100;
+                player.sandboxOutsideZone = false;
+            }
+            return { clearedEntities: true };
+
         case 'clear':
             room.players = [];
             room.bots = [];
