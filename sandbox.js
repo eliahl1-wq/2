@@ -156,6 +156,8 @@ function sandboxEntityPosition(entity, mode) {
 function applySandboxZoneDamage(room, io, dtSeconds) {
     const zone = getSandboxZone(room);
     if (!zone) return;
+    room.sandboxVitalsTick = (room.sandboxVitalsTick || 0) + 1;
+    const shouldBroadcastVitals = room.sandboxVitalsTick % 5 === 0;
     const eliminated = new Set();
     const groups = room.mode === 'slither'
         ? [room.players, room.slitherBots]
@@ -178,7 +180,7 @@ function applySandboxZoneDamage(room, io, dtSeconds) {
             ));
             entity.sandboxOutsideZone = outside;
 
-            if (!entity.isBot && !String(entity.id || '').startsWith('bot_')) {
+            if (shouldBroadcastVitals && !entity.isBot && !String(entity.id || '').startsWith('bot_')) {
                 io.to(entity.id).emit('sandboxVitals', {
                     zoneHealth: entity.sandboxZoneHealth,
                     outsideZone: outside,
