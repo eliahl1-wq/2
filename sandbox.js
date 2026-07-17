@@ -24,11 +24,17 @@ const MAX_SANDBOX_BOTS = 12;
 const MAX_SANDBOX_BOTS_PER_SPAWN = 8;
 const MAX_SANDBOX_STATIC_WORMS = 10;
 const SANDBOX_PAUSED_BROADCAST_INTERVAL = 4;
+const SANDBOX_TICK_RATE = 40;
+const SANDBOX_NETWORK_TICK_DIVISOR = 2;
+const SANDBOX_RECONNECT_GRACE_MS = 45_000;
+const SANDBOX_ZONE_DAMAGE_PER_SECOND = 34;
+const SANDBOX_ZONE_HEAL_PER_SECOND = 18;
 
-function defaultZone(worldHalf) {
+function defaultZone(worldHalf, mode = 'slither') {
+    const center = mode === 'agar' ? worldHalf : 0;
     return {
-        cx: 0,
-        cy: 0,
+        cx: center,
+        cy: center,
         radius: worldHalf,
         shrinking: false,
         shrinkStartAt: null,
@@ -66,7 +72,9 @@ function createSandboxRoom(mode) {
         sandboxAutoBots: false,
         sandboxAutoFood: false,
         sandboxWorldHalf: worldHalf,
-        sandboxZone: defaultZone(worldHalf),
+        sandboxNetworkTick: 0,
+        sandboxLastTickAt: Date.now(),
+        sandboxZone: defaultZone(worldHalf, mode),
         qt: null,
     };
 }
@@ -125,7 +133,75 @@ function getSandboxZone(room) {
     const endR = zone.endRadius ?? Math.max(200, startR * 0.15);
     const radius = startR + (endR - startR) * t;
     zone.radius = radius;
+    if (t >= 1) {
+        zone.shrinking = false;
+        zone.shrinkStartAt = null;
+    }
     return { cx: zone.cx, cy: zone.cy, radius, shrinking: t < 1 };
+}
+
+function sandboxEntityPosition(entity, mode) {
+    if (mode === 'slither') {
+        const head = entity?.segments?.[0];
+        return head ? { x: head.x, y: head.y, radius: head.radius || 10 } : null;
+    }
+    const cell = entity?.cells?.[0];
+    if (cell) return { x: cell.x, y: cell.y, radius: cell.radius || 10 };
+    if (Number.isFinite(entity?.x) && Number.isFinite(entity?.y)) {
+        return { x: entity.x, y: entity.y, radius: 10 };
+    }
+    return null;
+}
+
+function applySandboxZoneDamage(room, io, dtSeconds) {
+    const zone = getSandboxZone(room);
+    if (!zone) return;
+    room.sandboxVitalsTick = (room.sandboxVitalsTick || 0) + 1;
+    const shouldBroadcastVitals = room.sandboxVitalsTick % 5 === 0;
+    const eliminated = new Set();
+    const groups = room.mode === 'slither'
+        ? [room.players, room.slitherBots]
+        : [room.players, room.bots];
+
+    for (const group of groups) {
+        for (const entity of group) {
+            if (entity.disconnected) continue;
+            const pos = sandboxEntityPosition(entity, room.mode);
+            if (!pos) continue;
+            const distance = Math.hypot(pos.x - zone.cx, pos.y - zone.cy);
+            const outside = distance + Math.max(0, pos.radius * 0.25) > zone.radius;
+            const currentHealth = Number.isFinite(entity.sandboxZoneHealth)
+                ? entity.sandboxZoneHealth
+                : 100;
+            entity.sandboxZoneHealth = Math.max(0, Math.min(100,
+                currentHealth + (outside
+                    ? -SANDBOX_ZONE_DAMAGE_PER_SECOND * dtSeconds
+                    : SANDBOX_ZONE_HEAL_PER_SECOND * dtSeconds)
+            ));
+            entity.sandboxOutsideZone = outside;
+
+            if (shouldBroadcastVitals && !entity.isBot && !String(entity.id || '').startsWith('bot_')) {
+                io.to(entity.id).emit('sandboxVitals', {
+                    zoneHealth: entity.sandboxZoneHealth,
+                    outsideZone: outside,
+                });
+            }
+            if (entity.sandboxZoneHealth <= 0) eliminated.add(entity);
+        }
+    }
+
+    if (eliminated.size === 0) return;
+    for (const entity of eliminated) {
+        if (!entity.isBot && !String(entity.id || '').startsWith('bot_')) {
+            io.to(entity.id).emit('sandboxEliminated', {
+                reason: 'zone',
+                message: 'Eliminated by the zone',
+            });
+        }
+    }
+    room.players = room.players.filter(entity => !eliminated.has(entity));
+    room.bots = room.bots.filter(entity => !eliminated.has(entity));
+    room.slitherBots = room.slitherBots.filter(entity => !eliminated.has(entity));
 }
 
 export function getSandboxStatus() {
@@ -144,7 +220,7 @@ export function getSandboxStatus() {
             invincible: room.sandboxInvincible,
             worldHalf: room.sandboxWorldHalf,
             zone: getSandboxZone(room),
-            players: room.players.length,
+            players: room.players.filter(p => !p.disconnected).length,
             bots: key === 'slither' ? room.slitherBots.length : room.bots.length,
             staticWorms: room.sandboxStaticWorms?.length ?? 0,
             staticWormIds: (room.sandboxStaticWorms || []).map(w => {
@@ -520,6 +596,22 @@ export function applySandboxAction(mode, action, params = {}) {
             return { id: entity.id, balance: size };
         }
 
+        case 'clearEntities':
+            room.bots = [];
+            room.slitherBots = [];
+            room.sandboxStaticWorms = [];
+            room.food = [];
+            room.slitherFood = [];
+            room.ejected = [];
+            room.foodPoolBalance = SANDBOX_POOL;
+            room.aiBudgetBalance = SANDBOX_POOL;
+            room.sandboxZone = defaultZone(room.sandboxWorldHalf, room.mode);
+            for (const player of room.players) {
+                player.sandboxZoneHealth = 100;
+                player.sandboxOutsideZone = false;
+            }
+            return { clearedEntities: true };
+
         case 'clear':
             room.players = [];
             room.bots = [];
@@ -531,7 +623,7 @@ export function applySandboxAction(mode, action, params = {}) {
             room.foodPoolBalance = SANDBOX_POOL;
             room.aiBudgetBalance = SANDBOX_POOL;
             room.sandboxPaused = false;
-            room.sandboxZone = defaultZone(room.sandboxWorldHalf);
+            room.sandboxZone = defaultZone(room.sandboxWorldHalf, room.mode);
             return { cleared: true };
 
         case 'removeEntity': {
@@ -599,11 +691,47 @@ export function setupSandbox(io, deps) {
                 const gameMode = mode === 'slither' ? 'slither' : 'agar';
                 const room = getSandboxRoom(gameMode);
 
-                // Remove existing player with same mongo id
-                room.players = room.players.filter(p => p.mongoId?.toString() !== user._id.toString());
+                const existingPlayer = room.players.find(
+                    p => p.mongoId?.toString() === user._id.toString()
+                );
 
                 socket.sandboxMode = gameMode;
                 socket.roomId = room.id;
+
+                if (existingPlayer) {
+                    existingPlayer.id = socket.id;
+                    existingPlayer.disconnected = false;
+                    existingPlayer.sandboxReconnectUntil = null;
+                    existingPlayer.sandboxZoneHealth = Math.max(1, existingPlayer.sandboxZoneHealth ?? 100);
+                    const zone = getSandboxZone(room);
+                    const reconnectMeta = gameMode === 'slither'
+                        ? {
+                            width: room.sandboxWorldHalf * 2,
+                            height: room.sandboxWorldHalf * 2,
+                            mode: 'slither',
+                            sandbox: true,
+                            reconnected: true,
+                            entryFeeUsd: entryFee,
+                            zone,
+                            competitiveSlither: true,
+                            circularMap: true,
+                        }
+                        : {
+                            width: c.worldWidth,
+                            height: c.worldHeight,
+                            mode: 'agar',
+                            sandbox: true,
+                            reconnected: true,
+                            entryFeeUsd: entryFee,
+                            zone,
+                        };
+                    socket.emit('welcome', existingPlayer, reconnectMeta);
+                    socket.emit('sandboxState', {
+                        ...getSandboxStatus()[gameMode],
+                        reconnected: true,
+                    });
+                    return;
+                }
 
                 const eco = getEconomy(entryFee);
                 let player;
@@ -784,26 +912,46 @@ export function setupSandbox(io, deps) {
         socket.on('disconnect', () => {
             if (!socket.sandboxMode) return;
             const room = getSandboxRoom(socket.sandboxMode);
-            room.players = room.players.filter(p => p.id !== socket.id);
-            if (room.players.length === 0) {
-                room.slitherBots = [];
-                room.bots = [];
-                room.slitherFood = [];
-                room.food = [];
-                room.sandboxStaticWorms = [];
-                room.ejected = [];
-                room.sandboxPaused = false;
-            }
+            const player = room.players.find(p => p.id === socket.id);
+            if (!player) return;
+
+            player.disconnected = true;
+            player.sandboxReconnectUntil = Date.now() + SANDBOX_RECONNECT_GRACE_MS;
+            const mongoId = player.mongoId?.toString();
+
+            setTimeout(() => {
+                const currentRoom = getSandboxRoom(socket.sandboxMode);
+                const stale = currentRoom.players.find(
+                    p => p.mongoId?.toString() === mongoId
+                );
+                if (!stale?.disconnected || Date.now() < (stale.sandboxReconnectUntil || 0)) return;
+                currentRoom.players = currentRoom.players.filter(p => p !== stale);
+
+                if (!currentRoom.players.some(p => !p.disconnected)) {
+                    currentRoom.slitherBots = [];
+                    currentRoom.bots = [];
+                    currentRoom.slitherFood = [];
+                    currentRoom.food = [];
+                    currentRoom.sandboxStaticWorms = [];
+                    currentRoom.ejected = [];
+                    currentRoom.sandboxPaused = false;
+                }
+            }, SANDBOX_RECONNECT_GRACE_MS + 250);
         });
     });
 
-    // Sandbox tick — runs alongside main loop
+    // Sandbox physics stays responsive while network snapshots are throttled.
     let sandboxTickCounter = 0;
     setInterval(() => {
         sandboxTickCounter += 1;
+        const now = Date.now();
         for (const key of ['agar', 'slither']) {
             const room = sandboxRooms[key];
-            if (!room || room.players.length === 0) continue;
+            if (!room || !room.players.some(p => !p.disconnected)) continue;
+
+            const dtSeconds = Math.min(0.1, Math.max(0.001, (now - (room.sandboxLastTickAt || now)) / 1000));
+            room.sandboxLastTickAt = now;
+            applySandboxZoneDamage(room, io, dtSeconds);
 
             if (key === 'slither') {
                 let lb = buildStaticLeaderboard(room);
@@ -812,7 +960,9 @@ export function setupSandbox(io, deps) {
                 } else if (sandboxTickCounter % SANDBOX_PAUSED_BROADCAST_INTERVAL !== 0) {
                     continue;
                 }
-                broadcastSlitherState(room, io, lb, buildSlitherMeta(room));
+                if (sandboxTickCounter % SANDBOX_NETWORK_TICK_DIVISOR === 0 || room.sandboxPaused) {
+                    broadcastSlitherState(room, io, lb, buildSlitherMeta(room));
+                }
             } else {
                 getSandboxZone(room);
                 if (!room.sandboxPaused) {
@@ -822,7 +972,7 @@ export function setupSandbox(io, deps) {
                 }
             }
         }
-    }, 1000 / 40);
+    }, 1000 / SANDBOX_TICK_RATE);
 }
 
 function broadcastSandboxAgar(room, io, deps) {

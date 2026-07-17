@@ -7967,6 +7967,11 @@ function processRoom(room) {
         balance: Number(entry.balance).toFixed(2)
     }));
 
+    if (isSandbox) {
+        room.sandboxNetworkTick = (room.sandboxNetworkTick || 0) + 1;
+        if (room.sandboxNetworkTick % 2 !== 0) return;
+    }
+
     room.players.forEach(p => {
         if (p.mode === 'slither' || p.disconnected) return;
 
