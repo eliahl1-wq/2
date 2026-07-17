@@ -30,10 +30,11 @@ const SANDBOX_RECONNECT_GRACE_MS = 45_000;
 const SANDBOX_ZONE_DAMAGE_PER_SECOND = 34;
 const SANDBOX_ZONE_HEAL_PER_SECOND = 18;
 
-function defaultZone(worldHalf) {
+function defaultZone(worldHalf, mode = 'slither') {
+    const center = mode === 'agar' ? worldHalf : 0;
     return {
-        cx: 0,
-        cy: 0,
+        cx: center,
+        cy: center,
         radius: worldHalf,
         shrinking: false,
         shrinkStartAt: null,
@@ -73,7 +74,7 @@ function createSandboxRoom(mode) {
         sandboxWorldHalf: worldHalf,
         sandboxNetworkTick: 0,
         sandboxLastTickAt: Date.now(),
-        sandboxZone: defaultZone(worldHalf),
+        sandboxZone: defaultZone(worldHalf, mode),
         qt: null,
     };
 }
@@ -602,7 +603,7 @@ export function applySandboxAction(mode, action, params = {}) {
             room.ejected = [];
             room.foodPoolBalance = SANDBOX_POOL;
             room.aiBudgetBalance = SANDBOX_POOL;
-            room.sandboxZone = defaultZone(room.sandboxWorldHalf);
+            room.sandboxZone = defaultZone(room.sandboxWorldHalf, room.mode);
             for (const player of room.players) {
                 player.sandboxZoneHealth = 100;
                 player.sandboxOutsideZone = false;
@@ -620,7 +621,7 @@ export function applySandboxAction(mode, action, params = {}) {
             room.foodPoolBalance = SANDBOX_POOL;
             room.aiBudgetBalance = SANDBOX_POOL;
             room.sandboxPaused = false;
-            room.sandboxZone = defaultZone(room.sandboxWorldHalf);
+            room.sandboxZone = defaultZone(room.sandboxWorldHalf, room.mode);
             return { cleared: true };
 
         case 'removeEntity': {
