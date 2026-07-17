@@ -59,6 +59,7 @@ import {
     SURVIV,
     beginSurvivReload,
     createSurvivPlayer,
+    eliminateSurvivPlayer,
     generateSurvivMap,
     getSurvivZone,
     processSurvivRoom,
@@ -5746,6 +5747,9 @@ async function refundTournamentJoin(pending, reason) {
 io.on('connection', (socket) => {
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
+    const survivInputRate = { windowStartedAt: 0, count: 0 };
+    const survivSpectateRate = { windowStartedAt: 0, count: 0 };
+    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'armor']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
         let userKey = null;
@@ -6181,6 +6185,7 @@ io.on('connection', (socket) => {
 
                 const existingPlayer = existing?.player ?? null;
                 if (existingPlayer) {
+                    const activeRoom = existing.room;
                     const oldSocketId = existingPlayer.id;
                     const oldSocket = io.sockets.sockets.get(oldSocketId);
                     if (oldSocket?.connected && oldSocket.id !== socket.id) {
@@ -6190,9 +6195,12 @@ io.on('connection', (socket) => {
                         clearTimeout(existingPlayer.removeTimeout);
                         delete existingPlayer.removeTimeout;
                     }
+                    removeSurvivSpectator(activeRoom, oldSocketId);
+                    removeSurvivSpectator(activeRoom, socket.id);
                     existingPlayer.id = socket.id;
                     existingPlayer.disconnected = false;
-                    socket.roomId = room.id;
+                    delete existingPlayer.disconnectedAt;
+                    socket.roomId = activeRoom.id;
                     let remaining = 0;
                     if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
                         remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
@@ -6203,15 +6211,15 @@ io.on('connection', (socket) => {
                         cashOutRemaining: remaining,
                         mode: 'surviv',
                         rejoin: true,
-                        entryFeeUsd: existingPlayer.entryFeeUsd ?? room.entryFeeUsd,
+                        entryFeeUsd: existingPlayer.entryFeeUsd ?? activeRoom.entryFeeUsd,
                         solPrice: SOL_PRICE_USD,
                         surviv: true,
-                        zone: getSurvivZone(room.startTime + c.roomDuration),
+                        zone: getSurvivZone(activeRoom.startTime + c.roomDuration),
                     });
                     return;
                 }
 
-                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
                 if (!DEV_FREE_PLAY) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
