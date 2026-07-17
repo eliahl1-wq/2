@@ -3001,7 +3001,7 @@ function tryShoot(entity, room, now) {
 
         const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
         const targets = [
-            ...room.players.filter(p => !p.disconnected),
+            ...room.players.filter(p => !p._eliminated),
             ...room.bots,
         ].filter(target => target.id !== entity.id && target.hp > 0);
         let closest = null;
