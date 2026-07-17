@@ -90,6 +90,29 @@ export function getSandboxRoom(mode) {
     return sandboxRooms[key];
 }
 
+function recoverSandboxStackOverflow(mode, err, socket, deps) {
+    const isStackOverflow = err instanceof RangeError
+        || /maximum call stack size exceeded/i.test(String(err?.message || err));
+    if (!isStackOverflow || socket.sandboxStackRecoveryAttempted) return false;
+
+    socket.sandboxStackRecoveryAttempted = true;
+    const key = mode === 'slither' ? 'slither' : 'agar';
+    console.error('[Sandbox] Recovering corrupted room after stack overflow:', err?.stack || err);
+    sandboxRooms[key] = createSandboxRoom(key);
+    if (key === 'agar') {
+        initAgarSandboxRoom(sandboxRooms[key], {
+            QuadTree: deps.QuadTree,
+            Rectangle: deps.Rectangle,
+            c: deps.c,
+            addViruses: deps.addViruses,
+        });
+    }
+    socket.sandboxMode = null;
+    socket.roomId = null;
+    socket.emit('sandboxRecovered');
+    return true;
+}
+
 function initAgarSandboxRoom(room, deps) {
     const { QuadTree, Rectangle, c, addViruses } = deps;
     room.qt = new QuadTree(
@@ -681,6 +704,7 @@ export function setupSandbox(io, deps) {
 
     io.on('connection', (socket) => {
         socket.on('sandboxJoin', async ({ token, mode, username }) => {
+            const requestedMode = mode === 'slither' ? 'slither' : 'agar';
             try {
                 const user = await verifyAdminToken(token, User, deps.JWT_SECRET);
                 if (!user) {
@@ -809,11 +833,14 @@ export function setupSandbox(io, deps) {
                 socket.emit('welcome', player, welcomeMeta);
                 socket.emit('sandboxState', getSandboxStatus()[gameMode]);
             } catch (err) {
+                if (recoverSandboxStackOverflow(requestedMode, err, socket, deps)) return;
+                console.error('[Sandbox] Join failed:', err?.stack || err);
                 socket.emit('error', err.message || 'Sandbox join failed');
             }
         });
 
         socket.on('sandboxControl', async ({ token, mode, action, params }) => {
+            const requestedMode = mode === 'slither' ? 'slither' : 'agar';
             try {
                 const user = await verifyAdminToken(token, User, deps.JWT_SECRET);
                 if (!user) {
@@ -896,6 +923,8 @@ export function setupSandbox(io, deps) {
                 });
                 socket.emit('sandboxState', { ...getSandboxStatus()[gameMode], lastAction: action, result });
             } catch (err) {
+                if (recoverSandboxStackOverflow(requestedMode, err, socket, deps)) return;
+                console.error('[Sandbox] Control failed:', err?.stack || err);
                 socket.emit('error', err.message || 'Sandbox control failed');
             }
         });
