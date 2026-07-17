@@ -2356,7 +2356,7 @@ export function getSurvivEffectiveRadius(resetTime, now = Date.now()) {
     return getSurvivZone(resetTime, now)?.radius ?? SURVIV.worldHalf;
 }
 
-function makeWeaponState(typeId) {function makeWeaponState(typeId) {
+function makeWeaponState(typeId) {
     const def = WEAPONS[typeId] || WEAPONS.fists;
     return {
         type: def.id,
@@ -2382,7 +2382,7 @@ export function beginSurvivReload(entity, now = Date.now()) {
     return true;
 }
 
-function makeInventory() {function makeInventory() {
+function makeInventory() {
     return {
         // Firearms only. Fists are an always-available third/melee slot.
         weapons: [],
@@ -2635,7 +2635,7 @@ export function equipSurvivWeaponSlot(entity, slot) {
     return true;
 }
 
-function removeWeaponSlot(entity, index) {function removeWeaponSlot(entity, index) {
+function removeWeaponSlot(entity, index) {
     const inv = ensureInventory(entity);
     if (!Number.isInteger(index) || index < 0 || index >= inv.weapons.length) return null;
     saveActiveWeaponAmmo(entity);
@@ -3534,9 +3534,6 @@ function checkZoneDamage(entity, zone, now) {
     entity.hp = Math.max(0, entity.hp - SURVIV.zoneDamagePerSecond * elapsedMs / 1000);
 }
 
-function checkZoneDamage() {
-    return;
-}
 
 function randomLootSpawn(room) {
     const anchors = room.spawnPoints?.length ? room.spawnPoints : room.landmarks;
