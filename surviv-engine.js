@@ -3158,25 +3158,27 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null) {
     });
     dropDeathLoot(room, player);
     const socketId = player.id;
-    if (!room.spectators) room.spectators = [];
-    room.spectators = room.spectators.filter(s => s.id !== socketId);
-    room.spectators.push({
-        id: socketId,
-        mongoId: player.mongoId,
-        x: player.x,
-        y: player.y,
-        dollarBalance: player.dollarBalance,
-    });
-    io.to(socketId).emit('RIP');
-    io.to(socketId).emit('died', {
-        killer: attacker ? {
-            id: attacker.id,
-            username: attacker.username || (attacker.isBot ? 'Bot' : 'Player'),
-            weapon: attacker.weapon?.type || 'fists',
-        } : null,
-        balance: player.dollarBalance,
-        kills: player.kills || 0,
-    });
+    if (!player.disconnected) {
+        if (!room.spectators) room.spectators = [];
+        room.spectators = room.spectators.filter(s => s.id !== socketId);
+        room.spectators.push({
+            id: socketId,
+            mongoId: player.mongoId,
+            x: player.x,
+            y: player.y,
+            dollarBalance: player.dollarBalance,
+        });
+        io.to(socketId).emit('RIP');
+        io.to(socketId).emit('died', {
+            killer: attacker ? {
+                id: attacker.id,
+                username: attacker.username || (attacker.isBot ? 'Bot' : 'Player'),
+                weapon: attacker.weapon?.type || 'fists',
+            } : null,
+            balance: player.dollarBalance,
+            kills: player.kills || 0,
+        });
+    }
     if (player.isBot) {
         room.bots = room.bots.filter(b => b.id !== player.id);
     } else {
