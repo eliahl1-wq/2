@@ -6219,7 +6219,7 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
                 if (!DEV_FREE_PLAY) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
@@ -7251,7 +7251,7 @@ io.on('connection', (socket) => {
         }, 5 * 60 * 1000);
     });
 
-    socket.on('slitherSpectateCam',    socket.on('slitherSpectateCam', ({ x, y }) => {
+    socket.on('slitherSpectateCam', ({ x, y }) => {
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
         if (room.isCompetitiveSlither) {
@@ -7401,9 +7401,6 @@ io.on('connection', (socket) => {
         if (Number.isFinite(x)) spectator.x = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, x));
         if (Number.isFinite(y)) spectator.y = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, y));
     });
-});
-
-function getArenaRoomById
 });
 
 function getArenaRoomById(roomId) {
