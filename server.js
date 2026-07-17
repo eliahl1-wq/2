@@ -2171,6 +2171,23 @@ app.post('/api/admin/tournaments/:tournamentId/cancel', authenticateAdmin, async
     }
 });
 
+app.post('/api/admin/tournaments/:tournamentId/end', authenticateAdmin, async (req, res) => {
+    try {
+        const current = await Tournament.findById(req.params.tournamentId).select('status');
+        if (!current) return res.status(404).json({ error: 'Tournament not found' });
+        if (current.status !== 'live') {
+            return res.status(409).json({ error: 'Only live tournaments can be ended manually' });
+        }
+
+        const tournament = await settleTournament(current._id);
+        if (!tournament) return res.status(409).json({ error: 'Tournament is no longer live' });
+        res.json({ tournament: serializeTournament(tournament) });
+    } catch (err) {
+        if (err.name === 'CastError') return res.status(404).json({ error: 'Tournament not found' });
+        res.status(500).json({ error: err.message || 'Unable to end tournament' });
+    }
+});
+
 
 // Public config (no auth) — frontend uses this for test-mode UI
 app.get('/api/config', (req, res) => {
