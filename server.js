@@ -7129,7 +7129,15 @@ io.on('connection', (socket) => {
         }
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.isCashingOut) return;
+        if (!p) {
+            socket.emit('error', 'Your active match could not be found. Rejoin before cashing out.');
+            return;
+        }
+        if (p.isCashingOut) {
+            const remainingSeconds = Math.max(1, Math.ceil(((p.cashOutEndTime || Date.now()) - Date.now()) / 1000));
+            socket.emit('cashOutStarting', { seconds: remainingSeconds });
+            return;
+        }
         if (!acquireCashoutLock(p.mongoId)) {
             socket.emit('error', 'Cashout already in progress.');
             return;
