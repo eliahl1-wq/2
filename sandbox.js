@@ -754,6 +754,7 @@ export function setupSandbox(io, deps) {
                         ...getSandboxStatus()[gameMode],
                         reconnected: true,
                     });
+                    socket.sandboxStackRecoveryAttempted = false;
                     return;
                 }
 
@@ -832,6 +833,7 @@ export function setupSandbox(io, deps) {
 
                 socket.emit('welcome', player, welcomeMeta);
                 socket.emit('sandboxState', getSandboxStatus()[gameMode]);
+                socket.sandboxStackRecoveryAttempted = false;
             } catch (err) {
                 if (recoverSandboxStackOverflow(requestedMode, err, socket, deps)) return;
                 console.error('[Sandbox] Join failed:', err?.stack || err);
