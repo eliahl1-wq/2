@@ -9,6 +9,7 @@ const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
 const MELEE_ANIMATION_MS = 280;
 const SURVIV_MAX_WEAPONS = 2;
+const SURVIV_MELEE_SLOT = SURVIV_MAX_WEAPONS;
 const SURVIV_MAX_MEDKITS = 6;
 const SURVIV_MAX_AMMO_PACKS = 9;
 
@@ -21,7 +22,9 @@ export const SURVIV = {
     viewRange: 1200,
     botMinCount: 2,
     botMaxCount: 8,
-    zoneDamagePerTick: 0,
+    minZoneRadius: 1150,
+    zoneDamagePerSecond: 12,
+    reconnectGraceMs: 20 * 1000,
     bulletLifetimeMs: 1800,
     lootPickupRadius: 34,
     chestOpenRadius: 92,
@@ -155,8 +158,8 @@ const WEAPON_RARITY_POOLS = {
 const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
 const SURVIV_OBSTACLE_CELL = 700;
 const SURVIV_LOOT_CELL = 600;
-const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 250;
-const SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD = 160;
+const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 1500;
+const SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD = 320;
 const SURVIV_DESTRUCTIBLE_OBSTACLE_HP = Object.freeze({
     bush: 18,
     furniture: 28,
@@ -258,6 +261,53 @@ function lineSegmentRectIntersects(x1, y1, x2, y2, rect) {
         || lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMax, ryMin, rxMax, ryMax)
         || lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMin, ryMin, rxMax, ryMin)
         || lineSegmentsIntersect(start.x, start.y, end.x, end.y, rxMin, ryMax, rxMax, ryMax);
+}
+
+function segmentRectHitT(x1, y1, x2, y2, rect) {
+    const start = toRectLocal(x1, y1, rect);
+    const end = toRectLocal(x2, y2, rect);
+    const deltaX = end.x - start.x;
+    const deltaY = end.y - start.y;
+    const minX = -rect.w / 2;
+    const maxX = rect.w / 2;
+    const minY = -rect.h / 2;
+    const maxY = rect.h / 2;
+    let enter = 0;
+    let exit = 1;
+
+    const clipAxis = (origin, delta, min, max) => {
+        if (Math.abs(delta) < 1e-9) return origin >= min && origin <= max;
+        let first = (min - origin) / delta;
+        let second = (max - origin) / delta;
+        if (first > second) [first, second] = [second, first];
+        enter = Math.max(enter, first);
+        exit = Math.min(exit, second);
+        return enter <= exit;
+    };
+
+    if (!clipAxis(start.x, deltaX, minX, maxX)) return null;
+    if (!clipAxis(start.y, deltaY, minY, maxY)) return null;
+    return enter >= 0 && enter <= 1 ? enter : null;
+}
+
+function segmentCircleHitT(x1, y1, x2, y2, cx, cy, radius) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const fx = x1 - cx;
+    const fy = y1 - cy;
+    const a = dx * dx + dy * dy;
+    if (a <= 1e-9) return Math.hypot(fx, fy) <= radius ? 0 : null;
+    const c = fx * fx + fy * fy - radius * radius;
+    if (c <= 0) return 0;
+    const b = 2 * (fx * dx + fy * dy);
+    const discriminant = b * b - 4 * a * c;
+    if (discriminant < 0) return null;
+    const root = Math.sqrt(discriminant);
+    const first = (-b - root) / (2 * a);
+    const second = (-b + root) / (2 * a);
+    if (first >= 0 && first <= 1) return first;
+    if (second >= 0 && second <= 1) return second;
+    return null;
 }
 
 function circleRectCollision(cx, cy, r, rect) {
@@ -2276,12 +2326,34 @@ export function generateSurvivObstacles(worldHalf) {
     return generateSurvivMap(worldHalf).obstacles;
 }
 
-export function getSurvivEffectiveRadius() {
-    return SURVIV.worldHalf;
+export function getSurvivZone(resetTime, now = Date.now()) {
+    const resetAt = Number(resetTime);
+    if (!Number.isFinite(resetAt)) return null;
+
+    const duration = Math.max(1, SURVIV.shrinkBeforeResetMs);
+    const shrinkStartsAt = resetAt - duration;
+    const linearProgress = clamp((now - shrinkStartsAt) / duration, 0, 1);
+    const easedProgress = linearProgress * linearProgress * (3 - 2 * linearProgress);
+    const startRadius = Math.SQRT2 * SURVIV.worldHalf + SURVIV.playerRadius;
+    const radius = startRadius + (SURVIV.minZoneRadius - startRadius) * easedProgress;
+
+    return {
+        x: 0,
+        y: 0,
+        radius,
+        targetX: 0,
+        targetY: 0,
+        targetRadius: SURVIV.minZoneRadius,
+        progress: linearProgress,
+        shrinking: linearProgress > 0 && linearProgress < 1,
+        damagePerSecond: SURVIV.zoneDamagePerSecond,
+        startsInMs: Math.max(0, shrinkStartsAt - now),
+        endsInMs: Math.max(0, resetAt - now),
+    };
 }
 
-export function getSurvivZone() {
-    return null;
+export function getSurvivEffectiveRadius(resetTime, now = Date.now()) {
+    return getSurvivZone(resetTime, now)?.radius ?? SURVIV.worldHalf;
 }
 
 function makeWeaponState(typeId) {
@@ -2302,6 +2374,9 @@ export function beginSurvivReload(entity, now = Date.now()) {
     if (!definition || definition.melee || definition.clipSize <= 0) return false;
     if ((Number(weapon.ammo) || 0) >= definition.clipSize) return false;
 
+    const inventory = ensureInventory(entity);
+    if (inventory.ammoPacks <= 0) return false;
+    inventory.ammoPacks -= 1;
     weapon.reloading = true;
     weapon.reloadEndAt = now + definition.reloadMs;
     return true;
@@ -2440,8 +2515,6 @@ function applyLootContents(entity, contents = {}, options = {}) {
         const packs = Math.max(0, Math.min(Number(contents.ammoPacks) || 0, SURVIV_MAX_AMMO_PACKS - inv.ammoPacks));
         summary.ammoPacks = packs;
         inv.ammoPacks += packs;
-        const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
-        entity.weapon.ammo = Math.min(wDef.clipSize, entity.weapon.ammo + Math.ceil(wDef.clipSize * 0.4 * packs));
     }
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
         const def = WEAPONS[contents.weaponType];
@@ -2499,7 +2572,8 @@ function pickupGroundWeapon(entity, room) {
         slotAmmo.push(nextAmmo);
         removeSurvivLootAt(room, candidate.index);
     } else {
-        nextSlot = Number.isInteger(entity.activeWeaponSlot) ? entity.activeWeaponSlot : inv.weapons.indexOf(entity.weapon?.type);
+        const requestedSlot = Number.isInteger(entity.activeWeaponSlot) ? entity.activeWeaponSlot : inv.weapons.indexOf(entity.weapon?.type);
+        nextSlot = requestedSlot === SURVIV_MELEE_SLOT ? 0 : requestedSlot;
         if (nextSlot < 0 || nextSlot >= inv.weapons.length) return false;
         const oldType = inv.weapons[nextSlot];
         const oldAmmo = slotAmmo[nextSlot] ?? 0;
@@ -2533,19 +2607,23 @@ function pickupGroundWeapon(entity, room) {
 export function equipSurvivWeaponSlot(entity, slot) {
     const inv = ensureInventory(entity);
     const index = Number(slot);
-    if (!Number.isInteger(index) || index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
+    if (!Number.isInteger(index)) return false;
+
     saveActiveWeaponAmmo(entity);
-    const slotAmmo = ensureWeaponSlotAmmo(entity);
-    const weaponType = inv.weapons[index];
-    entity.activeWeaponSlot = index;
-    if (!weaponType) {
+    if (index === SURVIV_MELEE_SLOT) {
+        entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
         entity.weapon = makeWeaponState('fists');
         syncLegacyWeaponAmmo(entity);
         return true;
     }
-    if (!WEAPONS[weaponType]) return false;
+    if (index < 0 || index >= SURVIV_MAX_WEAPONS) return false;
+
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const weaponType = inv.weapons[index];
+    if (!weaponType || !WEAPONS[weaponType]) return false;
 
     const targetAmmo = slotAmmo[index] ?? WEAPONS[weaponType].clipSize;
+    entity.activeWeaponSlot = index;
     entity.weapon = {
         type: weaponType,
         ammo: targetAmmo,
@@ -2577,12 +2655,12 @@ function removeWeaponSlot(entity, index) {
             entity.weapon.ammo = slotAmmo[nextIndex] ?? WEAPONS[nextType].clipSize;
             syncLegacyWeaponAmmo(entity);
         } else {
-            entity.activeWeaponSlot = 0;
+            entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
             entity.weapon = makeWeaponState('fists');
             syncLegacyWeaponAmmo(entity);
         }
     } else {
-        if (Number.isInteger(entity.activeWeaponSlot) && entity.activeWeaponSlot > index) entity.activeWeaponSlot -= 1;
+        if (Number.isInteger(entity.activeWeaponSlot) && entity.activeWeaponSlot !== SURVIV_MELEE_SLOT && entity.activeWeaponSlot > index) entity.activeWeaponSlot -= 1;
         syncLegacyWeaponAmmo(entity);
     }
     return { weaponType, ammo };
@@ -2639,7 +2717,7 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         botThinkAt: 0,
         botTargetId: null,
         inventory: makeInventory(),
-        activeWeaponSlot: 0,
+        activeWeaponSlot: SURVIV_MELEE_SLOT,
         weaponSlotAmmo: [],
         weaponsAmmo: {},
         useMedkit: false,
@@ -2923,7 +3001,7 @@ function tryShoot(entity, room, now) {
 
         const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
         const targets = [
-            ...room.players.filter(p => !p.disconnected),
+            ...room.players.filter(p => !p._eliminated),
             ...room.bots,
         ].filter(target => target.id !== entity.id && target.hp > 0);
         let closest = null;
@@ -3063,7 +3141,7 @@ function dropDeathLoot(room, entity) {
     inventory.ammoPacks = 0;
 }
 
-function eliminateSurvivPlayer(room, player, io, attacker = null) {
+export function eliminateSurvivPlayer(room, player, io, attacker = null) {
     if (player._eliminated) return;
     player._eliminated = true;
     if (!Array.isArray(room.deathMarkers)) room.deathMarkers = [];
@@ -3080,21 +3158,27 @@ function eliminateSurvivPlayer(room, player, io, attacker = null) {
     });
     dropDeathLoot(room, player);
     const socketId = player.id;
-    if (!room.spectators) room.spectators = [];
-    room.spectators = room.spectators.filter(s => s.id !== socketId);
-    room.spectators.push({
-        id: socketId,
-        mongoId: player.mongoId,
-        x: player.x,
-        y: player.y,
-        dollarBalance: player.dollarBalance,
-    });
-    io.to(socketId).emit('RIP');
-    io.to(socketId).emit('died', {
-        killer: null,
-        balance: player.dollarBalance,
-        kills: player.kills || 0,
-    });
+    if (!player.disconnected) {
+        if (!room.spectators) room.spectators = [];
+        room.spectators = room.spectators.filter(s => s.id !== socketId);
+        room.spectators.push({
+            id: socketId,
+            mongoId: player.mongoId,
+            x: player.x,
+            y: player.y,
+            dollarBalance: player.dollarBalance,
+        });
+        io.to(socketId).emit('RIP');
+        io.to(socketId).emit('died', {
+            killer: attacker ? {
+                id: attacker.id,
+                username: attacker.username || (attacker.isBot ? 'Bot' : 'Player'),
+                weapon: attacker.weapon?.type || 'fists',
+            } : null,
+            balance: player.dollarBalance,
+            kills: player.kills || 0,
+        });
+    }
     if (player.isBot) {
         room.bots = room.bots.filter(b => b.id !== player.id);
     } else {
@@ -3370,57 +3454,86 @@ function updateBullets(room, now, effectiveRadius) {
     const allEntities = [...room.players, ...room.bots];
     const entitiesById = new Map(allEntities.map(entity => [entity.id, entity]));
     for (let i = room.bullets.length - 1; i >= 0; i--) {
-        const b = room.bullets[i];
-        const previousX = b.x;
-        const previousY = b.y;
-        b.x += b.vx;
-        b.y += b.vy;
+        const bullet = room.bullets[i];
+        const previousX = bullet.x;
+        const previousY = bullet.y;
+        bullet.x += bullet.vx;
+        bullet.y += bullet.vy;
 
-        if (now - b.bornAt > SURVIV.bulletLifetimeMs) {
+        if (now - bullet.bornAt > SURVIV.bulletLifetimeMs || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
             room.bullets.splice(i, 1);
             continue;
         }
 
-        if (Math.hypot(b.x, b.y) > SURVIV.worldHalf) {
+        const midX = (previousX + bullet.x) / 2;
+        const midY = (previousY + bullet.y) / 2;
+        const distanceMoved = Math.hypot(bullet.vx, bullet.vy);
+        const queryRange = Math.max(90, distanceMoved / 2 + 10);
+
+        let nearestObstacle = null;
+        let obstacleHitT = Infinity;
+        for (const obstacle of getNearbyObstacles(room, midX, midY, queryRange)) {
+            const hitT = segmentRectHitT(previousX, previousY, bullet.x, bullet.y, obstacle);
+            if (hitT != null && hitT < obstacleHitT) {
+                nearestObstacle = obstacle;
+                obstacleHitT = hitT;
+            }
+        }
+
+        let nearestEntity = null;
+        let entityHitT = Infinity;
+        for (const entity of allEntities) {
+            if (entity.id === bullet.ownerId || entity.hp <= 0 || entity._eliminated) continue;
+            const hitT = segmentCircleHitT(
+                previousX,
+                previousY,
+                bullet.x,
+                bullet.y,
+                entity.x,
+                entity.y,
+                SURVIV.playerRadius,
+            );
+            if (hitT != null && hitT < entityHitT) {
+                nearestEntity = entity;
+                entityHitT = hitT;
+            }
+        }
+
+        if (nearestObstacle && obstacleHitT <= entityHitT) {
+            damageSurvivObstacle(room, nearestObstacle, bullet.damage);
             room.bullets.splice(i, 1);
             continue;
         }
-
-        let hit = false;
-        const midX = (previousX + b.x) / 2;
-        const midY = (previousY + b.y) / 2;
-        const distMoved = Math.hypot(b.vx, b.vy);
-        const queryRange = Math.max(90, distMoved / 2 + 10);
-
-        const hitObstacle = getNearbyObstacles(room, midX, midY, queryRange)
-            .filter(o => lineSegmentRectIntersects(previousX, previousY, b.x, b.y, o))
-            .sort((a, c) => dist(previousX, previousY, a.x, a.y) - dist(previousX, previousY, c.x, c.y))[0];
-        if (hitObstacle) {
-            damageSurvivObstacle(room, hitObstacle, b.damage);
+        if (nearestEntity) {
+            const attacker = entitiesById.get(bullet.ownerId);
+            applyDamage(nearestEntity, bullet.damage, attacker);
             room.bullets.splice(i, 1);
-            continue;
-        }
-
-        for (const ent of allEntities) {
-            if (ent.id === b.ownerId || ent.hp <= 0) continue;
-            if (distanceToSegment(ent.x, ent.y, previousX, previousY, b.x, b.y) <= SURVIV.playerRadius) {
-                const attacker = entitiesById.get(b.ownerId);
-                applyDamage(ent, b.damage, attacker);
-                room.bullets.splice(i, 1);
-                if (ent.hp <= 0) {
-                    eliminateSurvivPlayer(room, ent, room._io, attacker);
-                    entitiesById.delete(ent.id);
-                }
-                hit = true;
-                break;
+            if (nearestEntity.hp <= 0) {
+                eliminateSurvivPlayer(room, nearestEntity, room._io, attacker);
+                entitiesById.delete(nearestEntity.id);
             }
         }
     }
 }
 
-function checkZoneDamage() {
-    return;
+function checkZoneDamage(entity, zone, now) {
+    if (!zone || entity.hp <= 0) {
+        entity.outsideZone = false;
+        entity._lastZoneDamageAt = now;
+        return;
+    }
+
+    const outside = Math.hypot(entity.x - zone.x, entity.y - zone.y) > zone.radius;
+    entity.outsideZone = outside;
+    const previousAt = Number(entity._lastZoneDamageAt) || now;
+    entity._lastZoneDamageAt = now;
+    if (!outside) return;
+
+    const elapsedMs = clamp(now - previousAt, 0, 250);
+    if (elapsedMs <= 0) return;
+    entity.hp = Math.max(0, entity.hp - SURVIV.zoneDamagePerSecond * elapsedMs / 1000);
 }
+
 
 function randomLootSpawn(room) {
     const anchors = room.spawnPoints?.length ? room.spawnPoints : room.landmarks;
@@ -3522,7 +3635,7 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         botTargetId: null,
         isCashingOut: false,
         inventory: makeInventory(),
-        activeWeaponSlot: 0,
+        activeWeaponSlot: SURVIV_MELEE_SLOT,
         weaponSlotAmmo: [],
         weaponsAmmo: {},
         useMedkit: false,
@@ -3602,7 +3715,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     bot.botThinkAt = now + 90 + Math.random() * 100;
 
     const allTargets = [
-        ...room.players.filter(player => !player.disconnected && player.hp > 0),
+        ...room.players.filter(player => !player._eliminated && player.hp > 0),
         ...room.bots.filter(candidate => candidate.id !== bot.id && candidate.hp > 0),
     ];
     let nearest = null;
@@ -3704,8 +3817,17 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     }
     bot.shooting = false;
 }
-function processEntity(entity, room, now, effectiveRadius) {
+function processEntity(entity, room, now, effectiveRadius, zone) {
     if (entity.hp <= 0) return;
+    if (entity.disconnected) {
+        entity.inputDx = 0;
+        entity.inputDy = 0;
+        entity.shooting = false;
+        entity.useMedkit = false;
+        entity.pickupWeaponPending = false;
+        entity.openChestId = null;
+        entity.takeChestItem = null;
+    }
     if (entity.isCashingOut) {
         entity.shooting = false;
         entity.useMedkit = false;
@@ -3753,7 +3875,7 @@ function processEntity(entity, room, now, effectiveRadius) {
     }
 
     pickupLoot(entity, room);
-    checkZoneDamage(entity, effectiveRadius);
+    checkZoneDamage(entity, zone, now);
 
     if (entity.hp <= 0) {
         eliminateSurvivPlayer(room, entity, room._io);
@@ -3762,7 +3884,7 @@ function processEntity(entity, room, now, effectiveRadius) {
 
 function getActiveSurvivEntities(room) {
     return [
-        ...room.players.filter(p => !p.disconnected && !p._eliminated && p.hp > 0),
+        ...room.players.filter(p => !p._eliminated && p.hp > 0),
         ...room.bots.filter(b => !b.disconnected && !b._eliminated && b.hp > 0),
     ];
 }
@@ -3810,6 +3932,7 @@ function serializePlayer(p, isYou) {
         isBot: !!p.isBot,
         isYou,
         isCashingOut: !!p.isCashingOut,
+        outsideZone: !!p.outsideZone,
 
         activeWeaponSlot: Number.isInteger(p.activeWeaponSlot) ? p.activeWeaponSlot : 0,
         weaponSlotAmmo: ensureWeaponSlotAmmo(p),
@@ -3898,15 +4021,15 @@ function pruneSurvivViewerPayloadCache(room, now) {
 export function processSurvivRoom(room, io, resetTime) {
     room._io = io;
     const now = Date.now();
-    const effectiveRadius = getSurvivEffectiveRadius(resetTime);
-    const zone = getSurvivZone(resetTime);
+    const zone = getSurvivZone(resetTime, now);
+    const effectiveRadius = zone?.radius ?? SURVIV.worldHalf;
 
     syncSurvivBots(room);
 
     const entities = getActiveSurvivEntities(room);
 
     for (const ent of entities) {
-        processEntity(ent, room, now, effectiveRadius);
+        processEntity(ent, room, now, effectiveRadius, zone);
     }
 
     updateBullets(room, now, effectiveRadius);

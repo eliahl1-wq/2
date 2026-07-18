@@ -8,6 +8,7 @@ import {
     createSurvivPlayer,
     equipSurvivWeaponSlot,
     generateSurvivMap,
+    getSurvivZone,
     processSurvivRoom,
     resetSurvivRoomRuntime,
     spawnLootFromPool,
@@ -605,7 +606,7 @@ test('players can carry two identical guns with independent magazines', () => {
     assert.equal(player.weapon.ammo, 3);
     assert.deepEqual(player.weaponSlotAmmo, [5, 3]);
 });
-test('empty weapon slots select melee and G drops the held gun', () => {
+test('the dedicated melee slot stays available and G drops the held gun', () => {
     const room = makeRoom();
     room.obstacles = [];
     room.loot = [];
@@ -617,7 +618,8 @@ test('empty weapon slots select melee and G drops the held gun', () => {
     player.weaponsAmmo = { pistol: 9 };
     room.players.push(player);
 
-    assert.equal(equipSurvivWeaponSlot(player, 1), true);
+    assert.equal(equipSurvivWeaponSlot(player, 1), false);
+    assert.equal(equipSurvivWeaponSlot(player, 2), true);
     assert.equal(player.weapon.type, 'fists');
     assert.equal(equipSurvivWeaponSlot(player, 0), true);
     assert.equal(player.weapon.type, 'pistol');
@@ -751,21 +753,40 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     assert.ok(deathDrops.some(item => item.type === 'armor' && item.armorValue > 0));
     assert.equal(room.loot.some(item => item.type === 'deathCrate'), false);
 });
-test('manual reload only starts for a partially empty firearm', () => {
-    const fullWeapon = { weapon: { type: 'smg', ammo: 30, reloading: false, reloadEndAt: 0 } };
+test('manual reload requires and consumes exactly one ammo pack', () => {
+    const fullWeapon = {
+        weapon: { type: 'smg', ammo: 30, reloading: false, reloadEndAt: 0 },
+        inventory: { weapons: ['smg'], medkits: 0, ammoPacks: 1, chestsOpened: 0 },
+    };
     assert.equal(beginSurvivReload(fullWeapon, 1000), false);
     assert.equal(fullWeapon.weapon.reloading, false);
+    assert.equal(fullWeapon.inventory.ammoPacks, 1);
 
-    const partialWeapon = { weapon: { type: 'smg', ammo: 11, reloading: false, reloadEndAt: 0 } };
+    const noReserve = {
+        weapon: { type: 'smg', ammo: 11, reloading: false, reloadEndAt: 0 },
+        inventory: { weapons: ['smg'], medkits: 0, ammoPacks: 0, chestsOpened: 0 },
+    };
+    assert.equal(beginSurvivReload(noReserve, 1000), false);
+    assert.equal(noReserve.weapon.reloading, false);
+
+    const partialWeapon = {
+        weapon: { type: 'smg', ammo: 11, reloading: false, reloadEndAt: 0 },
+        inventory: { weapons: ['smg'], medkits: 0, ammoPacks: 2, chestsOpened: 0 },
+    };
     assert.equal(beginSurvivReload(partialWeapon, 1000), true);
     assert.equal(partialWeapon.weapon.reloading, true);
     assert.equal(partialWeapon.weapon.reloadEndAt, 2800);
+    assert.equal(partialWeapon.inventory.ammoPacks, 1);
 
     assert.equal(beginSurvivReload(partialWeapon, 1500), false);
-    assert.equal(partialWeapon.weapon.reloadEndAt, 2800);
+    assert.equal(partialWeapon.inventory.ammoPacks, 1);
 
-    const fists = { weapon: { type: 'fists', ammo: 0, reloading: false, reloadEndAt: 0 } };
+    const fists = {
+        weapon: { type: 'fists', ammo: 0, reloading: false, reloadEndAt: 0 },
+        inventory: { weapons: [], medkits: 0, ammoPacks: 1, chestsOpened: 0 },
+    };
     assert.equal(beginSurvivReload(fists, 1000), false);
+    assert.equal(fists.inventory.ammoPacks, 1);
 });
 
 test('ground loot creates a pickup summary for the player', () => {
@@ -1092,10 +1113,10 @@ test('surviv alive count and leaderboard use the same active entities', () => {
     deadBot.hp = 0;
     const lbData = processSurvivRoom(room, silentIo, Date.now() + 600000);
 
-    assert.equal(lbData.aliveCount, 2);
+    assert.equal(lbData.aliveCount, 3);
     assert.deepEqual(
         new Set(lbData.leaderboard.map(entry => entry.id)),
-        new Set([active.id, liveBot.id]),
+        new Set([active.id, disconnected.id, liveBot.id]),
     );
 
     const ticks = [];
@@ -1110,4 +1131,90 @@ test('surviv alive count and leaderboard use the same active entities', () => {
     };
     broadcastSurvivState(room, io, lbData, {});
     assert.equal(ticks[0].aliveCount, lbData.aliveCount);
+});
+
+
+test('safe zone covers the map before shrinking and closes before reset', () => {
+    const resetAt = 1_000_000;
+    const beforeShrink = getSurvivZone(resetAt, resetAt - SURVIV.shrinkBeforeResetMs - 1);
+    const halfway = getSurvivZone(resetAt, resetAt - SURVIV.shrinkBeforeResetMs / 2);
+    const closed = getSurvivZone(resetAt, resetAt);
+
+    assert.ok(beforeShrink.radius > Math.SQRT2 * SURVIV.worldHalf);
+    assert.equal(beforeShrink.progress, 0);
+    assert.ok(halfway.radius < beforeShrink.radius);
+    assert.ok(halfway.radius > SURVIV.minZoneRadius);
+    assert.equal(closed.radius, SURVIV.minZoneRadius);
+    assert.equal(closed.progress, 1);
+});
+
+test('players outside the safe zone take server-authoritative damage', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('outside-zone', 'outside-zone-mongo', 'Runner', '#fff', room);
+    player.x = SURVIV.worldHalf - 100;
+    player.y = 0;
+    player._lastZoneDamageAt = Date.now() - 250;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now());
+
+    assert.equal(player.outsideZone, true);
+    assert.ok(player.hp < 100);
+});
+
+test('a player in front of a wall is hit before the wall behind them', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'wall-behind-target', kind: 'wall', x: 95, y: 0, w: 12, h: 100,
+        collidable: true, destructible: true, hp: 100, maxHp: 100,
+    }];
+    const shooter = createSurvivPlayer('ordered-shot', 'ordered-shot-mongo', 'Shooter', '#fff', room);
+    shooter.x = 0;
+    shooter.y = 0;
+    shooter.aimAngle = 0;
+    shooter.weapon = { type: 'sniper', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    shooter.inventory.weapons = ['sniper'];
+    shooter.activeWeaponSlot = 0;
+    shooter.shooting = true;
+    room.players.push(shooter);
+    const target = spawnSurvivBotNear(room, 58, 0, { adminSpawned: true });
+    target.botThinkAt = Number.POSITIVE_INFINITY;
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.ok(target.hp < 100);
+    assert.equal(room.obstacles[0].hp, 100);
+});
+
+test('a wall in front of a player blocks the shot', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'wall-before-target', kind: 'wall', x: 48, y: 0, w: 12, h: 100,
+        collidable: true, destructible: true, hp: 100, maxHp: 100,
+    }];
+    const shooter = createSurvivPlayer('blocked-shot', 'blocked-shot-mongo', 'Shooter', '#fff', room);
+    shooter.x = 0;
+    shooter.y = 0;
+    shooter.aimAngle = 0;
+    shooter.weapon = { type: 'sniper', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    shooter.inventory.weapons = ['sniper'];
+    shooter.activeWeaponSlot = 0;
+    shooter.shooting = true;
+    room.players.push(shooter);
+    const target = spawnSurvivBotNear(room, 90, 0, { adminSpawned: true });
+    target.botThinkAt = Number.POSITIVE_INFINITY;
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(target.hp, 100);
+    assert.ok(room.obstacles[0].hp < 100);
 });

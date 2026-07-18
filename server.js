@@ -59,6 +59,7 @@ import {
     SURVIV,
     beginSurvivReload,
     createSurvivPlayer,
+    eliminateSurvivPlayer,
     generateSurvivMap,
     getSurvivZone,
     processSurvivRoom,
@@ -5746,6 +5747,9 @@ async function refundTournamentJoin(pending, reason) {
 io.on('connection', (socket) => {
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
+    const survivInputRate = { windowStartedAt: 0, count: 0 };
+    const survivSpectateRate = { windowStartedAt: 0, count: 0 };
+    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'armor']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
         let userKey = null;
@@ -6181,6 +6185,7 @@ io.on('connection', (socket) => {
 
                 const existingPlayer = existing?.player ?? null;
                 if (existingPlayer) {
+                    const activeRoom = existing.room;
                     const oldSocketId = existingPlayer.id;
                     const oldSocket = io.sockets.sockets.get(oldSocketId);
                     if (oldSocket?.connected && oldSocket.id !== socket.id) {
@@ -6190,9 +6195,12 @@ io.on('connection', (socket) => {
                         clearTimeout(existingPlayer.removeTimeout);
                         delete existingPlayer.removeTimeout;
                     }
+                    removeSurvivSpectator(activeRoom, oldSocketId);
+                    removeSurvivSpectator(activeRoom, socket.id);
                     existingPlayer.id = socket.id;
                     existingPlayer.disconnected = false;
-                    socket.roomId = room.id;
+                    delete existingPlayer.disconnectedAt;
+                    socket.roomId = activeRoom.id;
                     let remaining = 0;
                     if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
                         remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
@@ -6203,10 +6211,10 @@ io.on('connection', (socket) => {
                         cashOutRemaining: remaining,
                         mode: 'surviv',
                         rejoin: true,
-                        entryFeeUsd: existingPlayer.entryFeeUsd ?? room.entryFeeUsd,
+                        entryFeeUsd: existingPlayer.entryFeeUsd ?? activeRoom.entryFeeUsd,
                         solPrice: SOL_PRICE_USD,
                         surviv: true,
-                        zone: getSurvivZone(room.startTime + c.roomDuration),
+                        zone: getSurvivZone(activeRoom.startTime + c.roomDuration),
                     });
                     return;
                 }
@@ -7121,7 +7129,15 @@ io.on('connection', (socket) => {
         }
         const room = getArenaRoomById(socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.isCashingOut) return;
+        if (!p) {
+            socket.emit('error', 'Your active match could not be found. Rejoin before cashing out.');
+            return;
+        }
+        if (p.isCashingOut) {
+            const remainingSeconds = Math.max(1, Math.ceil(((p.cashOutEndTime || Date.now()) - Date.now()) / 1000));
+            socket.emit('cashOutStarting', { seconds: remainingSeconds });
+            return;
+        }
         if (!acquireCashoutLock(p.mongoId)) {
             socket.emit('error', 'Cashout already in progress.');
             return;
@@ -7208,7 +7224,7 @@ io.on('connection', (socket) => {
         const room = getArenaRoomById(socket.roomId);
         if (!room) return;
         if (room.spectators) {
-            room.spectators = room.spectators.filter(s => s.id !== socket.id);
+            room.spectators = room.spectators.filter(spectator => spectator.id !== socket.id);
         }
         if (room.isCompetitiveSlither) {
             removeCompetitiveSpectator(room, socket.id);
@@ -7216,15 +7232,31 @@ io.on('connection', (socket) => {
         if (room.isSurviv) {
             removeSurvivSpectator(room, socket.id);
         }
-        const p = room.players.find(pl => pl.id === socket.id);
-        if (p) {
-            p.disconnected = true;
-            p.disconnectedAt = Date.now();
-            p.removeTimeout = setTimeout(() => {
-                room.players = room.players.filter(x => x !== p);
-                console.log(`🗑️ Removed disconnected player ${p.username} after timeout`);
-            }, 5 * 60 * 1000);
+        const player = room.players.find(candidate => candidate.id === socket.id);
+        if (!player) return;
+
+        player.disconnected = true;
+        player.disconnectedAt = Date.now();
+        if (room.isSurviv || player.mode === 'surviv') {
+            player.inputDx = 0;
+            player.inputDy = 0;
+            player.shooting = false;
+            player.useMedkit = false;
+            player.pickupWeaponPending = false;
+            player.openChestId = null;
+            player.takeChestItem = null;
+            player.removeTimeout = setTimeout(() => {
+                if (!player.disconnected || player._eliminated || !room.players.includes(player)) return;
+                eliminateSurvivPlayer(room, player, io, null);
+                console.log(`🗑️ Eliminated disconnected Surviv player ${player.username} after reconnect grace`);
+            }, SURVIV.reconnectGraceMs);
+            return;
         }
+
+        player.removeTimeout = setTimeout(() => {
+            room.players = room.players.filter(candidate => candidate !== player);
+            console.log(`🗑️ Removed disconnected player ${player.username} after timeout`);
+        }, 5 * 60 * 1000);
     });
 
     socket.on('slitherSpectateCam', ({ x, y }) => {
@@ -7269,55 +7301,113 @@ io.on('connection', (socket) => {
         p.boost = p.isCashingOut ? false : !!boost;
     });
 
-    socket.on('survivInput', ({ dx, dy, aimAngle, shooting, reload, useMedkit, pickupWeapon, equipSlot, openChestId, takeChestItem, putChestItem, closeChest, dropItem }) => {
-        const room = getArenaRoomById(socket.roomId);
-        const p = room?.players.find(pl => pl.id === socket.id && pl.mode === 'surviv');
-        if (!p) return;
-        p.inputDx = Number(dx) || 0;
-        p.inputDy = Number(dy) || 0;
-        if (Number.isFinite(aimAngle)) p.aimAngle = aimAngle;
+    socket.on('survivInput', (payload = {}) => {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
 
-        if (p.isCashingOut) {
-            p.shooting = false;
+        const now = Date.now();
+        if (now - survivInputRate.windowStartedAt >= 1000) {
+            survivInputRate.windowStartedAt = now;
+            survivInputRate.count = 0;
+        }
+        survivInputRate.count += 1;
+        if (survivInputRate.count > 90) return;
+
+        const room = getArenaRoomById(socket.roomId);
+        const player = room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
+        if (!player || player.disconnected) return;
+
+        const finiteClamp = (value, min, max, fallback = 0) => {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+        };
+        const safeId = (value, maxLength = 128) => (
+            typeof value === 'string' && value.length > 0 && value.length <= maxLength ? value : null
+        );
+        const {
+            dx,
+            dy,
+            aimAngle,
+            shooting,
+            reload,
+            useMedkit,
+            pickupWeapon,
+            equipSlot,
+            openChestId,
+            takeChestItem,
+            putChestItem,
+            closeChest,
+            dropItem,
+        } = payload;
+
+        player.inputDx = finiteClamp(dx, -1, 1);
+        player.inputDy = finiteClamp(dy, -1, 1);
+        const parsedAim = Number(aimAngle);
+        if (Number.isFinite(parsedAim)) {
+            player.aimAngle = Math.atan2(Math.sin(parsedAim), Math.cos(parsedAim));
+        }
+
+        if (player.isCashingOut) {
+            player.shooting = false;
             return;
         }
 
-        p.shooting = !!shooting;
-        if (useMedkit) p.useMedkit = true;
-        if (pickupWeapon) p.pickupWeaponPending = true;
-        if (typeof openChestId === 'string' && openChestId.length > 0) p.openChestId = openChestId;
-        if (takeChestItem && typeof takeChestItem === 'object') {
-            const chestId = typeof takeChestItem.chestId === 'string' ? takeChestItem.chestId : null;
-            const itemKey = typeof takeChestItem.itemKey === 'string' ? takeChestItem.itemKey : null;
-            if (chestId && itemKey) p.takeChestItem = { chestId, itemKey };
+        player.shooting = shooting === true;
+        if (useMedkit === true) player.useMedkit = true;
+        if (pickupWeapon === true) player.pickupWeaponPending = true;
+
+        const requestedChestId = safeId(openChestId);
+        if (requestedChestId) player.openChestId = requestedChestId;
+
+        if (takeChestItem && typeof takeChestItem === 'object' && !Array.isArray(takeChestItem)) {
+            const chestId = safeId(takeChestItem.chestId);
+            const itemKey = safeId(takeChestItem.itemKey, 24);
+            if (chestId && itemKey && survivItemKeys.has(itemKey)) player.takeChestItem = { chestId, itemKey };
         }
-        if (putChestItem && typeof putChestItem === 'object') {
-            const chestId = typeof putChestItem.chestId === 'string' ? putChestItem.chestId : null;
-            const itemKey = typeof putChestItem.itemKey === 'string' ? putChestItem.itemKey : null;
-            const weaponType = typeof putChestItem.weaponType === 'string' ? putChestItem.weaponType : null;
-            const slotIdx = Number.isInteger(putChestItem.slotIdx) ? putChestItem.slotIdx : null;
-            if (chestId && itemKey) p.putChestItem = { chestId, itemKey, weaponType, slotIdx };
+        if (putChestItem && typeof putChestItem === 'object' && !Array.isArray(putChestItem)) {
+            const chestId = safeId(putChestItem.chestId);
+            const itemKey = safeId(putChestItem.itemKey, 24);
+            const weaponType = safeId(putChestItem.weaponType, 24);
+            const slotIdx = Number.isInteger(putChestItem.slotIdx) && putChestItem.slotIdx >= 0 && putChestItem.slotIdx < 2
+                ? putChestItem.slotIdx
+                : null;
+            if (chestId && itemKey && survivItemKeys.has(itemKey)) {
+                player.putChestItem = { chestId, itemKey, weaponType, slotIdx };
+            }
         }
-        if (dropItem && typeof dropItem === 'object') {
-            const itemKey = typeof dropItem.itemKey === 'string' ? dropItem.itemKey : null;
-            const slotIdx = Number.isInteger(dropItem.slotIdx) ? dropItem.slotIdx : null;
-            if (itemKey) p.dropItemPending = { itemKey, slotIdx };
+        if (dropItem && typeof dropItem === 'object' && !Array.isArray(dropItem)) {
+            const itemKey = safeId(dropItem.itemKey, 24);
+            const slotIdx = Number.isInteger(dropItem.slotIdx) && dropItem.slotIdx >= 0 && dropItem.slotIdx < 2
+                ? dropItem.slotIdx
+                : null;
+            if (itemKey && survivItemKeys.has(itemKey)) player.dropItemPending = { itemKey, slotIdx };
         }
-        if (closeChest) {
-            p.openedContainerId = null;
-            p.openedContainer = null;
+        if (closeChest === true) {
+            player.openedContainerId = null;
+            player.openedContainer = null;
         }
-        if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 3) p.equipSlotPending = equipSlot;
-        if (reload) beginSurvivReload(p);
+        if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 2) player.equipSlotPending = equipSlot;
+        if (reload === true) beginSurvivReload(player);
     });
 
-    socket.on('survivSpectateCam', ({ x, y }) => {
+    socket.on('survivSpectateCam', (payload = {}) => {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+
+        const now = Date.now();
+        if (now - survivSpectateRate.windowStartedAt >= 1000) {
+            survivSpectateRate.windowStartedAt = now;
+            survivSpectateRate.count = 0;
+        }
+        survivSpectateRate.count += 1;
+        if (survivSpectateRate.count > 20) return;
+
         const room = getArenaRoomById(socket.roomId);
         if (!room?.isSurviv) return;
-        const spec = room.spectators?.find(s => s.id === socket.id);
-        if (!spec) return;
-        spec.x = Number(x) || 0;
-        spec.y = Number(y) || 0;
+        const spectator = room.spectators?.find(candidate => candidate.id === socket.id);
+        if (!spectator) return;
+        const x = Number(payload.x);
+        const y = Number(payload.y);
+        if (Number.isFinite(x)) spectator.x = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, x));
+        if (Number.isFinite(y)) spectator.y = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, y));
     });
 });
 
@@ -7375,9 +7465,9 @@ function processCompetitiveSlitherTick() {
 function processSurvivTick() {
     for (const room of survivRooms) {
         if (room.isResetting) continue;
-        const humanCount = room.players.filter(p => !p.disconnected).length;
+        const alivePlayerCount = room.players.filter(player => !player._eliminated && player.hp > 0).length;
         const spectatorCount = room.spectators?.length ?? 0;
-        if (humanCount === 0 && spectatorCount === 0) continue;
+        if (alivePlayerCount === 0 && spectatorCount === 0) continue;
 
         const resetTime = room.startTime + c.roomDuration;
         const lbData = processSurvivRoom(room, io, resetTime);
