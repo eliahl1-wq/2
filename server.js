@@ -6280,7 +6280,9 @@ io.on('connection', (socket) => {
 
                 socket.roomId = room.id;
                 const survivSkinColor = (validatedSkinColor === 'random' || validatedSkinColor === 'random_color')
-                    ? util.randomColor()
+                    // Surviv's canvas renderer expects a CSS color string. randomColor()
+                    // returns an Agar-style { fill, border } object, which Canvas ignores.
+                    ? util.randomSlitherColor()
                     : (validatedSkinColor || util.randomSlitherColor());
                 const newPlayer = createSurvivPlayer(
                     socket.id,
