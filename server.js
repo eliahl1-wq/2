@@ -5760,6 +5760,7 @@ io.on('connection', (socket) => {
     touchSitePresence(socket.request, presenceId);
     const survivInputRate = { windowStartedAt: 0, count: 0 };
     const survivSpectateRate = { windowStartedAt: 0, count: 0 };
+    const socialRate = { chatWindowAt: 0, chatCount: 0, emoteWindowAt: 0, emoteCount: 0 };
     const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'grenades', 'armor']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
@@ -7418,6 +7419,63 @@ io.on('connection', (socket) => {
         }
         if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 2) player.equipSlotPending = equipSlot;
         if (reload === true) beginSurvivReload(player);
+    });
+
+    const resolveGameSocialContext = () => {
+        const battleRoyale = findBRPlayerBySocket(socket.id);
+        if (battleRoyale) return battleRoyale;
+        const room = getArenaRoomById(socket.roomId);
+        const player = room?.players?.find(candidate => candidate.id === socket.id);
+        return room && player ? { room, player } : null;
+    };
+
+    const emitGameSocial = (context, event, payload) => {
+        const mode = context.player.mode;
+        for (const recipient of context.room.players || []) {
+            if (!recipient?.id || recipient.isBot || recipient.disconnected) continue;
+            if (!context.room.isBattleRoyale && mode && recipient.mode && recipient.mode !== mode) continue;
+            io.to(recipient.id).emit(event, payload);
+        }
+    };
+
+    socket.on('gameChatSend', (payload = {}) => {
+        const now = Date.now();
+        if (now - socialRate.chatWindowAt > 5000) {
+            socialRate.chatWindowAt = now;
+            socialRate.chatCount = 0;
+        }
+        if (++socialRate.chatCount > 5) return;
+        const context = resolveGameSocialContext();
+        if (!context || context.player.disconnected) return;
+        const message = typeof payload?.message === 'string'
+            ? payload.message.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180)
+            : '';
+        if (!message) return;
+        emitGameSocial(context, 'gameChatMessage', {
+            id: `${socket.id}:${now}`,
+            sender: String(context.player.name || context.player.username || 'Player').slice(0, 32),
+            message,
+            sentAt: now,
+        });
+    });
+
+    socket.on('gameEmote', (payload = {}) => {
+        const now = Date.now();
+        if (now - socialRate.emoteWindowAt > 1000) {
+            socialRate.emoteWindowAt = now;
+            socialRate.emoteCount = 0;
+        }
+        if (++socialRate.emoteCount > 4) return;
+        const allowed = new Set(['👍', '😂', '🔥', '❤️', '😡', '😢', '🎯', '👋']);
+        const emote = typeof payload?.emote === 'string' && allowed.has(payload.emote) ? payload.emote : null;
+        const context = emote ? resolveGameSocialContext() : null;
+        if (!context || context.player.disconnected) return;
+        emitGameSocial(context, 'gameEmote', {
+            id: `${socket.id}:${now}`,
+            sender: String(context.player.name || context.player.username || 'Player').slice(0, 32),
+            emote,
+            sentAt: now,
+        });
     });
 
     socket.on('survivSpectateCam', (payload = {}) => {
