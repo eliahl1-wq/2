@@ -1,3 +1,4 @@
+
 import express from 'express';
 import mongoose from 'mongoose';
 import cors from 'cors';
@@ -448,6 +449,8 @@ function createArenaRoom(entryFeeUsd) {
         entryFeeUsd,
         players: [],
         bots: [],
+
+
         slitherBots: [],
         food: [],
         slitherFood: [],
@@ -498,7 +501,6 @@ function getTournamentRoom(tournamentOrId) {
 
 function createCompetitiveSlitherRoom(entryFeeUsd) {
     return {
-
         id: `competitive-slither-${entryFeeUsd}`,
         entryFeeUsd,
         isCompetitiveSlither: true,
@@ -899,6 +901,8 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
 
     const totalLamports = await connection.getBalance(housePubKey);
     const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+
+
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
     const canTransferOwnerFee = false;
@@ -999,7 +1003,6 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         playerId: mongoId,
         timestamp: new Date().toISOString(),
     };
-
 
     if (player.isFreeTicketPlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
@@ -1350,6 +1353,8 @@ async function sweepHouseWalletOnReset() {
             currency: 'SOL',
             meta: {
                 event: 'reward_pool_sweep',
+
+
                 amountUsd: sweptUsd,
                 signature: sig,
                 reason: 'Room Reset Reward Sweep',
@@ -1500,7 +1505,6 @@ function getTransactionAccountKeys(txDetails) {
 }
 
 function extractNativeDeposit(txDetails, destinationAddress) {
-
     if (!txDetails || txDetails.meta?.err) return null;
     const keys = getTransactionAccountKeys(txDetails);
     const destinationIndex = keys.findIndex(key => key.toString() === destinationAddress);
@@ -1801,6 +1805,8 @@ const authenticateToken = (req, res, next) => {
                 message: expired ? 'Session expired — please log in again' : 'Invalid token',
                 expired,
             });
+
+
         }
         req.user = user;
         next();
@@ -2001,7 +2007,6 @@ async function settleTournament(tournamentId) {
         for (const player of room.players) {
             if (!player.isBot && player.id) {
                 io.to(player.id).emit('tournamentEnded', {
-
                     tournamentId: tournament._id.toString(),
                     name: tournament.name,
                 });
@@ -2252,6 +2257,8 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
             if (player) {
                 return res.json({
                     inGame: true,
+
+
                     mode: 'competitive-slither',
                     balance: player.dollarBalance ?? null,
                     entryFeeUsd: player.entryFeeUsd ?? room.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE,
@@ -2502,7 +2509,6 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             return res.status(400).json({ error: 'No unlocked rewards available to claim' });
         }
 
-
         const { user, claim } = reserved;
         const amountUsd = claim.amountUsd;
 
@@ -2703,6 +2709,8 @@ app.post('/api/user/claim-tournament-rewards', sensitiveRateLimit({ limit: 10, w
         }
         if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET) throw new Error('Tournament wallet not configured');
         const tournamentKeypair = solanaWeb3.Keypair.fromSecretKey(
+
+
             Uint8Array.from(Buffer.from(TOURNAMENT_WALLET_SECRET, 'hex')),
         );
         if (tournamentKeypair.publicKey.toBase58() !== TOURNAMENT_WALLET_ADDRESS) {
@@ -3003,7 +3011,6 @@ function objectIdCreatedAt(id) {
         return new mongoose.Types.ObjectId(id).getTimestamp();
     } catch {
         return null;
-
     }
 }
 
@@ -3154,6 +3161,8 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ]),
             Transaction.aggregate([
                 { $match: withdrawMatch },
+
+
                 { $group: { _id: null, txs: { $push: { amount: '$amount', currency: '$currency', meta: '$meta' } }, count: { $sum: 1 } } },
             ]),
             Transaction.countDocuments({ excludedFromReports: true }),
@@ -3504,7 +3513,6 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
         if (!user) return res.status(404).json({ message: 'User not found' });
 
         const uid = user._id;
-
         const [allTxs, joinTxs, cashoutTxs] = await Promise.all([
             Transaction.find({ userId: uid }).sort({ createdAt: -1 }).limit(500).lean(),
             Transaction.find({ userId: uid, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } }).sort({ createdAt: -1 }).lean(),
@@ -3605,6 +3613,8 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             const reason = tx.meta?.reason || '';
             if (tx.type === 'game' && ['join', 'br_join'].includes(event)) {
                 const mode = event === 'br_join'
+
+
                     ? ('br-' + (tx.meta?.variant || tx.meta?.mode || 'unknown'))
                     : (tx.meta?.mode || 'agar');
                 const row = ensureMode(mode);
@@ -4005,7 +4015,6 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             total: history.length,
         });
     } catch (err) {
-
         console.error('Admin sweeps error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -4056,6 +4065,8 @@ app.get('/api/admin/dashboard/live-feed', authenticateAdmin, async (req, res) =>
                     }
                 }
                 return players;
+
+
             })(),
         ]);
 
@@ -4507,6 +4518,7 @@ async function sweepTournamentWalletToOwner() {
             reason: 'Tournament Wallet Sweep',
             solAmount,
 
+
             signature,
             verifiedOnChain: true,
             sourceWallet: TOURNAMENT_WALLET_ADDRESS,
@@ -4957,6 +4969,8 @@ function touchSitePresence(req, customKey = null) {
 
 function getSiteUsersOnline() {
     const cutoff = Date.now() - PRESENCE_TTL_MS;
+
+
     const uniqueIps = new Set();
     for (const [key, data] of sitePresence) {
         const seenAt = typeof data === 'number' ? data : data.lastSeen;
@@ -5006,7 +5020,6 @@ app.get('/api/stats', (req, res) => {
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0, surviv: 0 };
         let totalBotsOnline = 0;
-
 
         const pushTop = (list, name, balance) => {
             if (name && balance > 0) list.push({ username: name, balance });
@@ -5408,6 +5421,8 @@ function foodBlobValueForRoom(room) {
 
 function findPlayerInArena(mongoId) {
     const key = mongoId?.toString();
+
+
     for (const room of rooms) {
         const player = room.players.find(p => p.mongoId?.toString() === key);
         if (player) return { room, player };
@@ -5508,7 +5523,6 @@ function addBots(room, n, botStake = null) {
                 id: Math.random().toString(36).substr(2, 9),
                 x: Math.random() * c.worldWidth,
                 y: Math.random() * c.worldHeight,
-
                 balance: startMass,
                 radius: calculateCellRadius(startMass, startMass, 1, startMass),
             }],
@@ -5760,6 +5774,7 @@ io.on('connection', (socket) => {
     touchSitePresence(socket.request, presenceId);
     const survivInputRate = { windowStartedAt: 0, count: 0 };
     const survivSpectateRate = { windowStartedAt: 0, count: 0 };
+    const socialRate = { chatWindowAt: 0, chatCount: 0, emoteWindowAt: 0, emoteCount: 0 };
     const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'grenades', 'armor']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
@@ -5858,6 +5873,8 @@ io.on('connection', (socket) => {
                 );
                 paidJoin = {
                     userId: user._id,
+
+
                     destination: user.depositAddress,
                     lamports: feeLamports,
                     tournamentId: tournament._id.toString(),
@@ -6008,7 +6025,6 @@ io.on('connection', (socket) => {
                 return;
             }
             user = await ensureUserDepositWallet(user);
-
 
             if (getBRMatchForMongo(user._id.toString())) {
                 socket.emit('error', 'You are in an active Battle Royale match.');
@@ -6309,6 +6325,8 @@ io.on('connection', (socket) => {
                     if (pendingPaidJoin) {
                         await refundPaidJoin(pendingPaidJoin, 'duplicate_join_race');
                         pendingPaidJoin = null;
+
+
                     }
                     raced.id = socket.id;
                     raced.disconnected = false;
@@ -6510,7 +6528,6 @@ io.on('connection', (socket) => {
                         },
                         status: 'confirmed'
                     });
-
                 } else {
                     await Transaction.create({
                         userId: user._id,
@@ -6760,6 +6777,8 @@ io.on('connection', (socket) => {
                         { $set: { freeTicketUsed: false, hasFreeTicket: true } },
                     );
                     pendingTicketUserId = null;
+
+
                 }
                 raced.id = socket.id;
                 raced.disconnected = false;
@@ -7011,7 +7030,6 @@ io.on('connection', (socket) => {
             if (!DEV_FREE_PLAY && !room.isSandbox) return;
 
             if (room.isCompetitiveSlither) {
-
                 room.players = room.players.filter(pl => !pl.isBot);
             } else {
                 room.bots = [];
@@ -7211,6 +7229,8 @@ io.on('connection', (socket) => {
 
             if (isCompetitive || activePlayer.mode === 'competitive-slither') {
                 try {
+
+
                     await executeCompetitiveCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
                     await logSolanaTransactionError('❌ Competitive cashout error:', err);
@@ -7420,6 +7440,63 @@ io.on('connection', (socket) => {
         if (reload === true) beginSurvivReload(player);
     });
 
+    const resolveGameSocialContext = () => {
+        const battleRoyale = findBRPlayerBySocket(socket.id);
+        if (battleRoyale) return battleRoyale;
+        const room = getArenaRoomById(socket.roomId);
+        const player = room?.players?.find(candidate => candidate.id === socket.id);
+        return room && player ? { room, player } : null;
+    };
+
+    const emitGameSocial = (context, event, payload) => {
+        const mode = context.player.mode;
+        for (const recipient of context.room.players || []) {
+            if (!recipient?.id || recipient.isBot || recipient.disconnected) continue;
+            if (!context.room.isBattleRoyale && mode && recipient.mode && recipient.mode !== mode) continue;
+            io.to(recipient.id).emit(event, payload);
+        }
+    };
+
+    socket.on('gameChatSend', (payload = {}) => {
+        const now = Date.now();
+        if (now - socialRate.chatWindowAt > 5000) {
+            socialRate.chatWindowAt = now;
+            socialRate.chatCount = 0;
+        }
+        if (++socialRate.chatCount > 5) return;
+        const context = resolveGameSocialContext();
+        if (!context || context.player.disconnected) return;
+        const message = typeof payload?.message === 'string'
+            ? payload.message.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180)
+            : '';
+        if (!message) return;
+        emitGameSocial(context, 'gameChatMessage', {
+            id: `${socket.id}:${now}`,
+            sender: String(context.player.name || context.player.username || 'Player').slice(0, 32),
+            message,
+            sentAt: now,
+        });
+    });
+
+    socket.on('gameEmote', (payload = {}) => {
+        const now = Date.now();
+        if (now - socialRate.emoteWindowAt > 1000) {
+            socialRate.emoteWindowAt = now;
+            socialRate.emoteCount = 0;
+        }
+        if (++socialRate.emoteCount > 4) return;
+        const allowed = new Set(['👍', '😂', '🔥', '❤️', '😡', '😢', '🎯', '👋']);
+        const emote = typeof payload?.emote === 'string' && allowed.has(payload.emote) ? payload.emote : null;
+        const context = emote ? resolveGameSocialContext() : null;
+        if (!context || context.player.disconnected) return;
+        emitGameSocial(context, 'gameEmote', {
+            id: `${socket.id}:${now}`,
+            sender: String(context.player.name || context.player.username || 'Player').slice(0, 32),
+            emote,
+            sentAt: now,
+        });
+    });
+
     socket.on('survivSpectateCam', (payload = {}) => {
         if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
 
@@ -7512,7 +7589,6 @@ function processSurvivTick() {
 }
 
 function getBattleRoyaleDeps() {
-
     return {
         User,
         Transaction,
@@ -7605,6 +7681,8 @@ setInterval(() => {
 
 function processRoom(room) {
     if (room.isResetting) return; // Pause during global reset
+
+
 
     const isSandbox = room.isSandbox === true;
     const agarHumans = countActiveHumansByMode(room, 'agar');
@@ -8013,7 +8091,6 @@ function processRoom(room) {
                         if (cell.balance > otherCell.balance * 1.05 && d < r) {
                             const victim = room.players.find(p => p.id === item.socketId)
                                 || room.bots.find(b => b.id === item.botId);
-
                             // Reject stale quadtree cells already consumed by another eater.
                             if (!victim?.cells?.some(c => c.id === otherCell.id)) continue;
 
@@ -8056,6 +8133,8 @@ function processRoom(room) {
                                             },
                                             status: 'confirmed',
                                         }).catch(err => console.error("Error logging agar death:", err));
+
+
 
                                         room.players = room.players.filter(p => p.id !== victim.id);
                                     } else {
