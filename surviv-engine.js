@@ -12,6 +12,7 @@ const SURVIV_MAX_WEAPONS = 2;
 const SURVIV_MELEE_SLOT = SURVIV_MAX_WEAPONS;
 const SURVIV_MAX_MEDKITS = 6;
 const SURVIV_MAX_AMMO_PACKS = 9;
+const SURVIV_MAX_GRENADES = 3;
 
 export const SURVIV = {
     worldHalf: 10000,
@@ -29,6 +30,10 @@ export const SURVIV = {
     lootPickupRadius: 34,
     chestOpenRadius: 92,
     medkitUseMs: 2500,
+    grenadeFuseMs: 850,
+    grenadeSpeed: 15,
+    grenadeRadius: 145,
+    grenadeDamage: 62,
 };
 
 export const WEAPONS = {
@@ -41,6 +46,21 @@ export const WEAPONS = {
         melee: true,
         meleeReach: 58,
         meleeArc: 0.95,
+        clipSize: 0,
+        reloadMs: 0,
+        spread: 0,
+        bulletSpeed: 0,
+        pellets: 0,
+    },
+    knife: {
+        id: 'knife',
+        label: 'Combat Knife',
+        rarity: 'rare',
+        damage: 34,
+        fireRateMs: 340,
+        melee: true,
+        meleeReach: 76,
+        meleeArc: 0.78,
         clipSize: 0,
         reloadMs: 0,
         spread: 0,
@@ -152,7 +172,7 @@ const BOT_NAMES = [
 
 const WEAPON_RARITY_POOLS = {
     common: ['revolver', 'revolver', 'smg', 'shotgun'],
-    rare: ['smg', 'shotgun', 'assault', 'assault', 'dmr'],
+    rare: ['knife', 'smg', 'shotgun', 'assault', 'assault', 'dmr'],
     military: ['assault', 'dmr', 'dmr', 'sniper', 'lmg'],
 };
 const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
@@ -433,6 +453,9 @@ function randomChestContents(tier = 'common', options = {}) {
     contents.ammoPacks = tier === 'military'
         ? 2 + Math.floor(Math.random() * 2)
         : tier === 'rare' ? 2 : 1;
+    if (Math.random() < (tier === 'military' ? 0.55 : tier === 'rare' ? 0.35 : 0.16)) {
+        contents.grenades = 1;
+    }
     const medkitChance = (tier === 'military' ? 0.86 : tier === 'rare' ? 0.68 : 0.36) * (outdoor ? 0.78 : 1);
     if (Math.random() < medkitChance) {
         contents.medkits = tier === 'military' && Math.random() > 0.55 ? 2 : 1;
@@ -475,6 +498,7 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
     const options = typeof opts === 'string' ? { variant: opts } : (opts || {});
     const defaultHp = options.collidable === false ? null : SURVIV_DESTRUCTIBLE_OBSTACLE_HP[kind];
     const maxHp = Number.isFinite(options.maxHp) ? Math.max(1, options.maxHp) : defaultHp;
+
     const obstacle = {
         id: randId(),
         kind,
@@ -975,6 +999,7 @@ function addContainerYard(obstacles, loot, spawnPoints, x, y) {
     ];
     
     let containerIndex = 0;
+
     for (const stack of stacks) {
         for (let i = 0; i < stack.count; i++) {
             const cx = stack.horizontal ? stack.x + i * 140 : stack.x;
@@ -1475,6 +1500,7 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
 
     // Central Warehouse
     addHouse(obstacles, loot, spawnPoints, x, y, 600, 450, {
+
         variant: 'warehouse', tier: 'military', hue: 205, wall: 16, doorSide: 'south',
         landmarkType: 'military', label: 'ARMORY', role: 'armory', layout: 'corridor',
     });
@@ -1975,6 +2001,7 @@ function isAreaOverlapping(x, y, w, h, buffer = 200, poiList = []) {
     // 3. Check branch roads
     // Center branch: x = 0, y from 0 to 2000
     if (rectsOverlap(x, y, w, h, 0, 1000, 120 + buffer * 2, 2000)) return true;
+
     // South Villa branch: x = -200, y from 2000 to 5200
     if (rectsOverlap(x, y, w, h, -200, 3600, 120 + buffer * 2, 3200)) return true;
     // Gas station branch: y = -7800, x from -2500 to -1500
@@ -2384,10 +2411,12 @@ export function beginSurvivReload(entity, now = Date.now()) {
 
 function makeInventory() {
     return {
-        // Firearms only. Fists are an always-available third/melee slot.
+        // Firearms only. The third slot is a replaceable melee weapon.
         weapons: [],
+        meleeWeapon: 'fists',
         medkits: 0,
         ammoPacks: 0,
+        grenades: 0,
         chestsOpened: 0,
     };
 }
@@ -2400,14 +2429,16 @@ function ensureInventory(entity) {
     const validSlotAmmo = [];
     for (let index = 0; index < currentWeapons.length && validWeapons.length < SURVIV_MAX_WEAPONS; index++) {
         const weapon = currentWeapons[index];
-        if (weapon === 'fists' || !WEAPONS[weapon]) continue;
+        if (weapon === 'fists' || weapon === 'knife' || !WEAPONS[weapon]) continue;
         validWeapons.push(weapon);
         validSlotAmmo.push(currentSlotAmmo[index]);
     }
     entity.inventory.weapons = validWeapons;
+    entity.inventory.meleeWeapon = entity.inventory.meleeWeapon === 'knife' ? 'knife' : 'fists';
     if (Array.isArray(entity.weaponSlotAmmo)) entity.weaponSlotAmmo = validSlotAmmo;
     entity.inventory.medkits = Math.max(0, Math.min(SURVIV_MAX_MEDKITS, Number(entity.inventory.medkits) || 0));
     entity.inventory.ammoPacks = Math.max(0, Math.min(SURVIV_MAX_AMMO_PACKS, Number(entity.inventory.ammoPacks) || 0));
+    entity.inventory.grenades = Math.max(0, Math.min(SURVIV_MAX_GRENADES, Number(entity.inventory.grenades) || 0));
     entity.inventory.chestsOpened = Number(entity.inventory.chestsOpened) || 0;
     return entity.inventory;
 }
@@ -2471,11 +2502,15 @@ function describeContainerItems(contents = {}) {
     if (contents.money) {
         items.push({ key: 'money', kind: 'money', label: '$' + Number(contents.money).toFixed(2), value: Number(contents.money) });
     }
+
     if (contents.medkits) {
         items.push({ key: 'medkits', kind: 'medkit', label: 'Medkit', value: Number(contents.medkits) });
     }
     if (contents.ammoPacks) {
         items.push({ key: 'ammoPacks', kind: 'ammo', label: 'Ammo', value: Number(contents.ammoPacks) });
+    }
+    if (contents.grenades) {
+        items.push({ key: 'grenades', kind: 'grenade', label: 'Grenade', value: Number(contents.grenades) });
     }
     if (contents.armor) {
         items.push({ key: 'armor', kind: 'armor', label: 'Armor', value: Number(contents.armor) });
@@ -2484,7 +2519,7 @@ function describeContainerItems(contents = {}) {
 }
 
 function isContainerEmpty(contents = {}) {
-    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoPacks && !contents.armor;
+    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoPacks && !contents.grenades && !contents.armor;
 }
 
 function applyLootContents(entity, contents = {}, options = {}) {
@@ -2494,6 +2529,7 @@ function applyLootContents(entity, contents = {}, options = {}) {
         medkits: 0,
         armor: 0,
         ammoPacks: 0,
+        grenades: 0,
         weaponType: null,
         weaponLabel: null,
         rarity: contents.rarity || null,
@@ -2516,8 +2552,21 @@ function applyLootContents(entity, contents = {}, options = {}) {
         summary.ammoPacks = packs;
         inv.ammoPacks += packs;
     }
+    if (contents.grenades) {
+        const grenades = Math.max(0, Math.min(Number(contents.grenades) || 0, SURVIV_MAX_GRENADES - inv.grenades));
+        summary.grenades = grenades;
+        inv.grenades += grenades;
+    }
     if (contents.weaponType && WEAPONS[contents.weaponType]) {
         const def = WEAPONS[contents.weaponType];
+        if (def.melee) {
+            if (contents.weaponType === 'knife' && inv.meleeWeapon !== 'knife') {
+                inv.meleeWeapon = 'knife';
+                summary.weaponType = 'knife';
+                summary.weaponLabel = def.label;
+            }
+            return summary;
+        }
         const pickupAmmo = Number.isFinite(contents.ammo) ? Math.max(0, Number(contents.ammo)) : def.clipSize;
         saveActiveWeaponAmmo(entity);
         const added = addWeaponToInventory(entity, contents.weaponType, pickupAmmo);
@@ -2563,6 +2612,22 @@ function pickupGroundWeapon(entity, room) {
     const nextDef = WEAPONS[nextType];
     const nextAmmo = Number.isFinite(item.ammo) ? Math.max(0, Number(item.ammo)) : nextDef.clipSize;
     saveActiveWeaponAmmo(entity);
+    if (nextDef.melee) {
+        if (nextType !== 'knife' || inv.meleeWeapon === 'knife') return false;
+        inv.meleeWeapon = 'knife';
+        removeSurvivLootAt(room, candidate.index);
+        entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
+        entity.weapon = makeWeaponState('knife');
+        entity.lastLoot = {
+            id: `ground-knife:${entity.id}:${Date.now()}`,
+            type: 'ground',
+            tier: nextDef.rarity,
+            source: 'ground',
+            items: { weaponType: 'knife', weaponLabel: nextDef.label },
+            pickedAt: Date.now(),
+        };
+        return true;
+    }
     const slotAmmo = ensureWeaponSlotAmmo(entity);
     let nextSlot;
 
@@ -2612,7 +2677,7 @@ export function equipSurvivWeaponSlot(entity, slot) {
     saveActiveWeaponAmmo(entity);
     if (index === SURVIV_MELEE_SLOT) {
         entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
-        entity.weapon = makeWeaponState('fists');
+        entity.weapon = makeWeaponState(inv.meleeWeapon || 'fists');
         syncLegacyWeaponAmmo(entity);
         return true;
     }
@@ -2656,7 +2721,7 @@ function removeWeaponSlot(entity, index) {
             syncLegacyWeaponAmmo(entity);
         } else {
             entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
-            entity.weapon = makeWeaponState('fists');
+            entity.weapon = makeWeaponState(inv.meleeWeapon || 'fists');
             syncLegacyWeaponAmmo(entity);
         }
     } else {
@@ -2938,6 +3003,7 @@ function addSurvivLoot(room, item) {
 function removeSurvivLootAt(room, index) {
     if (index < 0 || index >= room.loot.length) return null;
     const [removed] = room.loot.splice(index, 1);
+
     if (removed) markSurvivLootChanged(room);
     return removed || null;
 }
@@ -3119,8 +3185,10 @@ function dropDeathLoot(room, entity) {
             });
         }
     });
+    if (inventory.meleeWeapon === 'knife') drops.push({ type: 'weapon', weaponType: 'knife', tier: WEAPONS.knife.rarity });
     if (inventory.medkits > 0) drops.push({ type: 'medkit', amount: inventory.medkits });
     if (inventory.ammoPacks > 0) drops.push({ type: 'ammo', amount: inventory.ammoPacks });
+    if (inventory.grenades > 0) drops.push({ type: 'grenade', amount: inventory.grenades });
     if (entity.armor > 0) drops.push({ type: 'armor', armorValue: Math.round(entity.armor) });
 
     drops.forEach((drop, index) => {
@@ -3139,6 +3207,8 @@ function dropDeathLoot(room, entity) {
     entity.weaponsAmmo = {};
     inventory.medkits = 0;
     inventory.ammoPacks = 0;
+    inventory.grenades = 0;
+    inventory.meleeWeapon = 'fists';
 }
 
 export function eliminateSurvivPlayer(room, player, io, attacker = null) {
@@ -3252,10 +3322,60 @@ function takeLootContainerItem(entity, room) {
         picked = { medkits: contents.medkits, rarity: contents.rarity };
     } else if (itemKey === 'ammoPacks' && contents.ammoPacks) {
         picked = { ammoPacks: contents.ammoPacks, rarity: contents.rarity };
+    } else if (itemKey === 'grenades' && contents.grenades) {
+        picked = { grenades: contents.grenades, rarity: contents.rarity };
     } else if (itemKey === 'armor' && contents.armor) {
         picked = { armor: contents.armor, rarity: contents.rarity };
     }
     if (!picked) return;
+
+    // A chest weapon can be dropped directly onto a firearm slot. When that
+    // slot is occupied, exchange the two weapons instead of silently refusing
+    // the take because the backpack is full.
+    const targetSlot = Number.isInteger(request.targetSlot) ? request.targetSlot : null;
+    if (itemKey === 'weapon' && targetSlot != null && !WEAPONS[contents.weaponType]?.melee) {
+        const inv = ensureInventory(entity);
+        if (targetSlot >= 0 && targetSlot < inv.weapons.length) {
+            saveActiveWeaponAmmo(entity);
+            const slotAmmo = ensureWeaponSlotAmmo(entity);
+            const outgoingType = inv.weapons[targetSlot];
+            const outgoingAmmo = slotAmmo[targetSlot] ?? 0;
+            const incomingType = contents.weaponType;
+            const incomingAmmo = Number.isFinite(contents.ammo)
+                ? Math.max(0, Number(contents.ammo))
+                : WEAPONS[incomingType].clipSize;
+
+            inv.weapons[targetSlot] = incomingType;
+            slotAmmo[targetSlot] = incomingAmmo;
+            contents.weaponType = outgoingType;
+            contents.ammo = outgoingAmmo;
+            contents.rarity = WEAPONS[outgoingType]?.rarity || 'common';
+            if (entity.activeWeaponSlot === targetSlot) {
+                entity.weapon = makeWeaponState(incomingType);
+                entity.weapon.ammo = incomingAmmo;
+            }
+            syncLegacyWeaponAmmo(entity);
+            entity.lastLoot = {
+                id: item.id + ':weapon-swap:' + Date.now(),
+                chestId: item.id,
+                type: item.type,
+                tier: item.tier,
+                source: item.source,
+                items: { weaponType: incomingType, weaponLabel: WEAPONS[incomingType].label },
+                openedAt: Date.now(),
+            };
+            entity.openedContainerId = item.id;
+            refreshOpenedContainer(entity, room);
+            return;
+        }
+    }
+    // A normal click on a full firearm inventory must not replace a gun by
+    // accident. The UI sends targetSlot when the player intentionally drops
+    // the chest weapon on a slot to exchange it.
+    if (itemKey === 'weapon' && !WEAPONS[contents.weaponType]?.melee && ensureInventory(entity).weapons.length >= SURVIV_MAX_WEAPONS) {
+        refreshOpenedContainer(entity, room);
+        return;
+    }
     const summary = applyLootContents(entity, picked, { countChest: false });
     if (summary.weaponType) {
         delete contents.weaponType;
@@ -3264,11 +3384,12 @@ function takeLootContainerItem(entity, room) {
     if (summary.money > 0) contents.money = Math.max(0, Number(contents.money || 0) - summary.money);
     if (summary.medkits > 0) contents.medkits = Math.max(0, Number(contents.medkits || 0) - summary.medkits);
     if (summary.ammoPacks > 0) contents.ammoPacks = Math.max(0, Number(contents.ammoPacks || 0) - summary.ammoPacks);
+    if (summary.grenades > 0) contents.grenades = Math.max(0, Number(contents.grenades || 0) - summary.grenades);
     if (summary.armor > 0) contents.armor = Math.max(0, Number(contents.armor || 0) - summary.armor);
-    for (const key of ['money', 'medkits', 'ammoPacks', 'armor']) {
+    for (const key of ['money', 'medkits', 'ammoPacks', 'grenades', 'armor']) {
         if (!(Number(contents[key]) > 0)) delete contents[key];
     }
-    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoPacks > 0 || summary.armor > 0;
+    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoPacks > 0 || summary.grenades > 0 || summary.armor > 0;
     if (!accepted) {
         refreshOpenedContainer(entity, room);
         return;
@@ -3307,13 +3428,51 @@ function putLootContainerItem(entity, room) {
 
     if (itemKey === 'weapon') {
         const requestedSlot = Number.isInteger(request.slotIdx) ? request.slotIdx : -1;
+        if (requestedSlot === SURVIV_MELEE_SLOT) {
+            if (inv.meleeWeapon === 'knife' && !contents.weaponType) {
+                inv.meleeWeapon = 'fists';
+                if (entity.activeWeaponSlot === SURVIV_MELEE_SLOT) entity.weapon = makeWeaponState('fists');
+                contents.weaponType = 'knife';
+                contents.rarity = WEAPONS.knife.rarity;
+            }
+            refreshOpenedContainer(entity, room);
+            return;
+        }
         const fallbackType = request.weaponType || (entity.weapon?.type !== 'fists' ? entity.weapon?.type : null);
         const slotIndex = requestedSlot >= 0 ? requestedSlot : inv.weapons.indexOf(fallbackType);
-        const removed = !contents.weaponType ? removeWeaponSlot(entity, slotIndex) : null;
-        if (removed?.weaponType) {
-            contents.weaponType = removed.weaponType;
-            contents.ammo = removed.ammo;
-            contents.rarity = WEAPONS[removed.weaponType]?.rarity || 'common';
+        // Swapping a chest weapon is an explicit drag-and-drop action. Do not
+        // exchange it merely because a legacy click request omitted slotIdx.
+        if (contents.weaponType && (requestedSlot < 0 || slotIndex >= inv.weapons.length)) {
+            refreshOpenedContainer(entity, room);
+            return;
+        }
+        if (contents.weaponType && slotIndex >= 0 && slotIndex < inv.weapons.length) {
+            saveActiveWeaponAmmo(entity);
+            const slotAmmo = ensureWeaponSlotAmmo(entity);
+            const outgoingType = inv.weapons[slotIndex];
+            const outgoingAmmo = slotAmmo[slotIndex] ?? 0;
+            const incomingType = contents.weaponType;
+            const incomingAmmo = Number.isFinite(contents.ammo)
+                ? Math.max(0, Number(contents.ammo))
+                : WEAPONS[incomingType].clipSize;
+
+            inv.weapons[slotIndex] = incomingType;
+            slotAmmo[slotIndex] = incomingAmmo;
+            contents.weaponType = outgoingType;
+            contents.ammo = outgoingAmmo;
+            contents.rarity = WEAPONS[outgoingType]?.rarity || 'common';
+            if (entity.activeWeaponSlot === slotIndex) {
+                entity.weapon = makeWeaponState(incomingType);
+                entity.weapon.ammo = incomingAmmo;
+            }
+            syncLegacyWeaponAmmo(entity);
+        } else {
+            const removed = !contents.weaponType ? removeWeaponSlot(entity, slotIndex) : null;
+            if (removed?.weaponType) {
+                contents.weaponType = removed.weaponType;
+                contents.ammo = removed.ammo;
+                contents.rarity = WEAPONS[removed.weaponType]?.rarity || 'common';
+            }
         }
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
@@ -3321,6 +3480,9 @@ function putLootContainerItem(entity, room) {
     } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
         inv.ammoPacks -= 1;
         contents.ammoPacks = (contents.ammoPacks || 0) + 1;
+    } else if (itemKey === 'grenades' && inv.grenades > 0) {
+        inv.grenades -= 1;
+        contents.grenades = (contents.grenades || 0) + 1;
     } else if (itemKey === 'armor' && entity.armor > 0) {
         const transfer = Math.min(35, Math.round(entity.armor));
         entity.armor = Math.max(0, entity.armor - transfer);
@@ -3328,6 +3490,67 @@ function putLootContainerItem(entity, room) {
     }
 
     refreshOpenedContainer(entity, room);
+}
+
+function throwSurvivGrenade(entity, room, now) {
+    if (entity.isCashingOut || entity.hp <= 0) return false;
+    const inventory = ensureInventory(entity);
+    if (inventory.grenades <= 0) return false;
+    inventory.grenades -= 1;
+    const angle = entity.aimAngle ?? entity.angle ?? 0;
+    room.bullets.push({
+        id: randId(),
+        ownerId: entity.id,
+        ownerIsBot: !!entity.isBot,
+        x: entity.x + Math.cos(angle) * (SURVIV.playerRadius + 8),
+        y: entity.y + Math.sin(angle) * (SURVIV.playerRadius + 8),
+
+        vx: Math.cos(angle) * SURVIV.grenadeSpeed,
+        vy: Math.sin(angle) * SURVIV.grenadeSpeed,
+        damage: SURVIV.grenadeDamage,
+        weaponType: 'grenade',
+        isGrenade: true,
+        bornAt: now,
+        detonateAt: now + SURVIV.grenadeFuseMs,
+    });
+    return true;
+}
+
+function detonateGrenade(room, grenade, entitiesById) {
+    const allEntities = [...room.players, ...room.bots];
+    const attacker = entitiesById.get(grenade.ownerId) || null;
+    for (const target of allEntities) {
+        if (target.hp <= 0 || target._eliminated) continue;
+        const distance = dist(grenade.x, grenade.y, target.x, target.y);
+        if (distance > SURVIV.grenadeRadius) continue;
+        const falloff = 1 - distance / SURVIV.grenadeRadius;
+        applyDamage(target, Math.max(8, grenade.damage * falloff), attacker);
+        if (target.hp <= 0) eliminateSurvivPlayer(room, target, room._io, attacker);
+    }
+    for (const obstacle of queryObstacles(room, grenade.x, grenade.y, SURVIV.grenadeRadius, true)) {
+        if (!getDestructibleObstacleHp(obstacle)) continue;
+        const distance = Math.max(0, dist(grenade.x, grenade.y, obstacle.x, obstacle.y) - Math.max(obstacle.w || 0, obstacle.h || 0) / 2);
+        if (distance <= SURVIV.grenadeRadius) damageSurvivObstacle(room, obstacle, Math.max(12, grenade.damage * (1 - distance / SURVIV.grenadeRadius)));
+    }
+}
+
+function swapSurvivWeaponSlots(entity) {
+    const request = entity.swapWeaponSlots;
+    if (!request) return;
+    entity.swapWeaponSlots = null;
+    const fromSlot = Number(request.fromSlot);
+    const toSlot = Number(request.toSlot);
+    if (!Number.isInteger(fromSlot) || !Number.isInteger(toSlot) || fromSlot === toSlot) return;
+
+    const inv = ensureInventory(entity);
+    if (fromSlot < 0 || toSlot < 0 || fromSlot >= inv.weapons.length || toSlot >= inv.weapons.length) return;
+    saveActiveWeaponAmmo(entity);
+    const slotAmmo = ensureWeaponSlotAmmo(entity);
+    [inv.weapons[fromSlot], inv.weapons[toSlot]] = [inv.weapons[toSlot], inv.weapons[fromSlot]];
+    [slotAmmo[fromSlot], slotAmmo[toSlot]] = [slotAmmo[toSlot], slotAmmo[fromSlot]];
+    if (entity.activeWeaponSlot === fromSlot) entity.activeWeaponSlot = toSlot;
+    else if (entity.activeWeaponSlot === toSlot) entity.activeWeaponSlot = fromSlot;
+    syncLegacyWeaponAmmo(entity);
 }
 
 function dropPlayerItem(entity, room) {
@@ -3345,6 +3568,19 @@ function dropPlayerItem(entity, room) {
 
     if (itemKey === 'weapon') {
         const idx = Number.isInteger(slotIdx) ? slotIdx : entity.activeWeaponSlot;
+        if (idx === SURVIV_MELEE_SLOT) {
+            if (inv.meleeWeapon !== 'knife') return;
+            inv.meleeWeapon = 'fists';
+            entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
+            entity.weapon = makeWeaponState('fists');
+            addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
+                weaponType: 'knife',
+                tier: WEAPONS.knife.rarity,
+                source: 'player-drop',
+                pickupAfter: Date.now() + 900,
+            }));
+            return;
+        }
         const removed = removeWeaponSlot(entity, idx);
         if (removed?.weaponType) {
             addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
@@ -3361,6 +3597,9 @@ function dropPlayerItem(entity, room) {
     } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
         inv.ammoPacks -= 1;
         addSurvivLoot(room, makeGroundLoot('ammo', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
+    } else if (itemKey === 'grenades' && inv.grenades > 0) {
+        inv.grenades -= 1;
+        addSurvivLoot(room, makeGroundLoot('grenade', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     } else if (itemKey === 'armor' && entity.armor > 0) {
         const transfer = Math.min(35, Math.round(entity.armor));
         entity.armor = Math.max(0, entity.armor - transfer);
@@ -3373,6 +3612,7 @@ function pickupLoot(entity, room) {
     openLootContainer(entity, room);
     takeLootContainerItem(entity, room);
     putLootContainerItem(entity, room);
+    swapSurvivWeaponSlots(entity);
     dropPlayerItem(entity, room);
     refreshOpenedContainer(entity, room);
 
@@ -3381,6 +3621,7 @@ function pickupLoot(entity, room) {
         medkits: 0,
         armor: 0,
         ammoPacks: 0,
+        grenades: 0,
         weaponType: null,
         weaponLabel: null,
     };
@@ -3410,16 +3651,18 @@ function pickupLoot(entity, room) {
             if (item.type === 'medkit') { requested = { medkits: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'medkits'; }
             if (item.type === 'armor') { requested = { armor: Math.max(1, Number(item.armorValue) || 35) }; quantityKey = 'armor'; }
             if (item.type === 'ammo') { requested = { ammoPacks: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'ammoPacks'; }
+            if (item.type === 'grenade') { requested = { grenades: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'grenades'; }
             if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) requested = { weaponType: item.weaponType };
             if (!requested) continue;
 
             const accepted = applyLootContents(entity, requested, { countChest: false });
-            const acceptedAmount = accepted.money || accepted.medkits || accepted.armor || accepted.ammoPacks || (accepted.weaponType ? 1 : 0);
+            const acceptedAmount = accepted.money || accepted.medkits || accepted.armor || accepted.ammoPacks || accepted.grenades || (accepted.weaponType ? 1 : 0);
             if (!(acceptedAmount > 0)) continue;
             pickedUp.money += accepted.money;
             pickedUp.medkits += accepted.medkits;
             pickedUp.armor += accepted.armor;
             pickedUp.ammoPacks += accepted.ammoPacks;
+            pickedUp.grenades = (pickedUp.grenades || 0) + accepted.grenades;
             if (accepted.weaponType) {
                 pickedUp.weaponType = accepted.weaponType;
                 pickedUp.weaponLabel = accepted.weaponLabel;
@@ -3428,7 +3671,7 @@ function pickupLoot(entity, room) {
             let remaining = 0;
             if (quantityKey) remaining = Math.max(0, Number(requested[quantityKey]) - Number(accepted[quantityKey]));
             if (remaining > 0) {
-                if (item.type === 'medkit' || item.type === 'ammo') item.amount = remaining;
+                if (item.type === 'medkit' || item.type === 'ammo' || item.type === 'grenade') item.amount = remaining;
                 if (item.type === 'armor') item.armorValue = remaining;
             } else {
                 removeSurvivLootAt(room, index);
@@ -3459,6 +3702,16 @@ function updateBullets(room, now, effectiveRadius) {
         const previousY = bullet.y;
         bullet.x += bullet.vx;
         bullet.y += bullet.vy;
+
+        if (bullet.isGrenade) {
+            bullet.vx *= 0.96;
+            bullet.vy *= 0.96;
+            if (now >= bullet.detonateAt || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
+                detonateGrenade(room, bullet, entitiesById);
+                room.bullets.splice(i, 1);
+            }
+            continue;
+        }
 
         if (now - bullet.bornAt > SURVIV.bulletLifetimeMs || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
             room.bullets.splice(i, 1);
@@ -3752,6 +4005,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         ))
             || bot.openedContainer.items.find(item => item.kind === 'money')
             || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
+
             || bot.openedContainer.items.find(item => item.kind === 'medkit' && inventory.medkits < SURVIV_MAX_MEDKITS)
             || bot.openedContainer.items.find(item => item.kind === 'ammo' && inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS);
         if (wanted) bot.takeChestItem = { chestId: bot.openedContainer.id, itemKey: wanted.key };
@@ -3851,6 +4105,10 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     if (!entity.isCashingOut && entity.equipSlotPending != null) {
         equipSurvivWeaponSlot(entity, entity.equipSlotPending);
         entity.equipSlotPending = null;
+    }
+    if (!entity.isCashingOut && entity.throwGrenadePending) {
+        throwSurvivGrenade(entity, room, now);
+        entity.throwGrenadePending = false;
     }
 
     // Process weapon reloading tick independent of shooting
@@ -4084,7 +4342,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
 
         const visibleBullets = room.bullets
             .filter(b => isInView(viewX, viewY, b.x, b.y, range))
-            .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType }));
+            .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType, isGrenade: !!b.isGrenade, detonateAt: b.detonateAt || 0 }));
         const visibleDeathMarkers = room.deathMarkers
             .filter(marker => isInView(viewX, viewY, marker.x, marker.y, range))
             .map(marker => ({ ...marker }));
@@ -4143,3 +4401,4 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     }
     pruneSurvivViewerPayloadCache(room, now);
 }
+

@@ -498,6 +498,7 @@ function getTournamentRoom(tournamentOrId) {
 
 function createCompetitiveSlitherRoom(entryFeeUsd) {
     return {
+
         id: `competitive-slither-${entryFeeUsd}`,
         entryFeeUsd,
         isCompetitiveSlither: true,
@@ -999,6 +1000,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         timestamp: new Date().toISOString(),
     };
 
+
     if (player.isFreeTicketPlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         user.playtime += (Date.now() - player.startTime);
@@ -1498,6 +1500,7 @@ function getTransactionAccountKeys(txDetails) {
 }
 
 function extractNativeDeposit(txDetails, destinationAddress) {
+
     if (!txDetails || txDetails.meta?.err) return null;
     const keys = getTransactionAccountKeys(txDetails);
     const destinationIndex = keys.findIndex(key => key.toString() === destinationAddress);
@@ -1998,6 +2001,7 @@ async function settleTournament(tournamentId) {
         for (const player of room.players) {
             if (!player.isBot && player.id) {
                 io.to(player.id).emit('tournamentEnded', {
+
                     tournamentId: tournament._id.toString(),
                     name: tournament.name,
                 });
@@ -2497,6 +2501,7 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             if (user?.rewardClaimInProgress) return res.status(409).json({ error: 'A reward claim is already processing' });
             return res.status(400).json({ error: 'No unlocked rewards available to claim' });
         }
+
 
         const { user, claim } = reserved;
         const amountUsd = claim.amountUsd;
@@ -2998,6 +3003,7 @@ function objectIdCreatedAt(id) {
         return new mongoose.Types.ObjectId(id).getTimestamp();
     } catch {
         return null;
+
     }
 }
 
@@ -3498,6 +3504,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
         if (!user) return res.status(404).json({ message: 'User not found' });
 
         const uid = user._id;
+
         const [allTxs, joinTxs, cashoutTxs] = await Promise.all([
             Transaction.find({ userId: uid }).sort({ createdAt: -1 }).limit(500).lean(),
             Transaction.find({ userId: uid, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } }).sort({ createdAt: -1 }).lean(),
@@ -3998,6 +4005,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             total: history.length,
         });
     } catch (err) {
+
         console.error('Admin sweeps error:', err);
         res.status(500).json({ error: err.message });
     }
@@ -4498,6 +4506,7 @@ async function sweepTournamentWalletToOwner() {
             event: 'tournament_owner_sweep',
             reason: 'Tournament Wallet Sweep',
             solAmount,
+
             signature,
             verifiedOnChain: true,
             sourceWallet: TOURNAMENT_WALLET_ADDRESS,
@@ -4997,6 +5006,7 @@ app.get('/api/stats', (req, res) => {
         };
         const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0, surviv: 0 };
         let totalBotsOnline = 0;
+
 
         const pushTop = (list, name, balance) => {
             if (name && balance > 0) list.push({ username: name, balance });
@@ -5498,6 +5508,7 @@ function addBots(room, n, botStake = null) {
                 id: Math.random().toString(36).substr(2, 9),
                 x: Math.random() * c.worldWidth,
                 y: Math.random() * c.worldHeight,
+
                 balance: startMass,
                 radius: calculateCellRadius(startMass, startMass, 1, startMass),
             }],
@@ -5749,7 +5760,7 @@ io.on('connection', (socket) => {
     touchSitePresence(socket.request, presenceId);
     const survivInputRate = { windowStartedAt: 0, count: 0 };
     const survivSpectateRate = { windowStartedAt: 0, count: 0 };
-    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'armor']);
+    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'grenades', 'armor']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
         let userKey = null;
@@ -5997,6 +6008,7 @@ io.on('connection', (socket) => {
                 return;
             }
             user = await ensureUserDepositWallet(user);
+
 
             if (getBRMatchForMongo(user._id.toString())) {
                 socket.emit('error', 'You are in an active Battle Royale match.');
@@ -6498,6 +6510,7 @@ io.on('connection', (socket) => {
                         },
                         status: 'confirmed'
                     });
+
                 } else {
                     await Transaction.create({
                         userId: user._id,
@@ -6998,6 +7011,7 @@ io.on('connection', (socket) => {
             if (!DEV_FREE_PLAY && !room.isSandbox) return;
 
             if (room.isCompetitiveSlither) {
+
                 room.players = room.players.filter(pl => !pl.isBot);
             } else {
                 room.bots = [];
@@ -7334,9 +7348,11 @@ io.on('connection', (socket) => {
             useMedkit,
             pickupWeapon,
             equipSlot,
+            throwGrenade,
             openChestId,
             takeChestItem,
             putChestItem,
+            swapWeaponSlots,
             closeChest,
             dropItem,
         } = payload;
@@ -7356,6 +7372,7 @@ io.on('connection', (socket) => {
         player.shooting = shooting === true;
         if (useMedkit === true) player.useMedkit = true;
         if (pickupWeapon === true) player.pickupWeaponPending = true;
+        if (throwGrenade === true) player.throwGrenadePending = true;
 
         const requestedChestId = safeId(openChestId);
         if (requestedChestId) player.openChestId = requestedChestId;
@@ -7363,22 +7380,34 @@ io.on('connection', (socket) => {
         if (takeChestItem && typeof takeChestItem === 'object' && !Array.isArray(takeChestItem)) {
             const chestId = safeId(takeChestItem.chestId);
             const itemKey = safeId(takeChestItem.itemKey, 24);
-            if (chestId && itemKey && survivItemKeys.has(itemKey)) player.takeChestItem = { chestId, itemKey };
+            const targetSlot = Number.isInteger(takeChestItem.targetSlot) && takeChestItem.targetSlot >= 0 && takeChestItem.targetSlot < 2
+                ? takeChestItem.targetSlot
+                : null;
+            if (chestId && itemKey && survivItemKeys.has(itemKey)) player.takeChestItem = { chestId, itemKey, targetSlot };
         }
         if (putChestItem && typeof putChestItem === 'object' && !Array.isArray(putChestItem)) {
             const chestId = safeId(putChestItem.chestId);
             const itemKey = safeId(putChestItem.itemKey, 24);
             const weaponType = safeId(putChestItem.weaponType, 24);
-            const slotIdx = Number.isInteger(putChestItem.slotIdx) && putChestItem.slotIdx >= 0 && putChestItem.slotIdx < 2
+            const slotIdx = Number.isInteger(putChestItem.slotIdx) && putChestItem.slotIdx >= 0 && putChestItem.slotIdx <= 2
                 ? putChestItem.slotIdx
                 : null;
             if (chestId && itemKey && survivItemKeys.has(itemKey)) {
                 player.putChestItem = { chestId, itemKey, weaponType, slotIdx };
             }
         }
+        if (swapWeaponSlots && typeof swapWeaponSlots === 'object' && !Array.isArray(swapWeaponSlots)) {
+            const fromSlot = Number.isInteger(swapWeaponSlots.fromSlot) && swapWeaponSlots.fromSlot >= 0 && swapWeaponSlots.fromSlot < 2
+                ? swapWeaponSlots.fromSlot
+                : null;
+            const toSlot = Number.isInteger(swapWeaponSlots.toSlot) && swapWeaponSlots.toSlot >= 0 && swapWeaponSlots.toSlot < 2
+                ? swapWeaponSlots.toSlot
+                : null;
+            if (fromSlot != null && toSlot != null && fromSlot !== toSlot) player.swapWeaponSlots = { fromSlot, toSlot };
+        }
         if (dropItem && typeof dropItem === 'object' && !Array.isArray(dropItem)) {
             const itemKey = safeId(dropItem.itemKey, 24);
-            const slotIdx = Number.isInteger(dropItem.slotIdx) && dropItem.slotIdx >= 0 && dropItem.slotIdx < 2
+            const slotIdx = Number.isInteger(dropItem.slotIdx) && dropItem.slotIdx >= 0 && dropItem.slotIdx <= 2
                 ? dropItem.slotIdx
                 : null;
             if (itemKey && survivItemKeys.has(itemKey)) player.dropItemPending = { itemKey, slotIdx };
@@ -7483,6 +7512,7 @@ function processSurvivTick() {
 }
 
 function getBattleRoyaleDeps() {
+
     return {
         User,
         Transaction,
@@ -7983,6 +8013,7 @@ function processRoom(room) {
                         if (cell.balance > otherCell.balance * 1.05 && d < r) {
                             const victim = room.players.find(p => p.id === item.socketId)
                                 || room.bots.find(b => b.id === item.botId);
+
                             // Reject stale quadtree cells already consumed by another eater.
                             if (!victim?.cells?.some(c => c.id === otherCell.id)) continue;
 
@@ -8228,3 +8259,4 @@ app.use((err, req, res, next) => {
 });
 
 httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
+
