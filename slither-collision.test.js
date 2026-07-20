@@ -831,3 +831,35 @@ test('Competitive bots always boost toward contested paid death food', () => {
     assert.equal(snake._paidDeathDropTarget?.id, paidDrop.id);
     assert.equal(snake.boost, true);
 });
+
+
+test('Slither bots keep death food as a directional goal while escaping danger', () => {
+    const snake = {
+        id: 'escape-with-food-goal', balance: 5,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 100, targetY: 0, inputDx: 1, inputDy: 0, angle: 0, boost: false,
+    };
+    const threat = {
+        id: 'close-threat', balance: 20,
+        segments: [{ x: 40, y: 0 }, { x: 50, y: 0 }],
+    };
+    const deathFood = {
+        id: 'remembered-death-food', x: 0, y: 300,
+        balance: 0.2, dollarValue: 0.2, deathDrop: true,
+    };
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }, { entity: threat }],
+        [deathFood],
+        null,
+        { sandboxWorldHalf: SLITHER.worldHalf },
+        9000,
+        [deathFood],
+        new Set([deathFood.id]),
+    );
+
+    assert.ok(snake.targetX < 0, 'escape must still lead away from danger');
+    assert.ok(snake.targetY > 0, 'escape should retain progress toward death food');
+    assert.equal(snake._deathDropTarget?.id, deathFood.id);
+});

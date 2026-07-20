@@ -1132,6 +1132,7 @@ function applyBotBodyAvoidance(snake, allSnakes, brain, now) {
     }
 
     const wideTurn = Math.min(1.18, planningTurn * 1.75);
+    const survivalGoalAngle = brain.survivalGoal ? Math.atan2(brain.survivalGoal.y - head.y, brain.survivalGoal.x - head.x) : null;
     const candidates = [
         { angle: currentAngle - planningTurn, direction: -1 },
         { angle: currentAngle + planningTurn, direction: 1 },
@@ -1146,7 +1147,8 @@ function applyBotBodyAvoidance(snake, allSnakes, brain, now) {
             && (brain.avoidBodyUntil || 0) > now
             ? 10
             : 0;
-        const score = clearance + continuityBonus;
+        const goalAlignmentBonus = survivalGoalAngle == null ? 0 : Math.cos(candidate.angle - survivalGoalAngle) * 12;
+        const score = clearance + continuityBonus + goalAlignmentBonus;
         if (!best || score > best.score) best = { ...candidate, clearance, score };
     }
 
@@ -1160,6 +1162,24 @@ function applyBotBodyAvoidance(snake, allSnakes, brain, now) {
     snake.inputDy = snake.targetY - head.y;
     snake.boost = false;
     return true;
+}
+
+function aimBotAwayFromThreat(snake, head, threat, fleeDistance, nearestThreatDist, brain) {
+    const awayAngle = Math.atan2(head.y - threat.y, head.x - threat.x);
+    let steerX = Math.cos(awayAngle); let steerY = Math.sin(awayAngle);
+    if (brain.survivalGoal) {
+        const goalDx = brain.survivalGoal.x - head.x; const goalDy = brain.survivalGoal.y - head.y;
+        const goalDistance = Math.hypot(goalDx, goalDy);
+        if (goalDistance > 1e-6) {
+            const urgency = Math.max(0, Math.min(1, 1 - nearestThreatDist / Math.max(1, fleeDistance * 0.42)));
+            const goalWeight = 0.12 + (1 - urgency) * 0.20;
+            steerX += goalDx / goalDistance * goalWeight; steerY += goalDy / goalDistance * goalWeight;
+        }
+    }
+    const steerLength = Math.hypot(steerX, steerY) || 1;
+    snake.targetX = head.x + steerX / steerLength * fleeDistance;
+    snake.targetY = head.y + steerY / steerLength * fleeDistance;
+    snake.boost = nearestThreatDist < fleeDistance * 0.3;
 }
 export function runSlitherBotAI(
     snake,
@@ -1236,11 +1256,10 @@ export function runSlitherBotAI(
         snake._lastDeathDropScan = now;
     }
 
+    brain.survivalGoal = deathDrop || null;
+
     if (urgentThreat) {
-        const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
-        snake.targetX = head.x + Math.cos(angle) * fleeDistance;
-        snake.targetY = head.y + Math.sin(angle) * fleeDistance;
-        snake.boost = nearestThreatDist < fleeDistance * 0.3;
+        aimBotAwayFromThreat(snake, head, threat, fleeDistance, nearestThreatDist, brain);
     } else if (deathDrop) {
         aimBotAtFood(snake, head, deathDrop, brain, now);
         snake.lastTargetUpdate = now;
@@ -1362,6 +1381,7 @@ export function runCompetitiveSlitherBotAI(
 ) {
     const head = snake.segments[0];
     const brain = ensureSlitherBotBrain(snake);
+    brain.survivalGoal = snake._paidDeathDropTarget?.id != null && paidDeathDropIds.has(snake._paidDeathDropTarget.id) ? snake._paidDeathDropTarget : null;
     if (applyCompetitiveZoneAvoidance(snake, effectiveRadius, brain, now)) {
         snake.inputDx = snake.targetX - head.x;
         snake.inputDy = snake.targetY - head.y;
@@ -1429,12 +1449,10 @@ export function runCompetitiveSlitherBotAI(
         snake._paidDeathDropTarget = paidDeathDrop;
         snake._lastPaidDeathDropScan = now;
     }
+    brain.survivalGoal = paidDeathDrop || null;
 
     if (urgentThreat) {
-        const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
-        snake.targetX = head.x + Math.cos(angle) * fleeDistance;
-        snake.targetY = head.y + Math.sin(angle) * fleeDistance;
-        snake.boost = nearestThreatDist < fleeDistance * 0.3;
+        aimBotAwayFromThreat(snake, head, threat, fleeDistance, nearestThreatDist, brain);
     } else if (paidDeathDrop) {
         aimBotAtFood(snake, head, paidDeathDrop, brain, now);
         snake.lastTargetUpdate = now;
