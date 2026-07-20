@@ -727,3 +727,107 @@ test('Competitive Slither bots also join hunts against a standout snake', () => 
 
     assert.equal(hunter._botBrain.huntTargetId, giant.id);
 });
+
+test('Fresh death food shortens the bot reaction window to a fast rush', () => {
+    const deathFood = {
+        id: 'new-death-cluster',
+        x: 180,
+        y: 0,
+        balance: 0.2,
+        dollarValue: 0.2,
+        deathDrop: true,
+    };
+    const snake = {
+        id: 'rush-reaction-bot',
+        balance: 5,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 0,
+        targetY: 100,
+        inputDx: 0,
+        inputDy: 100,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            bigGameDrive: 0,
+            caution: 1,
+            aimOffset: 8,
+            weaveSpeed: 0.003,
+            phase: 0,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0,
+            nextDecisionAt: 2000,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+        },
+    };
+    const room = { sandboxWorldHalf: SLITHER.worldHalf };
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }],
+        [deathFood],
+        null,
+        room,
+        1000,
+        [deathFood],
+        new Set([deathFood.id]),
+    );
+    assert.equal(snake._botBrain.nextDecisionAt, 1095);
+    assert.equal(snake._deathDropTarget, undefined);
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }],
+        [deathFood],
+        null,
+        room,
+        1095,
+        [deathFood],
+        new Set([deathFood.id]),
+    );
+    assert.equal(snake._deathDropTarget?.id, deathFood.id);
+    assert.equal(snake.boost, true);
+});
+
+test('Competitive bots always boost toward contested paid death food', () => {
+    const snake = {
+        id: 'arena-death-rush-bot',
+        entryFeeUsd: 5,
+        balance: 5,
+        dollarBalance: 5,
+        segments: Array.from({ length: 12 }, (_, i) => ({ x: -i * 8, y: 0 })),
+        targetX: 0,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+    };
+    const paidDrop = {
+        id: 'paid-death-drop',
+        x: 180,
+        y: 0,
+        balance: 0.2,
+        dollarValue: 0.2,
+        competitiveDeathDrop: true,
+    };
+
+    runCompetitiveSlitherBotAI(
+        snake,
+        [{ entity: snake }],
+        [paidDrop],
+        COMPETITIVE_SLITHER.worldHalf,
+        [paidDrop],
+        new Set([paidDrop.id]),
+        8000,
+    );
+
+    assert.equal(snake._paidDeathDropTarget?.id, paidDrop.id);
+    assert.equal(snake.boost, true);
+});

@@ -1173,18 +1173,27 @@ export function runSlitherBotAI(
 ) {
     const head = snake.segments[0];
     const brain = ensureSlitherBotBrain(snake);
+    const availableDeathDrops = deathDrops ?? food.filter(f => f.deathDrop);
+    const availableDeathDropIds = deathDropIds ?? new Set(availableDeathDrops.map(f => f.id));
+    const cachedDeathDropIsLive = snake._deathDropTarget?.id != null
+        && availableDeathDropIds.has(snake._deathDropTarget.id);
+    if (availableDeathDrops.length > 0 && !cachedDeathDropIsLive && !brain.deathRushPending) {
+        brain.deathRushPending = true;
+        brain.nextDecisionAt = Math.min(brain.nextDecisionAt, now + 95);
+    } else if (availableDeathDrops.length === 0) {
+        brain.deathRushPending = false;
+    }
     if (now < brain.nextDecisionAt) {
         keepBotSteering(snake, head, room);
         return;
     }
     scheduleNextBotDecision(brain, now);
+    brain.deathRushPending = false;
 
     const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
     const minDistFood = scaleAgarBotDistance(AGAR_BOT_FOOD_RANGE);
     const fleeDistance = scaleAgarBotDistance(AGAR_BOT_FLEE_DISTANCE);
-    const availableDeathDrops = deathDrops ?? food.filter(f => f.deathDrop);
-    const availableDeathDropIds = deathDropIds ?? new Set(availableDeathDrops.map(f => f.id));
 
     let threat = null;
     let targetPrey = null;
@@ -1214,7 +1223,7 @@ export function runSlitherBotAI(
     // and prey. The short cache avoids a full food scan on every server tick.
     let deathDrop = snake._deathDropTarget;
     const deathDropStillExists = deathDrop?.id != null && availableDeathDropIds.has(deathDrop.id);
-    if (!deathDropStillExists || now - (snake._lastDeathDropScan || 0) >= 220) {
+    if (!deathDropStillExists || now - (snake._lastDeathDropScan || 0) >= 120) {
         deathDrop = findNearestFoodForBot(
             head,
             availableDeathDrops,
@@ -1235,7 +1244,7 @@ export function runSlitherBotAI(
     } else if (deathDrop) {
         aimBotAtFood(snake, head, deathDrop, brain, now);
         snake.lastTargetUpdate = now;
-        snake.boost = dist(head.x, head.y, deathDrop.x, deathDrop.y) > 70;
+        snake.boost = dist(head.x, head.y, deathDrop.x, deathDrop.y) > 45;
     } else if (largeHunt) {
         aimBotAtLargeSnake(snake, largeHunt, brain, now);
         snake.lastTargetUpdate = now;
@@ -1359,12 +1368,22 @@ export function runCompetitiveSlitherBotAI(
         return;
     }
 
+    const cachedPaidDropIsLive = snake._paidDeathDropTarget?.id != null
+        && paidDeathDropIds.has(snake._paidDeathDropTarget.id);
+    if (paidDeathDrops.length > 0 && !cachedPaidDropIsLive && !brain.deathRushPending) {
+        brain.deathRushPending = true;
+        brain.nextDecisionAt = Math.min(brain.nextDecisionAt, now + 95);
+    } else if (paidDeathDrops.length === 0) {
+        brain.deathRushPending = false;
+    }
+
     if (now < brain.nextDecisionAt) {
         snake.inputDx = snake.targetX - head.x;
         snake.inputDy = snake.targetY - head.y;
         return;
     }
     scheduleNextBotDecision(brain, now);
+    brain.deathRushPending = false;
 
     const minDistThreat = scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
     const minDistPrey = scaleAgarBotDistance(AGAR_BOT_PREY_RANGE);
@@ -1398,7 +1417,7 @@ export function runCompetitiveSlitherBotAI(
     const deathDropRange = Math.max(minDistFood, effectiveRadius * 2);
     let paidDeathDrop = snake._paidDeathDropTarget;
     const targetStillExists = paidDeathDrop?.id != null && paidDeathDropIds.has(paidDeathDrop.id);
-    if (!targetStillExists || now - (snake._lastPaidDeathDropScan || 0) >= 250) {
+    if (!targetStillExists || now - (snake._lastPaidDeathDropScan || 0) >= 120) {
         paidDeathDrop = findNearestFoodForBot(
             head,
             paidDeathDrops,
@@ -1419,8 +1438,7 @@ export function runCompetitiveSlitherBotAI(
     } else if (paidDeathDrop) {
         aimBotAtFood(snake, head, paidDeathDrop, brain, now);
         snake.lastTargetUpdate = now;
-        snake.boost = brain.boostGreed > 0.2
-            && dist(head.x, head.y, paidDeathDrop.x, paidDeathDrop.y) > 80;
+        snake.boost = dist(head.x, head.y, paidDeathDrop.x, paidDeathDrop.y) > 45;
     } else if (largeHunt) {
         aimBotAtLargeSnake(snake, largeHunt, brain, now);
         snake.lastTargetUpdate = now;
