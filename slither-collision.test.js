@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+    bodyCollisionThreshold,
     COMPETITIVE_SLITHER,
+    headRadiusForSegmentCount,
     randomCoordInRoom,
     radiusScaleForSegmentCount,
     resolveAllSnakeCollisions,
@@ -13,6 +15,24 @@ import {
     syncCompetitiveSlitherFood,
     syncSlitherFood,
 } from './slither-engine.js';
+
+test('Slither body hitbox keeps a small proportional inset at every snake size', () => {
+    const desktopVisualThickness = 0.9;
+    const smallRadius = headRadiusForSegmentCount(12);
+    const largeRadius = headRadiusForSegmentCount(1200);
+    const smallVisualContact = smallRadius * 2 * desktopVisualThickness;
+    const largeVisualContact = largeRadius * 2 * desktopVisualThickness;
+    const smallLethalCore = bodyCollisionThreshold(smallRadius, smallRadius);
+    const largeLethalCore = bodyCollisionThreshold(largeRadius, largeRadius);
+
+    assert.ok(smallLethalCore < smallVisualContact, 'small snakes should survive a tiny visual edge touch');
+    assert.ok(largeLethalCore < largeVisualContact, 'large snakes should also survive a visual edge touch');
+    assert.ok(largeLethalCore > smallLethalCore, 'the hitbox must still grow with snake width');
+    assert.ok(largeVisualContact - largeLethalCore > smallVisualContact - smallLethalCore);
+    assert.ok(Math.abs(
+        smallLethalCore / smallVisualContact - largeLethalCore / largeVisualContact,
+    ) < 1e-9, 'the inset should remain proportional instead of becoming a fixed pixel gap');
+});
 
 test('Slither uses a half-area circular arena and circular spawn distribution', () => {
     const oldSquareArea = 6000 * 6000;

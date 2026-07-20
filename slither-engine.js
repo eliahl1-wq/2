@@ -51,7 +51,7 @@ export const SLITHER = {
     minimapThreatRange: 1700,
     selfCollisionSkip: 4,
     // Slither-style combat: heads are non-lethal; the body core is slightly narrower than the rendered snake.
-    bodyCollisionScale: 0.82,
+    bodyCollisionScale: 0.78,
     // Ignore body points still visually inside the head/neck.
     lethalBodyStartRadius: 1.8,
 };
@@ -1081,7 +1081,7 @@ function botRouteClearance(snake, allSnakes, angle, lookAhead) {
         if (other.id === snake.id || !other.segments?.length) continue;
 
         const otherRadius = headRadiusForSnake(other);
-        const collisionPadding = (ownRadius + otherRadius) * SLITHER.bodyCollisionScale + 7;
+        const collisionPadding = bodyCollisionThreshold(ownRadius, otherRadius) + 7;
         const first = firstLethalBodySegment(other, otherRadius);
         const stride = other.segments.length > 180 ? 3 : 2;
 
@@ -1566,10 +1566,15 @@ function firstLethalBodySegment(snake, radius) {
     return Math.max(2, Math.ceil((radius * SLITHER.lethalBodyStartRadius) / Math.max(1, spacing)));
 }
 
+/** Proportional lethal core: grows with both snakes but stays inside the rendered edges. */
+export function bodyCollisionThreshold(headRadius, bodyRadius) {
+    return (Math.max(0, headRadius) + Math.max(0, bodyRadius)) * SLITHER.bodyCollisionScale;
+}
+
 function headHitsSnakeBody(head, headRadius, other, otherRadius) {
     const segments = other.segments || [];
     const first = firstLethalBodySegment(other, otherRadius);
-    const threshold = (headRadius + otherRadius) * SLITHER.bodyCollisionScale;
+    const threshold = bodyCollisionThreshold(headRadius, otherRadius);
     // Long snakes are sampled densely. Test short swept body chords instead of
     // every individual point: this keeps the hitbox continuous and halves the
     // hot collision loop without creating gaps between segments.
