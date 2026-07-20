@@ -1072,6 +1072,8 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
     assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
     assert.ok(Array.isArray(ticks[1].players));
+    assert.equal(ticks[1].you.id, player.id);
+    assert.equal(ticks[1].players.some(other => other.id === player.id), false);
     assert.ok(Array.isArray(ticks[1].loot));
 
     room._survivViewerPayloadCache.get(player.id).lastStaticAt = 0;

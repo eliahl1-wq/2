@@ -563,3 +563,167 @@ test('Competitive Slither zone rescue cannot be overridden by body avoidance', (
     assert.equal(snake.boost, false, 'boost must stop during an arena-edge rescue');
     assert.equal(snake._botBrain.zoneAvoiding, true);
 });
+
+test('Multiple Slither bots coordinate pressure on the same standout large snake', () => {
+    const makeHunter = (id, y) => ({
+        id,
+        balance: 4,
+        segments: Array.from({ length: 12 }, (_, i) => ({ x: -i * 8, y })),
+        targetX: 0,
+        targetY: y,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            bigGameDrive: 1,
+            caution: 1,
+            aimOffset: 8,
+            weaveSpeed: 0.003,
+            phase: 0,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0.5,
+            nextDecisionAt: 0,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+        },
+    });
+    const hunters = [
+        makeHunter('hunter-a', -100),
+        makeHunter('hunter-b', 0),
+        makeHunter('hunter-c', 100),
+    ];
+    const giant = {
+        id: 'giant-snake',
+        balance: 40,
+        segments: Array.from({ length: 100 }, (_, i) => ({ x: 650 - i * 6, y: 0 })),
+        angle: 0,
+        inputDx: 1,
+        inputDy: 0,
+    };
+    const allSnakes = [
+        ...hunters.map(entity => ({ entity })),
+        { entity: giant },
+    ];
+    const ambientFood = [{ id: 'easy-food', x: 0, y: 70, balance: 0.02, dollarValue: 0.02 }];
+
+    for (const hunter of hunters) {
+        runSlitherBotAI(
+            hunter,
+            allSnakes,
+            ambientFood,
+            null,
+            { sandboxWorldHalf: SLITHER.worldHalf },
+            5000,
+        );
+    }
+
+    const committedHunters = hunters.filter(
+        hunter => hunter._botBrain.huntTargetId === giant.id,
+    );
+    assert.ok(committedHunters.length >= 2, 'several bots should pressure the standout snake');
+});
+
+test('Death food still beats a coordinated large-snake hunt', () => {
+    const hunter = {
+        id: 'death-food-first-hunter',
+        balance: 4,
+        segments: Array.from({ length: 12 }, (_, i) => ({ x: -i * 8, y: 0 })),
+        targetX: 0,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            reactionMs: 180,
+            foodScanMs: 340,
+            foodValueBias: 1,
+            preyChance: 0,
+            bigGameDrive: 1,
+            caution: 1,
+            aimOffset: 8,
+            weaveSpeed: 0.003,
+            phase: 0,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0.5,
+            nextDecisionAt: 0,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+        },
+    };
+    const giant = {
+        id: 'giant-target',
+        balance: 40,
+        segments: Array.from({ length: 100 }, (_, i) => ({ x: 650 - i * 6, y: 0 })),
+        angle: 0,
+    };
+    const deathFood = {
+        id: 'fresh-death-food',
+        x: 0,
+        y: 300,
+        balance: 0.2,
+        dollarValue: 0.2,
+        deathDrop: true,
+    };
+
+    runSlitherBotAI(
+        hunter,
+        [{ entity: hunter }, { entity: giant }],
+        [deathFood],
+        null,
+        { sandboxWorldHalf: SLITHER.worldHalf },
+        6000,
+        [deathFood],
+        new Set([deathFood.id]),
+    );
+
+    assert.equal(hunter._botBrain.huntTargetId, null);
+    assert.equal(hunter._deathDropTarget?.id, deathFood.id);
+});
+
+test('Competitive Slither bots also join hunts against a standout snake', () => {
+    const hunter = {
+        id: 'arena-hunter',
+        entryFeeUsd: 5,
+        balance: 4,
+        dollarBalance: 5,
+        segments: Array.from({ length: 12 }, (_, i) => ({ x: -200 - i * 8, y: 0 })),
+        targetX: -100,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+    };
+    const giant = {
+        id: 'arena-giant',
+        entryFeeUsd: 5,
+        balance: 40,
+        dollarBalance: 40,
+        segments: Array.from({ length: 100 }, (_, i) => ({ x: 300 - i * 6, y: 0 })),
+        angle: 0,
+        inputDx: 1,
+        inputDy: 0,
+    };
+
+    runCompetitiveSlitherBotAI(
+        hunter,
+        [{ entity: hunter }, { entity: giant }],
+        [],
+        COMPETITIVE_SLITHER.worldHalf,
+        [],
+        new Set(),
+        7000,
+    );
+
+    assert.equal(hunter._botBrain.huntTargetId, giant.id);
+});

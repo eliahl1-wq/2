@@ -928,6 +928,7 @@ function ensureSlitherBotBrain(snake) {
         foodScanMs: BOT_FOOD_SCAN_MIN_MS + Math.random() * (BOT_FOOD_SCAN_MAX_MS - BOT_FOOD_SCAN_MIN_MS),
         foodValueBias: 0.7 + Math.random() * 0.8,
         preyChance: 0.02 + Math.random() * 0.08,
+        bigGameDrive: 0.55 + Math.random() * 0.3,
         caution: 0.86 + Math.random() * 0.24,
         aimOffset: 4 + Math.random() * 13,
         weaveSpeed: 0.0025 + Math.random() * 0.0025,
@@ -969,6 +970,69 @@ function preferredFoodScore(snake, brain, foodItem, distance2) {
     return (distance2 * individuality) / valueWeight;
 }
 
+
+function chooseLargeSnakeHuntTarget(snake, allSnakes, brain, huntRange) {
+    const head = snake.segments[0];
+    const ownSegments = Math.max(1, snake.segments?.length || 1);
+    const ownBalance = Math.max(0.01, Number(snake.balance) || 0.01);
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (const { entity: other } of allSnakes) {
+        if (other.id === snake.id || other.isStatic || !other.segments?.length) continue;
+
+        const otherHead = other.segments[0];
+        const distance = dist(head.x, head.y, otherHead.x, otherHead.y);
+        if (distance > huntRange) continue;
+
+        const segmentRatio = other.segments.length / ownSegments;
+        const balanceRatio = Math.max(0.01, Number(other.balance) || 0.01) / ownBalance;
+        const sizeRatio = Math.max(segmentRatio, balanceRatio);
+        if (sizeRatio < 1.55 || other.segments.length < 24) continue;
+
+        // Most, but not every, bot joins a hunt. Bigger targets attract a larger
+        // share of the bots, making group pressure emerge without perfect swarms.
+        const participation = Math.min(
+            1,
+            (brain.bigGameDrive ?? 0.7) + Math.min(0.2, (sizeRatio - 1.55) * 0.09),
+        );
+        const joinRoll = stableBotFoodNoise(snake.id, 'hunt:' + String(other.id));
+        if (joinRoll > participation) continue;
+
+        // Size dominates this score, so nearby bots independently converge on
+        // the same standout snake instead of scattering across small prey.
+        const score = Math.log1p(sizeRatio) * 4.2
+            - distance / Math.max(1, huntRange)
+            + Math.min(0.7, other.segments.length / 900);
+        if (score > bestScore) {
+            bestScore = score;
+            best = { snake: other, distance, sizeRatio };
+        }
+    }
+
+    return best;
+}
+
+function aimBotAtLargeSnake(snake, hunt, brain, now) {
+    const target = hunt.snake;
+    const targetHead = target.segments[0];
+    const targetAngle = Number.isFinite(target.angle)
+        ? target.angle
+        : Math.atan2(target.inputDy || 0, target.inputDx || 1);
+    const leadDistance = Math.min(210, 90 + Math.sqrt(target.segments.length) * 4.5);
+    const sideNoise = stableBotFoodNoise(snake.id, 'side:' + String(target.id));
+    const side = sideNoise < 0.5 ? -1 : 1;
+    const lateral = 36 + brain.aimOffset * 1.8;
+
+    const leadX = targetHead.x + Math.cos(targetAngle) * leadDistance;
+    const leadY = targetHead.y + Math.sin(targetAngle) * leadDistance;
+    snake.targetX = leadX - Math.sin(targetAngle) * lateral * side;
+    snake.targetY = leadY + Math.cos(targetAngle) * lateral * side;
+    snake.boost = hunt.distance > 135;
+    brain.huntTargetId = target.id;
+    brain.huntSide = side;
+    brain.huntUntil = now + 650;
+}
 function aimBotAtFood(snake, head, target, brain, now) {
     const dx = target.x - head.x;
     const dy = target.y - head.y;
@@ -1140,6 +1204,11 @@ export function runSlitherBotAI(
             targetPrey = oh;
         }
     }
+    const largeHunt = chooseLargeSnakeHuntTarget(
+        snake, allSnakes, brain, Math.max(minDistPrey * 2.2, SLITHER.viewRange * 1.65),
+    );
+    const urgentThreat = threat && nearestThreatDist < fleeDistance * 0.42;
+    brain.huntTargetId = null;
 
     // Death food is scanned across the full map and always beats ambient food
     // and prey. The short cache avoids a full food scan on every server tick.
@@ -1158,7 +1227,7 @@ export function runSlitherBotAI(
         snake._lastDeathDropScan = now;
     }
 
-    if (threat) {
+    if (urgentThreat) {
         const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
         snake.targetX = head.x + Math.cos(angle) * fleeDistance;
         snake.targetY = head.y + Math.sin(angle) * fleeDistance;
@@ -1167,6 +1236,14 @@ export function runSlitherBotAI(
         aimBotAtFood(snake, head, deathDrop, brain, now);
         snake.lastTargetUpdate = now;
         snake.boost = dist(head.x, head.y, deathDrop.x, deathDrop.y) > 70;
+    } else if (largeHunt) {
+        aimBotAtLargeSnake(snake, largeHunt, brain, now);
+        snake.lastTargetUpdate = now;
+    } else if (threat) {
+        const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
+        snake.targetX = head.x + Math.cos(angle) * fleeDistance;
+        snake.targetY = head.y + Math.sin(angle) * fleeDistance;
+        snake.boost = nearestThreatDist < fleeDistance * 0.3;
     } else {
         const targetReached = brain.foodTarget
             && dist(head.x, head.y, brain.foodTarget.x, brain.foodTarget.y) < 34;
@@ -1310,6 +1387,11 @@ export function runCompetitiveSlitherBotAI(
             targetPrey = otherHead;
         }
     }
+    const largeHunt = chooseLargeSnakeHuntTarget(
+        snake, allSnakes, brain, Math.max(minDistPrey * 2.2, effectiveRadius * 1.35),
+    );
+    const urgentThreat = threat && nearestThreatDist < fleeDistance * 0.42;
+    brain.huntTargetId = null;
 
     // Paid death drops stay the strongest food target in arena mode. Scanning is
     // cached, while each bot's route and boost appetite remain individual.
@@ -1329,7 +1411,7 @@ export function runCompetitiveSlitherBotAI(
         snake._lastPaidDeathDropScan = now;
     }
 
-    if (threat) {
+    if (urgentThreat) {
         const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
         snake.targetX = head.x + Math.cos(angle) * fleeDistance;
         snake.targetY = head.y + Math.sin(angle) * fleeDistance;
@@ -1339,6 +1421,14 @@ export function runCompetitiveSlitherBotAI(
         snake.lastTargetUpdate = now;
         snake.boost = brain.boostGreed > 0.2
             && dist(head.x, head.y, paidDeathDrop.x, paidDeathDrop.y) > 80;
+    } else if (largeHunt) {
+        aimBotAtLargeSnake(snake, largeHunt, brain, now);
+        snake.lastTargetUpdate = now;
+    } else if (threat) {
+        const angle = Math.atan2(head.y - threat.y, head.x - threat.x);
+        snake.targetX = head.x + Math.cos(angle) * fleeDistance;
+        snake.targetY = head.y + Math.sin(angle) * fleeDistance;
+        snake.boost = nearestThreatDist < fleeDistance * 0.3;
     } else {
         const targetReached = brain.foodTarget
             && dist(head.x, head.y, brain.foodTarget.x, brain.foodTarget.y) < 34;

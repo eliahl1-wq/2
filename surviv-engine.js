@@ -4323,8 +4323,8 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         const sendStaticPayload = shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now);
 
         const visiblePlayers = allPlayers
-            .filter(p => isInView(viewX, viewY, p.x, p.y, range))
-            .map(p => serializePlayer(p, p.id === youId));
+            .filter(p => p.id !== youId && isInView(viewX, viewY, p.x, p.y, range))
+            .map(p => serializePlayer(p, false));
 
         const visibleLoot = querySurvivLoot(room, viewX, viewY, range)
             .map(({ item: l }) => ({
