@@ -7472,6 +7472,7 @@ io.on('connection', (socket) => {
         if (!context || context.player.disconnected) return;
         emitGameSocial(context, 'gameEmote', {
             id: `${socket.id}:${now}`,
+            playerId: context.player.id,
             sender: String(context.player.name || context.player.username || 'Player').slice(0, 32),
             emote,
             sentAt: now,
