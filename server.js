@@ -399,11 +399,15 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 /** In-game cashouts only — excludes account withdrawals to external wallets. */
 const GAME_CASHOUT_REASON_RE = /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i;
 const ADMIN_GAME_JOIN_EVENTS = ['join', 'br_join', 'free_ticket_join'];
+const ADMIN_FREE_TICKET_CASHOUT_EVENT = 'free_ticket_cashout';
 
 function buildGameCashoutTxFilter() {
     return {
         type: 'withdraw',
-        'meta.reason': { $regex: GAME_CASHOUT_REASON_RE },
+        $or: [
+            { 'meta.event': ADMIN_FREE_TICKET_CASHOUT_EVENT },
+            { 'meta.reason': { $regex: GAME_CASHOUT_REASON_RE } },
+        ],
         'meta.destination': { $exists: false },
         'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
     };
@@ -2932,7 +2936,7 @@ async function buildAdminTxListFilter({ userId, showExcluded } = {}) {
 
 function txAmountUsd(tx) {
     const reason = tx.meta?.reason || '';
-    if (GAME_CASHOUT_REASON_RE.test(reason)) {
+    if (tx.meta?.event === ADMIN_FREE_TICKET_CASHOUT_EVENT || GAME_CASHOUT_REASON_RE.test(reason)) {
         return tx.amount;
     }
     if (tx.currency === 'SOL' || tx.meta?.solAmount != null) {
@@ -3044,7 +3048,7 @@ function classifyTxActivity(tx) {
     }
     if (tx.type === 'withdraw') {
         const r = m.reason || '';
-        if (GAME_CASHOUT_REASON_RE.test(r)) return 'cashout';
+        if (m.event === ADMIN_FREE_TICKET_CASHOUT_EVENT || GAME_CASHOUT_REASON_RE.test(r)) return 'cashout';
         return 'withdraw';
     }
     return 'other';
@@ -3522,6 +3526,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             Transaction.find({
                 userId: uid,
                 $or: [
+                    { type: 'withdraw', 'meta.event': ADMIN_FREE_TICKET_CASHOUT_EVENT },
                     { type: 'withdraw', 'meta.reason': { $regex: GAME_CASHOUT_REASON_RE } },
                     { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } },
                 ],
@@ -3571,7 +3576,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             id: String(tx._id),
             time: new Date(tx.createdAt).getTime(),
             sessionId: tx.meta?.gameSessionId || null,
-            isFreeTicketPlay: !!tx.meta?.isFreeTicketPlay,
+            isFreeTicketPlay: tx.meta?.event === ADMIN_FREE_TICKET_CASHOUT_EVENT || !!tx.meta?.isFreeTicketPlay,
             isDeath: tx.type === 'game',
         }));
         const matchedTerminalIds = new Set();
@@ -3702,7 +3707,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 const fallbackMode = reason === 'Competitive Slither Death' ? 'competitive-slither' : reason === 'BR Eliminated' ? 'battle-royale' : 'agar';
                 ensureMode(tx.meta?.mode || tx.meta?.variant || fallbackMode).deaths += 1;
             }
-            if (tx.type === 'withdraw' && /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i.test(reason)) {
+            if (tx.type === 'withdraw' && (event === ADMIN_FREE_TICKET_CASHOUT_EVENT || GAME_CASHOUT_REASON_RE.test(reason))) {
                 const fallbackMode = /BR Victory/i.test(reason) ? 'battle-royale' : 'arena';
                 const row = ensureMode(tx.meta?.mode || tx.meta?.variant || fallbackMode);
                 row.cashouts += 1;
@@ -4234,6 +4239,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
                 { type: 'game', 'meta.event': 'join' },
                 { type: 'game', 'meta.event': 'br_join' },
                 { type: 'game', 'meta.event': 'free_ticket_join' },
+                { type: 'withdraw', 'meta.event': ADMIN_FREE_TICKET_CASHOUT_EVENT },
                 { type: 'game', 'meta.reason': 'Arena Death' },
                 { type: 'game', 'meta.reason': 'BR Eliminated' },
                 { type: 'game', 'meta.reason': 'Competitive Slither Death' },
@@ -4252,7 +4258,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
         } else if (eventType === 'death') {
             andClauses.push({ type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } });
         } else if (eventType === 'cashout') {
-            andClauses.push({ type: 'withdraw', 'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i } });
+            andClauses.push(buildGameCashoutTxFilter());
         } else if (eventType === 'refund') {
             andClauses.push({ type: 'game', 'meta.event': 'br_refund' });
         }
@@ -4269,6 +4275,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
             if (tx.meta?.event === 'free_ticket_join') eventType = 'free_ticket_entry';
             else if (tx.meta?.event === 'join' || tx.meta?.event === 'br_join') eventType = 'join';
             else if (tx.meta?.reason === 'Arena Death' || tx.meta?.reason === 'BR Eliminated' || tx.meta?.reason === 'Competitive Slither Death') eventType = 'death';
+            else if (tx.meta?.event === ADMIN_FREE_TICKET_CASHOUT_EVENT) eventType = 'free_ticket_reward';
             else if (/BR Victory/i.test(tx.meta?.reason || '')) eventType = 'br_win';
             else if (/Arena Cashout/i.test(tx.meta?.reason || '')) eventType = 'cashout';
             else if (/Auto Room Reset/i.test(tx.meta?.reason || '')) eventType = 'reset_cashout';
@@ -7453,6 +7460,7 @@ io.on('connection', (socket) => {
             dx,
             dy,
             aimAngle,
+            aimDistance,
             shooting,
             reload,
             useMedkit,
@@ -7460,8 +7468,7 @@ io.on('connection', (socket) => {
             equipSlot,
             throwGrenade,
             openChestId,
-            takeChestItem,
-            putChestItem,
+            chestHoldId,
             swapWeaponSlots,
             closeChest,
             dropItem,
@@ -7473,6 +7480,7 @@ io.on('connection', (socket) => {
         if (Number.isFinite(parsedAim)) {
             player.aimAngle = Math.atan2(Math.sin(parsedAim), Math.cos(parsedAim));
         }
+        player.aimDistance = finiteClamp(aimDistance, SURVIV.grenadeMinRange, SURVIV.grenadeMaxRange, 300);
 
         if (player.isCashingOut) {
             player.shooting = false;
@@ -7486,28 +7494,9 @@ io.on('connection', (socket) => {
 
         const requestedChestId = safeId(openChestId);
         if (requestedChestId) player.openChestId = requestedChestId;
+        player.chestHoldId = safeId(chestHoldId);
+        player.chestHoldSeenAt = Date.now();
 
-        if (takeChestItem && typeof takeChestItem === 'object' && !Array.isArray(takeChestItem)) {
-            const chestId = safeId(takeChestItem.chestId);
-            const itemKey = safeId(takeChestItem.itemKey, 24);
-            const targetSlot = Number.isInteger(takeChestItem.targetSlot) && takeChestItem.targetSlot >= 0 && takeChestItem.targetSlot < 2
-                ? takeChestItem.targetSlot
-                : null;
-            const ammoType = safeId(takeChestItem.ammoType, 8);
-            if (chestId && itemKey && survivItemKeys.has(itemKey)) player.takeChestItem = { chestId, itemKey, targetSlot, ammoType: survivAmmoTypes.has(ammoType) ? ammoType : null };
-        }
-        if (putChestItem && typeof putChestItem === 'object' && !Array.isArray(putChestItem)) {
-            const chestId = safeId(putChestItem.chestId);
-            const itemKey = safeId(putChestItem.itemKey, 24);
-            const weaponType = safeId(putChestItem.weaponType, 24);
-            const ammoType = safeId(putChestItem.ammoType, 8);
-            const slotIdx = Number.isInteger(putChestItem.slotIdx) && putChestItem.slotIdx >= 0 && putChestItem.slotIdx <= 2
-                ? putChestItem.slotIdx
-                : null;
-            if (chestId && itemKey && survivItemKeys.has(itemKey)) {
-                player.putChestItem = { chestId, itemKey, weaponType, slotIdx, ammoType: survivAmmoTypes.has(ammoType) ? ammoType : null };
-            }
-        }
         if (swapWeaponSlots && typeof swapWeaponSlots === 'object' && !Array.isArray(swapWeaponSlots)) {
             const fromSlot = Number.isInteger(swapWeaponSlots.fromSlot) && swapWeaponSlots.fromSlot >= 0 && swapWeaponSlots.fromSlot < 2
                 ? swapWeaponSlots.fromSlot

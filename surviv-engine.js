@@ -12,6 +12,7 @@ const SURVIV_MAX_WEAPONS = 2;
 const SURVIV_MELEE_SLOT = SURVIV_MAX_WEAPONS;
 const SURVIV_MAX_MEDKITS = 6;
 const SURVIV_MAX_GRENADES = 3;
+const SURVIV_CHEST_OPEN_MS = 2000;
 
 export const SURVIV_AMMO = Object.freeze({
     '9mm': { id: '9mm', label: '9mm', color: '#f5d547', max: 180, pickup: 30 },
@@ -39,6 +40,8 @@ export const SURVIV = {
     medkitUseMs: 2500,
     grenadeFuseMs: 850,
     grenadeSpeed: 15,
+    grenadeMinRange: 70,
+    grenadeMaxRange: 440,
     grenadeRadius: 145,
     grenadeDamage: 62,
 };
@@ -197,9 +200,13 @@ const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 1500;
 const SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD = 320;
 const SURVIV_DESTRUCTIBLE_OBSTACLE_HP = Object.freeze({
     bush: 18,
+    signpost: 26,
     furniture: 28,
+    stump: 34,
     crate: 36,
     barrel: 42,
+    hayBale: 48,
+    fallenLog: 62,
     tent: 54,
     door: 60,
     tree: 84,
@@ -394,12 +401,22 @@ function isNearRoadOrRiver(x, y, radius = 30) {
 const BLOCKED_KINDS = new Set([
     'houseFloor', 'wall', 'interiorWall', 'door', 'furniture', 'container', 'house',
     'road', 'water', 'river', 'bridge',
-    'tree', 'rock', 'crate', 'barrel', 'sandbag', 'tent',
+    'tree', 'bush', 'rock', 'stump', 'fallenLog', 'signpost', 'hayBale',
+    'crate', 'barrel', 'sandbag', 'tent',
 ]);
 function isMapPositionBlocked(obstacles, x, y, radius = 30) {
     if (isNearRoadOrRiver(x, y, radius)) return true;
 
     for (const o of obstacles) {
+        if (o.kind === 'trail_path' && Array.isArray(o.points)) {
+            const clearance = (o.width || 54) / 2 + radius + 10;
+            for (let i = 0; i < o.points.length - 1; i++) {
+                if (distanceToSegment(x, y, o.points[i].x, o.points[i].y, o.points[i + 1].x, o.points[i + 1].y) < clearance) {
+                    return true;
+                }
+            }
+            continue;
+        }
         if (!BLOCKED_KINDS.has(o.kind)) continue;
         // Expand the rect by the placement radius so trees don't clip edges
         const pad = radius + 12;
@@ -537,6 +554,7 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         orientation: options.orientation || null,
         points: Array.isArray(options.points) ? options.points : null,
         width: Number.isFinite(options.width) ? options.width : null,
+        widths: Array.isArray(options.widths) ? options.widths : null,
         ...(Number.isFinite(maxHp) ? {
             destructible: options.destructible !== false,
             hp: Number.isFinite(options.hp) ? clamp(options.hp, 0, maxHp) : maxHp,
@@ -613,6 +631,57 @@ function removeShortNetworkRoadStubs(obstacles, minLength) {
         if (road.kind !== 'road' || road.role !== 'networkRoad') continue;
         if (Math.max(road.w, road.h) >= minLength) continue;
         obstacles.splice(i, 1);
+    }
+}
+
+function addRoadJunctions(obstacles) {
+    const roads = obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.variant === 'asphalt'
+        && obstacle.role === 'networkRoad'
+        && (!obstacle.rotation || Math.abs(obstacle.rotation) < 0.001)
+    ));
+    const horizontal = roads.filter(road => road.w > road.h);
+    const vertical = roads.filter(road => road.h > road.w);
+    const junctions = new Map();
+
+    for (const hRoad of horizontal) {
+        const hMin = hRoad.x - hRoad.w / 2;
+        const hMax = hRoad.x + hRoad.w / 2;
+        for (const vRoad of vertical) {
+            const vMin = vRoad.y - vRoad.h / 2;
+            const vMax = vRoad.y + vRoad.h / 2;
+            if (vRoad.x < hMin - 2 || vRoad.x > hMax + 2) continue;
+            if (hRoad.y < vMin - 2 || hRoad.y > vMax + 2) continue;
+
+            const key = `${Math.round(vRoad.x)},${Math.round(hRoad.y)}`;
+            let junction = junctions.get(key);
+            if (!junction) {
+                junction = {
+                    x: vRoad.x,
+                    y: hRoad.y,
+                    w: vRoad.w + 18,
+                    h: hRoad.h + 18,
+                    directions: new Set(),
+                };
+                junctions.set(key, junction);
+            }
+            const armMin = Math.max(hRoad.h, vRoad.w) * 0.65;
+            if (junction.x - hMin > armMin) junction.directions.add('west');
+            if (hMax - junction.x > armMin) junction.directions.add('east');
+            if (junction.y - vMin > armMin) junction.directions.add('north');
+            if (vMax - junction.y > armMin) junction.directions.add('south');
+        }
+    }
+
+    for (const junction of junctions.values()) {
+        const armCount = junction.directions.size;
+        addObstacle(obstacles, 'roadJunction', junction.x, junction.y, junction.w, junction.h, {
+            collidable: false,
+            variant: 'asphalt',
+            role: armCount >= 4 ? 'crossIntersection' : armCount === 3 ? 'tIntersection' : 'roadJoin',
+            orientation: [...junction.directions].sort().join('-'),
+        });
     }
 }
 
@@ -1271,7 +1340,7 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
         addObstacle(obstacles, 'field', x, y, 820, 580, { collidable: false, variant: 'farm' });
         addHouse(obstacles, loot, spawnPoints, x - 160, y - 30, 250, 200, { variant: 'barn', hue: 8, tier });
         for (let i = 0; i < 5; i++) addObstacle(obstacles, 'field', x - 300 + i * 145, y + 210, 110, 240, { collidable: false, variant: 'crop' });
-        addObstacle(obstacles, 'crate', x + 190, y - 80, 54, 54, { hue: 34, variant: 'hay' });
+        addObstacle(obstacles, 'hayBale', x + 190, y - 80, 70, 38, { hue: 34, variant: 'twine' });
     } else if (roll < 0.9) {
         // Pond with a clear shoreline and a fishing shack outside the water footprint.
         const pondW = 460 + Math.random() * 140;
@@ -1336,8 +1405,12 @@ function addFarmstead(obstacles, loot, spawnPoints, x, y) {
             collidable: false, variant: 'crop', role: 'cropRow', landmarkType: 'farm',
         });
     }
-    addObstacle(obstacles, 'crate', x - 760, y - 50, 54, 54, { hue: 34, variant: 'hay', role: 'farmProp' });
-    addObstacle(obstacles, 'crate', x - 700, y - 50, 54, 54, { hue: 34, variant: 'hay', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x - 760, y - 50, 72, 40, { hue: 34, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x - 680, y - 50, 72, 40, { hue: 34, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x - 590, y + 710, 78, 42, { hue: 34, rotation: 0.12, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x - 80, y + 715, 74, 40, { hue: 34, rotation: -0.18, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x + 410, y + 700, 76, 42, { hue: 34, rotation: 0.08, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'wildflowers', x + 720, y + 480, 52, 48, { collidable: false, hue: 48, variant: 'sunflowers', role: 'farmProp' });
     addObstacle(obstacles, 'barrel', x + 760, y - 180, 38, 38, { hue: 205, variant: 'water', role: 'farmProp' });
 
     loot.push(makeChest(x - 560, y - 300, 'rare'));
@@ -1727,6 +1800,219 @@ function addRadioTower(obstacles, loot, spawnPoints, x, y) {
     spawnPoints.push({ x, y: y - 460 });
 }
 
+function pathBounds(points, padding = 0) {
+    const xs = points.map(point => point.x);
+    const ys = points.map(point => point.y);
+    const minX = Math.min(...xs) - padding;
+    const maxX = Math.max(...xs) + padding;
+    const minY = Math.min(...ys) - padding;
+    const maxY = Math.max(...ys) + padding;
+    return { x: (minX + maxX) / 2, y: (minY + maxY) / 2, w: maxX - minX, h: maxY - minY };
+}
+
+function addTrailPath(obstacles, points, opts = {}) {
+    const width = opts.width || 54;
+    const bounds = pathBounds(points, width / 2 + 18);
+    return addObstacle(obstacles, 'trail_path', bounds.x, bounds.y, bounds.w, bounds.h, {
+        collidable: false,
+        variant: opts.variant || 'footpath',
+        role: opts.role || 'wildernessTrail',
+        landmarkType: opts.landmarkType || null,
+        label: opts.label || null,
+        points,
+        width,
+    });
+}
+
+function addWildernessTrailNetwork(obstacles) {
+    const trails = [
+        addTrailPath(obstacles, [
+            { x: -870, y: 520 }, { x: -1120, y: 920 }, { x: -980, y: 1370 },
+            { x: -520, y: 1680 }, { x: -200, y: 1940 },
+        ], { width: 58, label: 'Estate Walk' }),
+        addTrailPath(obstacles, [
+            { x: -8950, y: -5050 }, { x: -8240, y: -4600 }, { x: -7420, y: -4380 },
+            { x: -6500, y: -4470 }, { x: -5570, y: -4230 }, { x: -4580, y: -4100 },
+        ], { width: 62, variant: 'forest', label: 'Pine Trail' }),
+        addTrailPath(obstacles, [
+            { x: -7700, y: -6760 }, { x: -6940, y: -6480 }, { x: -6120, y: -6200 },
+            { x: -5350, y: -5740 }, { x: -4700, y: -5050 },
+        ], { width: 52, variant: 'forest', label: 'North Ridge' }),
+        addTrailPath(obstacles, [
+            { x: 5880, y: -3050 }, { x: 6380, y: -2550 }, { x: 6950, y: -2020 },
+            { x: 7420, y: -1540 }, { x: 7760, y: -1240 },
+        ], { width: 56, variant: 'gravel', label: 'Quarry Track' }),
+        addTrailPath(obstacles, [
+            { x: -7900, y: 2460 }, { x: -8280, y: 3260 }, { x: -8340, y: 4130 },
+            { x: -8170, y: 5020 }, { x: -7820, y: 5920 },
+        ], { width: 48, variant: 'boardwalk', label: 'Wetland Walk' }),
+        addTrailPath(obstacles, [
+            { x: -7000, y: 6370 }, { x: -6250, y: 6580 }, { x: -5480, y: 6960 },
+            { x: -4700, y: 7240 }, { x: -4160, y: 7300 },
+        ], { width: 60, variant: 'gravel', label: 'Market Track' }),
+        addTrailPath(obstacles, [
+            { x: 480, y: 5690 }, { x: 880, y: 6260 }, { x: 1380, y: 6820 },
+            { x: 1900, y: 7280 }, { x: 2350, y: 7490 },
+        ], { width: 56, label: 'South Ridge' }),
+        addTrailPath(obstacles, [
+            { x: 6060, y: 5300 }, { x: 6500, y: 5780 }, { x: 6980, y: 6240 },
+            { x: 7390, y: 6740 }, { x: 7680, y: 7090 },
+        ], { width: 54, variant: 'gravel', label: 'Research Trail' }),
+        addTrailPath(obstacles, [
+            { x: 6600, y: -600 }, { x: 7040, y: -220 }, { x: 7500, y: 60 },
+            { x: 8120, y: 120 }, { x: 8560, y: -180 },
+        ], { width: 50, variant: 'farm', label: 'Orchard Path' }),
+        addTrailPath(obstacles, [
+            { x: -3600, y: 2900 }, { x: -3180, y: 3400 }, { x: -2800, y: 3920 },
+            { x: -2480, y: 4470 }, { x: -2210, y: 5060 },
+        ], { width: 50, variant: 'forest', label: 'Birch Path' }),
+        addTrailPath(obstacles, [
+            { x: 3420, y: 2980 }, { x: 3820, y: 3350 }, { x: 4170, y: 3740 },
+            { x: 4530, y: 4190 }, { x: 4870, y: 4590 },
+        ], { width: 48, label: 'Prison Footpath' }),
+    ];
+
+    for (const [trailIndex, trail] of trails.entries()) {
+        const points = trail.points || [];
+        for (let i = 1; i < points.length - 1; i += 2) {
+            const prev = points[i - 1];
+            const next = points[i + 1];
+            const length = Math.max(1, Math.hypot(next.x - prev.x, next.y - prev.y));
+            const side = (trailIndex + i) % 2 === 0 ? 1 : -1;
+            const offset = (trail.width || 54) / 2 + 72 + Math.random() * 26;
+            const dx = (-(next.y - prev.y) / length) * offset * side;
+            const dy = ((next.x - prev.x) / length) * offset * side;
+            const x = points[i].x + dx;
+            const y = points[i].y + dy;
+            if (isMapPositionBlocked(obstacles, x, y, 22)) continue;
+            const variant = trail.variant === 'forest' ? 'juniper' : trail.variant === 'boardwalk' ? 'willow' : 'berry';
+            addObstacle(obstacles, 'bush', x, y, 34 + Math.random() * 18, 30 + Math.random() * 15, {
+                collidable: false,
+                hue: variant === 'willow' ? 126 : 96 + Math.floor(Math.random() * 24),
+                rotation: Math.random() * Math.PI,
+                variant,
+                role: 'trailEdge',
+            });
+            addObstacle(obstacles, i % 3 === 0 ? 'wildflowers' : 'grassTuft', x - dx * 0.42, y - dy * 0.42, 24, 22, {
+                collidable: false,
+                hue: 38 + ((trailIndex * 37 + i * 23) % 220),
+                rotation: Math.random() * Math.PI,
+                variant: i % 3 === 0 ? 'meadow' : 'trailGrass',
+                role: 'trailEdge',
+            });
+        }
+
+        const first = points[0];
+        const second = points[1];
+        if (first && second && trailIndex % 2 === 0) {
+            addObstacle(obstacles, 'signpost', first.x + 34, first.y + 34, 30, 30, {
+                collidable: false,
+                rotation: Math.atan2(second.y - first.y, second.x - first.x),
+                variant: 'trailMarker',
+                role: 'trailMarker',
+                label: trail.label,
+            });
+        }
+    }
+    return trails;
+}
+
+function addRiverbankDetails(obstacles, riverData) {
+    for (let i = 1; i < riverData.points.length - 1; i += 2) {
+        const point = riverData.points[i];
+        const prev = riverData.points[i - 1];
+        const next = riverData.points[i + 1];
+        const length = Math.max(1, Math.hypot(next.x - prev.x, next.y - prev.y));
+        const nx = -(next.y - prev.y) / length;
+        const ny = (next.x - prev.x) / length;
+        for (const side of [-1, 1]) {
+            const bankOffset = (riverData.widths?.[i] || riverData.width) / 2 + 22 + Math.random() * 20;
+            addObstacle(obstacles, 'reeds', point.x + nx * bankOffset * side, point.y + ny * bankOffset * side, 34, 30, {
+                collidable: false,
+                hue: 74 + Math.floor(Math.random() * 24),
+                rotation: Math.atan2(next.y - prev.y, next.x - prev.x),
+                variant: i % 4 === 1 ? 'cattails' : 'riverGrass',
+                role: 'riverbank',
+            });
+        }
+    }
+}
+
+function addPondDetails(obstacles) {
+    const ponds = obstacles.filter(obstacle => obstacle.kind === 'water' && obstacle.variant === 'pond');
+    for (const pond of ponds) {
+        const count = 9;
+        for (let i = 0; i < count; i++) {
+            const angle = (i / count) * Math.PI * 2 + (pond.rotation || 0);
+            const x = pond.x + Math.cos(angle) * (pond.w / 2 + 12);
+            const y = pond.y + Math.sin(angle) * (pond.h / 2 + 10);
+            addObstacle(obstacles, 'reeds', x, y, 28 + Math.random() * 12, 24 + Math.random() * 10, {
+                collidable: false,
+                hue: 72 + Math.floor(Math.random() * 24),
+                rotation: angle + Math.PI / 2,
+                variant: i % 3 === 0 ? 'cattails' : 'pondGrass',
+                role: 'pondEdge',
+            });
+        }
+    }
+}
+
+function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
+    const bushVariants = ['bramble', 'berry', 'flowering', 'juniper'];
+    const step = 650;
+    const margin = 620;
+    for (let gx = -worldHalf + margin; gx <= worldHalf - margin; gx += step) {
+        for (let gy = -worldHalf + margin; gy <= worldHalf - margin; gy += step) {
+            if (Math.random() < 0.18) continue;
+            const baseX = gx + (Math.random() - 0.5) * step * 0.68;
+            const baseY = gy + (Math.random() - 0.5) * step * 0.68;
+            if (exclusionAreas.some(area => rectsOverlap(baseX, baseY, 80, 80, area.x, area.y, area.w + 360, area.h + 360))) continue;
+            const clusterCount = Math.random() < 0.36 ? 2 : 1;
+            for (let cluster = 0; cluster < clusterCount; cluster++) {
+                const x = baseX + (Math.random() - 0.5) * 105;
+                const y = baseY + (Math.random() - 0.5) * 105;
+                const roll = Math.random();
+                const size = 22 + Math.random() * 28;
+                if (isMapPositionBlocked(obstacles, x, y, size / 2)) continue;
+
+                if (roll < 0.50) {
+                    const variant = bushVariants[Math.floor(Math.random() * bushVariants.length)];
+                    addObstacle(obstacles, 'bush', x, y, size + 10, size, {
+                        collidable: Math.random() < 0.32,
+                        hue: variant === 'juniper' ? 126 : 92 + Math.floor(Math.random() * 36),
+                        rotation: Math.random() * Math.PI,
+                        variant,
+                        role: 'naturalDetail',
+                    });
+                } else if (roll < 0.69) {
+                    addObstacle(obstacles, 'grassTuft', x, y, size, size * 0.72, {
+                        collidable: false, hue: 74 + Math.floor(Math.random() * 34),
+                        rotation: Math.random() * Math.PI, variant: gy > 4300 ? 'dry' : 'meadow', role: 'naturalDetail',
+                    });
+                } else if (roll < 0.82) {
+                    addObstacle(obstacles, 'wildflowers', x, y, size, size, {
+                        collidable: false, hue: Math.floor(Math.random() * 360),
+                        rotation: Math.random() * Math.PI, variant: 'meadow', role: 'naturalDetail',
+                    });
+                } else if (roll < 0.90) {
+                    addObstacle(obstacles, 'stump', x, y, 26 + Math.random() * 15, 24 + Math.random() * 12, {
+                        rotation: Math.random() * Math.PI, variant: 'mossy', role: 'naturalDetail',
+                    });
+                } else if (roll < 0.97) {
+                    addObstacle(obstacles, 'fallenLog', x, y, 62 + Math.random() * 42, 20 + Math.random() * 8, {
+                        rotation: Math.random() * Math.PI, variant: Math.random() < 0.55 ? 'mossy' : 'birch', role: 'naturalDetail',
+                    });
+                } else {
+                    addObstacle(obstacles, 'mushrooms', x, y, 30, 26, {
+                        collidable: false, hue: 18 + Math.floor(Math.random() * 28),
+                        rotation: Math.random() * Math.PI, variant: 'forestRing', role: 'naturalDetail',
+                    });
+                }
+            }
+        }
+    }
+}
+
 // --- Rivers & Bridges ---
 
 function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12) {
@@ -1757,21 +2043,23 @@ function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12)
 }
 
 function addRiver(obstacles, worldHalf, startX, startY, endX, endY, width = 220) {
-    const points = generateRiverPath(worldHalf, startX, startY, endX, endY, 14);
-    const xs = points.map(point => point.x);
-    const ys = points.map(point => point.y);
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
+    const points = generateRiverPath(worldHalf, startX, startY, endX, endY, 20);
+    const widthPhase = Math.random() * Math.PI * 2;
+    const widths = points.map((point, index) => {
+        const t = index / Math.max(1, points.length - 1);
+        return width * (0.94 + Math.sin(t * Math.PI * 3.2 + widthPhase) * 0.12 + Math.sin(t * Math.PI * 7.4) * 0.045);
+    });
+    const maxWidth = Math.max(...widths);
+    const bounds = pathBounds(points, maxWidth / 2 + 12);
 
     // A path-sized bounding box keeps the static spline visible to clients near
     // any part of the river, instead of only near its western start point.
-    addObstacle(obstacles, 'river_path', (minX + maxX) / 2, (minY + maxY) / 2, maxX - minX + width, maxY - minY + width, {
+    addObstacle(obstacles, 'river_path', bounds.x, bounds.y, bounds.w, bounds.h, {
         collidable: false,
         variant: 'river_path',
         points,
         width,
+        widths,
         role: 'riverSpline',
     });
 
@@ -1783,7 +2071,7 @@ function addRiver(obstacles, worldHalf, startX, startY, endX, endY, width = 220)
         const my = (a.y + b.y) / 2;
         const segLen = Math.hypot(b.x - a.x, b.y - a.y);
         const angle = Math.atan2(b.y - a.y, b.x - a.x);
-        const segWidth = width * (0.8 + Math.random() * 0.4);
+        const segWidth = (widths[i] + widths[i + 1]) / 2;
         
         // These are just for physics now (we won't render them directly on client)
         addObstacle(obstacles, 'river', mx, my, segLen + width * 0.5, segWidth, {
@@ -1793,7 +2081,7 @@ function addRiver(obstacles, worldHalf, startX, startY, endX, endY, width = 220)
         });
         riverSegments.push({ x: mx, y: my, w: segLen + width * 0.5, h: segWidth, angle });
     }
-    return { points, segments: riverSegments, width };
+    return { points, segments: riverSegments, width, widths };
 }
 
 function addBridge(obstacles, x, y, width, length, rotation = 0) {
@@ -1940,7 +2228,7 @@ function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
 }
 
 const CLEARABLE_MAP_PROP_KINDS = new Set([
-    'tree', 'bush', 'rock', 'crate', 'barrel', 'container', 'sandbag', 'tent',
+    'tree', 'bush', 'rock', 'stump', 'fallenLog', 'signpost', 'hayBale', 'reeds', 'grassTuft', 'wildflowers', 'mushrooms', 'crate', 'barrel', 'container', 'sandbag', 'tent',
 ]);
 
 function getDoorApproachRect(door) {
@@ -2235,6 +2523,7 @@ export function generateSurvivMap(worldHalf) {
     // Only discard tiny clipping fragments. The previous 1020-unit threshold
     // erased legitimate final approaches to several landmarks.
     removeShortNetworkRoadStubs(obstacles, roadW * 1.1);
+    addRoadJunctions(obstacles);
 
     // ─────────────────────────────────────────────────────────────────────────
     // RIVERS & BRIDGES (Aligned with N-S highways)
@@ -2249,6 +2538,10 @@ export function generateSurvivMap(worldHalf) {
         { x: -2500, y: -1500 },
         { x: 2500, y: -1500 }
     ]);
+    addRiverbankDetails(obstacles, riverEW);
+    addPondDetails(obstacles);
+
+    addWildernessTrailNetwork(obstacles);
 
     // ─────────────────────────────────────────────────────────────────────────
     // BIOME COVER & ROAD MARKERS
@@ -2359,6 +2652,7 @@ export function generateSurvivMap(worldHalf) {
         }
     }
 
+    addNaturalDetailScatter(obstacles, wh, POI_LIST);
     addScatteredGroundLoot(obstacles, loot);
     clearInvalidBuildingProps(obstacles);
     sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
@@ -2829,6 +3123,7 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         inputDx: 0,
         inputDy: 0,
         aimAngle: 0,
+        aimDistance: 300,
         shooting: false,
         kills: 0,
         startTime: Date.now(),
@@ -2845,6 +3140,9 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
         openChestId: null,
+        chestHoldId: null,
+        chestHoldStartedAt: 0,
+        chestHoldSeenAt: 0,
         lastLoot: null,
         openedContainerId: null,
         openedContainer: null,
@@ -3345,19 +3643,67 @@ function refreshOpenedContainer(entity, room) {
 }
 
 function openLootContainer(entity, room) {
-    const chestId = entity.openChestId;
-    if (!chestId) return;
-    entity.openChestId = null;
-    const { item } = getLootContainer(room, chestId);
-    if (!item) return;
-    if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius) return;
-    if (!item._openedBy) item._openedBy = new Set();
-    if (!item._openedBy.has(entity.id)) {
-        ensureInventory(entity).chestsOpened += 1;
-        item._openedBy.add(entity.id);
+    const now = Date.now();
+    const chestId = entity.chestHoldId;
+    const cancelHold = () => {
+        entity.chestHoldStartedAt = 0;
+        entity.openedContainerId = null;
+        entity.openedContainer = null;
+    };
+    if (!chestId || now - (entity.chestHoldSeenAt || 0) > 550) {
+        cancelHold();
+        return;
     }
-    entity.openedContainerId = item.id;
-    refreshOpenedContainer(entity, room);
+    const { item, index } = getLootContainer(room, chestId);
+    if (!item || dist(entity.x, entity.y, item.x, item.y) > SURVIV.chestOpenRadius) {
+        cancelHold();
+        return;
+    }
+    if (!entity.chestHoldStartedAt) {
+        entity.chestHoldStartedAt = now;
+        return;
+    }
+    if (now - entity.chestHoldStartedAt < SURVIV_CHEST_OPEN_MS) return;
+
+    const contents = item.contents || {};
+    const drops = [];
+    if (contents.weaponType && WEAPONS[contents.weaponType]) {
+        drops.push({
+            type: 'weapon',
+            weaponType: contents.weaponType,
+            ammo: Number.isFinite(contents.ammo) ? contents.ammo : WEAPONS[contents.weaponType].clipSize,
+            tier: WEAPONS[contents.weaponType].rarity || contents.rarity || item.tier || 'common',
+        });
+    }
+    if (Number(contents.money) > 0) drops.push({ type: 'money', dollarValue: Number(contents.money) });
+    if (Number(contents.medkits) > 0) drops.push({ type: 'medkit', amount: Number(contents.medkits) });
+    if (contents.ammoType && Number(contents.ammoAmount) > 0) {
+        drops.push({ type: 'ammo', ammoType: contents.ammoType, amount: Number(contents.ammoAmount) });
+    }
+    if (Number(contents.grenades) > 0) drops.push({ type: 'grenade', amount: Number(contents.grenades) });
+    if (Number(contents.armor) > 0) drops.push({ type: 'armor', armorValue: Number(contents.armor) });
+
+    removeSurvivLootAt(room, index);
+    drops.forEach((drop, dropIndex) => {
+        const angle = (dropIndex / Math.max(1, drops.length)) * Math.PI * 2 + Math.random() * 0.3;
+        const scatter = 42 + Math.random() * 18;
+        addSurvivLoot(room, makeGroundLoot(drop.type,
+            item.x + Math.cos(angle) * scatter,
+            item.y + Math.sin(angle) * scatter, {
+                ...drop,
+                source: item.source === 'death' ? 'death' : 'chest',
+                tier: drop.tier || item.tier || contents.rarity || 'common',
+                pickupAfter: now + 700,
+                houseId: item.houseId || null,
+                room: item.room || null,
+            }));
+    });
+    ensureInventory(entity).chestsOpened += 1;
+    entity.chestHoldId = null;
+    entity.chestHoldStartedAt = 0;
+    entity.chestHoldSeenAt = 0;
+    entity.openedContainerId = null;
+    entity.openedContainer = null;
 }
 
 function takeLootContainerItem(entity, room) {
@@ -3566,15 +3912,26 @@ function throwSurvivGrenade(entity, room, now) {
     if (inventory.grenades <= 0) return false;
     inventory.grenades -= 1;
     const angle = entity.aimAngle ?? entity.angle ?? 0;
+    const throwDistance = clamp(
+        Number(entity.aimDistance) || 300,
+        SURVIV.grenadeMinRange,
+        SURVIV.grenadeMaxRange,
+    );
+    const spawnOffset = SURVIV.playerRadius + 8;
+    const flightTicks = Math.max(1, Math.round(SURVIV.grenadeFuseMs / (1000 / TICK_RATE)));
+    const drag = 0.96;
+    const travelMultiplier = (1 - Math.pow(drag, flightTicks)) / (1 - drag);
+    const throwSpeed = Math.max(1, (throwDistance - spawnOffset) / travelMultiplier);
     room.bullets.push({
         id: randId(),
         ownerId: entity.id,
         ownerIsBot: !!entity.isBot,
-        x: entity.x + Math.cos(angle) * (SURVIV.playerRadius + 8),
-        y: entity.y + Math.sin(angle) * (SURVIV.playerRadius + 8),
+        x: entity.x + Math.cos(angle) * spawnOffset,
+        y: entity.y + Math.sin(angle) * spawnOffset,
 
-        vx: Math.cos(angle) * SURVIV.grenadeSpeed,
-        vy: Math.sin(angle) * SURVIV.grenadeSpeed,
+        vx: Math.cos(angle) * throwSpeed,
+        vy: Math.sin(angle) * throwSpeed,
+        throwDistance,
         damage: SURVIV.grenadeDamage,
         weaponType: 'grenade',
         isGrenade: true,
@@ -3681,11 +4038,8 @@ function dropPlayerItem(entity, room) {
 function pickupLoot(entity, room) {
     if (entity.isCashingOut) return;
     openLootContainer(entity, room);
-    takeLootContainerItem(entity, room);
-    putLootContainerItem(entity, room);
     swapSurvivWeaponSlots(entity);
     dropPlayerItem(entity, room);
-    refreshOpenedContainer(entity, room);
 
     const pickedUp = {
         money: 0,
@@ -3970,6 +4324,9 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
         openChestId: null,
+        chestHoldId: null,
+        chestHoldStartedAt: 0,
+        chestHoldSeenAt: 0,
         lastLoot: null,
         openedContainerId: null,
         openedContainer: null,
@@ -4041,6 +4398,8 @@ function getBotCombatProfile(weaponType) {
 function updateBotAI(bot, room, now, effectiveRadius) {
     if (now < bot.botThinkAt) return;
     bot.botThinkAt = now + 90 + Math.random() * 100;
+    bot.chestHoldId = null;
+    bot.chestHoldSeenAt = now;
 
     const allTargets = [
         ...room.players.filter(player => !player._eliminated && player.hp > 0),
@@ -4074,21 +4433,6 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         return;
     }
 
-    if (bot.openedContainer?.items?.length) {
-        const wanted = bot.openedContainer.items.find(item => (
-            item.kind === 'weapon' && inventory.weapons.length < SURVIV_MAX_WEAPONS
-        ))
-            || bot.openedContainer.items.find(item => item.kind === 'money')
-            || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
-
-            || bot.openedContainer.items.find(item => item.kind === 'medkit' && inventory.medkits < SURVIV_MAX_MEDKITS)
-            || bot.openedContainer.items.find(item => item.kind === 'ammo' && SURVIV_AMMO[item.ammoType] && inventory.ammoReserves[item.ammoType] < SURVIV_AMMO[item.ammoType].max);
-        if (wanted) bot.takeChestItem = { chestId: bot.openedContainer.id, itemKey: wanted.key };
-        bot.inputDx = 0;
-        bot.inputDy = 0;
-        bot.shooting = false;
-        return;
-    }
 
     const distFromCenter = Math.hypot(bot.x, bot.y);
     if (distFromCenter > effectiveRadius * 0.82) {
@@ -4130,7 +4474,8 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     if (bestLoot) {
         const { item, distance: lootDistance } = bestLoot;
         if ((item.type === 'chest' || item.type === 'deathCrate') && lootDistance < SURVIV.chestOpenRadius) {
-            bot.openChestId = item.id;
+            bot.chestHoldId = item.id;
+            bot.chestHoldSeenAt = now;
         }
         const waypoint = getBotLootWaypoint(bot, item, room);
         const direction = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
@@ -4271,7 +4616,7 @@ function serializePlayer(p, isYou) {
         weaponsAmmo: syncLegacyWeaponAmmo(p),
         inventory: ensureInventory(p),
         lastLoot: isYou ? (p.lastLoot || null) : null,
-        openedContainer: isYou ? (p.openedContainer || null) : null,
+        openedContainer: null,
     };
 }
 
@@ -4306,6 +4651,7 @@ function serializeSurvivObstacle(o) {
         ...(o.orientation ? { orientation: o.orientation } : {}),
         ...(Array.isArray(o.points) ? { points: o.points } : {}),
         ...(Number.isFinite(o.width) ? { width: o.width } : {}),
+        ...(Array.isArray(o.widths) ? { widths: o.widths } : {}),
         ...(o.destructible ? { destructible: true, hp: o.hp, maxHp: o.maxHp } : {}),
     };
 }
@@ -4428,7 +4774,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 .filter(o => isObstacleInView(viewX, viewY, o, range + 200))
                 .map(serializeSurvivObstacle);
             const minimapRange = range * 3.35;
-            const minimapObstacleKinds = new Set(['road', 'houseFloor', 'wall', 'interiorWall', 'water', 'container']);
+            const minimapObstacleKinds = new Set(['road', 'roadJunction', 'trail_path', 'river_path', 'houseFloor', 'wall', 'interiorWall', 'water', 'container']);
             const minimapObstacles = queryObstacles(room, viewX, viewY, minimapRange, false)
                 .filter(o => minimapObstacleKinds.has(o.kind))
                 .filter(o => isObstacleInView(viewX, viewY, o, minimapRange))

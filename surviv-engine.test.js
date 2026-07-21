@@ -307,6 +307,47 @@ test('straight surviv roads do not create extra square asphalt stubs', () => {
     assert.equal(squareAsphaltRoads.length, 0);
 });
 
+test('surviv roads expose clean crossing and T-junction surfaces', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad');
+    const horizontalRoads = roads.filter(road => road.w > road.h);
+    const verticalRoads = roads.filter(road => road.h > road.w);
+    const junctions = map.obstacles.filter(obstacle => obstacle.kind === 'roadJunction');
+
+    assert.ok(junctions.length >= 15);
+    assert.ok(junctions.filter(junction => junction.role === 'crossIntersection').length >= 4);
+    assert.ok(junctions.filter(junction => junction.role === 'tIntersection').length >= 8);
+    for (const junction of junctions) {
+        assert.equal(junction.collidable, false);
+        assert.equal(junction.variant, 'asphalt');
+        assert.ok(horizontalRoads.some(road => pointInRect(junction.x, junction.y, road, 2)));
+        assert.ok(verticalRoads.some(road => pointInRect(junction.x, junction.y, road, 2)));
+    }
+});
+
+test('surviv adds curved trails and varied natural detail without another building pass', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const trails = map.obstacles.filter(obstacle => obstacle.kind === 'trail_path');
+    const naturalKinds = new Set(['bush', 'grassTuft', 'wildflowers', 'reeds', 'stump', 'fallenLog', 'mushrooms', 'signpost']);
+    const naturalDetails = map.obstacles.filter(obstacle => naturalKinds.has(obstacle.kind));
+    const bushVariants = new Set(map.obstacles
+        .filter(obstacle => obstacle.kind === 'bush' && obstacle.variant)
+        .map(obstacle => obstacle.variant));
+
+    assert.equal(trails.length, 11);
+    assert.ok(trails.every(trail => trail.collidable === false));
+    assert.ok(trails.every(trail => trail.points.length >= 5 && trail.width >= 48));
+    assert.ok(trails.some(trail => trail.variant === 'boardwalk'));
+    assert.ok(trails.some(trail => trail.variant === 'forest'));
+    assert.ok(trails.some(trail => trail.variant === 'gravel'));
+    assert.ok(naturalDetails.length >= 550);
+    assert.ok(bushVariants.has('bramble'));
+    assert.ok(bushVariants.has('berry'));
+    assert.ok(bushVariants.has('flowering'));
+    assert.ok(bushVariants.has('juniper'));
+    assert.ok(map.obstacles.some(obstacle => obstacle.kind === 'hayBale'));
+});
+
 test('surviv landmark approaches survive road clipping without tiny fragments', () => {
     const approachPoints = [
         { x: 6950, y: -1200, name: 'farm' },
@@ -525,8 +566,10 @@ test('river spline metadata survives generation and bridges hit both highways ex
     const bridges = map.obstacles.filter(obstacle => obstacle.kind === 'bridge');
 
     assert.ok(riverPath);
-    assert.equal(riverPath.points.length, 15);
+    assert.equal(riverPath.points.length, 21);
     assert.ok(riverPath.width >= 210 && riverPath.width <= 270);
+    assert.equal(riverPath.widths.length, riverPath.points.length);
+    assert.ok(Math.max(...riverPath.widths) - Math.min(...riverPath.widths) > riverPath.width * 0.1);
     assert.ok(riverPath.points.every(point => pointInRect(point.x, point.y, riverPath)));
     assert.equal(bridges.length, 2);
     assert.deepEqual(bridges.map(bridge => Math.round(bridge.x)).sort((a, b) => a - b), [-2500, 2500]);
@@ -633,21 +676,63 @@ test('the dedicated melee slot stays available and G drops the held gun', () => 
     assert.equal(dropped.ammo, 9);
 });
 
-test('chest transfers preserve overflow and reject occupied weapon slots', () => {
+test('holding a chest open drops every item onto the ground after two seconds', () => {
     const room = makeRoom();
     room.obstacles = [];
     room.loot = [];
     room.spawnPoints = [];
-    const player = createSurvivPlayer('human-chest', 'mongo-chest', 'Pack Rat', '#fff', room);
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('human-hold-chest', 'mongo-hold-chest', 'Opener', '#fff', room);
     player.x = 0;
     player.y = 0;
-    player.inventory.medkits = 5;
-    player.inventory.weapons = ['pistol', 'smg'];
-    player.weapon = { type: 'pistol', ammo: 7, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
     room.players.push(player);
+    room.loot.push({
+        id: 'hold-chest',
+        type: 'chest',
+        x: 0,
+        y: 0,
+        tier: 'rare',
+        contents: {
+            weaponType: 'shotgun',
+            ammo: 3,
+            money: 1.25,
+            medkits: 2,
+            ammoType: '12g',
+            ammoAmount: 8,
+            grenades: 1,
+            armor: 35,
+            rarity: 'rare',
+        },
+    });
 
+    player.chestHoldId = 'hold-chest';
+    player.chestHoldStartedAt = Date.now() - 2100;
+    player.chestHoldSeenAt = Date.now();
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.loot.some(item => item.id === 'hold-chest'), false);
+    assert.deepEqual(new Set(room.loot.map(item => item.type)), new Set([
+        'weapon', 'money', 'medkit', 'ammo', 'grenade', 'armor',
+    ]));
+    assert.equal(room.loot.find(item => item.type === 'weapon')?.ammo, 3);
+    assert.equal(room.loot.find(item => item.type === 'money')?.dollarValue, 1.25);
+    assert.equal(room.loot.find(item => item.type === 'medkit')?.amount, 2);
+    assert.equal(player.inventory.chestsOpened, 1);
+    assert.equal(player.openedContainer, null);
+});
+
+test('chests ignore legacy inventory transfer requests', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    const player = createSurvivPlayer('human-no-chest-inventory', 'mongo-no-chest-inventory', 'Pack Rat', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inventory.medkits = 2;
+    room.players.push(player);
     const chest = {
-        id: 'transaction-chest',
+        id: 'closed-chest',
         type: 'chest',
         x: 0,
         y: 0,
@@ -656,49 +741,13 @@ test('chest transfers preserve overflow and reject occupied weapon slots', () =>
     room.loot.push(chest);
 
     player.takeChestItem = { chestId: chest.id, itemKey: 'medkits' };
+    player.putChestItem = { chestId: chest.id, itemKey: 'medkits' };
     processSurvivRoom(room, silentIo, Date.now() + 600000);
-    assert.equal(player.inventory.medkits, 6);
-    assert.equal(chest.contents.medkits, 3);
 
-    player.takeChestItem = { chestId: chest.id, itemKey: 'weapon' };
-    processSurvivRoom(room, silentIo, Date.now() + 600001);
-    assert.deepEqual(player.inventory.weapons, ['pistol', 'smg']);
+    assert.equal(player.inventory.medkits, 2);
+    assert.equal(chest.contents.medkits, 4);
     assert.equal(chest.contents.weaponType, 'shotgun');
-
-    player.putChestItem = { chestId: chest.id, itemKey: 'weapon', weaponType: 'pistol' };
-    processSurvivRoom(room, silentIo, Date.now() + 600002);
-    assert.deepEqual(player.inventory.weapons, ['pistol', 'smg']);
-    assert.equal(chest.contents.weaponType, 'shotgun');
-    assert.equal(player.weapon.type, 'pistol');
-});
-
-test('chest weapon transfers retain the gun magazine and selected duplicate slot', () => {
-    const room = makeRoom();
-    room.obstacles = [];
-    room.loot = [];
-    const player = createSurvivPlayer('human-chest-ammo', 'mongo-chest-ammo', 'Ammo Keeper', '#fff', room);
-    player.x = 0;
-    player.y = 0;
-    player.inventory.weapons = ['pistol', 'pistol'];
-    player.activeWeaponSlot = 1;
-    player.weaponSlotAmmo = [7, 2];
-    player.weapon = { type: 'pistol', ammo: 2, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
-    room.players.push(player);
-    const chest = { id: 'ammo-chest', type: 'chest', x: 0, y: 0, contents: {} };
-    room.loot.push(chest);
-
-    player.putChestItem = { chestId: chest.id, itemKey: 'weapon', weaponType: 'pistol', slotIdx: 1 };
-    processSurvivRoom(room, silentIo, Date.now() + 600000);
-    assert.deepEqual(player.inventory.weapons, ['pistol']);
-    assert.equal(chest.contents.weaponType, 'pistol');
-    assert.equal(chest.contents.ammo, 2);
-
-    player.takeChestItem = { chestId: chest.id, itemKey: 'weapon' };
-    processSurvivRoom(room, silentIo, Date.now() + 600001);
-    assert.deepEqual(player.inventory.weapons, ['pistol', 'pistol']);
-    assert.equal(player.weapon.ammo, 2);
-    assert.equal(player.weaponSlotAmmo[1], 2);
-    assert.equal(chest.contents.ammo, undefined);
+    assert.equal(player.openedContainer, null);
 });
 test('players and automatic bots start with fists and no dollars', () => {
     const room = makeRoom();
@@ -831,6 +880,34 @@ test('medkits heal only after the server timer completes', () => {
     assert.equal(player.medkitUseEndAt, 0);
 });
 
+test('grenades follow crosshair distance within the server range limit', () => {
+    const makeThrow = (aimDistance) => {
+        const room = makeRoom();
+        room.obstacles = [];
+        room.loot = [];
+        room.spawnPoints = [];
+        room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+        const player = createSurvivPlayer('grenade-' + aimDistance, 'mongo-grenade-' + aimDistance, 'Grenadier', '#fff', room);
+        player.x = 0;
+        player.y = 0;
+        player.aimAngle = 0;
+        player.aimDistance = aimDistance;
+        player.inventory.grenades = 1;
+        player.throwGrenadePending = true;
+        room.players.push(player);
+        processSurvivRoom(room, silentIo, Date.now() + 600000);
+        return room.bullets.find(bullet => bullet.isGrenade);
+    };
+
+    const shortThrow = makeThrow(90);
+    const longThrow = makeThrow(360);
+    const cappedThrow = makeThrow(5000);
+
+    assert.equal(shortThrow?.throwDistance, 90);
+    assert.equal(longThrow?.throwDistance, 360);
+    assert.equal(cappedThrow?.throwDistance, SURVIV.grenadeMaxRange);
+    assert.ok(Math.hypot(shortThrow.vx, shortThrow.vy) < Math.hypot(longThrow.vx, longThrow.vy));
+});
 test('fast bullets hit and eliminate bots along their full travel path', () => {
     const room = makeRoom();
     room.obstacles = [];
@@ -993,12 +1070,22 @@ test('surviv bots prioritize useful chests and loot their contents', () => {
     room.players.push(player);
     const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
 
+    for (let tick = 0; tick < 12; tick++) {
+        bot.botThinkAt = 0;
+        processSurvivRoom(room, silentIo, Date.now() + 600000);
+    }
+    bot.x = 120;
+    bot.y = 0;
+    bot.chestHoldStartedAt = Date.now() - 2100;
+    bot.botThinkAt = 0;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    for (const item of room.loot) item.pickupAfter = 0;
     for (let tick = 0; tick < 32; tick++) {
         bot.botThinkAt = 0;
         processSurvivRoom(room, silentIo, Date.now() + 600000);
     }
 
-    assert.ok(bot.inventory.weapons.includes('assault'), 'bot should open and take the chest weapon');
+    assert.ok(bot.inventory.weapons.includes('assault'), 'bot should open and pick up the dropped chest weapon');
     assert.ok(bot.dollarBalance >= 1, 'bot should continue looting money from the opened chest');
 });
 
@@ -1070,7 +1157,8 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.ok(ticks[0].minimap);
     const serializedRiver = ticks[0].obstacles.find(obstacle => obstacle.kind === 'river_path');
     assert.ok(serializedRiver);
-    assert.equal(serializedRiver.points.length, 15);
+    assert.equal(serializedRiver.points.length, 21);
+    assert.equal(serializedRiver.widths.length, serializedRiver.points.length);
     assert.ok(serializedRiver.width >= 210);
     assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
     assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
