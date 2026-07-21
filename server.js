@@ -266,6 +266,7 @@ const UserSchema = new mongoose.Schema({
     email: { type: String, unique: true, sparse: true },
     googleId: { type: String, unique: true, sparse: true },
     password: { type: String, required: true },
+    authVersion: { type: Number, default: 0 },
     balance: { type: Number, default: 0 }, // Tracked in raw SOL
     visualBalanceOverrideUsd: { type: Number, default: null }, // UI-only admin override; never used for payments or gameplay
     walletAddress: { type: String },
@@ -442,6 +443,10 @@ const c = {
 
 const CASHOUT_DURATION_MS = 5_000;
 const joiningUsers = new Set();
+function isUserJoining(userId) {
+    const id = String(userId || '');
+    return [...joiningUsers].some(key => key === id || String(key).endsWith(`:${id}`));
+}
 let rewardPoolAdminResetting = false;
 
 let GLOBAL_ARENA_START = Date.now();
@@ -1777,7 +1782,7 @@ app.get('/api/auth/google/callback',
     passport.authenticate('google', { session: false, failureRedirect: '/login' }),
     (req, res) => {
         const secret = JWT_SECRET;
-        const token = jwt.sign({ id: req.user._id }, secret, { expiresIn: '24h' });
+        const token = jwt.sign({ id: req.user._id, authVersion: req.user.authVersion || 0 }, secret, { expiresIn: '24h' });
         // Skicka tillbaka användaren till frontenden med token i URL:en
         const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
         res.redirect(`${frontendUrl}/?token=${token}`);
@@ -1796,25 +1801,40 @@ app.get('/', (req, res) => {
     res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>AgarStake Engine v2.0 🎮</h1><p style="color:#007AFF;font-size:1.5rem;">Status: Pro Physics Enabled (v11)</p><p>Full Agar.io clone logic integrated.</p><p style="color:#00ff7f;">Ready for redeploy on Railway.</p></body></html>');
 });
 
-const authenticateToken = (req, res, next) => {
+async function verifyAccountToken(token) {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const account = await User.findById(decoded.id).select('authVersion').lean();
+    if (!account) {
+        const err = new Error('Account no longer exists');
+        err.name = 'AccountNotFoundError';
+        throw err;
+    }
+    if (Number(decoded.authVersion || 0) !== Number(account.authVersion || 0)) {
+        const err = new Error('Session was revoked');
+        err.name = 'SessionRevokedError';
+        throw err;
+    }
+    return decoded;
+}
+
+const authenticateToken = async (req, res, next) => {
     applyCorsHeaders(req, res);
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (!token) return res.status(401).json({ message: 'No token provided' });
 
-    const jwtSecret = JWT_SECRET;
-
-    jwt.verify(token, jwtSecret, (err, user) => {
-        if (err) {
-            const expired = err.name === 'TokenExpiredError';
-            return res.status(403).json({
-                message: expired ? 'Session expired — please log in again' : 'Invalid token',
-                expired,
-            });
-        }
-        req.user = user;
+    try {
+        req.user = await verifyAccountToken(token);
         next();
-    });
+    } catch (err) {
+        const expired = err.name === 'TokenExpiredError';
+        const revoked = err.name === 'SessionRevokedError' || err.name === 'AccountNotFoundError';
+        return res.status(403).json({
+            message: expired ? 'Session expired — please log in again' : revoked ? 'Session revoked — please log in again' : 'Invalid token',
+            expired,
+            revoked,
+        });
+    }
 };
 
 async function ensureUserDepositWallet(user) {
@@ -1955,6 +1975,7 @@ const authenticateAdmin = (req, res, next) => {
             const user = await User.findById(req.user.id);
             // Replace with your actual owner/admin identification logic
             if (user && user.username === process.env.ADMIN_USERNAME) {
+                req.adminUser = user;
                 next();
             } else {
                 res.status(403).json({ message: "Admin access required" });
@@ -2318,63 +2339,118 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
 });
 
 // --- NYTT: UTTAG (WITHDRAW) ---
-app.post('/api/withdraw', authenticateToken, async (req, res) => {
-    const { amountUSD, destinationAddress } = req.body;
-    let solToWithdraw = null;
+async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress, adminActorId = null }) {
+    const amountUsdNumber = Number(amountUSD);
+    if (!Number.isFinite(amountUsdNumber) || amountUsdNumber <= 0 || amountUsdNumber > 1_000_000) {
+        const err = new Error('Withdrawal amount must be between $0 and $1,000,000');
+        err.status = 400;
+        throw err;
+    }
 
+    let destination;
     try {
-        solToWithdraw = amountUSD / SOL_PRICE_USD;
+        destination = new solanaWeb3.PublicKey(String(destinationAddress || '').trim());
+    } catch {
+        const err = new Error('Invalid Solana destination address');
+        err.status = 400;
+        throw err;
+    }
 
-        const reserved = await User.findOneAndUpdate(
-            { _id: req.user.id, balance: { $gte: solToWithdraw } },
+    const solToWithdraw = amountUsdNumber / SOL_PRICE_USD;
+    const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
+    const fee = 5000;
+    const sendAmount = lamports - fee;
+    if (sendAmount <= 0) {
+        const err = new Error('Amount too small to cover network fees');
+        err.status = 400;
+        throw err;
+    }
+
+    if (!acquireCashoutLock(userId)) {
+        const err = new Error('A withdrawal or cashout is already processing for this account');
+        err.status = 409;
+        throw err;
+    }
+
+    let reserved = null;
+    let record = null;
+    let signature = null;
+    try {
+        reserved = await User.findOneAndUpdate(
+            { _id: userId, balance: { $gte: solToWithdraw } },
             { $inc: { balance: -solToWithdraw } },
             { new: true },
         );
-        if (!reserved) return res.status(400).json({ message: "Insufficient balance" });
-        const user = reserved;
-        if (!user.depositSecret) {
-            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } });
-            return res.status(500).json({ message: "Account configuration error" });
+        if (!reserved) {
+            const err = new Error('Insufficient balance');
+            err.status = 400;
+            throw err;
+        }
+        if (!reserved.depositSecret) {
+            const err = new Error('Account wallet is not configured');
+            err.status = 500;
+            throw err;
         }
 
-        const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
         const userKeypair = solanaWeb3.Keypair.fromSecretKey(
-            Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
+            Uint8Array.from(Buffer.from(reserved.depositSecret, 'hex'))
         );
-
-        const fee = 5000;
-        const sendAmount = lamports - fee;
-        if (sendAmount <= 0) {
-            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } });
-            return res.status(400).json({ message: "Amount too small to cover fees" });
-        }
+        record = await Transaction.create({
+            userId: reserved._id,
+            type: 'withdraw',
+            amount: solToWithdraw,
+            currency: 'SOL',
+            meta: {
+                destination: destination.toBase58(),
+                solAmount: solToWithdraw,
+                amountUsd: amountUsdNumber,
+                ...(adminActorId ? { event: 'admin_owner_account_withdrawal', adminActorId: String(adminActorId) } : {}),
+            },
+            status: 'pending',
+        });
 
         const transaction = new solanaWeb3.Transaction().add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: userKeypair.publicKey,
-                toPubkey: new solanaWeb3.PublicKey(destinationAddress),
+                toPubkey: destination,
                 lamports: sendAmount,
             })
         );
-
-        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [userKeypair]);
-
-        await Transaction.create({
-            userId: user._id,
-            type: 'withdraw',
-            amount: solToWithdraw,
-            currency: 'SOL',
-            meta: { signature, destination: destinationAddress, solAmount: solToWithdraw, amountUsd: amountUSD },
-            status: 'confirmed'
-        });
-
-        res.json({ success: true, newBalance: user.balance, signature });
-    } catch (err) {
-        console.error("Withdraw Error:", err.message);
-        if (typeof solToWithdraw === 'number' && Number.isFinite(solToWithdraw)) {
-            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: solToWithdraw } }).catch(() => { });
+        signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [userKeypair]);
+        try {
+            await Transaction.findByIdAndUpdate(record._id, {
+                $set: { status: 'confirmed', 'meta.signature': signature },
+            });
+        } catch (recordErr) {
+            console.error('Withdrawal confirmed but audit update failed:', recordErr.message);
         }
-        res.status(500).json({ error: "Blockchain transaction failed" });
+        return { success: true, newBalance: reserved.balance, signature, amountUsd: amountUsdNumber, solAmount: solToWithdraw };
+    } catch (err) {
+        if (!signature && reserved) {
+            await User.findByIdAndUpdate(userId, { $inc: { balance: solToWithdraw } }).catch(() => { });
+            if (record) {
+                await Transaction.findByIdAndUpdate(record._id, {
+                    $set: { status: 'failed', 'meta.error': String(err.message || 'Withdrawal failed').slice(0, 300) },
+                }).catch(() => { });
+            }
+        }
+        throw err;
+    } finally {
+        releaseCashoutLock(userId);
+    }
+}
+
+app.post('/api/withdraw', authenticateToken, async (req, res) => {
+    try {
+        const result = await executeAccountWithdrawal({
+            userId: req.user.id,
+            amountUSD: req.body?.amountUSD,
+            destinationAddress: req.body?.destinationAddress,
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('Withdraw Error:', err.message);
+        res.status(err.status || 500).json({ message: err.status ? err.message : 'Blockchain transaction failed' });
     }
 });
 
@@ -4371,6 +4447,98 @@ app.post('/api/admin/users/owner-status', authenticateAdmin, async (req, res) =>
         res.status(500).json({ error: err.message });
     }
 });
+app.put('/api/admin/users/:userId/password', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const password = String(req.body?.password || '');
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        if (password.length < 8 || password.length > 128) return res.status(400).json({ message: 'Password must be 8–128 characters' });
+
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        user.password = await bcrypt.hash(password, 12);
+        user.authVersion = Number(user.authVersion || 0) + 1;
+        await user.save();
+        await Transaction.create({
+            userId: user._id,
+            type: 'game',
+            amount: 0,
+            meta: { event: 'admin_action', action: 'password_reset', adminActorId: String(req.adminUser._id) },
+        }).catch(err => console.error('Password reset audit write failed:', err.message));
+        res.json({ success: true, message: `Password changed for ${user.username}. Existing sessions were signed out.` });
+    } catch (err) {
+        console.error('Admin password reset error:', err);
+        res.status(500).json({ message: 'Could not change password' });
+    }
+});
+
+app.post('/api/admin/users/:userId/withdraw', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        const user = await User.findOne({ _id: userId, isOwnerAccount: true }).select('walletAddress username');
+        if (!user) return res.status(403).json({ message: 'Only accounts marked as yours can be withdrawn by admin' });
+        if (isUserJoining(userId) || processingCashouts.has(userId) || findPlayerInArena(userId) || getBRMatchForMongo(userId)) {
+            return res.status(409).json({ message: 'Account is joining, playing, or already cashing out. Try again when it is idle.' });
+        }
+        const destinationAddress = String(req.body?.destinationAddress || user.walletAddress || '').trim();
+        const result = await executeAccountWithdrawal({
+            userId,
+            amountUSD: req.body?.amountUSD,
+            destinationAddress,
+            adminActorId: req.adminUser._id,
+        });
+        res.json({ ...result, message: `Withdrawal from ${user.username} was confirmed on-chain.` });
+    } catch (err) {
+        console.error('Admin owner withdrawal error:', err);
+        res.status(err.status || 500).json({ message: err.status ? err.message : 'Blockchain transaction failed' });
+    }
+});
+
+app.delete('/api/admin/users/:userId', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        if (user.username === process.env.ADMIN_USERNAME || String(user._id) === String(req.adminUser._id)) {
+            return res.status(403).json({ message: 'The active admin account cannot be deleted' });
+        }
+        if (req.body?.confirmation !== user.username) {
+            return res.status(400).json({ message: `Type ${user.username} exactly to confirm deletion` });
+        }
+        if (isUserJoining(userId) || processingCashouts.has(userId) || findPlayerInArena(userId) || getBRMatchForMongo(userId)) {
+            return res.status(409).json({ message: 'Account is joining, playing, or cashing out and cannot be deleted yet' });
+        }
+        if (user.rewardClaimInProgress || user.tournamentRewardClaimInProgress) {
+            return res.status(409).json({ message: 'Account has a reward claim in progress and cannot be deleted yet' });
+        }
+        const liabilities = [
+            user.balance,
+            user.sponsoredRewardsBalance,
+            user.rentFallbackBalanceUsd,
+            user.tournamentRewardsBalance,
+            user.tournamentRewardsLamports,
+            user.rewardClaimReservedUsd,
+            user.tournamentRewardClaimReservedUsd,
+        ].map(Number).some(value => Number.isFinite(value) && value > 0.000000001);
+        if (liabilities) {
+            return res.status(409).json({ message: 'Account still has balance or rewards. Withdraw or clear them before deletion.' });
+        }
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'game',
+            amount: 0,
+            meta: { event: 'admin_action', action: 'account_deleted', username: user.username, adminActorId: String(req.adminUser._id) },
+        });
+        await User.deleteOne({ _id: user._id });
+        res.json({ success: true, message: `Account ${user.username} was permanently deleted. Transaction history was preserved.` });
+    } catch (err) {
+        console.error('Admin delete account error:', err);
+        res.status(500).json({ message: 'Could not delete account' });
+    }
+});
 app.post('/api/admin/users/exclude', authenticateAdmin, async (req, res) => {
     try {
         const { ids } = req.body;
@@ -4986,7 +5154,7 @@ app.post('/api/login', async (req, res) => {
 
         // Skapa en JWT (Inloggningskvitto). Använd en hemlig nyckel från .env
         const secret = JWT_SECRET;
-        const token = jwt.sign({ id: user._id }, secret, { expiresIn: '7d' });
+        const token = jwt.sign({ id: user._id, authVersion: user.authVersion || 0 }, secret, { expiresIn: '7d' });
 
         console.log("✅ SUCCESS: Inloggning lyckades, skickar token för:", username);
         res.json({
@@ -5879,7 +6047,7 @@ io.on('connection', (socket) => {
         let paidJoin = null;
         let entryRecorded = false;
         try {
-            const decoded = jwt.verify(token, JWT_SECRET);
+            const decoded = await verifyAccountToken(token);
             let user = await User.findById(decoded.id);
             if (!user) throw new Error('User not found');
             user = await ensureUserDepositWallet(user);
@@ -6109,7 +6277,7 @@ io.on('connection', (socket) => {
             if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
-            const decoded = jwt.verify(token, JWT_SECRET);
+            const decoded = await verifyAccountToken(token);
             let user = await User.findById(decoded.id);
             if (!user) {
                 socket.emit('error', 'Account not found — please log in again.');
@@ -6966,8 +7134,7 @@ io.on('connection', (socket) => {
     socket.on('adminSpawnBotNearMe', async ({ token, mode }) => {
         console.log(`[Admin Spawn] Received request. Mode parameter: ${mode}, Socket ID: ${socket.id}, Room ID: ${socket.roomId}`);
         try {
-            const secret = JWT_SECRET;
-            const decoded = jwt.verify(token, secret);
+            const decoded = await verifyAccountToken(token);
             const user = await User.findById(decoded.id);
             if (!user) {
                 console.log(`[Admin Spawn] Rejected: User not found for ID ${decoded.id}`);
@@ -7116,8 +7283,7 @@ io.on('connection', (socket) => {
 
     socket.on('adminClearBots', async ({ token }) => {
         try {
-            const secret = JWT_SECRET;
-            const decoded = jwt.verify(token, secret);
+            const decoded = await verifyAccountToken(token);
             const user = await User.findById(decoded.id);
             if (!user) return;
             const isAdmin = user.isAdmin || (process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
