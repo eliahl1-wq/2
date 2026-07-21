@@ -449,7 +449,7 @@ export function getSlitherTargetBots(humanCount) {
 
 function getAllSlitherSnakes(room) {
     const humans = room.players
-        .filter(p => p.mode === 'slither' && p.segments?.length)
+        .filter(p => p.mode === 'slither' && !p.cashoutSettling && p.segments?.length)
         .map(p => ({ entity: p, isHuman: true }));
     const bots = room.slitherBots.map(b => ({ entity: b, isHuman: false }));
     const statics = (room.sandboxStaticWorms || []).map(s => ({ entity: s, isHuman: false }));
@@ -2192,8 +2192,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             );
         }
 
-        // Players keep moving while cashing out (no freeze) — getting eaten cancels the cashout
-        updateSnakeMovement(snake, room);
+        // Holding the cashout control freezes position and heading, but the snake remains vulnerable.
+        if (!snake.cashoutHoldActive) updateSnakeMovement(snake, room);
         if (!sandboxSkipFoodCollisions) {
             checkFoodCollisions(snake, room, foodGrid);
         }
@@ -2643,7 +2643,7 @@ export function getCompetitiveZone(resetTime) {
 
 function getCompetitiveSnakes(room) {
     return room.players
-        .filter(p => p.mode === 'competitive-slither' && p.segments?.length)
+        .filter(p => p.mode === 'competitive-slither' && !p.cashoutSettling && p.segments?.length)
         .map(p => ({ entity: p, isHuman: true }));
 }
 
@@ -2923,7 +2923,7 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
                 paidDeathDropIds,
             );
         }
-        updateCompetitiveSnakeMovement(snake);
+        if (!snake.cashoutHoldActive) updateCompetitiveSnakeMovement(snake);
         checkCompetitiveFoodCollisions(snake, room);
     }
 

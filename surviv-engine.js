@@ -3942,7 +3942,7 @@ function throwSurvivGrenade(entity, room, now) {
 }
 
 function detonateGrenade(room, grenade, entitiesById) {
-    const allEntities = [...room.players, ...room.bots];
+    const allEntities = [...room.players.filter(player => !player.cashoutSettling), ...room.bots];
     const attacker = entitiesById.get(grenade.ownerId) || null;
     for (const target of allEntities) {
         if (target.hp <= 0 || target._eliminated) continue;
@@ -4123,7 +4123,7 @@ function pickupLoot(entity, room) {
 }
 
 function updateBullets(room, now, effectiveRadius) {
-    const allEntities = [...room.players, ...room.bots];
+    const allEntities = [...room.players.filter(player => !player.cashoutSettling), ...room.bots];
     const entitiesById = new Map(allEntities.map(entity => [entity.id, entity]));
     for (let i = room.bullets.length - 1; i >= 0; i--) {
         const bullet = room.bullets[i];
@@ -4402,7 +4402,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     bot.chestHoldSeenAt = now;
 
     const allTargets = [
-        ...room.players.filter(player => !player._eliminated && player.hp > 0),
+        ...room.players.filter(player => !player.cashoutSettling && !player._eliminated && player.hp > 0),
         ...room.bots.filter(candidate => candidate.id !== bot.id && candidate.hp > 0),
     ];
     let nearest = null;
@@ -4493,6 +4493,15 @@ function updateBotAI(bot, room, now, effectiveRadius) {
 }
 function processEntity(entity, room, now, effectiveRadius, zone) {
     if (entity.hp <= 0) return;
+    if (entity.cashoutHoldActive) {
+        entity.inputDx = 0;
+        entity.inputDy = 0;
+        entity.shooting = false;
+        entity.useMedkit = false;
+        checkZoneDamage(entity, zone, now);
+        if (entity.hp <= 0) eliminateSurvivPlayer(room, entity, room._io);
+        return;
+    }
     if (entity.disconnected) {
         entity.inputDx = 0;
         entity.inputDy = 0;
@@ -4561,7 +4570,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
 
 function getActiveSurvivEntities(room) {
     return [
-        ...room.players.filter(p => !p._eliminated && p.hp > 0),
+        ...room.players.filter(p => !p.cashoutSettling && !p._eliminated && p.hp > 0),
         ...room.bots.filter(b => !b.disconnected && !b._eliminated && b.hp > 0),
     ];
 }
@@ -4813,7 +4822,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         });
     };
 
-    for (const p of room.players.filter(pl => !pl.disconnected && pl.hp > 0)) {
+    for (const p of room.players.filter(pl => !pl.disconnected && !pl.cashoutSettling && pl.hp > 0)) {
         emitToViewer(p.id, p.x, p.y, p.id, p.dollarBalance, false);
     }
 

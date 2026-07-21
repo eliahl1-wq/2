@@ -442,6 +442,7 @@ const c = {
 };
 
 const CASHOUT_DURATION_MS = 5_000;
+const CASHOUT_HOLD_MS = 3_000;
 const joiningUsers = new Set();
 function isUserJoining(userId) {
     const id = String(userId || '');
@@ -6351,6 +6352,7 @@ io.on('connection', (socket) => {
                         circularMap: true,
                         zone: getCompetitiveZone(room.startTime + c.roomDuration),
                     });
+                    if (existingPlayer.cashoutSettling) socket.emit('cashOutProcessing');
                     return;
                 }
 
@@ -6508,6 +6510,7 @@ io.on('connection', (socket) => {
                         surviv: true,
                         zone: getSurvivZone(activeRoom.startTime + c.roomDuration),
                     });
+                    if (existingPlayer.cashoutSettling) socket.emit('cashOutProcessing');
                     return;
                 }
 
@@ -6706,6 +6709,7 @@ io.on('connection', (socket) => {
                     entryFeeUsd: existingPlayer.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                     solPrice: SOL_PRICE_USD,
                 });
+                if (existingPlayer.cashoutSettling) socket.emit('cashOutProcessing');
                 return;
             }
 
@@ -7327,6 +7331,11 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (p) {
             const inputX = Number(data?.x);
+            if (p.cashoutHoldActive) {
+                if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) p.screenWidth = data.screenWidth;
+                if (Number.isFinite(data.screenHeight) && data.screenHeight > 0) p.screenHeight = data.screenHeight;
+                return;
+            }
             const inputY = Number(data?.y);
             if (Number.isFinite(inputX)) p.mouseX = inputX;
             if (Number.isFinite(inputY)) p.mouseY = inputY;
@@ -7344,7 +7353,7 @@ io.on('connection', (socket) => {
     socket.on('2', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.cells.length >= c.maxCells) return;
+        if (!p || p.cashoutHoldActive || p.cells.length >= c.maxCells) return;
 
         const totalMass = playerTotalMass(p);
         const massStart = playerMassStart(p);
@@ -7382,7 +7391,7 @@ io.on('connection', (socket) => {
     socket.on('1', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p) return;
+        if (!p || p.cashoutHoldActive) return;
         const s = playerDollarStart(p);
         p.cells.forEach(cell => {
             const massStart = playerMassStart(p);
@@ -7420,6 +7429,36 @@ io.on('connection', (socket) => {
     });
 
     // Cash Out Logik
+    // Freeze a player during the deliberate hold-to-cashout gesture. The
+    // completed timestamp verifies the cashOut event sent immediately after release.
+    socket.on('cashOutHold', (active) => {
+        const room = getArenaRoomById(socket.roomId);
+        const player = room?.players.find(candidate => candidate.id === socket.id);
+        if (!player || player.isCashingOut || room?.isBattleRoyale) return;
+
+        const now = Date.now();
+        if (active === true) {
+            player.cashoutHoldActive = true;
+            player.cashoutHoldStartedAt = now;
+            player.cashoutHoldCompletedAt = 0;
+            player.boost = false;
+            player.inputDx = 0;
+            player.inputDy = 0;
+            player.shooting = false;
+            for (const cell of player.cells || []) {
+                cell.vx = 0;
+                cell.vy = 0;
+                cell.vX = 0;
+                cell.vY = 0;
+            }
+            return;
+        }
+
+        const heldFor = now - (player.cashoutHoldStartedAt || now);
+        player.cashoutHoldActive = false;
+        player.cashoutHoldStartedAt = 0;
+        player.cashoutHoldCompletedAt = heldFor >= CASHOUT_HOLD_MS - 100 ? now : 0;
+    });
     socket.on('cashOut', async () => {
         const br = findBRPlayerBySocket(socket.id);
         if (br?.player) {
@@ -7437,6 +7476,18 @@ io.on('connection', (socket) => {
             socket.emit('cashOutStarting', { seconds: remainingSeconds });
             return;
         }
+        const completedHoldAt = Number(p.cashoutHoldCompletedAt) || 0;
+        if (!completedHoldAt || Date.now() - completedHoldAt > 1_500) {
+            p.cashoutHoldActive = false;
+            p.cashoutHoldStartedAt = 0;
+            p.cashoutHoldCompletedAt = 0;
+            socket.emit('error', 'Hold Cash Out for 3 seconds before starting the timer.');
+            return;
+        }
+        p.cashoutHoldActive = false;
+        p.cashoutHoldStartedAt = 0;
+        p.cashoutHoldCompletedAt = 0;
+
         if (!acquireCashoutLock(p.mongoId)) {
             socket.emit('error', 'Cashout already in progress.');
             return;
@@ -7467,6 +7518,15 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            // The five-second risk window is over. Remove the entity from active
+            // simulation immediately while the wallet transfer confirms.
+            activePlayer.cashoutSettling = true;
+            activePlayer.boost = false;
+            activePlayer.inputDx = 0;
+            activePlayer.inputDy = 0;
+            activePlayer.shooting = false;
+            io.to(activePlayer.id).emit('cashOutProcessing');
+
             if (isTournament || activeRoom?.isTournament || activePlayer.isTournament) {
                 try {
                     await executeTournamentCashout(activePlayer, activeRoom);
@@ -7474,6 +7534,7 @@ io.on('connection', (socket) => {
                     console.error('Tournament cashout error:', err);
                     io.to(activePlayer.id).emit('error', err.message || 'Tournament cashout failed');
                     activePlayer.isCashingOut = false;
+                    activePlayer.cashoutSettling = false;
                 } finally {
                     releaseCashoutLock(playerMongoId);
                 }
@@ -7486,6 +7547,7 @@ io.on('connection', (socket) => {
                     await logSolanaTransactionError('❌ Surviv cashout error:', err);
                     io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
+                    activePlayer.cashoutSettling = false;
                 } finally {
                     releaseCashoutLock(playerMongoId);
                 }
@@ -7499,6 +7561,7 @@ io.on('connection', (socket) => {
                     await logSolanaTransactionError('❌ Competitive cashout error:', err);
                     io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
+                    activePlayer.cashoutSettling = false;
                 } finally {
                     releaseCashoutLock(playerMongoId);
                 }
@@ -7511,7 +7574,10 @@ io.on('connection', (socket) => {
                 releaseArenaCashoutReservation(activeRoom, activePlayer);
                 await logSolanaTransactionError('❌ Cashout error:', err);
                 io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
-                if (activePlayer) activePlayer.isCashingOut = false;
+                if (activePlayer) {
+                    activePlayer.isCashingOut = false;
+                    activePlayer.cashoutSettling = false;
+                }
             } finally {
                 releaseCashoutLock(playerMongoId);
             }
@@ -7534,6 +7600,9 @@ io.on('connection', (socket) => {
         const player = room.players.find(candidate => candidate.id === socket.id);
         if (!player) return;
 
+        player.cashoutHoldActive = false;
+        player.cashoutHoldStartedAt = 0;
+        player.cashoutHoldCompletedAt = 0;
         player.disconnected = true;
         player.disconnectedAt = Date.now();
         if (room.isSurviv || player.mode === 'surviv') {
@@ -7595,6 +7664,12 @@ io.on('connection', (socket) => {
             pl.id === socket.id && (pl.mode === 'slither' || pl.mode === 'competitive-slither')
         );
         if (!p) return;
+        if (p.cashoutHoldActive) {
+            p.inputDx = 0;
+            p.inputDy = 0;
+            p.boost = false;
+            return;
+        }
         p.inputDx = Number(dx) || 0;
         p.inputDy = Number(dy) || 0;
         p.boost = p.isCashingOut ? false : !!boost;
@@ -7614,6 +7689,12 @@ io.on('connection', (socket) => {
         const room = getArenaRoomById(socket.roomId);
         const player = room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
         if (!player || player.disconnected) return;
+        if (player.cashoutHoldActive) {
+            player.inputDx = 0;
+            player.inputDy = 0;
+            player.shooting = false;
+            return;
+        }
 
         const finiteClamp = (value, min, max, fallback = 0) => {
             const parsed = Number(value);
@@ -8037,7 +8118,7 @@ function processRoom(room) {
     }
 
     const allUsers = [
-        ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected),
+        ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected && !p.cashoutSettling),
         ...room.bots,
     ];
     rebuildQuadTree(room, allUsers);
@@ -8220,7 +8301,7 @@ function processRoom(room) {
         const cellsToDelete = new Set();
 
         // Calculate absolute target position in the world
-        ensureAgarMovementInput(player);
+        if (!player.cashoutHoldActive) ensureAgarMovementInput(player);
         const targetWorldX = player.isBot ? player.targetX : (player.x + (player.mouseX || 0));
         const targetWorldY = player.isBot ? player.targetY : (player.y + (player.mouseY || 0));
 
@@ -8229,6 +8310,13 @@ function processRoom(room) {
             const cell = player.cells[i];
             
             // PHYSICS: Movement & Friction
+            if (player.cashoutHoldActive) {
+                cell.vx = 0;
+                cell.vy = 0;
+                cell.vX = 0;
+                cell.vY = 0;
+                continue;
+            }
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
             const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult * (isSandbox ? (room.sandboxSpeedMultiplier ?? 1) : 1);
             
@@ -8255,7 +8343,9 @@ function processRoom(room) {
         }
 
 
-        resolveAgarOwnCells(player, Date.now(), massStart);
+        if (!player.cashoutHoldActive) {
+            resolveAgarOwnCells(player, Date.now(), massStart);
+        }
         if (!player.isBot) {
             applyAgarWealthTax(player, room, dollarStart);
         }
@@ -8486,7 +8576,7 @@ function processRoom(room) {
         const visibleViruses = [];
         const visibleEjected = [];
         const visibleUsersSet = new Set();
-        visibleUsersSet.add(p);
+        if (!p.cashoutSettling) visibleUsersSet.add(p);
         visibleItems.forEach(item => {
             if (item.type === 'virus') visibleViruses.push(item.data);
             else if (item.type === 'ejected') visibleEjected.push(item.data);
