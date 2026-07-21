@@ -7466,7 +7466,7 @@ io.on('connection', (socket) => {
             socialRate.emoteCount = 0;
         }
         if (++socialRate.emoteCount > 4) return;
-        const allowed = new Set(['?', '\u{1F4B0}', '\u{1F3AF}', '\u{1F451}', '\u{1F480}', '\u{1F602}', '\u{2764}\u{FE0F}', '\u{1F44D}']);
+        const allowed = new Set(['?', '\u{1F44E}', '\u{1F3AF}', '\u{1F451}', '\u{1F480}', '\u{1F602}', '\u{2764}\u{FE0F}', '\u{1F44D}']);
         const emote = typeof payload?.emote === 'string' && allowed.has(payload.emote) ? payload.emote : null;
         const context = emote ? resolveGameSocialContext() : null;
         if (!context || context.player.disconnected) return;
