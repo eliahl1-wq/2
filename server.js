@@ -5761,7 +5761,8 @@ io.on('connection', (socket) => {
     const survivInputRate = { windowStartedAt: 0, count: 0 };
     const survivSpectateRate = { windowStartedAt: 0, count: 0 };
     const socialRate = { chatWindowAt: 0, chatCount: 0, emoteWindowAt: 0, emoteCount: 0 };
-    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammoPacks', 'grenades', 'armor']);
+    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammo', 'grenades', 'armor']);
+    const survivAmmoTypes = new Set(['9mm', '12g', '556', '762']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
         let userKey = null;
@@ -7384,17 +7385,19 @@ io.on('connection', (socket) => {
             const targetSlot = Number.isInteger(takeChestItem.targetSlot) && takeChestItem.targetSlot >= 0 && takeChestItem.targetSlot < 2
                 ? takeChestItem.targetSlot
                 : null;
-            if (chestId && itemKey && survivItemKeys.has(itemKey)) player.takeChestItem = { chestId, itemKey, targetSlot };
+            const ammoType = safeId(takeChestItem.ammoType, 8);
+            if (chestId && itemKey && survivItemKeys.has(itemKey)) player.takeChestItem = { chestId, itemKey, targetSlot, ammoType: survivAmmoTypes.has(ammoType) ? ammoType : null };
         }
         if (putChestItem && typeof putChestItem === 'object' && !Array.isArray(putChestItem)) {
             const chestId = safeId(putChestItem.chestId);
             const itemKey = safeId(putChestItem.itemKey, 24);
             const weaponType = safeId(putChestItem.weaponType, 24);
+            const ammoType = safeId(putChestItem.ammoType, 8);
             const slotIdx = Number.isInteger(putChestItem.slotIdx) && putChestItem.slotIdx >= 0 && putChestItem.slotIdx <= 2
                 ? putChestItem.slotIdx
                 : null;
             if (chestId && itemKey && survivItemKeys.has(itemKey)) {
-                player.putChestItem = { chestId, itemKey, weaponType, slotIdx };
+                player.putChestItem = { chestId, itemKey, weaponType, slotIdx, ammoType: survivAmmoTypes.has(ammoType) ? ammoType : null };
             }
         }
         if (swapWeaponSlots && typeof swapWeaponSlots === 'object' && !Array.isArray(swapWeaponSlots)) {
@@ -7408,10 +7411,11 @@ io.on('connection', (socket) => {
         }
         if (dropItem && typeof dropItem === 'object' && !Array.isArray(dropItem)) {
             const itemKey = safeId(dropItem.itemKey, 24);
+            const ammoType = safeId(dropItem.ammoType, 8);
             const slotIdx = Number.isInteger(dropItem.slotIdx) && dropItem.slotIdx >= 0 && dropItem.slotIdx <= 2
                 ? dropItem.slotIdx
                 : null;
-            if (itemKey && survivItemKeys.has(itemKey)) player.dropItemPending = { itemKey, slotIdx };
+            if (itemKey && survivItemKeys.has(itemKey)) player.dropItemPending = { itemKey, slotIdx, ammoType: survivAmmoTypes.has(ammoType) ? ammoType : null };
         }
         if (closeChest === true) {
             player.openedContainerId = null;

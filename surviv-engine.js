@@ -11,8 +11,15 @@ const MELEE_ANIMATION_MS = 280;
 const SURVIV_MAX_WEAPONS = 2;
 const SURVIV_MELEE_SLOT = SURVIV_MAX_WEAPONS;
 const SURVIV_MAX_MEDKITS = 6;
-const SURVIV_MAX_AMMO_PACKS = 9;
 const SURVIV_MAX_GRENADES = 3;
+
+export const SURVIV_AMMO = Object.freeze({
+    '9mm': { id: '9mm', label: '9mm', color: '#f5d547', max: 180, pickup: 30 },
+    '12g': { id: '12g', label: '12 Gauge', color: '#f05a5a', max: 48, pickup: 8 },
+    '556': { id: '556', label: '5.56mm', color: '#63d471', max: 180, pickup: 30 },
+    '762': { id: '762', label: '7.62mm', color: '#5aa9f8', max: 90, pickup: 15 },
+});
+const SURVIV_AMMO_TYPES = Object.keys(SURVIV_AMMO);
 
 export const SURVIV = {
     worldHalf: 10000,
@@ -78,6 +85,7 @@ export const WEAPONS = {
         spread: 0.06,
         bulletSpeed: 34,
         pellets: 1,
+        ammoType: '9mm',
     },
     smg: {
         id: 'smg',
@@ -90,6 +98,7 @@ export const WEAPONS = {
         spread: 0.14,
         bulletSpeed: 38,
         pellets: 1,
+        ammoType: '9mm',
     },
     shotgun: {
         id: 'shotgun',
@@ -102,6 +111,7 @@ export const WEAPONS = {
         spread: 0.32,
         bulletSpeed: 30,
         pellets: 5,
+        ammoType: '12g',
     },
     assault: {
         id: 'assault',
@@ -114,6 +124,7 @@ export const WEAPONS = {
         spread: 0.09,
         bulletSpeed: 42,
         pellets: 1,
+        ammoType: '556',
     },
     revolver: {
         id: 'revolver',
@@ -126,6 +137,7 @@ export const WEAPONS = {
         spread: 0.035,
         bulletSpeed: 44,
         pellets: 1,
+        ammoType: '762',
     },
     dmr: {
         id: 'dmr',
@@ -138,6 +150,7 @@ export const WEAPONS = {
         spread: 0.025,
         bulletSpeed: 48,
         pellets: 1,
+        ammoType: '762',
     },
     sniper: {
         id: 'sniper',
@@ -150,6 +163,7 @@ export const WEAPONS = {
         spread: 0.012,
         bulletSpeed: 58,
         pellets: 1,
+        ammoType: '762',
     },
     lmg: {
         id: 'lmg',
@@ -162,6 +176,7 @@ export const WEAPONS = {
         spread: 0.13,
         bulletSpeed: 40,
         pellets: 1,
+        ammoType: '556',
     },
 };
 
@@ -450,9 +465,11 @@ function randomChestContents(tier = 'common', options = {}) {
     const weaponChance = outdoor ? weaponChanceBase * 0.68 : weaponChanceBase;
     if (Math.random() < weaponChance) contents.weaponType = pickWeaponForTier(tier);
 
-    contents.ammoPacks = tier === 'military'
-        ? 2 + Math.floor(Math.random() * 2)
-        : tier === 'rare' ? 2 : 1;
+    const ammoType = WEAPONS[contents.weaponType]?.ammoType
+        || SURVIV_AMMO_TYPES[Math.floor(Math.random() * SURVIV_AMMO_TYPES.length)];
+    const ammoDefinition = SURVIV_AMMO[ammoType];
+    contents.ammoType = ammoType;
+    contents.ammoAmount = ammoDefinition.pickup * (tier === 'military' ? 2 : 1);
     if (Math.random() < (tier === 'military' ? 0.55 : tier === 'rare' ? 0.35 : 0.16)) {
         contents.grenades = 1;
     }
@@ -2390,6 +2407,7 @@ function makeWeaponState(typeId) {
         ammo: def.clipSize,
         reloading: false,
         reloadEndAt: 0,
+        reloadAmount: 0,
         lastShotAt: 0,
     };
 }
@@ -2402,11 +2420,32 @@ export function beginSurvivReload(entity, now = Date.now()) {
     if ((Number(weapon.ammo) || 0) >= definition.clipSize) return false;
 
     const inventory = ensureInventory(entity);
-    if (inventory.ammoPacks <= 0) return false;
-    inventory.ammoPacks -= 1;
+    const ammoType = definition.ammoType;
+    const available = Math.max(0, Number(inventory.ammoReserves[ammoType]) || 0);
+    const missing = Math.max(0, definition.clipSize - (Number(weapon.ammo) || 0));
+    const reloadAmount = Math.min(missing, available);
+    if (reloadAmount <= 0) return false;
+    inventory.ammoReserves[ammoType] -= reloadAmount;
+    weapon.reloadAmount = reloadAmount;
     weapon.reloading = true;
     weapon.reloadEndAt = now + definition.reloadMs;
     return true;
+}
+
+function finishSurvivReload(entity) {
+    const weapon = entity?.weapon;
+    const definition = WEAPONS[weapon?.type];
+    if (!weapon || !definition) return false;
+    const amount = Math.max(0, Number(weapon.reloadAmount) || 0);
+    weapon.reloading = false;
+    weapon.reloadEndAt = 0;
+    weapon.reloadAmount = 0;
+    weapon.ammo = Math.min(definition.clipSize, (Number(weapon.ammo) || 0) + amount);
+    return amount > 0;
+}
+
+function makeAmmoReserves() {
+    return Object.fromEntries(SURVIV_AMMO_TYPES.map(ammoType => [ammoType, 0]));
 }
 
 function makeInventory() {
@@ -2415,7 +2454,7 @@ function makeInventory() {
         weapons: [],
         meleeWeapon: 'fists',
         medkits: 0,
-        ammoPacks: 0,
+        ammoReserves: makeAmmoReserves(),
         grenades: 0,
         chestsOpened: 0,
     };
@@ -2437,7 +2476,21 @@ function ensureInventory(entity) {
     entity.inventory.meleeWeapon = entity.inventory.meleeWeapon === 'knife' ? 'knife' : 'fists';
     if (Array.isArray(entity.weaponSlotAmmo)) entity.weaponSlotAmmo = validSlotAmmo;
     entity.inventory.medkits = Math.max(0, Math.min(SURVIV_MAX_MEDKITS, Number(entity.inventory.medkits) || 0));
-    entity.inventory.ammoPacks = Math.max(0, Math.min(SURVIV_MAX_AMMO_PACKS, Number(entity.inventory.ammoPacks) || 0));
+    if (!entity.inventory.ammoReserves || typeof entity.inventory.ammoReserves !== 'object') {
+        entity.inventory.ammoReserves = makeAmmoReserves();
+        const legacyPacks = Math.max(0, Number(entity.inventory.ammoPacks) || 0);
+        if (legacyPacks > 0) {
+            const legacyType = WEAPONS[entity.weapon?.type]?.ammoType || '9mm';
+            entity.inventory.ammoReserves[legacyType] = legacyPacks * SURVIV_AMMO[legacyType].pickup;
+        }
+    }
+    for (const ammoType of SURVIV_AMMO_TYPES) {
+        entity.inventory.ammoReserves[ammoType] = Math.max(0, Math.min(
+            SURVIV_AMMO[ammoType].max,
+            Math.floor(Number(entity.inventory.ammoReserves[ammoType]) || 0),
+        ));
+    }
+    delete entity.inventory.ammoPacks;
     entity.inventory.grenades = Math.max(0, Math.min(SURVIV_MAX_GRENADES, Number(entity.inventory.grenades) || 0));
     entity.inventory.chestsOpened = Number(entity.inventory.chestsOpened) || 0;
     return entity.inventory;
@@ -2506,8 +2559,8 @@ function describeContainerItems(contents = {}) {
     if (contents.medkits) {
         items.push({ key: 'medkits', kind: 'medkit', label: 'Medkit', value: Number(contents.medkits) });
     }
-    if (contents.ammoPacks) {
-        items.push({ key: 'ammoPacks', kind: 'ammo', label: 'Ammo', value: Number(contents.ammoPacks) });
+    if (contents.ammoType && contents.ammoAmount && SURVIV_AMMO[contents.ammoType]) {
+        items.push({ key: 'ammo', kind: 'ammo', label: `${SURVIV_AMMO[contents.ammoType].label} Ammo`, ammoType: contents.ammoType, color: SURVIV_AMMO[contents.ammoType].color, value: Number(contents.ammoAmount) });
     }
     if (contents.grenades) {
         items.push({ key: 'grenades', kind: 'grenade', label: 'Grenade', value: Number(contents.grenades) });
@@ -2519,7 +2572,7 @@ function describeContainerItems(contents = {}) {
 }
 
 function isContainerEmpty(contents = {}) {
-    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoPacks && !contents.grenades && !contents.armor;
+    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoAmount && !contents.grenades && !contents.armor;
 }
 
 function applyLootContents(entity, contents = {}, options = {}) {
@@ -2528,7 +2581,8 @@ function applyLootContents(entity, contents = {}, options = {}) {
         money: 0,
         medkits: 0,
         armor: 0,
-        ammoPacks: 0,
+        ammoType: null,
+        ammoAmount: 0,
         grenades: 0,
         weaponType: null,
         weaponLabel: null,
@@ -2547,10 +2601,12 @@ function applyLootContents(entity, contents = {}, options = {}) {
         summary.armor = Math.max(0, Math.min(Number(contents.armor) || 0, entity.maxArmor - (entity.armor || 0)));
         entity.armor = (entity.armor || 0) + summary.armor;
     }
-    if (contents.ammoPacks) {
-        const packs = Math.max(0, Math.min(Number(contents.ammoPacks) || 0, SURVIV_MAX_AMMO_PACKS - inv.ammoPacks));
-        summary.ammoPacks = packs;
-        inv.ammoPacks += packs;
+    if (contents.ammoType && contents.ammoAmount && SURVIV_AMMO[contents.ammoType]) {
+        const ammoType = contents.ammoType;
+        const amount = Math.max(0, Math.min(Number(contents.ammoAmount) || 0, SURVIV_AMMO[ammoType].max - inv.ammoReserves[ammoType]));
+        summary.ammoType = ammoType;
+        summary.ammoAmount = amount;
+        inv.ammoReserves[ammoType] += amount;
     }
     if (contents.grenades) {
         const grenades = Math.max(0, Math.min(Number(contents.grenades) || 0, SURVIV_MAX_GRENADES - inv.grenades));
@@ -3109,8 +3165,7 @@ function tryShoot(entity, room, now) {
 
     if (w.reloading) {
         if (now >= w.reloadEndAt) {
-            w.reloading = false;
-            w.ammo = wDef.clipSize;
+            finishSurvivReload(entity);
         } else {
             return;
         }
@@ -3187,7 +3242,10 @@ function dropDeathLoot(room, entity) {
     });
     if (inventory.meleeWeapon === 'knife') drops.push({ type: 'weapon', weaponType: 'knife', tier: WEAPONS.knife.rarity });
     if (inventory.medkits > 0) drops.push({ type: 'medkit', amount: inventory.medkits });
-    if (inventory.ammoPacks > 0) drops.push({ type: 'ammo', amount: inventory.ammoPacks });
+    for (const ammoType of SURVIV_AMMO_TYPES) {
+        const amount = Math.max(0, Number(inventory.ammoReserves[ammoType]) || 0);
+        if (amount > 0) drops.push({ type: 'ammo', ammoType, amount });
+    }
     if (inventory.grenades > 0) drops.push({ type: 'grenade', amount: inventory.grenades });
     if (entity.armor > 0) drops.push({ type: 'armor', armorValue: Math.round(entity.armor) });
 
@@ -3206,7 +3264,7 @@ function dropDeathLoot(room, entity) {
     entity.weaponSlotAmmo = [];
     entity.weaponsAmmo = {};
     inventory.medkits = 0;
-    inventory.ammoPacks = 0;
+    inventory.ammoReserves = makeAmmoReserves();
     inventory.grenades = 0;
     inventory.meleeWeapon = 'fists';
 }
@@ -3320,8 +3378,8 @@ function takeLootContainerItem(entity, room) {
         picked = { money: contents.money, rarity: contents.rarity };
     } else if (itemKey === 'medkits' && contents.medkits) {
         picked = { medkits: contents.medkits, rarity: contents.rarity };
-    } else if (itemKey === 'ammoPacks' && contents.ammoPacks) {
-        picked = { ammoPacks: contents.ammoPacks, rarity: contents.rarity };
+    } else if (itemKey === 'ammo' && contents.ammoType && contents.ammoAmount) {
+        picked = { ammoType: contents.ammoType, ammoAmount: contents.ammoAmount, rarity: contents.rarity };
     } else if (itemKey === 'grenades' && contents.grenades) {
         picked = { grenades: contents.grenades, rarity: contents.rarity };
     } else if (itemKey === 'armor' && contents.armor) {
@@ -3383,13 +3441,14 @@ function takeLootContainerItem(entity, room) {
     }
     if (summary.money > 0) contents.money = Math.max(0, Number(contents.money || 0) - summary.money);
     if (summary.medkits > 0) contents.medkits = Math.max(0, Number(contents.medkits || 0) - summary.medkits);
-    if (summary.ammoPacks > 0) contents.ammoPacks = Math.max(0, Number(contents.ammoPacks || 0) - summary.ammoPacks);
+    if (summary.ammoAmount > 0) contents.ammoAmount = Math.max(0, Number(contents.ammoAmount || 0) - summary.ammoAmount);
     if (summary.grenades > 0) contents.grenades = Math.max(0, Number(contents.grenades || 0) - summary.grenades);
     if (summary.armor > 0) contents.armor = Math.max(0, Number(contents.armor || 0) - summary.armor);
-    for (const key of ['money', 'medkits', 'ammoPacks', 'grenades', 'armor']) {
+    for (const key of ['money', 'medkits', 'ammoAmount', 'grenades', 'armor']) {
         if (!(Number(contents[key]) > 0)) delete contents[key];
     }
-    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoPacks > 0 || summary.grenades > 0 || summary.armor > 0;
+    if (!contents.ammoAmount) delete contents.ammoType;
+    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoAmount > 0 || summary.grenades > 0 || summary.armor > 0;
     if (!accepted) {
         refreshOpenedContainer(entity, room);
         return;
@@ -3477,9 +3536,18 @@ function putLootContainerItem(entity, room) {
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
         contents.medkits = (contents.medkits || 0) + 1;
-    } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
-        inv.ammoPacks -= 1;
-        contents.ammoPacks = (contents.ammoPacks || 0) + 1;
+    } else if (itemKey === 'ammo' && SURVIV_AMMO[request.ammoType]) {
+        const ammoType = request.ammoType;
+        if (contents.ammoType && contents.ammoType !== ammoType) {
+            refreshOpenedContainer(entity, room);
+            return;
+        }
+        const transfer = Math.min(SURVIV_AMMO[ammoType].pickup, inv.ammoReserves[ammoType]);
+        if (transfer > 0) {
+            inv.ammoReserves[ammoType] -= transfer;
+            contents.ammoType = ammoType;
+            contents.ammoAmount = (contents.ammoAmount || 0) + transfer;
+        }
     } else if (itemKey === 'grenades' && inv.grenades > 0) {
         inv.grenades -= 1;
         contents.grenades = (contents.grenades || 0) + 1;
@@ -3594,9 +3662,12 @@ function dropPlayerItem(entity, room) {
     } else if (itemKey === 'medkits' && inv.medkits > 0) {
         inv.medkits -= 1;
         addSurvivLoot(room, makeGroundLoot('medkit', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
-    } else if (itemKey === 'ammoPacks' && inv.ammoPacks > 0) {
-        inv.ammoPacks -= 1;
-        addSurvivLoot(room, makeGroundLoot('ammo', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
+    } else if (itemKey === 'ammo' && SURVIV_AMMO[request.ammoType]) {
+        const ammoType = request.ammoType;
+        const amount = Math.min(SURVIV_AMMO[ammoType].pickup, inv.ammoReserves[ammoType]);
+        if (amount <= 0) return;
+        inv.ammoReserves[ammoType] -= amount;
+        addSurvivLoot(room, makeGroundLoot('ammo', dropX, dropY, { ammoType, amount, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     } else if (itemKey === 'grenades' && inv.grenades > 0) {
         inv.grenades -= 1;
         addSurvivLoot(room, makeGroundLoot('grenade', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
@@ -3620,7 +3691,8 @@ function pickupLoot(entity, room) {
         money: 0,
         medkits: 0,
         armor: 0,
-        ammoPacks: 0,
+        ammoType: null,
+        ammoAmount: 0,
         grenades: 0,
         weaponType: null,
         weaponLabel: null,
@@ -3650,18 +3722,21 @@ function pickupLoot(entity, room) {
             if (item.type === 'money') requested = { money: Number(item.dollarValue || item.amount || 0) };
             if (item.type === 'medkit') { requested = { medkits: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'medkits'; }
             if (item.type === 'armor') { requested = { armor: Math.max(1, Number(item.armorValue) || 35) }; quantityKey = 'armor'; }
-            if (item.type === 'ammo') { requested = { ammoPacks: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'ammoPacks'; }
+            if (item.type === 'ammo' && SURVIV_AMMO[item.ammoType]) { requested = { ammoType: item.ammoType, ammoAmount: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'ammoAmount'; }
             if (item.type === 'grenade') { requested = { grenades: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'grenades'; }
             if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) requested = { weaponType: item.weaponType };
             if (!requested) continue;
 
             const accepted = applyLootContents(entity, requested, { countChest: false });
-            const acceptedAmount = accepted.money || accepted.medkits || accepted.armor || accepted.ammoPacks || accepted.grenades || (accepted.weaponType ? 1 : 0);
+            const acceptedAmount = accepted.money || accepted.medkits || accepted.armor || accepted.ammoAmount || accepted.grenades || (accepted.weaponType ? 1 : 0);
             if (!(acceptedAmount > 0)) continue;
             pickedUp.money += accepted.money;
             pickedUp.medkits += accepted.medkits;
             pickedUp.armor += accepted.armor;
-            pickedUp.ammoPacks += accepted.ammoPacks;
+            if (accepted.ammoAmount > 0) {
+                pickedUp.ammoType = accepted.ammoType;
+                pickedUp.ammoAmount += accepted.ammoAmount;
+            }
             pickedUp.grenades = (pickedUp.grenades || 0) + accepted.grenades;
             if (accepted.weaponType) {
                 pickedUp.weaponType = accepted.weaponType;
@@ -3926,7 +4001,7 @@ function getBotLootScore(bot, item, itemDistance) {
             || Number(contents.money) > 0
             || (Number(contents.armor) > 0 && bot.armor < bot.maxArmor)
             || (Number(contents.medkits) > 0 && inventory.medkits < SURVIV_MAX_MEDKITS)
-            || (Number(contents.ammoPacks) > 0 && inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS);
+            || (SURVIV_AMMO[contents.ammoType] && Number(contents.ammoAmount) > 0 && inventory.ammoReserves[contents.ammoType] < SURVIV_AMMO[contents.ammoType].max);
         return useful ? 1120 - distancePenalty : -Infinity;
     }
     if (item.type === 'weapon') {
@@ -3935,7 +4010,7 @@ function getBotLootScore(bot, item, itemDistance) {
     if (item.type === 'money') return 820 - distancePenalty;
     if (item.type === 'armor') return bot.armor < bot.maxArmor - 2 ? 760 - distancePenalty : -Infinity;
     if (item.type === 'medkit') return inventory.medkits < SURVIV_MAX_MEDKITS ? 700 - distancePenalty : -Infinity;
-    if (item.type === 'ammo') return inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS ? 640 - distancePenalty : -Infinity;
+    if (item.type === 'ammo' && SURVIV_AMMO[item.ammoType]) return inventory.ammoReserves[item.ammoType] < SURVIV_AMMO[item.ammoType].max ? 640 - distancePenalty : -Infinity;
     return -Infinity;
 }
 
@@ -4007,7 +4082,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
             || bot.openedContainer.items.find(item => item.kind === 'armor' && bot.armor < bot.maxArmor)
 
             || bot.openedContainer.items.find(item => item.kind === 'medkit' && inventory.medkits < SURVIV_MAX_MEDKITS)
-            || bot.openedContainer.items.find(item => item.kind === 'ammo' && inventory.ammoPacks < SURVIV_MAX_AMMO_PACKS);
+            || bot.openedContainer.items.find(item => item.kind === 'ammo' && SURVIV_AMMO[item.ammoType] && inventory.ammoReserves[item.ammoType] < SURVIV_AMMO[item.ammoType].max);
         if (wanted) bot.takeChestItem = { chestId: bot.openedContainer.id, itemKey: wanted.key };
         bot.inputDx = 0;
         bot.inputDy = 0;
@@ -4115,8 +4190,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     if (entity.weapon && entity.weapon.reloading) {
         const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
         if (now >= entity.weapon.reloadEndAt) {
-            entity.weapon.reloading = false;
-            entity.weapon.ammo = wDef.clipSize;
+            finishSurvivReload(entity);
         }
     }
 
@@ -4337,6 +4411,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 tier: l.tier,
                 source: l.source,
                 amount: l.amount,
+                ammoType: l.ammoType,
                 armorValue: l.armorValue,
             }));
 

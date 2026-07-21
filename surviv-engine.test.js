@@ -739,7 +739,7 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     victim.armor = 35;
     victim.inventory.weapons = ['smg'];
     victim.inventory.medkits = 1;
-    victim.inventory.ammoPacks = 2;
+    victim.inventory.ammoReserves = { '9mm': 60, '12g': 0, '556': 0, '762': 0 };
     player.aimAngle = 0;
     player.shooting = true;
 
@@ -749,44 +749,46 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     assert.ok(deathDrops.some(item => item.type === 'money' && item.dollarValue === 2));
     assert.ok(deathDrops.some(item => item.type === 'weapon' && item.weaponType === 'smg'));
     assert.ok(deathDrops.some(item => item.type === 'medkit' && item.amount === 1));
-    assert.ok(deathDrops.some(item => item.type === 'ammo' && item.amount === 2));
+    assert.ok(deathDrops.some(item => item.type === 'ammo' && item.ammoType === '9mm' && item.amount === 60));
     assert.ok(deathDrops.some(item => item.type === 'armor' && item.armorValue > 0));
     assert.equal(room.loot.some(item => item.type === 'deathCrate'), false);
 });
-test('manual reload requires and consumes exactly one ammo pack', () => {
+test('manual reload consumes only the matching caliber and only the missing rounds', () => {
     const fullWeapon = {
         weapon: { type: 'smg', ammo: 30, reloading: false, reloadEndAt: 0 },
-        inventory: { weapons: ['smg'], medkits: 0, ammoPacks: 1, chestsOpened: 0 },
+        inventory: { weapons: ['smg'], medkits: 0, ammoReserves: { '9mm': 30, '12g': 0, '556': 0, '762': 0 }, chestsOpened: 0 },
     };
     assert.equal(beginSurvivReload(fullWeapon, 1000), false);
     assert.equal(fullWeapon.weapon.reloading, false);
-    assert.equal(fullWeapon.inventory.ammoPacks, 1);
+    assert.equal(fullWeapon.inventory.ammoReserves['9mm'], 30);
 
     const noReserve = {
         weapon: { type: 'smg', ammo: 11, reloading: false, reloadEndAt: 0 },
-        inventory: { weapons: ['smg'], medkits: 0, ammoPacks: 0, chestsOpened: 0 },
+        inventory: { weapons: ['smg'], medkits: 0, ammoReserves: { '9mm': 0, '12g': 30, '556': 0, '762': 0 }, chestsOpened: 0 },
     };
     assert.equal(beginSurvivReload(noReserve, 1000), false);
     assert.equal(noReserve.weapon.reloading, false);
 
     const partialWeapon = {
         weapon: { type: 'smg', ammo: 11, reloading: false, reloadEndAt: 0 },
-        inventory: { weapons: ['smg'], medkits: 0, ammoPacks: 2, chestsOpened: 0 },
+        inventory: { weapons: ['smg'], medkits: 0, ammoReserves: { '9mm': 12, '12g': 30, '556': 0, '762': 0 }, chestsOpened: 0 },
     };
     assert.equal(beginSurvivReload(partialWeapon, 1000), true);
     assert.equal(partialWeapon.weapon.reloading, true);
     assert.equal(partialWeapon.weapon.reloadEndAt, 2800);
-    assert.equal(partialWeapon.inventory.ammoPacks, 1);
+    assert.equal(partialWeapon.weapon.reloadAmount, 12);
+    assert.equal(partialWeapon.inventory.ammoReserves['9mm'], 0);
+    assert.equal(partialWeapon.inventory.ammoReserves['12g'], 30);
 
     assert.equal(beginSurvivReload(partialWeapon, 1500), false);
-    assert.equal(partialWeapon.inventory.ammoPacks, 1);
+    assert.equal(partialWeapon.inventory.ammoReserves['9mm'], 0);
 
     const fists = {
         weapon: { type: 'fists', ammo: 0, reloading: false, reloadEndAt: 0 },
-        inventory: { weapons: [], medkits: 0, ammoPacks: 1, chestsOpened: 0 },
+        inventory: { weapons: [], medkits: 0, ammoReserves: { '9mm': 30, '12g': 0, '556': 0, '762': 0 }, chestsOpened: 0 },
     };
     assert.equal(beginSurvivReload(fists, 1000), false);
-    assert.equal(fists.inventory.ammoPacks, 1);
+    assert.equal(fists.inventory.ammoReserves['9mm'], 30);
 });
 
 test('ground loot creates a pickup summary for the player', () => {
@@ -794,16 +796,17 @@ test('ground loot creates a pickup summary for the player', () => {
     const player = createSurvivPlayer('human-loot', 'mongo-loot', 'Collector', '#fff', room);
     room.players.push(player);
     room.loot = [
-        { id: 'ammo-drop', type: 'ammo', x: player.x, y: player.y, amount: 2, tier: 'common' },
+        { id: 'ammo-drop', type: 'ammo', ammoType: '762', x: player.x, y: player.y, amount: 15, tier: 'common' },
         { id: 'medkit-drop', type: 'medkit', x: player.x, y: player.y, amount: 1, tier: 'rare' },
     ];
 
     processSurvivRoom(room, silentIo, Date.now() + 600000);
 
-    assert.equal(player.inventory.ammoPacks, 2);
+    assert.equal(player.inventory.ammoReserves['762'], 15);
     assert.equal(player.inventory.medkits, 1);
     assert.equal(player.lastLoot.source, 'ground');
-    assert.equal(player.lastLoot.items.ammoPacks, 2);
+    assert.equal(player.lastLoot.items.ammoType, '762');
+    assert.equal(player.lastLoot.items.ammoAmount, 15);
     assert.equal(player.lastLoot.items.medkits, 1);
 });
 test('medkits heal only after the server timer completes', () => {
