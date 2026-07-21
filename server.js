@@ -398,6 +398,7 @@ const Transaction = mongoose.model('Transaction', TransactionSchema);
 
 /** In-game cashouts only — excludes account withdrawals to external wallets. */
 const GAME_CASHOUT_REASON_RE = /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i;
+const ADMIN_GAME_JOIN_EVENTS = ['join', 'br_join', 'free_ticket_join'];
 
 function buildGameCashoutTxFilter() {
     return {
@@ -997,6 +998,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         platformFee,
         cashoutFeePct,
         playerId: mongoId,
+        gameSessionId: player.gameSessionId || null,
         timestamp: new Date().toISOString(),
     };
 
@@ -1014,7 +1016,11 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             amount: creditedPayout,
             meta: {
                 ...logMeta,
+                event: 'free_ticket_cashout',
                 playerPayout: creditedPayout,
+                rewardEligibleUsd: playerPayout,
+                rewardCreditedUsd: creditedPayout,
+                sponsoredBalanceAfterUsd: user.sponsoredRewardsBalance,
                 isFreeTicketPlay: true,
                 locked: creditedPayout > 0,
                 rewardBlocked: !!user.rewardsDisabled,
@@ -3031,7 +3037,7 @@ function classifyTxActivity(tx) {
     if (tx.type === 'deposit') return 'deposit';
     if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'].includes(m.event)) return 'sweep';
     if (tx.type === 'game') {
-        if (m.event === 'join' || m.event === 'br_join') return 'entry';
+        if (ADMIN_GAME_JOIN_EVENTS.includes(m.event)) return 'entry';
         if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated' || m.reason === 'Competitive Slither Death') return 'death';
         if (m.event === 'br_refund') return 'refund';
         return 'game';
@@ -3052,9 +3058,14 @@ function txActivityLabel(tx) {
         case 'withdraw': return 'Withdrawal';
         case 'entry':
             if (m.event === 'br_join') return `BR entry · $${m.entryFeeUsd ?? '?'}`;
+            if (m.event === 'free_ticket_join') return `Free ticket entry · ${m.mode || 'agar'} · $${m.entryFeeUsd ?? '?'} ticket`;
             return `Arena entry · ${m.mode || 'agar'} · $${m.entryFeeUsd ?? '?'}`;
-        case 'cashout': return m.reason || 'Cashout';
-        case 'death': return m.reason || 'Eliminated';
+        case 'cashout':
+            if (m.isFreeTicketPlay) return `Free ticket reward · ${m.mode || 'arena'} · $${m.rewardCreditedUsd ?? txAmountUsd(tx)}`;
+            return m.reason || 'Cashout';
+        case 'death':
+            if (m.isFreeTicketPlay) return `Free ticket death · ${m.mode || 'arena'} · no reward`;
+            return m.reason || 'Eliminated';
         case 'refund': return 'BR refund';
         case 'sweep': return m.reason || 'Owner sweep';
         default: return m.reason || m.event || tx.type;
@@ -3072,7 +3083,7 @@ function buildTxCategoryFilter(category) {
                 'meta.reason': { $not: { $regex: GAME_CASHOUT_REASON_RE } },
             };
         case 'entry':
-            return { type: 'game', 'meta.event': { $in: ['join', 'br_join'] } };
+            return { type: 'game', 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } };
         case 'cashout':
             return buildGameCashoutTxFilter();
         case 'death':
@@ -3505,13 +3516,15 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
 
         const uid = user._id;
 
-        const [allTxs, joinTxs, cashoutTxs] = await Promise.all([
+        const [allTxs, joinTxs, terminalTxs] = await Promise.all([
             Transaction.find({ userId: uid }).sort({ createdAt: -1 }).limit(500).lean(),
-            Transaction.find({ userId: uid, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } }).sort({ createdAt: -1 }).lean(),
+            Transaction.find({ userId: uid, type: 'game', 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } }).sort({ createdAt: -1 }).lean(),
             Transaction.find({
                 userId: uid,
-                type: 'withdraw',
-                'meta.reason': { $regex: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i },
+                $or: [
+                    { type: 'withdraw', 'meta.reason': { $regex: GAME_CASHOUT_REASON_RE } },
+                    { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } },
+                ],
             }).sort({ createdAt: 1 }).lean(),
         ]);
 
@@ -3548,52 +3561,121 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 totalWithdrawnUsd += txAmountUsd(tx);
                 withdrawalCount += 1;
             }
-            if (tx.type === 'game' && ['join', 'br_join'].includes(tx.meta?.event)) gameJoinCount += 1;
+            if (tx.type === 'game' && ADMIN_GAME_JOIN_EVENTS.includes(tx.meta?.event)) gameJoinCount += 1;
             if (tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(tx.meta?.reason)) deathCount += 1;
             if (tx.type === 'withdraw' && /BR Victory/i.test(tx.meta?.reason || '')) brWinCount += 1;
         }
 
-        const cashoutsByTime = cashoutTxs.map(c => ({ time: new Date(c.createdAt).getTime(), payoutUsd: txAmountUsd(c) }));
+        const terminalEvents = terminalTxs.map(tx => ({
+            tx,
+            id: String(tx._id),
+            time: new Date(tx.createdAt).getTime(),
+            sessionId: tx.meta?.gameSessionId || null,
+            isFreeTicketPlay: !!tx.meta?.isFreeTicketPlay,
+            isDeath: tx.type === 'game',
+        }));
+        const matchedTerminalIds = new Set();
+        const chronologicalJoins = [...joinTxs].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
 
-        const gameHistory = joinTxs.map(join => {
-            const wagerUsd = join.meta?.entryFeeUsd ?? (join.amount * SOL_PRICE_USD);
+        const gameHistory = chronologicalJoins.map((join, index) => {
+            const ticketValueUsd = Number(join.meta?.entryFeeUsd ?? (join.amount * SOL_PRICE_USD)) || 0;
+            const isFreeTicketPlay = join.meta?.event === 'free_ticket_join' || !!join.meta?.isFreeTicketPlay;
+            const wagerUsd = isFreeTicketPlay ? 0 : ticketValueUsd;
             const game = join.meta?.mode || join.meta?.variant || 'agar';
             const joinTime = new Date(join.createdAt).getTime();
+            const nextJoinTime = index + 1 < chronologicalJoins.length
+                ? new Date(chronologicalJoins[index + 1].createdAt).getTime()
+                : Number.POSITIVE_INFINITY;
+            const sessionId = join.meta?.gameSessionId || null;
 
-            let outcome = 'Loss';
-            let payoutUsd = 0;
-            const match = cashoutsByTime.find(c => c.time >= joinTime);
-            if (match) {
-                payoutUsd = match.payoutUsd;
-                if (payoutUsd > wagerUsd) outcome = 'Win';
-                else if (payoutUsd >= wagerUsd * 0.99) outcome = 'Break-even';
-                else outcome = 'Loss';
+            let match = sessionId
+                ? terminalEvents.find(event => !matchedTerminalIds.has(event.id) && event.sessionId === sessionId)
+                : null;
+            if (!match) {
+                match = terminalEvents.find(event => (
+                    !matchedTerminalIds.has(event.id)
+                    && event.time >= joinTime
+                    && event.time < nextJoinTime
+                    && event.isFreeTicketPlay === isFreeTicketPlay
+                ));
             }
+            if (match) matchedTerminalIds.add(match.id);
 
-            let eventType = join.meta?.event === 'br_join' ? 'br_join' : 'join';
-            if (join.meta?.reason === 'Arena Death' || join.meta?.reason === 'BR Eliminated' || join.meta?.reason === 'Competitive Slither Death') eventType = 'death';
+            const matchedTx = match?.tx;
+            const payoutUsd = matchedTx && !match.isDeath ? txAmountUsd(matchedTx) : 0;
+            const hasCashoutCalculation = matchedTx && !match.isDeath
+                && Number.isFinite(Number(matchedTx.meta?.dollarBalance))
+                && Number.isFinite(Number(matchedTx.meta?.cashoutFeePct));
+            const calculatedEligibleReward = hasCashoutCalculation
+                ? Number(matchedTx.meta.dollarBalance) * (1 - Number(matchedTx.meta.cashoutFeePct))
+                : payoutUsd;
+            const rewardEligibleUsd = isFreeTicketPlay
+                ? Number(matchedTx?.meta?.rewardEligibleUsd ?? calculatedEligibleReward) || 0
+                : payoutUsd;
+            const rewardCreditedUsd = isFreeTicketPlay
+                ? Number(matchedTx?.meta?.rewardCreditedUsd ?? payoutUsd) || 0
+                : payoutUsd;
+            const rewardBlocked = !!matchedTx?.meta?.rewardBlocked;
+
+            let outcome = 'In progress';
+            let rewardStatus = isFreeTicketPlay ? 'In progress' : 'No cashout recorded';
+            if (match?.isDeath) {
+                outcome = 'Loss';
+                rewardStatus = isFreeTicketPlay ? 'No reward (death)' : 'Eliminated';
+            } else if (matchedTx) {
+                if (isFreeTicketPlay) {
+                    outcome = rewardBlocked ? 'Blocked' : rewardCreditedUsd > 0 ? 'Reward earned' : 'No reward';
+                    rewardStatus = rewardBlocked ? 'Reward blocked' : rewardCreditedUsd > 0 ? 'Credited to sponsored rewards' : 'No reward credited';
+                } else {
+                    if (payoutUsd > wagerUsd) outcome = 'Win';
+                    else if (payoutUsd >= wagerUsd * 0.99) outcome = 'Break-even';
+                    else outcome = 'Loss';
+                    rewardStatus = 'Cashed out';
+                }
+            }
 
             return {
                 id: join._id,
-                eventType,
+                gameSessionId: sessionId,
+                eventType: isFreeTicketPlay ? 'free_ticket_join' : join.meta?.event === 'br_join' ? 'br_join' : 'join',
                 game,
+                isFreeTicketPlay,
                 wagerUsd: Number(wagerUsd.toFixed(2)),
+                ticketValueUsd: Number(ticketValueUsd.toFixed(2)),
                 payoutUsd: Number(payoutUsd.toFixed(2)),
+                rewardEligibleUsd: Number(rewardEligibleUsd.toFixed(2)),
+                rewardCreditedUsd: Number(rewardCreditedUsd.toFixed(2)),
+                rewardBlocked,
+                rewardStatus,
                 outcome,
                 entryFeeUsd: join.meta?.entryFeeUsd ?? null,
+                endedAt: matchedTx?.createdAt || null,
+                terminalType: match?.isDeath ? 'death' : matchedTx ? 'cashout' : null,
+                endReason: matchedTx?.meta?.reason || null,
                 createdAt: join.createdAt,
                 excludedFromReports: !!join.excludedFromReports,
             };
-        });
+        }).reverse();
 
+        gameJoinCount = joinTxs.filter(tx => !tx.excludedFromReports).length;
+        deathCount = terminalEvents.filter(event => event.isDeath && !event.tx.excludedFromReports).length;
         const wins = gameHistory.filter(g => g.outcome === 'Win' && !g.excludedFromReports).length;
         const losses = gameHistory.filter(g => g.outcome === 'Loss' && !g.excludedFromReports).length;
+        const freeTicketGames = gameHistory.filter(game => game.isFreeTicketPlay && !game.excludedFromReports);
+        const freeTicketCashouts = freeTicketGames.filter(game => game.terminalType === 'cashout');
+        const freeTicketDeaths = freeTicketGames.filter(game => game.terminalType === 'death');
+        const freeTicketRewardEligibleUsd = freeTicketCashouts.reduce((sum, game) => sum + game.rewardEligibleUsd, 0);
+        const freeTicketRewardCreditedUsd = freeTicketCashouts.reduce((sum, game) => sum + game.rewardCreditedUsd, 0);
+        const freeTicketRewardBlockedUsd = freeTicketCashouts.reduce(
+            (sum, game) => sum + (game.rewardBlocked ? Math.max(0, game.rewardEligibleUsd - game.rewardCreditedUsd) : 0),
+            0,
+        );
         const balanceSol = user.balance ?? 0;
 
         const modeMap = new Map();
         const ensureMode = (mode) => {
             const key = String(mode || 'unknown').toLowerCase();
-            if (!modeMap.has(key)) modeMap.set(key, { mode: key, games: 0, deaths: 0, cashouts: 0, entryUsd: 0, payoutUsd: 0 });
+            if (!modeMap.has(key)) modeMap.set(key, { mode: key, games: 0, freeTicketGames: 0, deaths: 0, cashouts: 0, entryUsd: 0, freeTicketValueUsd: 0, payoutUsd: 0, freeTicketRewardUsd: 0 });
             return modeMap.get(key);
         };
         let sponsoredRewardsClaimedUsd = 0;
@@ -3603,13 +3685,18 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
         for (const tx of allTxs) {
             const event = tx.meta?.event;
             const reason = tx.meta?.reason || '';
-            if (tx.type === 'game' && ['join', 'br_join'].includes(event)) {
+            if (tx.type === 'game' && ADMIN_GAME_JOIN_EVENTS.includes(event)) {
                 const mode = event === 'br_join'
                     ? ('br-' + (tx.meta?.variant || tx.meta?.mode || 'unknown'))
                     : (tx.meta?.mode || 'agar');
                 const row = ensureMode(mode);
                 row.games += 1;
-                row.entryUsd += Number(tx.meta?.entryFeeUsd ?? txAmountUsd(tx)) || 0;
+                if (event === 'free_ticket_join') {
+                    row.freeTicketGames += 1;
+                    row.freeTicketValueUsd += Number(tx.meta?.entryFeeUsd) || 0;
+                } else {
+                    row.entryUsd += Number(tx.meta?.entryFeeUsd ?? txAmountUsd(tx)) || 0;
+                }
             }
             if (tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(reason)) {
                 const fallbackMode = reason === 'Competitive Slither Death' ? 'competitive-slither' : reason === 'BR Eliminated' ? 'battle-royale' : 'agar';
@@ -3620,6 +3707,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 const row = ensureMode(tx.meta?.mode || tx.meta?.variant || fallbackMode);
                 row.cashouts += 1;
                 row.payoutUsd += txAmountUsd(tx);
+                if (tx.meta?.isFreeTicketPlay) row.freeTicketRewardUsd += Number(tx.meta?.rewardCreditedUsd ?? txAmountUsd(tx)) || 0;
             }
             if (event === 'sponsored_rewards_claim') sponsoredRewardsClaimedUsd += Number(tx.meta?.amountUsd ?? txAmountUsd(tx)) || 0;
             if (event === 'tournament_reward') tournamentRewardsEarnedUsd += Number(tx.meta?.amountUsd ?? txAmountUsd(tx)) || 0;
@@ -3627,7 +3715,13 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
         }
 
         const modeBreakdown = [...modeMap.values()]
-            .map(row => ({ ...row, entryUsd: Number(row.entryUsd.toFixed(2)), payoutUsd: Number(row.payoutUsd.toFixed(2)) }))
+            .map(row => ({
+                ...row,
+                entryUsd: Number(row.entryUsd.toFixed(2)),
+                freeTicketValueUsd: Number(row.freeTicketValueUsd.toFixed(2)),
+                payoutUsd: Number(row.payoutUsd.toFixed(2)),
+                freeTicketRewardUsd: Number(row.freeTicketRewardUsd.toFixed(2)),
+            }))
             .sort((a, b) => b.games - a.games || b.cashouts - a.cashouts);
         const latestActivityAt = allTxs[0]?.createdAt || objectIdCreatedAt(user._id);
 
@@ -3653,6 +3747,13 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             rewards: {
                 hasFreeTicket: !!user.hasFreeTicket,
                 freeTicketUsed: !!user.freeTicketUsed,
+                freeTicketGamesPlayed: freeTicketGames.length,
+                freeTicketCashouts: freeTicketCashouts.length,
+                freeTicketDeaths: freeTicketDeaths.length,
+                freeTicketRewardEligibleUsd: Number(freeTicketRewardEligibleUsd.toFixed(2)),
+                freeTicketRewardCreditedUsd: Number(freeTicketRewardCreditedUsd.toFixed(2)),
+                freeTicketRewardBlockedUsd: Number(freeTicketRewardBlockedUsd.toFixed(2)),
+                freeTicketLastPlayedAt: freeTicketGames[0]?.createdAt || null,
                 challengeCompleted: !!user.sponsoredRewardsCompleted,
                 challengeUnlocked: !!user.sponsoredRewardsUnlocked,
                 completedFiveDollarGames: user.completedFiveDollarNormalGames ?? 0,
@@ -4132,6 +4233,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
             $or: [
                 { type: 'game', 'meta.event': 'join' },
                 { type: 'game', 'meta.event': 'br_join' },
+                { type: 'game', 'meta.event': 'free_ticket_join' },
                 { type: 'game', 'meta.reason': 'Arena Death' },
                 { type: 'game', 'meta.reason': 'BR Eliminated' },
                 { type: 'game', 'meta.reason': 'Competitive Slither Death' },
@@ -4146,7 +4248,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
 
         const eventType = req.query.eventType || '';
         if (eventType === 'entry') {
-            andClauses.push({ type: 'game', 'meta.event': { $in: ['join', 'br_join'] } });
+            andClauses.push({ type: 'game', 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } });
         } else if (eventType === 'death') {
             andClauses.push({ type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } });
         } else if (eventType === 'cashout') {
@@ -4164,7 +4266,8 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
 
         const history = events.map(tx => {
             let eventType = tx.meta?.event || tx.meta?.reason || tx.type;
-            if (tx.meta?.event === 'join' || tx.meta?.event === 'br_join') eventType = 'join';
+            if (tx.meta?.event === 'free_ticket_join') eventType = 'free_ticket_entry';
+            else if (tx.meta?.event === 'join' || tx.meta?.event === 'br_join') eventType = 'join';
             else if (tx.meta?.reason === 'Arena Death' || tx.meta?.reason === 'BR Eliminated' || tx.meta?.reason === 'Competitive Slither Death') eventType = 'death';
             else if (/BR Victory/i.test(tx.meta?.reason || '')) eventType = 'br_win';
             else if (/Arena Cashout/i.test(tx.meta?.reason || '')) eventType = 'cashout';
@@ -6379,6 +6482,7 @@ io.on('connection', (socket) => {
             }
             const existingMode = existing?.player?.mode || null;
             const switchingNormalMode = existing?.room && existingMode && existingMode !== gameMode;
+            const gameSessionId = existing?.player?.gameSessionId || randomBytes(12).toString('hex');
 
             const room = existing?.room ?? (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd));
             const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
@@ -6476,7 +6580,7 @@ io.on('connection', (socket) => {
                 }
             } else if (!switchingNormalMode) {
                 if (isFreeTicketPlay) {
-                    console.log(`[FREE TICKET] ${user.username} joined Slither/Agar normal $10 match using free ticket.`);
+                    console.log(`[FREE TICKET] ${user.username} joined Slither/Agar normal $${entryFeeUsd} match using free ticket.`);
                 } else {
                     if (DEV_FREE_PLAY) {
                         user.balance = Math.max(0, user.balance - entryFeeInSol);
@@ -6509,6 +6613,7 @@ io.on('connection', (socket) => {
                             entryFeeUsd,
                             mode: mode === 'slither' ? 'slither' : 'agar',
                             isFreeTicketPlay: true,
+                            gameSessionId,
                         },
                         status: 'confirmed'
                     });
@@ -6523,6 +6628,7 @@ io.on('connection', (socket) => {
                             roomId: room.id,
                             entryFeeUsd,
                             mode: mode === 'slither' ? 'slither' : 'agar',
+                            gameSessionId,
                             ...(DEV_FREE_PLAY ? { simulated: true } : {}),
                         },
                         status: 'confirmed'
@@ -6746,6 +6852,8 @@ io.on('connection', (socket) => {
                     newPlayer.isFreeTicketPlay = true;
                 }
             }
+
+            newPlayer.gameSessionId = gameSessionId;
 
             // Race guard: another join may have completed while we awaited payment
             const raced = room.players.find(p => p.mongoId?.toString() === userKey);
@@ -8116,6 +8224,7 @@ function processRoom(room) {
                                                 entryFeeUsd: victim.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                                                 inGameBalanceUsd: balanceAtDeath,
                                                 isFreeTicketPlay: !!victim.isFreeTicketPlay,
+                                                gameSessionId: victim.gameSessionId || null,
                                             },
                                             status: 'confirmed',
                                         }).catch(err => console.error("Error logging agar death:", err));

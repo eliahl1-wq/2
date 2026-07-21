@@ -1958,6 +1958,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
                     mode: 'slither',
                     entryFeeUsd: snake.isTournament ? 1 : (snake.entryFeeUsd ?? DEFAULT_ENTRY_FEE),
                     isFreeTicketPlay: !!snake.isFreeTicketPlay,
+                    gameSessionId: snake.gameSessionId || null,
                     ...(snake.isTournament ? { tournamentId: snake.tournamentId, attempt: snake.tournamentAttempt } : {}),
                 },
                 status: 'confirmed',
