@@ -2192,8 +2192,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             );
         }
 
-        // Holding the cashout control freezes position and heading, but the snake remains vulnerable.
-        if (!snake.cashoutHoldActive) updateSnakeMovement(snake, room);
+        // Steering input is frozen by the socket handler, while movement keeps
+        // advancing along the snake's last heading during the cashout hold.
+        updateSnakeMovement(snake, room);
         if (!sandboxSkipFoodCollisions) {
             checkFoodCollisions(snake, room, foodGrid);
         }
@@ -2923,7 +2924,7 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
                 paidDeathDropIds,
             );
         }
-        if (!snake.cashoutHoldActive) updateCompetitiveSnakeMovement(snake);
+        updateCompetitiveSnakeMovement(snake);
         checkCompetitiveFoodCollisions(snake, room);
     }
 

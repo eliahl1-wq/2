@@ -7331,11 +7331,6 @@ io.on('connection', (socket) => {
         const p = room?.players.find(pl => pl.id === socket.id);
         if (p) {
             const inputX = Number(data?.x);
-            if (p.cashoutHoldActive) {
-                if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) p.screenWidth = data.screenWidth;
-                if (Number.isFinite(data.screenHeight) && data.screenHeight > 0) p.screenHeight = data.screenHeight;
-                return;
-            }
             const inputY = Number(data?.y);
             if (Number.isFinite(inputX)) p.mouseX = inputX;
             if (Number.isFinite(inputY)) p.mouseY = inputY;
@@ -7353,7 +7348,7 @@ io.on('connection', (socket) => {
     socket.on('2', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.cashoutHoldActive || p.cells.length >= c.maxCells) return;
+        if (!p || p.cells.length >= c.maxCells) return;
 
         const totalMass = playerTotalMass(p);
         const massStart = playerMassStart(p);
@@ -7391,7 +7386,7 @@ io.on('connection', (socket) => {
     socket.on('1', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.cashoutHoldActive) return;
+        if (!p) return;
         const s = playerDollarStart(p);
         p.cells.forEach(cell => {
             const massStart = playerMassStart(p);
@@ -7429,7 +7424,7 @@ io.on('connection', (socket) => {
     });
 
     // Cash Out Logik
-    // Freeze a player during the deliberate hold-to-cashout gesture. The
+    // Track the deliberate hold-to-cashout gesture. The
     // completed timestamp verifies the cashOut event sent immediately after release.
     socket.on('cashOutHold', (active) => {
         const room = getArenaRoomById(socket.roomId);
@@ -7441,10 +7436,11 @@ io.on('connection', (socket) => {
             player.cashoutHoldActive = true;
             player.cashoutHoldStartedAt = now;
             player.cashoutHoldCompletedAt = 0;
-            // Lock new controls, but preserve the last movement direction so the
-            // simulation keeps running naturally during the hold.
-            player.boost = false;
-            player.shooting = false;
+            // Slither alone locks steering during the hold. Keep its last heading
+            // and disable boost; Agar and Surviv retain their normal controls.
+            if (player.mode === 'slither' || player.mode === 'competitive-slither') {
+                player.boost = false;
+            }
             return;
         }
 
@@ -7679,11 +7675,6 @@ io.on('connection', (socket) => {
         const room = getArenaRoomById(socket.roomId);
         const player = room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
         if (!player || player.disconnected) return;
-        if (player.cashoutHoldActive) {
-            player.shooting = false;
-            return;
-        }
-
         const finiteClamp = (value, min, max, fallback = 0) => {
             const parsed = Number(value);
             return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
@@ -8289,7 +8280,7 @@ function processRoom(room) {
         const cellsToDelete = new Set();
 
         // Calculate absolute target position in the world
-        if (!player.cashoutHoldActive) ensureAgarMovementInput(player);
+        ensureAgarMovementInput(player);
         const targetWorldX = player.isBot ? player.targetX : (player.x + (player.mouseX || 0));
         const targetWorldY = player.isBot ? player.targetY : (player.y + (player.mouseY || 0));
 
@@ -8298,13 +8289,6 @@ function processRoom(room) {
             const cell = player.cells[i];
             
             // PHYSICS: Movement & Friction
-            if (player.cashoutHoldActive) {
-                cell.vx = 0;
-                cell.vy = 0;
-                cell.vX = 0;
-                cell.vY = 0;
-                continue;
-            }
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
             const speed = (6 / Math.pow(Math.max(cell.balance, 1), 0.449)) * c.speedMult * (isSandbox ? (room.sandboxSpeedMultiplier ?? 1) : 1);
             
@@ -8331,9 +8315,7 @@ function processRoom(room) {
         }
 
 
-        if (!player.cashoutHoldActive) {
-            resolveAgarOwnCells(player, Date.now(), massStart);
-        }
+        resolveAgarOwnCells(player, Date.now(), massStart);
         if (!player.isBot) {
             applyAgarWealthTax(player, room, dollarStart);
         }
