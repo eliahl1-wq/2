@@ -87,6 +87,7 @@ export const WEAPONS = {
         reloadMs: 1400,
         spread: 0.06,
         bulletSpeed: 34,
+        range: 2500,
         pellets: 1,
         ammoType: '9mm',
     },
@@ -100,6 +101,7 @@ export const WEAPONS = {
         reloadMs: 1800,
         spread: 0.14,
         bulletSpeed: 38,
+        range: 2800,
         pellets: 1,
         ammoType: '9mm',
     },
@@ -113,6 +115,7 @@ export const WEAPONS = {
         reloadMs: 2200,
         spread: 0.32,
         bulletSpeed: 30,
+        range: 2200,
         pellets: 5,
         ammoType: '12g',
     },
@@ -126,6 +129,7 @@ export const WEAPONS = {
         reloadMs: 2000,
         spread: 0.09,
         bulletSpeed: 42,
+        range: 3100,
         pellets: 1,
         ammoType: '556',
     },
@@ -139,6 +143,7 @@ export const WEAPONS = {
         reloadMs: 1500,
         spread: 0.035,
         bulletSpeed: 44,
+        range: 3200,
         pellets: 1,
         ammoType: '762',
     },
@@ -152,6 +157,7 @@ export const WEAPONS = {
         reloadMs: 1900,
         spread: 0.025,
         bulletSpeed: 48,
+        range: 3500,
         pellets: 1,
         ammoType: '762',
     },
@@ -165,6 +171,7 @@ export const WEAPONS = {
         reloadMs: 2400,
         spread: 0.012,
         bulletSpeed: 58,
+        range: 4200,
         pellets: 1,
         ammoType: '762',
     },
@@ -178,6 +185,7 @@ export const WEAPONS = {
         reloadMs: 2600,
         spread: 0.13,
         bulletSpeed: 40,
+        range: 3200,
         pellets: 1,
         ammoType: '556',
     },
@@ -3495,6 +3503,8 @@ function tryShoot(entity, room, now) {
             vy: Math.sin(angle) * wDef.bulletSpeed,
             damage: wDef.damage,
             weaponType: entity.weapon?.type || 'fists',
+            maxDistance: wDef.range || wDef.bulletSpeed * TICK_RATE * (SURVIV.bulletLifetimeMs / 1000),
+            distanceTravelled: 0,
             bornAt: now,
         });
     }
@@ -4207,14 +4217,20 @@ function updateBullets(room, now, effectiveRadius) {
             continue;
         }
 
-        if (now - bullet.bornAt > SURVIV.bulletLifetimeMs || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
+        const distanceMoved = Math.hypot(bullet.vx, bullet.vy);
+        bullet.distanceTravelled = (Number(bullet.distanceTravelled) || 0) + distanceMoved;
+        const fallbackRange = distanceMoved * TICK_RATE * (SURVIV.bulletLifetimeMs / 1000);
+        const maxDistance = Math.max(distanceMoved, Number(bullet.maxDistance) || fallbackRange);
+        const rangeExceeded = bullet.distanceTravelled >= maxDistance;
+        // Distance, rather than wall-clock time, owns firearm range. A delayed
+        // server tick must never make a round expire early after travelling less.
+        if (now - bullet.bornAt > 8000 || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
             room.bullets.splice(i, 1);
             continue;
         }
 
         const midX = (previousX + bullet.x) / 2;
         const midY = (previousY + bullet.y) / 2;
-        const distanceMoved = Math.hypot(bullet.vx, bullet.vy);
         const queryRange = Math.max(90, distanceMoved / 2 + 10);
 
         let nearestObstacle = null;
@@ -4259,7 +4275,9 @@ function updateBullets(room, now, effectiveRadius) {
                 eliminateSurvivPlayer(room, nearestEntity, room._io, attacker);
                 entitiesById.delete(nearestEntity.id);
             }
+            continue;
         }
+        if (rangeExceeded) room.bullets.splice(i, 1);
     }
 }
 
@@ -4845,7 +4863,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             }));
 
         const visibleBullets = room.bullets
-            .filter(b => isInView(viewX, viewY, b.x, b.y, range))
+            .filter(b => b.ownerId === youId || isInView(viewX, viewY, b.x, b.y, range + 300))
             .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType, isGrenade: !!b.isGrenade, detonateAt: b.detonateAt || 0 }));
         const visibleDeathMarkers = room.deathMarkers
             .filter(marker => isInView(viewX, viewY, marker.x, marker.y, range))

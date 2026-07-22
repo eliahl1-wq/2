@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
     SURVIV,
+    WEAPONS,
     beginSurvivReload,
     broadcastSurvivState,
     createSurvivPlayer,
@@ -984,6 +985,32 @@ test('fast bullets hit and eliminate bots along their full travel path', () => {
     assert.equal(grave.killerId, player.id);
 });
 
+test('firearm range depends on travelled distance instead of delayed wall-clock ticks', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('lag-range-shot', 'lag-range-mongo', 'Lag Proof', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['pistol'];
+    player.shooting = true;
+    room.players.push(player);
+
+    const firedAt = Date.now() + 600000;
+    processSurvivRoom(room, silentIo, firedAt);
+    player.shooting = false;
+    assert.equal(room.bullets.length, 1);
+    assert.equal(room.bullets[0].maxDistance, WEAPONS.pistol.range);
+
+    processSurvivRoom(room, silentIo, firedAt + SURVIV.bulletLifetimeMs + 1200);
+    assert.equal(room.bullets.length, 1, 'a delayed tick must not expire a barely-travelled bullet');
+    assert.ok(room.bullets[0].distanceTravelled > 0 && room.bullets[0].distanceTravelled < 100);
+});
 test('firearms retain enough range to damage destructible trees', () => {
     const room = makeRoom();
     room.loot = [];
