@@ -3642,6 +3642,65 @@ function refreshOpenedContainer(entity, room) {
     };
 }
 
+function getContainerDropSurface(item, room) {
+    if (!item.houseId) return null;
+    const roomZones = (room.obstacles || []).filter(obstacle => (
+        obstacle.kind === 'roomZone'
+        && obstacle.houseId === item.houseId
+        && (!item.room || obstacle.variant === item.room)
+    ));
+    const containingRoom = roomZones.find(zone => {
+        const local = toRectLocal(item.x, item.y, zone);
+        return Math.abs(local.x) <= zone.w / 2 && Math.abs(local.y) <= zone.h / 2;
+    });
+    if (containingRoom) return containingRoom;
+    return (room.obstacles || []).find(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.id === item.houseId
+    )) || null;
+}
+
+function clampPointToRectInset(x, y, rect, inset) {
+    const local = toRectLocal(x, y, rect);
+    const halfW = Math.max(0, rect.w / 2 - inset);
+    const halfH = Math.max(0, rect.h / 2 - inset);
+    return fromRectLocal(clamp(local.x, -halfW, halfW), clamp(local.y, -halfH, halfH), rect);
+}
+
+function isContainerDropPositionClear(room, x, y) {
+    return !queryObstacles(room, x, y, 34, true).some(obstacle => (
+        obstacle.kind !== 'houseFloor'
+        && obstacle.kind !== 'roomZone'
+        && obstacle.kind !== 'door'
+        && circleRectCollision(x, y, 14, obstacle)
+    ));
+}
+
+function findContainerDropPosition(item, room, angle, scatter) {
+    const surface = getContainerDropSurface(item, room);
+    if (!surface) {
+        return {
+            x: item.x + Math.cos(angle) * scatter,
+            y: item.y + Math.sin(angle) * scatter,
+        };
+    }
+
+    // Search inward around the intended throw direction. Clamping every candidate
+    // to the same convex room/floor also keeps the complete flight path indoors.
+    const angleOffsets = [0, 0.42, -0.42, 0.84, -0.84, 1.26, -1.26, Math.PI];
+    const radii = [scatter, scatter * 0.76, scatter * 0.52, 22, 10];
+    for (const radius of radii) {
+        for (const offset of angleOffsets) {
+            const candidate = clampPointToRectInset(
+                item.x + Math.cos(angle + offset) * radius,
+                item.y + Math.sin(angle + offset) * radius,
+                surface,
+                22,
+            );
+            if (isContainerDropPositionClear(room, candidate.x, candidate.y)) return candidate;
+        }
+    }
+    return clampPointToRectInset(item.x, item.y, surface, 22);
+}
 function openLootContainer(entity, room) {
     const now = Date.now();
     const chestId = entity.chestHoldId;
@@ -3687,9 +3746,10 @@ function openLootContainer(entity, room) {
     drops.forEach((drop, dropIndex) => {
         const angle = (dropIndex / Math.max(1, drops.length)) * Math.PI * 2 + Math.random() * 0.3;
         const scatter = 42 + Math.random() * 18;
+        const landing = findContainerDropPosition(item, room, angle, scatter);
         addSurvivLoot(room, makeGroundLoot(drop.type,
-            item.x + Math.cos(angle) * scatter,
-            item.y + Math.sin(angle) * scatter, {
+            landing.x,
+            landing.y, {
                 ...drop,
                 source: item.source === 'death' ? 'death' : 'chest',
                 tier: drop.tier || item.tier || contents.rarity || 'common',
@@ -4622,6 +4682,8 @@ function serializePlayer(p, isYou) {
         kills: p.kills || 0,
         isBot: !!p.isBot,
         isYou,
+        cashoutHoldActive: !!p.cashoutHoldActive,
+        cashoutHoldStartedAt: p.cashoutHoldStartedAt || 0,
         isCashingOut: !!p.isCashingOut,
         outsideZone: !!p.outsideZone,
 

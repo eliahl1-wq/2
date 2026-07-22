@@ -727,6 +727,48 @@ test('holding a chest open drops every item onto the ground after two seconds', 
     assert.equal(player.openedContainer, null);
 });
 
+test('indoor chest drops stay inside the house when opened beside a corner', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [
+        { id: 'corner-house', kind: 'houseFloor', x: 0, y: 0, w: 200, h: 200, rotation: 0, collidable: false },
+        { id: 'corner-room', kind: 'roomZone', x: 0, y: 0, w: 200, h: 200, rotation: 0, collidable: false, houseId: 'corner-house', variant: 'main' },
+    ];
+    const player = createSurvivPlayer('corner-opener', 'mongo-corner-opener', 'Corner Opener', '#fff', room);
+    player.x = 72;
+    player.y = 72;
+    room.players.push(player);
+    room.loot.push({
+        id: 'corner-chest',
+        type: 'chest',
+        x: 84,
+        y: 84,
+        tier: 'rare',
+        houseId: 'corner-house',
+        room: 'main',
+        contents: {
+            weaponType: 'shotgun',
+            ammo: 3,
+            money: 1,
+            medkits: 1,
+            ammoType: '12g',
+            ammoAmount: 8,
+            grenades: 1,
+            armor: 35,
+        },
+    });
+
+    player.chestHoldId = 'corner-chest';
+    player.chestHoldStartedAt = Date.now() - 2100;
+    player.chestHoldSeenAt = Date.now();
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.loot.length, 6);
+    assert.ok(room.loot.every(item => Math.abs(item.x) <= 78 && Math.abs(item.y) <= 78));
+    assert.ok(room.loot.every(item => item.houseId === 'corner-house' && item.room === 'main'));
+});
 test('chests ignore legacy inventory transfer requests', () => {
     const room = makeRoom();
     room.obstacles = [];
