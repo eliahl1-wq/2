@@ -238,7 +238,7 @@ const corsOptions = {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma', 'X-Presence-Id', 'X-Presence-Timezone', 'X-Presence-Page', 'X-Presence-Gamemode'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'bypass-tunnel-reminders', 'Cache-Control', 'Pragma', 'X-Presence-Id', 'X-Presence-Timezone', 'X-Presence-Page', 'X-Presence-Gamemode', 'X-Presence-Guest'],
 };
 
 const app = express();
@@ -248,7 +248,7 @@ app.use((req, res, next) => {
     applyCorsHeaders(req, res);
     if (req.method === 'OPTIONS') {
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma, X-Presence-Id, X-Presence-Timezone, X-Presence-Page, X-Presence-Gamemode');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, bypass-tunnel-reminders, Cache-Control, Pragma, X-Presence-Id, X-Presence-Timezone, X-Presence-Page, X-Presence-Gamemode, X-Presence-Guest');
         return res.sendStatus(204);
     }
     next();
