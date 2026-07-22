@@ -2382,6 +2382,75 @@ function isAreaOverlapping(x, y, w, h, buffer = 200, poiList = []) {
     return false;
 }
 
+const SPARSE_FILL_KINDS = new Set([
+    'houseFloor', 'tree', 'bush', 'rock', 'stump', 'fallenLog', 'hayBale',
+    'crate', 'barrel', 'sandbag', 'tent', 'water',
+]);
+
+function addSparseAreaFill(obstacles, loot, spawnPoints, worldHalf, placedPositions) {
+    const candidates = [];
+    const step = 1800;
+    const sampleRadius = step * 0.48;
+    const margin = 1100;
+
+    for (let x = -worldHalf + margin; x <= worldHalf - margin; x += step) {
+        for (let y = -worldHalf + margin; y <= worldHalf - margin; y += step) {
+            if (Math.hypot(x, y) < 1650) continue;
+            let houses = 0;
+            let details = 0;
+            for (const obstacle of obstacles) {
+                if (!SPARSE_FILL_KINDS.has(obstacle.kind)) continue;
+                if (Math.abs(obstacle.x - x) > sampleRadius || Math.abs(obstacle.y - y) > sampleRadius) continue;
+                if (obstacle.kind === 'houseFloor') houses++;
+                else details++;
+            }
+            candidates.push({ x, y, houses, details, score: houses * 12 + details });
+        }
+    }
+
+    // Fill the emptiest cells first. A stable coordinate tie-break keeps the
+    // overall distribution broad even though individual props remain varied.
+    candidates.sort((a, b) => a.score - b.score || a.y - b.y || a.x - b.x);
+    let housesAdded = 0;
+    let detailClustersAdded = 0;
+    const houseLimit = 14;
+    const detailClusterLimit = 18;
+
+    for (const candidate of candidates) {
+        if (housesAdded >= houseLimit && detailClustersAdded >= detailClusterLimit) break;
+        const preferHouse = housesAdded < houseLimit
+            && candidate.houses === 0
+            && (candidate.details < 14 || detailClustersAdded >= detailClusterLimit);
+
+        for (let attempt = 0; attempt < 7; attempt++) {
+            const x = clamp(candidate.x + (Math.random() - 0.5) * 620, -worldHalf + 760, worldHalf - 760);
+            const y = clamp(candidate.y + (Math.random() - 0.5) * 620, -worldHalf + 760, worldHalf - 760);
+            const areaW = preferHouse ? 620 : 440;
+            const areaH = preferHouse ? 560 : 440;
+            const buffer = preferHouse ? 145 : 80;
+            if (isAreaOverlapping(x, y, areaW, areaH, buffer, placedPositions)) continue;
+            if (isMapPositionBlocked(obstacles, x, y, preferHouse ? 155 : 48)) continue;
+
+            if (preferHouse) {
+                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
+                placedPositions.push({ x, y, w: areaW, h: areaH });
+                housesAdded++;
+            } else if (detailClustersAdded < detailClusterLimit) {
+                const placed = addOpenFieldScatter(obstacles, x, y, {
+                    radius: 135 + Math.random() * 75,
+                    count: 4 + Math.floor(Math.random() * 4),
+                    variant: y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
+                });
+                if (placed <= 0) continue;
+                placedPositions.push({ x, y, w: areaW, h: areaH });
+                detailClustersAdded++;
+            }
+            break;
+        }
+    }
+
+    return { housesAdded, detailClustersAdded };
+}
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
     const loot = [];
@@ -2703,6 +2772,8 @@ export function generateSurvivMap(worldHalf) {
         }
     }
 
+    // Add small points of interest only where the completed layout is still sparse.
+    addSparseAreaFill(obstacles, loot, spawnPoints, wh, placedPositions);
     addNaturalDetailScatter(obstacles, wh, POI_LIST);
     addScatteredGroundLoot(obstacles, loot);
     clearInvalidBuildingProps(obstacles);

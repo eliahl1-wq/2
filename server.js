@@ -7911,6 +7911,7 @@ io.on('connection', (socket) => {
             sender: String(context.player.name || context.player.username || 'Player').slice(0, 32),
             message,
             sentAt: now,
+            playerId: context.player.id,
         });
     });
 
