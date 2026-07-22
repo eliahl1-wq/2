@@ -3577,12 +3577,22 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                     page: data.page || 'unknown',
                     gamemode: data.gamemode || 'none',
                     userAgent: data.userAgent || 'Unknown',
+                    userId: data.userId || null,
                     lastSeen: seenAt
                 });
             }
         }
         const presenceData = Array.from(uniquePresence.values())
             .sort((a, b) => b.lastSeen - a.lastSeen);
+
+        const presenceUserIds = [...new Set(presenceData.map(item => item.userId).filter(Boolean))];
+        const presenceUsers = presenceUserIds.length
+            ? await User.find({ _id: { $in: presenceUserIds } }).select('username').lean()
+            : [];
+        const presenceUserMap = new Map(presenceUsers.map(user => [user._id.toString(), user.username]));
+        presenceData.forEach(item => {
+            item.username = item.userId ? (presenceUserMap.get(String(item.userId)) || 'Guest') : 'Guest';
+        });
 
         res.json({
             currentlyInGame: inGameUserIds.size,
@@ -5318,6 +5328,8 @@ function touchSitePresence(req, customKey = null) {
     }
 
     const existing = sitePresence.get(String(key)) || {};
+    const authenticatedUserId = optionalAuthenticatedUserId(req);
+    const explicitlyGuest = req?.headers?.['x-presence-guest'] === 'true';
     let country = existing.country || 'Unknown';
     let userAgent = existing.userAgent || 'Unknown';
     let page = existing.page || 'unknown';
@@ -5336,7 +5348,8 @@ function touchSitePresence(req, customKey = null) {
         country,
         userAgent,
         page,
-        gamemode
+        gamemode,
+        userId: authenticatedUserId || (explicitlyGuest ? null : existing.userId || null),
     });
 }
 
