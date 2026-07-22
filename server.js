@@ -81,7 +81,6 @@ import {
     BR,
     getActiveBRMatchesRaw,
 } from './battle-royale.js';
-import { setupSandbox, getSandboxStatus, applySandboxAction, getSandboxRoom } from './sandbox.js';
 import {
     RewardClaim,
     RewardPoolState,
@@ -275,6 +274,7 @@ const UserSchema = new mongoose.Schema({
     playtime: { type: Number, default: 0 },
     excludedFromReports: { type: Boolean, default: false },
     isOwnerAccount: { type: Boolean, default: false, index: true },
+    personalFreePlay: { type: Boolean, default: false },
     sponsoredRewardsCompleted: { type: Boolean, default: false },
     hasFreeTicket: { type: Boolean, default: true },
     freeTicketUsed: { type: Boolean, default: false },
@@ -301,6 +301,10 @@ const UserSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model('User', UserSchema);
+
+function isPersonalFreePlayUser(user) {
+    return !!(user?.personalFreePlay && process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+}
 
 const SiteDisplaySettingsSchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
@@ -331,7 +335,7 @@ function getDynamicChallengeReqs(sponsoredRewardsBalance) {
 }
 
 TransactionSchema.post('save', async function(doc) {
-    if (doc.status !== 'confirmed') return;
+    if (doc.status !== 'confirmed' || doc.excludedFromReports || doc.meta?.simulated) return;
     const isNormalGameDeath = doc.type === 'game' && doc.meta?.event === 'death' && doc.meta?.reason === 'Arena Death';
     const isNormalGameCashout = doc.type === 'withdraw'
         && (doc.meta?.reason === 'Arena Cashout' || doc.meta?.reason === 'Auto Room Reset to Account Address');
@@ -553,6 +557,47 @@ function createSurvivRoom(entryFeeUsd) {
 
 const survivRooms = SURVIV_ENTRY_FEES.map(fee => createSurvivRoom(fee));
 
+function getPersonalFreePlayRoom(userId, mode, entryFeeUsd) {
+    const ownerId = String(userId);
+    if (mode === 'competitive-slither') {
+        const fee = normalizeCompetitiveEntryFee(entryFeeUsd);
+        let room = competitiveSlitherRooms.find(candidate => candidate.personalFreePlayOwnerId === ownerId && candidate.entryFeeUsd === fee);
+        if (!room) {
+            room = createCompetitiveSlitherRoom(fee);
+            room.id = `personal-freeplay-competitive-slither-${ownerId}-${fee}`;
+            room.isPersonalFreePlay = true;
+            room.personalFreePlayOwnerId = ownerId;
+            competitiveSlitherRooms.push(room);
+        }
+        return room;
+    }
+    if (mode === 'surviv') {
+        const fee = normalizeSurvivEntryFee(entryFeeUsd);
+        let room = survivRooms.find(candidate => candidate.personalFreePlayOwnerId === ownerId && candidate.entryFeeUsd === fee);
+        if (!room) {
+            room = createSurvivRoom(fee);
+            room.id = `personal-freeplay-surviv-${ownerId}-${fee}`;
+            room.isPersonalFreePlay = true;
+            room.personalFreePlayOwnerId = ownerId;
+            survivRooms.push(room);
+        }
+        return room;
+    }
+    const fee = normalizeEntryFee(entryFeeUsd);
+    let room = rooms.find(candidate => candidate.personalFreePlayOwnerId === ownerId && candidate.entryFeeUsd === fee);
+    if (!room) {
+        room = createArenaRoom(fee);
+        room.id = `personal-freeplay-arena-${ownerId}-${fee}`;
+        room.isPersonalFreePlay = true;
+        room.personalFreePlayOwnerId = ownerId;
+        room.fundedEntryUsd = 1_000_000;
+        room.foodPoolBalance = 1_000_000;
+        room.aiBudgetBalance = 1_000_000;
+        rooms.push(room);
+    }
+    return room;
+}
+
 function getSurvivRoom(entryFeeUsd) {
     const fee = normalizeSurvivEntryFee(entryFeeUsd);
     return survivRooms.find(r => r.entryFeeUsd === fee)
@@ -751,18 +796,19 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
         timestamp: new Date().toISOString(),
     };
 
-    if (DEV_FREE_PLAY) {
+    if (DEV_FREE_PLAY || player.personalFreePlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepCompetitiveCashoutSpectator(room, player);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const payoutSol = playerPayout / SOL_PRICE_USD;
-        user.balance = (user.balance || 0) + payoutSol;
+        if (DEV_FREE_PLAY) user.balance = (user.balance || 0) + payoutSol;
         await user.save();
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
             amount: playerPayout,
             meta: { ...logMeta, simulated: true, signature: 'simulated' },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
@@ -800,7 +846,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepCompetitiveCashoutSpectator(room, player);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
         await addRewardFundingUsd(playerPayout);
@@ -810,6 +856,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
             type: 'withdraw',
             amount: playerPayout,
             meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
@@ -885,17 +932,18 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
         timestamp: new Date().toISOString(),
     };
 
-    if (DEV_FREE_PLAY) {
+    if (DEV_FREE_PLAY || player.personalFreePlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const payoutSol = playerPayout / SOL_PRICE_USD;
-        user.balance = (user.balance || 0) + payoutSol;
+        if (DEV_FREE_PLAY) user.balance = (user.balance || 0) + payoutSol;
         await user.save();
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
             amount: playerPayout,
             meta: { ...logMeta, simulated: true, signature: 'simulated' },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
@@ -932,7 +980,7 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
         await addRewardFundingUsd(playerPayout);
@@ -942,6 +990,7 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
             type: 'withdraw',
             amount: playerPayout,
             meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
@@ -1022,7 +1071,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 
     if (player.isFreeTicketPlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const creditedPayout = user.rewardsDisabled ? 0 : playerPayout;
         if (creditedPayout > 0) user.sponsoredRewardsBalance += creditedPayout;
         await user.save();
@@ -1043,6 +1092,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
                 rewardBlocked: !!user.rewardsDisabled,
                 signature: user.rewardsDisabled ? 'sponsored_blocked' : 'sponsored_locked'
             },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         const signature = user.rewardsDisabled ? 'sponsored_blocked' : 'sponsored_locked';
@@ -1051,17 +1101,18 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         return { playerPayout: creditedPayout, platformFee, signature };
     }
 
-    if (DEV_FREE_PLAY) {
+    if (DEV_FREE_PLAY || player.personalFreePlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const payoutSol = playerPayout / SOL_PRICE_USD;
-        user.balance = (user.balance || 0) + payoutSol;
+        if (DEV_FREE_PLAY) user.balance = (user.balance || 0) + payoutSol;
         await user.save();
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
             amount: playerPayout,
             meta: { ...logMeta, simulated: true, signature: 'simulated' },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
@@ -1097,7 +1148,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        user.playtime += (Date.now() - player.startTime);
+        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
         await addRewardFundingUsd(playerPayout);
@@ -1107,6 +1158,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             type: 'withdraw',
             amount: playerPayout,
             meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
         io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
@@ -1913,7 +1965,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.balanceUsd = hasVisualOverride ? user.visualBalanceOverrideUsd : realBalanceUsd;
         userObj.balanceSol = hasVisualOverride ? userObj.balanceUsd / SOL_PRICE_USD : realBalanceSol;
         userObj.solPrice = SOL_PRICE_USD;
-        userObj.freePlay = DEV_FREE_PLAY;
+        userObj.personalFreePlay = isPersonalFreePlayUser(user);
+        userObj.freePlay = DEV_FREE_PLAY || userObj.personalFreePlay;
         userObj.isAdmin = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
 
         res.json(userObj);
@@ -1965,7 +2018,8 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
         userObj.balanceSol = user.balance;
         userObj.balanceUsd = user.balance * SOL_PRICE_USD;
         userObj.solPrice = SOL_PRICE_USD;
-        userObj.freePlay = DEV_FREE_PLAY;
+        userObj.personalFreePlay = isPersonalFreePlayUser(user);
+        userObj.freePlay = DEV_FREE_PLAY || userObj.personalFreePlay;
 
         res.json({ user: userObj });
     } catch (err) {
@@ -2239,6 +2293,17 @@ app.post('/api/admin/tournaments/:tournamentId/end', authenticateAdmin, async (r
     }
 });
 
+
+app.put('/api/admin/personal-free-play', authenticateAdmin, async (req, res) => {
+    try {
+        const enabled = req.body?.enabled === true;
+        req.adminUser.personalFreePlay = enabled;
+        await req.adminUser.save();
+        res.json({ success: true, enabled, freePlay: DEV_FREE_PLAY || enabled });
+    } catch (err) {
+        res.status(500).json({ error: err.message || 'Could not update personal free play' });
+    }
+});
 
 // Public config (no auth) — frontend uses this for test-mode UI
 app.get('/api/config', (req, res) => {
@@ -5391,15 +5456,15 @@ app.get('/api/stats', (req, res) => {
         playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
         playersByGamemode.competitiveSlither = competitiveSlitherRooms.reduce(
-            (sum, room) => sum + room.players.filter(p => !p.disconnected).length,
+            (sum, room) => sum + (room.isPersonalFreePlay ? 0 : room.players.filter(p => !p.disconnected).length),
             0,
         );
         const survivHumanCount = survivRooms.reduce(
-            (sum, room) => sum + room.players.filter(p => !p.disconnected && p.hp > 0).length,
+            (sum, room) => sum + (room.isPersonalFreePlay ? 0 : room.players.filter(p => !p.disconnected && p.hp > 0).length),
             0,
         );
         const survivBotCount = survivRooms.reduce(
-            (sum, room) => sum + room.bots.filter(bot => bot.hp > 0).length,
+            (sum, room) => sum + (room.isPersonalFreePlay ? 0 : room.bots.filter(bot => bot.hp > 0).length),
             0,
         );
         playersByGamemode.surviv = survivHumanCount + survivBotCount;
@@ -6330,6 +6395,8 @@ io.on('connection', (socket) => {
                 return;
             }
             user = await ensureUserDepositWallet(user);
+            const personalFreePlay = isPersonalFreePlayUser(user);
+            const freePlay = DEV_FREE_PLAY || personalFreePlay;
 
 
             if (getBRMatchForMongo(user._id.toString())) {
@@ -6349,7 +6416,9 @@ io.on('connection', (socket) => {
             // ── Competitive Slither ($1 / $2 / $5 separate pools) ──
             if (mode === 'competitive-slither') {
                 const entryFeeUsd = normalizeCompetitiveEntryFee(rawEntryFee);
-                const room = getCompetitiveSlitherRoom(entryFeeUsd);
+                const room = personalFreePlay
+                    ? getPersonalFreePlayRoom(user._id, 'competitive-slither', entryFeeUsd)
+                    : getCompetitiveSlitherRoom(entryFeeUsd);
                 removeCompetitiveSpectatorsForUser(room, userKey);
                 const existing = findPlayerInArena(userKey);
                 if (existing) {
@@ -6399,7 +6468,7 @@ io.on('connection', (socket) => {
 
                 const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
-                if (!DEV_FREE_PLAY) {
+                if (!freePlay) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
@@ -6437,8 +6506,10 @@ io.on('connection', (socket) => {
                         return;
                     }
                 } else {
-                    user.balance = Math.max(0, user.balance - entryFeeInSol);
-                    await user.save();
+                    if (DEV_FREE_PLAY) {
+                        user.balance = Math.max(0, user.balance - entryFeeInSol);
+                        await user.save();
+                    }
                     console.log(`🎮 [FREE PLAY] ${user.username} joined Competitive Slither (simulated $${entryFeeUsd} entry)`);
                 }
 
@@ -6451,8 +6522,9 @@ io.on('connection', (socket) => {
                         roomId: room.id,
                         entryFeeUsd,
                         mode: 'competitive-slither',
-                        ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                        ...(freePlay ? { simulated: true } : {}),
                     },
+                    excludedFromReports: personalFreePlay,
                     status: 'confirmed',
                 });
 
@@ -6487,6 +6559,8 @@ io.on('connection', (socket) => {
                     return;
                 }
 
+                newPlayer.personalFreePlay = personalFreePlay;
+
                 room.players.push(newPlayer);
                 pendingPaidJoin = null;
                 syncCompetitiveSlitherFood(room, room.players.length);
@@ -6508,7 +6582,9 @@ io.on('connection', (socket) => {
             // ── Surviv ($5 pool) ──
             if (mode === 'surviv') {
                 const entryFeeUsd = normalizeSurvivEntryFee(rawEntryFee);
-                const room = getSurvivRoom(entryFeeUsd);
+                const room = personalFreePlay
+                    ? getPersonalFreePlayRoom(user._id, 'surviv', entryFeeUsd)
+                    : getSurvivRoom(entryFeeUsd);
                 removeSurvivSpectator(room, socket.id);
                 const existing = findPlayerInArena(userKey);
                 if (existing) {
@@ -6557,7 +6633,7 @@ io.on('connection', (socket) => {
 
                 const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
-                if (!DEV_FREE_PLAY) {
+                if (!freePlay) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
@@ -6595,8 +6671,10 @@ io.on('connection', (socket) => {
                         return;
                     }
                 } else {
-                    user.balance = Math.max(0, user.balance - entryFeeInSol);
-                    await user.save();
+                    if (DEV_FREE_PLAY) {
+                        user.balance = Math.max(0, user.balance - entryFeeInSol);
+                        await user.save();
+                    }
                     console.log(`🎮 [FREE PLAY] ${user.username} joined Surviv (simulated $${entryFeeUsd} entry)`);
                 }
 
@@ -6609,8 +6687,9 @@ io.on('connection', (socket) => {
                         roomId: room.id,
                         entryFeeUsd,
                         mode: 'surviv',
-                        ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                        ...(freePlay ? { simulated: true } : {}),
                     },
+                    excludedFromReports: personalFreePlay,
                     status: 'confirmed',
                 });
 
@@ -6651,6 +6730,7 @@ io.on('connection', (socket) => {
 
                 const eco = getSurvivEconomy(entryFeeUsd);
                 spawnLootFromPool(room, eco.lootPoolOnJoin);
+                newPlayer.personalFreePlay = personalFreePlay;
                 room.players.push(newPlayer);
                 pendingPaidJoin = null;
 
@@ -6672,7 +6752,7 @@ io.on('connection', (socket) => {
             const economy = getEconomy(entryFeeUsd);
 
             const existing = findPlayerInArena(userKey);
-            const isFreeTicketPlay = !!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom);
+            const isFreeTicketPlay = !personalFreePlay && (!!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom));
 
             if (isFreeTicketPlay && !existing) {
                 // First time joining with a free ticket
@@ -6703,7 +6783,9 @@ io.on('connection', (socket) => {
             const switchingNormalMode = existing?.room && existingMode && existingMode !== gameMode;
             const gameSessionId = existing?.player?.gameSessionId || randomBytes(12).toString('hex');
 
-            const room = existing?.room ?? (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd));
+            const room = existing?.room ?? (personalFreePlay
+                ? getPersonalFreePlayRoom(user._id, gameMode, entryFeeUsd)
+                : (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd)));
             const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
             let switchedDollarBalance = null;
             if (switchingNormalMode) {
@@ -6757,7 +6839,7 @@ io.on('connection', (socket) => {
             // FINANCIAL: Check SOL balance for entry fee
             const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
-            if (!switchingNormalMode && !DEV_FREE_PLAY && !isFreeTicketPlay) {
+            if (!switchingNormalMode && !freePlay && !isFreeTicketPlay) {
                 // 1. Kontrollera on-chain balans direkt innan start
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const currentLamports = await connection.getBalance(userPubKey);
@@ -6835,6 +6917,7 @@ io.on('connection', (socket) => {
                             isFreeTicketPlay: true,
                             gameSessionId,
                         },
+                        excludedFromReports: personalFreePlay,
                         status: 'confirmed'
                     });
 
@@ -6849,8 +6932,9 @@ io.on('connection', (socket) => {
                             entryFeeUsd,
                             mode: mode === 'slither' ? 'slither' : 'agar',
                             gameSessionId,
-                            ...(DEV_FREE_PLAY ? { simulated: true } : {}),
+                            ...(freePlay ? { simulated: true } : {}),
                         },
+                        excludedFromReports: personalFreePlay,
                         status: 'confirmed'
                     });
                 }
@@ -6862,7 +6946,7 @@ io.on('connection', (socket) => {
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
             let foodAlloc, aiAlloc, rewardContribution = 0, ownerContribution = 0;
 
-            if (!user.sponsoredRewardsCompleted && !user.rewardsDisabled && !isFreeTicketPlay) {
+            if (!freePlay && !user.sponsoredRewardsCompleted && !user.rewardsDisabled && !isFreeTicketPlay) {
                 const rpSplit = getRewardPoolSplit(entryFeeUsd);
                 foodAlloc = rpSplit.food;
                 aiAlloc = rpSplit.ai;
@@ -6932,7 +7016,8 @@ io.on('connection', (socket) => {
                             roomId: room.id,
                             mode: gameMode,
                         },
-                        status: 'confirmed',
+                        excludedFromReports: personalFreePlay,
+                    status: 'confirmed',
                     }).catch(err => console.error('Reward pool TX log error:', err.message));
                 }
                 if (ownerContribution > 0) {
@@ -6949,7 +7034,8 @@ io.on('connection', (socket) => {
                             roomId: room.id,
                             mode: gameMode,
                         },
-                        status: 'confirmed',
+                        excludedFromReports: personalFreePlay,
+                    status: 'confirmed',
                     }).catch(err => console.error('Owner vault TX log error:', err.message));
                 }
             }
@@ -7110,6 +7196,7 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            newPlayer.personalFreePlay = personalFreePlay;
             room.players.push(newPlayer);
             pendingJoinEconomy = null;
             pendingPaidJoin = null;
@@ -7196,8 +7283,8 @@ io.on('connection', (socket) => {
                 console.log(`[Admin Spawn] Rejected: Room ${socket.roomId} not found`);
                 return;
             }
-            if (!DEV_FREE_PLAY && !room.isSandbox) {
-                console.log(`[Admin Spawn] Rejected: DEV_FREE_PLAY is false and room is not sandbox`);
+            if (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox) {
+                console.log(`[Admin Spawn] Rejected: free play is disabled for this room`);
                 return;
             }
 
@@ -7336,7 +7423,7 @@ io.on('connection', (socket) => {
 
             const room = getArenaRoomById(socket.roomId);
             if (!room) return;
-            if (!DEV_FREE_PLAY && !room.isSandbox) return;
+            if (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox) return;
 
             if (room.isCompetitiveSlither) {
 
@@ -7876,20 +7963,9 @@ function getArenaRoomById(roomId) {
     if (survivRoom) return survivRoom;
     const compRoom = findCompetitiveSlitherRoomById(roomId);
     if (compRoom) return compRoom;
-    const sandboxRoom = getSandboxRoomById(roomId);
-    if (sandboxRoom) return sandboxRoom;
     return rooms.find(r => r.id === roomId);
 }
 
-function getSandboxRoomById(roomId) {
-    if (!roomId?.startsWith('sandbox-')) return null;
-    const mode = roomId.replace('sandbox-', '');
-    try {
-        return getSandboxRoom(mode);
-    } catch {
-        return null;
-    }
-}
 
 function processCompetitiveSlitherTick() {
     for (const room of competitiveSlitherRooms) {
@@ -7950,6 +8026,7 @@ function getBattleRoyaleDeps() {
         rooms,
         JWT_SECRET,
         DEV_FREE_PLAY,
+        isPersonalFreePlayUser,
         SOL_PRICE_USD,
         connection,
         ensureUserDepositWallet,
@@ -7959,22 +8036,6 @@ function getBattleRoyaleDeps() {
 
 setupBattleRoyale(io, getBattleRoyaleDeps());
 
-setupSandbox(io, {
-    User,
-    Transaction,
-    c,
-    util,
-    QuadTree,
-    Rectangle,
-    Point,
-    calculateCellRadius,
-    addBots,
-    addViruses,
-    rebuildQuadTree,
-    processRoom,
-    DEFAULT_ENTRY_FEE,
-    JWT_SECRET: JWT_SECRET,
-});
 
 setInterval(() => {
     try {
@@ -8466,7 +8527,7 @@ function processRoom(room) {
                                         const victimMongoId = victim.mongoId;
                                         const sessionPlaytime = Date.now() - victim.startTime;
 
-                                        User.findByIdAndUpdate(victimMongoId, { $inc: { playtime: sessionPlaytime } })
+                                        if (!victim.personalFreePlay) User.findByIdAndUpdate(victimMongoId, { $inc: { playtime: sessionPlaytime } })
                                             .catch(err => console.error("Error updating playtime on death:", err));
 
                                         Transaction.create({
@@ -8481,7 +8542,9 @@ function processRoom(room) {
                                                 inGameBalanceUsd: balanceAtDeath,
                                                 isFreeTicketPlay: !!victim.isFreeTicketPlay,
                                                 gameSessionId: victim.gameSessionId || null,
+                                                ...(victim.personalFreePlay ? { simulated: true } : {}),
                                             },
+                                            excludedFromReports: !!victim.personalFreePlay,
                                             status: 'confirmed',
                                         }).catch(err => console.error("Error logging agar death:", err));
 
@@ -8659,23 +8722,6 @@ function processRoom(room) {
     });
 }
 
-app.get('/api/admin/sandbox/status', authenticateAdmin, (req, res) => {
-    res.json(getSandboxStatus());
-});
-
-app.post('/api/admin/sandbox/action', authenticateAdmin, (req, res) => {
-    const { mode, action, params } = req.body;
-    const gameMode = mode === 'slither' ? 'slither' : 'agar';
-    const result = applySandboxAction(gameMode, action, params ?? {});
-    if (result?.needsAgarDeps && action === 'spawnBots') {
-        const room = getSandboxRoom(gameMode);
-        const count = Math.max(1, Math.min(30, Number(params?.count) || 3));
-        const stake = Number(params?.balance) || 5;
-        room.aiBudgetBalance = 1_000_000;
-        addBots(room, count, stake);
-    }
-    res.json({ status: getSandboxStatus(), result });
-});
 
 const PORT = process.env.PORT || 5000;
 

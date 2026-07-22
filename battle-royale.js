@@ -46,12 +46,12 @@ const recentBRVictories = {
     slither: [],
 };
 
-function queueKey(variant, entryFeeUsd) {
-    return `${variant}:${normalizeBREntryFee(entryFeeUsd)}`;
+function queueKey(variant, entryFeeUsd, personalFreePlay = false) {
+    return `${variant}:${normalizeBREntryFee(entryFeeUsd)}${personalFreePlay ? ':personal' : ''}`;
 }
 
-function getQueue(variant, entryFeeUsd) {
-    const key = queueKey(variant, entryFeeUsd);
+function getQueue(variant, entryFeeUsd, personalFreePlay = false) {
+    const key = queueKey(variant, entryFeeUsd, personalFreePlay);
     if (!queues.has(key)) queues.set(key, []);
     return queues.get(key);
 }
@@ -82,12 +82,13 @@ export function getBRPlayerCountsByFee() {
         slither: { 5: 0, 10: 0 },
     };
     for (const [key, q] of queues.entries()) {
+        if (key.endsWith(':personal')) continue;
         const [variant, feeStr] = key.split(':');
         const fee = Number(feeStr);
         if (result[variant]) result[variant][fee] = (result[variant][fee] || 0) + q.length;
     }
     for (const room of matches.values()) {
-        if (room.status === 'ended') continue;
+        if (room.status === 'ended' || room.personalFreePlay) continue;
         const fee = normalizeBREntryFee(room.entryFeeUsd);
         const variant = room.variant;
         const n = room.players.filter(p => !p.disconnected).length;
@@ -106,9 +107,9 @@ const BR_DEV_BOT_NAMES = [
 ];
 
 /** DEV_FREE_PLAY only — pad queue to minPlayers so solo dev can test BR. */
-function fillBRQueueWithDevBots(variant, entryFeeUsd) {
+function fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay = false) {
     const fee = normalizeBREntryFee(entryFeeUsd);
-    const q = getQueue(variant, fee);
+    const q = getQueue(variant, fee, personalFreePlay);
     const needed = Math.max(0, BR.minPlayers - q.length);
     for (let i = 0; i < needed; i++) {
         q.push({
@@ -126,8 +127,8 @@ function fillBRQueueWithDevBots(variant, entryFeeUsd) {
     }
 }
 
-function clearBRDevBotsFromQueue(variant, entryFeeUsd) {
-    const q = getQueue(variant, entryFeeUsd);
+function clearBRDevBotsFromQueue(variant, entryFeeUsd, personalFreePlay = false) {
+    const q = getQueue(variant, entryFeeUsd, personalFreePlay);
     for (let i = q.length - 1; i >= 0; i--) {
         if (q[i].isBot) q.splice(i, 1);
     }
@@ -151,13 +152,14 @@ function initialZoneRadius(variant) {
     return BR.agarWorld * 0.46;
 }
 
-function createMatchRoom(variant, prizePool, entryFeeUsd) {
+function createMatchRoom(variant, prizePool, entryFeeUsd, personalFreePlay = false) {
     const { cx, cy } = getZoneCenter(variant);
     const half = variant === 'slither' ? SLITHER.worldHalf : BR.agarWorld / 2;
     const room = {
         id: 'br_' + randId(),
         variant,
         isBattleRoyale: true,
+        personalFreePlay,
         status: 'countdown',
         players: [],
         bots: [],
@@ -205,25 +207,25 @@ function clearQueueGrace(key) {
     queueGrace.delete(key);
 }
 
-function scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps) {
+function scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps, personalFreePlay = false) {
     if (queueGrace.has(key)) return;
     const readyAt = Date.now();
     const timer = setTimeout(() => {
         queueGrace.delete(key);
         try {
-            launchMatch(variant, entryFeeUsd, io, deps);
+            launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
         } catch (err) {
             console.error('BR launch failed after grace:', err);
-            emitQueueStatus(io, variant, entryFeeUsd, deps);
+            emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
         }
     }, BR.gracePeriodMs);
     queueGrace.set(key, { readyAt, timer });
 }
 
-function emitQueueStatus(io, variant, entryFeeUsd, deps) {
-    const q = getQueue(variant, entryFeeUsd);
+function emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay = false) {
+    const q = getQueue(variant, entryFeeUsd, personalFreePlay);
     const fee = normalizeBREntryFee(entryFeeUsd);
-    const key = queueKey(variant, entryFeeUsd);
+    const key = queueKey(variant, entryFeeUsd, personalFreePlay);
     const grace = queueGrace.get(key);
     const graceEndsAt = grace ? grace.readyAt + BR.gracePeriodMs : null;
     const graceRemainingMs = graceEndsAt ? Math.max(0, graceEndsAt - Date.now()) : null;
@@ -237,14 +239,14 @@ function emitQueueStatus(io, variant, entryFeeUsd, deps) {
         graceRemainingMs,
         searching: q.length < BR.minPlayers
             || (graceRemainingMs != null && graceRemainingMs > 0 && q.length < BR.maxPlayers),
-        devFreePlay: !!deps?.DEV_FREE_PLAY,
+        devFreePlay: !!deps?.DEV_FREE_PLAY || personalFreePlay,
     };
     q.forEach(e => io.to(e.socketId).emit('brQueueStatus', payload));
 }
 
-function launchMatch(variant, entryFeeUsd, io, deps) {
-    const key = queueKey(variant, entryFeeUsd);
-    const q = getQueue(variant, entryFeeUsd);
+function launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay = false) {
+    const key = queueKey(variant, entryFeeUsd, personalFreePlay);
+    const q = getQueue(variant, entryFeeUsd, personalFreePlay);
     if (q.length < BR.minPlayers) return;
     clearQueueGrace(key);
     const take = Math.min(BR.maxPlayers, q.length);
@@ -259,9 +261,9 @@ function launchMatch(variant, entryFeeUsd, io, deps) {
     }
 }
 
-function tryStartMatch(variant, entryFeeUsd, io, deps) {
-    const key = queueKey(variant, entryFeeUsd);
-    const q = getQueue(variant, entryFeeUsd);
+function tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay = false) {
+    const key = queueKey(variant, entryFeeUsd, personalFreePlay);
+    const q = getQueue(variant, entryFeeUsd, personalFreePlay);
 
     if (q.length < BR.minPlayers) {
         clearQueueGrace(key);
@@ -269,18 +271,18 @@ function tryStartMatch(variant, entryFeeUsd, io, deps) {
     }
 
     if (q.length >= BR.maxPlayers) {
-        launchMatch(variant, entryFeeUsd, io, deps);
+        launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
         return;
     }
 
     // Solo dev testing — skip grace wait once min players (incl. AI) are queued
-    if (deps?.DEV_FREE_PLAY && q.length >= BR.minPlayers) {
-        launchMatch(variant, entryFeeUsd, io, deps);
+    if ((deps?.DEV_FREE_PLAY || personalFreePlay) && q.length >= BR.minPlayers) {
+        launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
         return;
     }
 
-    scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps);
-    emitQueueStatus(io, variant, entryFeeUsd, deps);
+    scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps, personalFreePlay);
+    emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
 }
 
 /** Safety tick — ensures grace timers / stale queues still progress. */
@@ -288,7 +290,7 @@ function tryStartMatch(variant, entryFeeUsd, io, deps) {
 export function getBRServerStatus() {
     const activeMatches = [];
     for (const room of matches.values()) {
-        if (room.status === 'ended') continue;
+        if (room.status === 'ended' || room.personalFreePlay) continue;
         activeMatches.push({
             id: room.id,
             variant: room.variant,
@@ -315,27 +317,28 @@ export function getActiveBRMatchesRaw() {
 export function processBRQueues(io, deps) {
     for (const [key, q] of queues.entries()) {
         if (!q.length) continue;
-        const [variant, feeStr] = key.split(':');
+        const [variant, feeStr, scope] = key.split(':');
         const entryFeeUsd = Number(feeStr);
-        if (deps?.DEV_FREE_PLAY && q.some(e => !e.isBot) && q.length < BR.minPlayers) {
-            fillBRQueueWithDevBots(variant, entryFeeUsd);
+        const personalFreePlay = scope === 'personal';
+        if ((deps?.DEV_FREE_PLAY || personalFreePlay) && q.some(e => !e.isBot) && q.length < BR.minPlayers) {
+            fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay);
         }
         if (q.length >= BR.maxPlayers) {
-            tryStartMatch(variant, entryFeeUsd, io, deps);
+            tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
             continue;
         }
         if (q.length >= BR.minPlayers) {
             const grace = queueGrace.get(key);
             if (!grace) {
-                tryStartMatch(variant, entryFeeUsd, io, deps);
+                tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
             } else if (Date.now() - grace.readyAt >= BR.gracePeriodMs) {
                 try {
-                    launchMatch(variant, entryFeeUsd, io, deps);
+                    launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
                 } catch (err) {
                     console.error('BR launch failed in queue tick:', err);
                 }
             } else {
-                emitQueueStatus(io, variant, entryFeeUsd, deps);
+                emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
             }
         }
     }
@@ -357,12 +360,13 @@ async function refundBREntryFee(entry, variant, entryFeeUsd, deps, reason) {
     const fee = normalizeBREntryFee(entryFeeUsd);
     const entryFeeInSol = fee / SOL_PRICE_USD;
 
-    if (DEV_FREE_PLAY) {
+    if (DEV_FREE_PLAY || entry.personalFreePlay) {
         await Transaction.create({
             userId: entry.mongoId,
             type: 'game',
             amount: entryFeeInSol,
             meta: { event: 'br_refund', entryFeeUsd: fee, variant, reason, simulated: true },
+            excludedFromReports: !!entry.personalFreePlay,
             status: 'confirmed',
         });
         return true;
@@ -417,20 +421,21 @@ async function refundAllBRPlayers(room, deps, reason) {
 function processQueueTimeouts(io, deps) {
     const now = Date.now();
     for (const [key, q] of queues.entries()) {
-        const [variant, feeStr] = key.split(':');
+        const [variant, feeStr, scope] = key.split(':');
         const entryFeeUsd = Number(feeStr);
+        const personalFreePlay = scope === 'personal';
         for (let i = q.length - 1; i >= 0; i--) {
             const entry = q[i];
             if (entry.isBot) continue;
             if (now - entry.joinedAt <= BR.queueTimeoutMs) continue;
             q.splice(i, 1);
             if (q.length < BR.minPlayers) clearQueueGrace(key);
-            if (deps.DEV_FREE_PLAY) clearBRDevBotsFromQueue(variant, entryFeeUsd);
+            if (deps.DEV_FREE_PLAY || personalFreePlay) clearBRDevBotsFromQueue(variant, entryFeeUsd, personalFreePlay);
             refundBREntryFee(entry, variant, entryFeeUsd, deps, 'queue_timeout').catch(err => {
                 console.error('Queue timeout refund failed:', err.message);
             });
             entry.socket?.emit('error', 'Queue timed out — entry fee refunded.');
-            emitQueueStatus(io, variant, entryFeeUsd, deps);
+            emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
         }
     }
 }
@@ -479,6 +484,7 @@ function createBRAgarPlayer(socketId, mongoId, username, color, room, deps) {
         username,
         mode: 'br-agar',
         isBattleRoyale: true,
+        personalFreePlay: !!room.personalFreePlay,
         brMatchId: room.id,
         kills: 0,
         balance: startBalance,
@@ -571,6 +577,7 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
                 placement,
                 matchId: room.id,
             },
+            excludedFromReports: !!room.personalFreePlay,
             status: 'confirmed',
         }).catch(() => {});
     }
@@ -616,7 +623,7 @@ async function sweepBROwnerCut(room, deps) {
     const totalPotUsd = room.playerCount * room.entryFeeUsd;
     const ownerCutUsd = totalPotUsd * BR.houseFeePct;
 
-    if (DEV_FREE_PLAY || !OWNER_VAULT_ADDRESS) {
+    if (DEV_FREE_PLAY || room.personalFreePlay || !OWNER_VAULT_ADDRESS) {
         if (DEV_FREE_PLAY) {
             await Transaction.create({
                 type: 'withdraw',
@@ -713,7 +720,7 @@ async function finishMatch(room, winner, io, deps) {
     try {
         const { User, Transaction, DEV_FREE_PLAY, SOL_PRICE_USD, connection, ensureUserDepositWallet } = deps;
 
-        if (DEV_FREE_PLAY) {
+        if (DEV_FREE_PLAY || room.personalFreePlay) {
             const user = await User.findById(winner.mongoId);
             if (user) {
                 user.playtime += Date.now() - winner.startTime;
@@ -724,10 +731,11 @@ async function finishMatch(room, winner, io, deps) {
                 type: 'withdraw',
                 amount: payout,
                 meta: { simulated: true, freePlay: true, reason: 'BR Victory', matchId: room.id, mode: winner.mode, entryFeeUsd: room.entryFeeUsd, variant: room.variant },
+                excludedFromReports: !!room.personalFreePlay,
                 status: 'confirmed',
             });
             console.log(`🎮 [FREE PLAY] BR victory: ${winner.username} won $${payout.toFixed(2)} (simulated)`);
-            recordBRVictory(room.variant, winner.username, payout);
+            if (!room.personalFreePlay) recordBRVictory(room.variant, winner.username, payout);
             io.to(winner.id).emit('brVictory', { amount: payout, signature: 'simulated', placement: 1 });
             await sweepBROwnerCut(room, deps);
         } else {
@@ -765,7 +773,7 @@ async function finishMatch(room, winner, io, deps) {
                 },
                 status: 'confirmed',
             });
-            recordBRVictory(room.variant, winner.username, payout);
+            if (!room.personalFreePlay) recordBRVictory(room.variant, winner.username, payout);
             io.to(winner.id).emit('brVictory', { amount: payout, signature: sig, placement: 1 });
             await sweepBROwnerCut(room, deps);
         }
@@ -1032,10 +1040,11 @@ function updateZone(room, io) {
 function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
     const fee = normalizeBREntryFee(entryFeeUsd ?? queuedPlayers[0]?.entryFeeUsd);
     const prizePool = queuedPlayers.length * fee * (1 - BR.houseFeePct);
-    const room = createMatchRoom(variant, prizePool, fee);
+    const personalFreePlay = queuedPlayers.some(entry => entry.personalFreePlay);
+    const room = createMatchRoom(variant, prizePool, fee, personalFreePlay);
     room.playerCount = queuedPlayers.length;
     matches.set(room.id, room);
-    const countdownMs = deps.DEV_FREE_PLAY ? 3000 : BR.countdownMs;
+    const countdownMs = (deps.DEV_FREE_PLAY || personalFreePlay) ? 3000 : BR.countdownMs;
 
     queuedPlayers.forEach(entry => {
         removeFromQueue(entry.socketId);
@@ -1064,6 +1073,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
             })();
             player = createBRAgarPlayer(entry.socketId, entry.mongoId, entry.username, color, room, deps);
         }
+        player.personalFreePlay = !!room.personalFreePlay;
         if (entry.isBot) player.isBot = true;
         room.players.push(player);
         if (!entry.isBot && entry.socket) {
@@ -1120,17 +1130,18 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
     }, countdownMs);
 }
 
-async function chargeEntryFee(user, deps, variant, entryFeeUsd) {
+async function chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay = false) {
     const { DEV_FREE_PLAY, SOL_PRICE_USD, connection, Transaction } = deps;
     const fee = normalizeBREntryFee(entryFeeUsd);
     const entryFeeInSol = fee / SOL_PRICE_USD;
 
-    if (DEV_FREE_PLAY) {
+    if (DEV_FREE_PLAY || personalFreePlay) {
         await Transaction.create({
             userId: user._id,
             type: 'game',
             amount: entryFeeInSol,
             meta: { event: 'br_join', entryFeeUsd: fee, variant, simulated: true, freePlay: true },
+            excludedFromReports: personalFreePlay,
             status: 'confirmed',
         });
         console.log(`🎮 [FREE PLAY] ${user.username} joined BR ${variant} $${fee} (simulated)`);
@@ -1250,6 +1261,8 @@ export function setupBattleRoyale(io, deps) {
                 const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
+                const personalFreePlay = !!deps.isPersonalFreePlayUser?.(user);
+                const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
                 if (mongoToMatch.has(user._id.toString())) {
                     socket.emit('error', 'You are already in a battle royale match.');
@@ -1267,12 +1280,12 @@ export function setupBattleRoyale(io, deps) {
                     }
                 }
 
-                if (!deps.DEV_FREE_PLAY && !isBRWalletConfigured(variant, entryFeeUsd)) {
+                if (!freePlay && !isBRWalletConfigured(variant, entryFeeUsd)) {
                     socket.emit('error', `Battle Royale (${variant} $${entryFeeUsd}) is not configured yet. Contact support.`);
                     return;
                 }
 
-                const paid = await chargeEntryFee(user, deps, variant, entryFeeUsd);
+                const paid = await chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay);
                 if (!paid) {
                     socket.emit('error', `Insufficient balance for $${entryFeeUsd} BR entry.`);
                     return;
@@ -1284,7 +1297,7 @@ export function setupBattleRoyale(io, deps) {
                 }
 
                 removeFromQueue(socket.id);
-                getQueue(variant, entryFeeUsd).push({
+                getQueue(variant, entryFeeUsd, personalFreePlay).push({
                     socketId: socket.id,
                     mongoId: user._id.toString(),
                     username: username || user.username,
@@ -1292,14 +1305,15 @@ export function setupBattleRoyale(io, deps) {
                     joinedAt: Date.now(),
                     socket,
                     skinColor: validatedSkinColor,
+                    personalFreePlay,
                 });
                 socket.brQueueVariant = variant;
                 socket.brQueueEntryFee = entryFeeUsd;
-                if (deps.DEV_FREE_PLAY) {
-                    fillBRQueueWithDevBots(variant, entryFeeUsd);
+                if (freePlay) {
+                    fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay);
                 }
-                tryStartMatch(variant, entryFeeUsd, io, deps);
-                emitQueueStatus(io, variant, entryFeeUsd, deps);
+                tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
+                emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
             } catch (err) {
                 console.error('brJoinQueue failed:', err.message);
                 socket.emit('error', 'Failed to join battle royale queue.');
@@ -1310,9 +1324,9 @@ export function setupBattleRoyale(io, deps) {
             const found = findQueueEntryBySocket(socket.id);
             if (!found) return;
             removeFromQueue(socket.id);
-            if (deps.DEV_FREE_PLAY) clearBRDevBotsFromQueue(found.variant, found.entryFeeUsd);
+            if (deps.DEV_FREE_PLAY || found.entry.personalFreePlay) clearBRDevBotsFromQueue(found.variant, found.entryFeeUsd, !!found.entry.personalFreePlay);
             await refundBREntryFee(found.entry, found.variant, found.entryFeeUsd, deps, 'queue_leave');
-            emitQueueStatus(io, found.variant, found.entryFeeUsd, deps);
+            emitQueueStatus(io, found.variant, found.entryFeeUsd, deps, !!found.entry.personalFreePlay);
         });
 
         socket.on('brRejoinMatch', async ({ token }) => {
@@ -1361,9 +1375,9 @@ export function setupBattleRoyale(io, deps) {
             const found = findQueueEntryBySocket(socket.id);
             if (found) {
                 removeFromQueue(socket.id);
-                if (deps.DEV_FREE_PLAY) clearBRDevBotsFromQueue(found.variant, found.entryFeeUsd);
+                if (deps.DEV_FREE_PLAY || found.entry.personalFreePlay) clearBRDevBotsFromQueue(found.variant, found.entryFeeUsd, !!found.entry.personalFreePlay);
                 refundBREntryFee(found.entry, found.variant, found.entryFeeUsd, deps, 'queue_disconnect').catch(() => {});
-                emitQueueStatus(io, found.variant, found.entryFeeUsd, deps);
+                emitQueueStatus(io, found.variant, found.entryFeeUsd, deps, !!found.entry.personalFreePlay);
             }
             const matchId = socketToMatch.get(socket.id);
             if (!matchId) return;

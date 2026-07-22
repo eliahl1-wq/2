@@ -1942,7 +1942,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
             io.to(socketId).emit('RIP');
         }
         room.players = room.players.filter(p => p.id !== snake.id);
-        if (snake.mongoId) {
+        if (snake.mongoId && !snake.personalFreePlay) {
             User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
         }
         if (Transaction && snake.mongoId) {
@@ -1961,6 +1961,7 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
                     gameSessionId: snake.gameSessionId || null,
                     ...(snake.isTournament ? { tournamentId: snake.tournamentId, attempt: snake.tournamentAttempt } : {}),
                 },
+                excludedFromReports: !!snake.personalFreePlay,
                 status: 'confirmed',
             }).catch(err => console.error('Error logging slither death:', err));
         }
@@ -2791,7 +2792,7 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
     }
 
     if (!snake.disconnected) io.to(socketId).emit('RIP');
-    if (snake.mongoId) {
+    if (snake.mongoId && !snake.personalFreePlay) {
         User.findByIdAndUpdate(snake.mongoId, { $inc: { playtime: Date.now() - snake.startTime } }).catch(() => {});
     }
     if (Transaction && snake.mongoId) {
@@ -2805,6 +2806,7 @@ function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
                 mode: 'competitive-slither',
                 entryFeeUsd: snake.entryFeeUsd ?? room.entryFeeUsd,
             },
+            excludedFromReports: !!snake.personalFreePlay,
             status: 'confirmed',
         }).catch(err => console.error('Error logging competitive slither death:', err));
     }
