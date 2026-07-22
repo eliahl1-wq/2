@@ -302,6 +302,13 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
+const SiteDisplaySettingsSchema = new mongoose.Schema({
+    key: { type: String, required: true, unique: true },
+    pregamePlayingOverride: { type: Number, default: null },
+}, { timestamps: true });
+
+const SiteDisplaySettings = mongoose.model('SiteDisplaySettings', SiteDisplaySettingsSchema);
+
 const TransactionSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     type: { type: String, enum: ['deposit', 'withdraw', 'game'], required: true },
@@ -3230,6 +3237,40 @@ async function buildAdminTxQuery({ userId, showExcluded, type, category, search 
     if (clauses.length === 0) return {};
     return clauses.length === 1 ? clauses[0] : { $and: clauses };
 }
+
+app.get('/api/pregame/display-settings', async (req, res) => {
+    try {
+        const settings = await SiteDisplaySettings.findOne({ key: 'pregame' }).lean();
+        res.json({ playingOverride: settings?.pregamePlayingOverride ?? null });
+    } catch (err) {
+        console.error('Pregame display settings error:', err);
+        res.status(500).json({ error: 'Could not load pregame display settings' });
+    }
+});
+
+app.put('/api/admin/pregame/display-settings', authenticateAdmin, async (req, res) => {
+    try {
+        const rawValue = req.body?.playingOverride;
+        const playingOverride = rawValue === null || rawValue === '' || rawValue === undefined
+            ? null
+            : Number(rawValue);
+
+        if (playingOverride !== null && (!Number.isInteger(playingOverride) || playingOverride < 0 || playingOverride > 999999)) {
+            return res.status(400).json({ message: 'Playing must be a whole number between 0 and 999999, or empty for automatic.' });
+        }
+
+        const settings = await SiteDisplaySettings.findOneAndUpdate(
+            { key: 'pregame' },
+            { pregamePlayingOverride: playingOverride },
+            { new: true, upsert: true, setDefaultsOnInsert: true },
+        ).lean();
+
+        res.json({ success: true, playingOverride: settings.pregamePlayingOverride ?? null });
+    } catch (err) {
+        console.error('Update pregame display settings error:', err);
+        res.status(500).json({ error: 'Could not update pregame display settings' });
+    }
+});
 
 app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
     try {
