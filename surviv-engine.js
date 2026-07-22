@@ -413,7 +413,7 @@ const BLOCKED_KINDS = new Set([
     'crate', 'barrel', 'sandbag', 'tent',
 ]);
 function isMapPositionBlocked(obstacles, x, y, radius = 30) {
-    if (isNearRoadOrRiver(x, y, radius)) return true;
+    if (isNearRoadOrRiver(x, y, radius) || isNearPlannedTrail(x, y, radius)) return true;
 
     for (const o of obstacles) {
         if (o.kind === 'trail_path' && Array.isArray(o.points)) {
@@ -573,7 +573,7 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
     return obstacle;
 }
 
-const NETWORK_ROAD_BLOCKER_KINDS = new Set(['houseFloor', 'wall', 'interiorWall', 'door', 'container']);
+const NETWORK_ROAD_BLOCKER_KINDS = new Set(['houseFloor', 'wall', 'interiorWall', 'door', 'container', 'road']);
 
 function subtractRoadCuts(intervals, cuts) {
     let remaining = intervals;
@@ -603,12 +603,14 @@ function addNetworkRoadSegment(obstacles, x1, y1, x2, y2, width) {
 
     for (const o of obstacles) {
         if (!NETWORK_ROAD_BLOCKER_KINDS.has(o.kind)) continue;
-        const crossMin = (horizontal ? o.y - o.h / 2 : o.x - o.w / 2) - pad;
-        const crossMax = (horizontal ? o.y + o.h / 2 : o.x + o.w / 2) + pad;
+        if (o.kind === 'road' && o.role === 'networkRoad') continue;
+        const blockerPad = o.kind === 'road' ? -4 : pad;
+        const crossMin = (horizontal ? o.y - o.h / 2 : o.x - o.w / 2) - blockerPad;
+        const crossMax = (horizontal ? o.y + o.h / 2 : o.x + o.w / 2) + blockerPad;
         if (center < crossMin || center > crossMax) continue;
         cuts.push({
-            min: (horizontal ? o.x - o.w / 2 : o.y - o.h / 2) - pad,
-            max: (horizontal ? o.x + o.w / 2 : o.y + o.h / 2) + pad,
+            min: (horizontal ? o.x - o.w / 2 : o.y - o.h / 2) - blockerPad,
+            max: (horizontal ? o.x + o.w / 2 : o.y + o.h / 2) + blockerPad,
         });
     }
 
@@ -1195,10 +1197,10 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
     for (let i = 0; i < size; i++) {
         const cx = x - roadLength / 2 + 100 + i * 260;
         if (Math.random() > 0.4) {
-            addObstacle(obstacles, 'crate', cx, y + (Math.random() > 0.5 ? 80 : -80), 44, 44, { rotation: Math.random() * 0.4 });
+            addObstacle(obstacles, 'crate', cx, y + (Math.random() > 0.5 ? 108 : -108), 44, 44, { rotation: Math.random() * 0.4 });
         }
         if (Math.random() > 0.5) {
-            addObstacle(obstacles, 'tree', cx + 130, y + (Math.random() > 0.5 ? 90 : -90), 38, 38, { hue: 105, rotation: Math.random() * 3 });
+            addObstacle(obstacles, 'tree', cx + 130, y + (Math.random() > 0.5 ? 126 : -126), 38, 38, { hue: 105, rotation: Math.random() * 3 });
         }
     }
     
@@ -1317,6 +1319,22 @@ function addOpenFieldScatter(obstacles, x, y, opts = {}) {
     return placedCount;
 }
 
+function addPondSite(obstacles, loot, spawnPoints, x, y) {
+    const pondW = 460 + Math.random() * 140;
+    const pondH = 280 + Math.random() * 90;
+    addObstacle(obstacles, 'water', x, y, pondW, pondH, {
+        collidable: false, variant: 'pond', rotation: Math.random() * 0.18,
+    });
+    addHouse(obstacles, loot, spawnPoints, x + pondW / 2 + 155, y - pondH * 0.22, 180, 150, {
+        variant: 'cabin', hue: 22, tier: 'common', doorSide: 'west',
+    });
+    addOpenFieldScatter(obstacles, x - 40, y + 35, {
+        radius: Math.max(pondW, pondH) * 0.72,
+        count: 8,
+        variant: 'wetlands',
+    });
+}
+
 function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
     const roll = Math.random();
     const tier = roll > 0.78 ? 'rare' : 'common';
@@ -1351,19 +1369,7 @@ function addMicroSite(obstacles, loot, spawnPoints, x, y, biome = 'grass') {
         addObstacle(obstacles, 'hayBale', x + 190, y - 80, 70, 38, { hue: 34, variant: 'twine' });
     } else if (roll < 0.9) {
         // Pond with a clear shoreline and a fishing shack outside the water footprint.
-        const pondW = 460 + Math.random() * 140;
-        const pondH = 280 + Math.random() * 90;
-        addObstacle(obstacles, 'water', x, y, pondW, pondH, {
-            collidable: false, variant: 'pond', rotation: Math.random() * 0.18,
-        });
-        addHouse(obstacles, loot, spawnPoints, x + pondW / 2 + 155, y - pondH * 0.22, 180, 150, {
-            variant: 'cabin', hue: 22, tier: 'common', doorSide: 'west',
-        });
-        addOpenFieldScatter(obstacles, x - 40, y + 35, {
-            radius: Math.max(pondW, pondH) * 0.72,
-            count: 8,
-            variant: 'wetlands',
-        });
+        addPondSite(obstacles, loot, spawnPoints, x, y);
     } else {
         // Ruins with shelter
         addObstacle(obstacles, 'field', x, y, 760, 560, { collidable: false, variant: 'ruins' });
@@ -1413,8 +1419,8 @@ function addFarmstead(obstacles, loot, spawnPoints, x, y) {
             collidable: false, variant: 'crop', role: 'cropRow', landmarkType: 'farm',
         });
     }
-    addObstacle(obstacles, 'hayBale', x - 760, y - 50, 72, 40, { hue: 34, variant: 'twine', role: 'farmProp' });
-    addObstacle(obstacles, 'hayBale', x - 680, y - 50, 72, 40, { hue: 34, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x - 760, y - 105, 72, 40, { hue: 34, variant: 'twine', role: 'farmProp' });
+    addObstacle(obstacles, 'hayBale', x - 680, y - 105, 72, 40, { hue: 34, variant: 'twine', role: 'farmProp' });
     addObstacle(obstacles, 'hayBale', x - 590, y + 710, 78, 42, { hue: 34, rotation: 0.12, variant: 'twine', role: 'farmProp' });
     addObstacle(obstacles, 'hayBale', x - 80, y + 715, 74, 40, { hue: 34, rotation: -0.18, variant: 'twine', role: 'farmProp' });
     addObstacle(obstacles, 'hayBale', x + 410, y + 700, 76, 42, { hue: 34, rotation: 0.08, variant: 'twine', role: 'farmProp' });
@@ -1832,54 +1838,80 @@ function addTrailPath(obstacles, points, opts = {}) {
     });
 }
 
-function addWildernessTrailNetwork(obstacles) {
-    const trails = [
-        addTrailPath(obstacles, [
-            { x: -870, y: 520 }, { x: -1120, y: 920 }, { x: -980, y: 1370 },
-            { x: -520, y: 1680 }, { x: -200, y: 1940 },
-        ], { width: 58, label: 'Estate Walk' }),
-        addTrailPath(obstacles, [
-            { x: -8950, y: -5050 }, { x: -8240, y: -4600 }, { x: -7420, y: -4380 },
-            { x: -6500, y: -4470 }, { x: -5570, y: -4230 }, { x: -4580, y: -4100 },
-        ], { width: 62, variant: 'forest', label: 'Pine Trail' }),
-        addTrailPath(obstacles, [
-            { x: -7700, y: -6760 }, { x: -6940, y: -6480 }, { x: -6120, y: -6200 },
-            { x: -5350, y: -5740 }, { x: -4700, y: -5050 },
-        ], { width: 52, variant: 'forest', label: 'North Ridge' }),
-        addTrailPath(obstacles, [
-            { x: 5880, y: -3050 }, { x: 6380, y: -2550 }, { x: 6950, y: -2020 },
-            { x: 7420, y: -1540 }, { x: 7760, y: -1240 },
-        ], { width: 56, variant: 'gravel', label: 'Quarry Track' }),
-        addTrailPath(obstacles, [
-            { x: -7900, y: 2460 }, { x: -8280, y: 3260 }, { x: -8340, y: 4130 },
-            { x: -8170, y: 5020 }, { x: -7820, y: 5920 },
-        ], { width: 48, variant: 'boardwalk', label: 'Wetland Walk' }),
-        addTrailPath(obstacles, [
-            { x: -7000, y: 6370 }, { x: -6250, y: 6580 }, { x: -5480, y: 6960 },
-            { x: -4700, y: 7240 }, { x: -4160, y: 7300 },
-        ], { width: 60, variant: 'gravel', label: 'Market Track' }),
-        addTrailPath(obstacles, [
-            { x: 480, y: 5690 }, { x: 880, y: 6260 }, { x: 1380, y: 6820 },
-            { x: 1900, y: 7280 }, { x: 2350, y: 7490 },
-        ], { width: 56, label: 'South Ridge' }),
-        addTrailPath(obstacles, [
-            { x: 6060, y: 5300 }, { x: 6500, y: 5780 }, { x: 6980, y: 6240 },
-            { x: 7390, y: 6740 }, { x: 7680, y: 7090 },
-        ], { width: 54, variant: 'gravel', label: 'Research Trail' }),
-        addTrailPath(obstacles, [
-            { x: 6600, y: -600 }, { x: 7040, y: -220 }, { x: 7500, y: 60 },
-            { x: 8120, y: 120 }, { x: 8560, y: -180 },
-        ], { width: 50, variant: 'farm', label: 'Orchard Path' }),
-        addTrailPath(obstacles, [
-            { x: -3600, y: 2900 }, { x: -3180, y: 3400 }, { x: -2800, y: 3920 },
-            { x: -2480, y: 4470 }, { x: -2210, y: 5060 },
-        ], { width: 50, variant: 'forest', label: 'Birch Path' }),
-        addTrailPath(obstacles, [
-            { x: 3420, y: 2980 }, { x: 3820, y: 3350 }, { x: 4170, y: 3740 },
-            { x: 4530, y: 4190 }, { x: 4870, y: 4590 },
-        ], { width: 48, label: 'Prison Footpath' }),
-    ];
+const WILDERNESS_TRAIL_PLANS = [
+    { points: [
+        { x: -870, y: 520 }, { x: -1120, y: 920 }, { x: -980, y: 1370 },
+        { x: -520, y: 1680 }, { x: -200, y: 1940 },
+    ], opts: { width: 58, label: 'Estate Walk' } },
+    { points: [
+        { x: -8950, y: -5250 }, { x: -8240, y: -5150 }, { x: -7420, y: -5200 },
+        { x: -6500, y: -5200 }, { x: -5570, y: -4650 }, { x: -5380, y: -4200 },
+    ], opts: { width: 62, variant: 'forest', label: 'Pine Trail' } },
+    { points: [
+        { x: -7700, y: -6760 }, { x: -6940, y: -6480 }, { x: -6120, y: -6200 },
+        { x: -5350, y: -5740 }, { x: -4700, y: -5050 },
+    ], opts: { width: 52, variant: 'forest', label: 'North Ridge' } },
+    { points: [
+        { x: 5880, y: -3050 }, { x: 6300, y: -3300 }, { x: 6800, y: -3420 },
+        { x: 7200, y: -3340 }, { x: 7420, y: -3100 },
+    ], opts: { width: 56, variant: 'gravel', label: 'Quarry Track' } },
+    { points: [
+        { x: -7900, y: 2460 }, { x: -8280, y: 3260 }, { x: -8340, y: 4130 },
+        { x: -8170, y: 5020 }, { x: -7820, y: 5920 },
+    ], opts: { width: 48, variant: 'boardwalk', label: 'Wetland Walk' } },
+    { points: [
+        { x: -7000, y: 6370 }, { x: -6250, y: 6580 }, { x: -5700, y: 6850 },
+        { x: -5250, y: 7100 }, { x: -4940, y: 7300 },
+    ], opts: { width: 60, variant: 'gravel', label: 'Market Track' } },
+    { points: [
+        { x: 480, y: 5690 }, { x: 880, y: 6260 }, { x: 1380, y: 6820 },
+        { x: 1900, y: 7280 }, { x: 2350, y: 7490 },
+    ], opts: { width: 56, label: 'South Ridge' } },
+    { points: [
+        { x: 6060, y: 5300 }, { x: 6420, y: 5700 }, { x: 6720, y: 6150 },
+        { x: 6900, y: 6650 }, { x: 6950, y: 7100 },
+    ], opts: { width: 54, variant: 'gravel', label: 'Research Trail' } },
+    { points: [
+        { x: 6600, y: -600 }, { x: 7040, y: -220 }, { x: 7500, y: 60 },
+        { x: 8120, y: 120 }, { x: 8560, y: -180 },
+    ], opts: { width: 50, variant: 'farm', label: 'Orchard Path' } },
+    { points: [
+        { x: -3600, y: 2900 }, { x: -3180, y: 3400 }, { x: -2800, y: 3920 },
+        { x: -2480, y: 4470 }, { x: -2210, y: 5060 },
+    ], opts: { width: 50, variant: 'forest', label: 'Birch Path' } },
+    { points: [
+        { x: 3420, y: 2980 }, { x: 3800, y: 3300 }, { x: 4200, y: 3540 },
+        { x: 4650, y: 3700 }, { x: 5150, y: 3820 },
+    ], opts: { width: 48, label: 'Prison Footpath' } },
+];
 
+function isNearPlannedTrail(x, y, radius = 30) {
+    for (const plan of WILDERNESS_TRAIL_PLANS) {
+        const clearance = (plan.opts.width || 54) / 2 + radius + 12;
+        for (let i = 0; i < plan.points.length - 1; i++) {
+            const a = plan.points[i];
+            const b = plan.points[i + 1];
+            if (distanceToSegment(x, y, a.x, a.y, b.x, b.y) < clearance) return true;
+        }
+    }
+    return false;
+}
+
+function areaOverlapsPlannedTrail(x, y, w, h, buffer = 0) {
+    for (const plan of WILDERNESS_TRAIL_PLANS) {
+        const clearance = (plan.opts.width || 54) / 2 + buffer;
+        const expanded = { x, y, w: w + clearance * 2, h: h + clearance * 2 };
+        for (let i = 0; i < plan.points.length - 1; i++) {
+            const a = plan.points[i];
+            const b = plan.points[i + 1];
+            if (lineSegmentRectIntersects(a.x, a.y, b.x, b.y, expanded)) return true;
+        }
+    }
+    return false;
+}
+
+function addWildernessTrailNetwork(obstacles) {
+    const trails = WILDERNESS_TRAIL_PLANS.map(plan => addTrailPath(obstacles, plan.points, plan.opts));
     for (const [trailIndex, trail] of trails.entries()) {
         const points = trail.points || [];
         for (let i = 1; i < points.length - 1; i += 2) {
@@ -2251,6 +2283,7 @@ function getDoorApproachRect(door) {
 
 function clearInvalidBuildingProps(obstacles) {
     const floors = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const networkRoads = obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad');
     const approaches = obstacles
         .filter(obstacle => obstacle.kind === 'door')
         .map(getDoorApproachRect);
@@ -2266,7 +2299,11 @@ function clearInvalidBuildingProps(obstacles) {
             obstacle.x, obstacle.y, obstacle.w, obstacle.h,
             floor.x, floor.y, floor.w, floor.h,
         ));
-        if (blocksDoor || embeddedInBuilding) obstacles.splice(i, 1);
+        const blocksNetworkRoad = !obstacle.houseId && networkRoads.some(road => rectsOverlap(
+            obstacle.x, obstacle.y, obstacle.w, obstacle.h,
+            road.x, road.y, road.w + 16, road.h + 16,
+        ));
+        if (blocksDoor || embeddedInBuilding || blocksNetworkRoad) obstacles.splice(i, 1);
     }
 }
 
@@ -2333,6 +2370,8 @@ function isAreaOverlapping(x, y, w, h, buffer = 200, poiList = []) {
     if (rectsOverlap(x, y, w, h, -5400, 3100, 120 + buffer * 2, 2200)) return true;
     // Pine town branch: x = -4200, y from -4200 to -4000
     if (rectsOverlap(x, y, w, h, -4200, -4100, 120 + buffer * 2, 200)) return true;
+
+    if (areaOverlapsPlannedTrail(x, y, w, h, buffer)) return true;
 
     // 4. Check POI overlap
     for (const poi of poiList) {
@@ -2444,7 +2483,7 @@ export function generateSurvivMap(worldHalf) {
         variant: 'warehouse', tier: 'military', hue: 205, wall: 18, doorSide: 'north',
         landmarkType: 'bunker', label: 'BUNKER', role: 'mainBuilding', layout: 'corridor',
     });
-    addHouse(obstacles, loot, spawnPoints, bunkerPos.x - 380, bunkerPos.y - 200, 260, 200, {
+    addHouse(obstacles, loot, spawnPoints, bunkerPos.x - 430, bunkerPos.y - 200, 260, 200, {
         variant: 'warehouse', tier: 'military', hue: 200, doorSide: 'east',
         landmarkType: 'bunker', label: 'UTILITY', role: 'utility', entranceRole: 'serviceEntrance',
     });
@@ -2456,10 +2495,11 @@ export function generateSurvivMap(worldHalf) {
     const forestCampSites = [
         { x: campPos.x - 900, y: campPos.y - 650 },
         { x: campPos.x + 900, y: campPos.y - 650 },
-        { x: campPos.x, y: campPos.y + 720 },
+        { x: campPos.x, y: campPos.y + 720, pond: true },
     ];
     for (const site of forestCampSites) {
-        addMicroSite(obstacles, loot, spawnPoints, site.x, site.y, 'wetlands');
+        if (site.pond) addPondSite(obstacles, loot, spawnPoints, site.x, site.y);
+        else addMicroSite(obstacles, loot, spawnPoints, site.x, site.y, 'wetlands');
     }
     addForest(obstacles, loot, spawnPoints, campPos.x, campPos.y, 24, 1050);
     landmarks.push({ name: 'West Forest Camp', x: campPos.x, y: campPos.y, type: 'camp' });
@@ -2524,7 +2564,10 @@ export function generateSurvivMap(worldHalf) {
     addObstacle(obstacles, 'road', campPos.x, -3900, roadW, 200, {
         collidable: false, variant: 'dirt', role: 'path', landmarkType: 'camp',
     });
-    addObstacle(obstacles, 'road', bunkerPos.x, 7310, roadW, 620, {
+    addObstacle(obstacles, 'road', bunkerPos.x + 50, 7490, 220, roadW, {
+        collidable: false, variant: 'dirt', role: 'driveway', landmarkType: 'bunker',
+    });
+    addObstacle(obstacles, 'road', bunkerPos.x - 10, 7555, 100, 130, {
         collidable: false, variant: 'dirt', role: 'driveway', landmarkType: 'bunker',
     });
 

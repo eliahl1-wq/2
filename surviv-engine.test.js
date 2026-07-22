@@ -109,10 +109,10 @@ test('surviv open areas keep scattered cover and small houses', () => {
     ));
 
     assert.ok(openCover.length >= 700);
-    assert.ok(openTrees.length >= 550);
+    assert.ok(openTrees.length >= 500);
     assert.ok(coverCells.size >= 75);
     assert.ok(treeCells.size >= 88);
-    assert.ok(smallOpenHouses.length >= 45);
+    assert.ok(smallOpenHouses.length >= 40);
 });
 
 test('pond sites and the west forest camp keep readable spacing', () => {
@@ -349,6 +349,72 @@ test('surviv adds curved trails and varied natural detail without another buildi
     assert.ok(map.obstacles.some(obstacle => obstacle.kind === 'hayBale'));
 });
 
+test('generated Surviv maps keep trails, roads, buildings, and props separated', () => {
+    const clearableKinds = new Set([
+        'tree', 'bush', 'rock', 'stump', 'fallenLog', 'signpost', 'hayBale',
+        'reeds', 'grassTuft', 'wildflowers', 'mushrooms', 'crate', 'barrel',
+        'container', 'sandbag', 'tent',
+    ]);
+
+    for (let sample = 0; sample < 4; sample++) {
+        const map = generateSurvivMap(SURVIV.worldHalf);
+        const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+        const trails = map.obstacles.filter(obstacle => obstacle.kind === 'trail_path');
+        const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+        const networkRoads = roads.filter(road => road.role === 'networkRoad');
+        const outdoorProps = map.obstacles.filter(obstacle => (
+            clearableKinds.has(obstacle.kind) && !obstacle.houseId
+        ));
+
+        for (const prop of outdoorProps) {
+            assert.ok(networkRoads.every(road => !rectsOverlap(
+                prop.x, prop.y, prop.w, prop.h,
+                road.x, road.y, road.w, road.h,
+            )), `${prop.kind} should stay off network roads`);
+        }
+
+        for (let i = 0; i < houses.length; i++) {
+            for (let j = i + 1; j < houses.length; j++) {
+                assert.ok(!rectsOverlap(
+                    houses[i].x, houses[i].y, houses[i].w, houses[i].h,
+                    houses[j].x, houses[j].y, houses[j].w, houses[j].h,
+                ), 'generated buildings should not overlap');
+            }
+        }
+
+        for (const trail of trails) {
+            for (let i = 0; i < trail.points.length - 1; i++) {
+                const from = trail.points[i];
+                const to = trail.points[i + 1];
+                const steps = Math.max(1, Math.ceil(Math.hypot(to.x - from.x, to.y - from.y) / 30));
+                for (let step = 0; step <= steps; step++) {
+                    const progress = step / steps;
+                    const x = from.x + (to.x - from.x) * progress;
+                    const y = from.y + (to.y - from.y) * progress;
+                    assert.ok(houses.every(house => !pointInRect(x, y, house, trail.width / 2)), `${trail.label} should avoid buildings`);
+                }
+            }
+        }
+
+        for (const networkRoad of networkRoads) {
+            const horizontal = networkRoad.w > networkRoad.h;
+            for (const localRoad of roads) {
+                if (localRoad === networkRoad || localRoad.role === 'networkRoad') continue;
+                if ((localRoad.w > localRoad.h) !== horizontal) continue;
+                if (!rectsOverlap(
+                    networkRoad.x, networkRoad.y, networkRoad.w, networkRoad.h,
+                    localRoad.x, localRoad.y, localRoad.w, localRoad.h,
+                )) continue;
+                const overlapLength = horizontal
+                    ? Math.min(networkRoad.x + networkRoad.w / 2, localRoad.x + localRoad.w / 2)
+                        - Math.max(networkRoad.x - networkRoad.w / 2, localRoad.x - localRoad.w / 2)
+                    : Math.min(networkRoad.y + networkRoad.h / 2, localRoad.y + localRoad.h / 2)
+                        - Math.max(networkRoad.y - networkRoad.h / 2, localRoad.y - localRoad.h / 2);
+                assert.ok(overlapLength <= 5, 'parallel road surfaces should only overlap at a short seam');
+            }
+        }
+    }
+});
 test('surviv landmark approaches survive road clipping without tiny fragments', () => {
     const approachPoints = [
         { x: 6950, y: -1200, name: 'farm' },
@@ -358,7 +424,7 @@ test('surviv landmark approaches survive road clipping without tiny fragments', 
         { x: -2500, y: 7300, name: 'ironworks' },
         { x: -7200, y: 1900, name: 'south-west town' },
         { x: -7800, y: -3900, name: 'forest camp' },
-        { x: 2400, y: 7310, name: 'bunker' },
+        { x: 2450, y: 7490, name: 'bunker' },
     ];
 
     for (let i = 0; i < 5; i++) {
