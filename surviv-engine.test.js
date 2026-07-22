@@ -714,6 +714,12 @@ test('holding a chest open drops every item onto the ground after two seconds', 
     assert.deepEqual(new Set(room.loot.map(item => item.type)), new Set([
         'weapon', 'money', 'medkit', 'ammo', 'grenade', 'armor',
     ]));
+    assert.ok(room.loot.every(item => item.source === 'chest'));
+    assert.ok(room.loot.every(item => item.spawnX === 0 && item.spawnY === 0));
+    assert.ok(room.loot.every(item => Number.isFinite(item.spawnedAt)));
+    assert.ok(room.loot.every(item => item.pickupAfter - item.spawnedAt === 700));
+    assert.deepEqual(room.loot.map(item => item.burstIndex).sort((a, b) => a - b), [0, 1, 2, 3, 4, 5]);
+    assert.ok(room.loot.every(item => item.burstCount === 6));
     assert.equal(room.loot.find(item => item.type === 'weapon')?.ammo, 3);
     assert.equal(room.loot.find(item => item.type === 'money')?.dollarValue, 1.25);
     assert.equal(room.loot.find(item => item.type === 'medkit')?.amount, 2);
@@ -1135,6 +1141,20 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     room.players.push(player);
     player.x = 0;
     player.y = -1500;
+    room.loot.push({
+        id: 'animated-chest-drop',
+        type: 'weapon',
+        weaponType: 'shotgun',
+        x: 42,
+        y: -1500,
+        source: 'chest',
+        spawnedAt: Date.now(),
+        spawnX: 0,
+        spawnY: -1500,
+        burstIndex: 0,
+        burstCount: 2,
+    });
+    room._survivLootRevision = (room._survivLootRevision || 0) + 1;
     const ticks = [];
     const io = {
         to() {
@@ -1155,6 +1175,13 @@ test('surviv static terrain payload is retained between periodic sends', () => {
 
     assert.ok(Array.isArray(ticks[0].obstacles));
     assert.ok(ticks[0].minimap);
+    const animatedDrop = ticks[0].loot.find(item => item.id === 'animated-chest-drop');
+    assert.ok(animatedDrop);
+    assert.equal(animatedDrop.spawnX, 0);
+    assert.equal(animatedDrop.spawnY, -1500);
+    assert.equal(animatedDrop.burstIndex, 0);
+    assert.equal(animatedDrop.burstCount, 2);
+    assert.ok(animatedDrop.burstRemainingMs > 0 && animatedDrop.burstRemainingMs <= 700);
     const serializedRiver = ticks[0].obstacles.find(obstacle => obstacle.kind === 'river_path');
     assert.ok(serializedRiver);
     assert.equal(serializedRiver.points.length, 21);

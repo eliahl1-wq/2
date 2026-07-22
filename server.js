@@ -441,7 +441,7 @@ const c = {
         : 3 * 60 * 60 * 1000,
 };
 
-const CASHOUT_DURATION_MS = 5_000;
+const BOT_CASHOUT_DURATION_MS = 5_000;
 const CASHOUT_HOLD_MS = 3_000;
 const joiningUsers = new Set();
 function isUserJoining(userId) {
@@ -7441,16 +7441,10 @@ io.on('connection', (socket) => {
             player.cashoutHoldActive = true;
             player.cashoutHoldStartedAt = now;
             player.cashoutHoldCompletedAt = 0;
+            // Lock new controls, but preserve the last movement direction so the
+            // simulation keeps running naturally during the hold.
             player.boost = false;
-            player.inputDx = 0;
-            player.inputDy = 0;
             player.shooting = false;
-            for (const cell of player.cells || []) {
-                cell.vx = 0;
-                cell.vy = 0;
-                cell.vX = 0;
-                cell.vY = 0;
-            }
             return;
         }
 
@@ -7472,8 +7466,7 @@ io.on('connection', (socket) => {
             return;
         }
         if (p.isCashingOut) {
-            const remainingSeconds = Math.max(1, Math.ceil(((p.cashOutEndTime || Date.now()) - Date.now()) / 1000));
-            socket.emit('cashOutStarting', { seconds: remainingSeconds });
+            socket.emit('cashOutProcessing');
             return;
         }
         const completedHoldAt = Number(p.cashoutHoldCompletedAt) || 0;
@@ -7493,9 +7486,10 @@ io.on('connection', (socket) => {
             return;
         }
 
-        console.log(`⏱️ User ${p.username} started cashout timer (${CASHOUT_DURATION_MS / 1000}s)`);
+        console.log(`⏱️ User ${p.username} completed cashout hold; settling immediately`);
         p.isCashingOut = true;
-        const duration = CASHOUT_DURATION_MS;
+        // The three-second hold is the full cashout risk window.
+        const duration = 0;
         p.cashOutEndTime = Date.now() + duration;
         const playerMongoId = p.mongoId.toString();
         const roomId = socket.roomId;
@@ -7504,8 +7498,6 @@ io.on('connection', (socket) => {
         const isTournament = room.isTournament === true || p.isTournament === true;
 
         // Meddela klienten att timern har börjat
-        socket.emit('cashOutStarting', { seconds: duration / 1000 });
-
         setTimeout(async () => {
             const activeRoom = getArenaRoomById(roomId);
             // Competitive admin bots live in room.players with mongoId=null.
@@ -7518,7 +7510,7 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            // The five-second risk window is over. Remove the entity from active
+            // The three-second hold is the complete risk window. Remove the entity from active
             // simulation immediately while the wallet transfer confirms.
             activePlayer.cashoutSettling = true;
             activePlayer.boost = false;
@@ -7665,8 +7657,6 @@ io.on('connection', (socket) => {
         );
         if (!p) return;
         if (p.cashoutHoldActive) {
-            p.inputDx = 0;
-            p.inputDy = 0;
             p.boost = false;
             return;
         }
@@ -7690,8 +7680,6 @@ io.on('connection', (socket) => {
         const player = room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
         if (!player || player.disconnected) return;
         if (player.cashoutHoldActive) {
-            player.inputDx = 0;
-            player.inputDy = 0;
             player.shooting = false;
             return;
         }
@@ -8190,7 +8178,7 @@ function processRoom(room) {
                     }
                     if (botWealth >= player.cashOutThreshold) {
                         player.isCashingOut = true;
-                        player.cashOutEndTime = Date.now() + CASHOUT_DURATION_MS;
+                        player.cashOutEndTime = Date.now() + BOT_CASHOUT_DURATION_MS;
                         console.log(`⏱️ Agar Bot ${player.username} started cashout timer (threshold: $${player.cashOutThreshold.toFixed(2)})`);
                     }
                 }

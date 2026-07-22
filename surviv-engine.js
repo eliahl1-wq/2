@@ -3694,6 +3694,11 @@ function openLootContainer(entity, room) {
                 source: item.source === 'death' ? 'death' : 'chest',
                 tier: drop.tier || item.tier || contents.rarity || 'common',
                 pickupAfter: now + 700,
+                spawnedAt: now,
+                spawnX: item.x,
+                spawnY: item.y,
+                burstIndex: dropIndex,
+                burstCount: drops.length,
                 houseId: item.houseId || null,
                 room: item.room || null,
             }));
@@ -4768,6 +4773,13 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 amount: l.amount,
                 ammoType: l.ammoType,
                 armorValue: l.armorValue,
+                ...(Number.isFinite(l.spawnedAt) && now - l.spawnedAt < 700 ? {
+                    spawnX: l.spawnX,
+                    spawnY: l.spawnY,
+                    burstIndex: l.burstIndex,
+                    burstCount: l.burstCount,
+                    burstRemainingMs: Math.max(0, 700 - (now - l.spawnedAt)),
+                } : {}),
             }));
 
         const visibleBullets = room.bullets
