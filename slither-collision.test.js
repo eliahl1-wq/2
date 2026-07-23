@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     bodyCollisionThreshold,
+    bodyCollisionThresholdForApproach,
     COMPETITIVE_SLITHER,
     headRadiusForSegmentCount,
     randomCoordInRoom,
@@ -32,6 +33,54 @@ test('Slither body hitbox keeps a small proportional inset at every snake size',
     assert.ok(Math.abs(
         smallLethalCore / smallVisualContact - largeLethalCore / largeVisualContact,
     ) < 1e-9, 'the inset should remain proportional instead of becoming a fixed pixel gap');
+});
+
+test('Slither head hitbox is shorter only in front, not at the sides', () => {
+    const radius = headRadiusForSegmentCount(SLITHER.spawnSegments);
+    const sideReach = bodyCollisionThresholdForApproach(radius, radius, 0);
+    const diagonalReach = bodyCollisionThresholdForApproach(radius, radius, Math.SQRT1_2);
+    const frontReach = bodyCollisionThresholdForApproach(radius, radius, 1);
+
+    assert.equal(sideReach, bodyCollisionThreshold(radius, radius));
+    assert.ok(frontReach < diagonalReach);
+    assert.ok(diagonalReach < sideReach);
+    assert.ok(sideReach - frontReach > 1.5, 'front needs enough inset to cover render interpolation');
+    assert.ok(sideReach - frontReach < radius * 0.35, 'front inset should remain subtle');
+});
+
+test('Straight-ahead body approach survives until the visual nose catches up', () => {
+    const radius = headRadiusForSegmentCount(SLITHER.spawnSegments);
+    const frontReach = bodyCollisionThresholdForApproach(radius, radius, 1);
+    const sideReach = bodyCollisionThreshold(radius, radius);
+    const bodyX = (frontReach + sideReach) * 0.5;
+    const attacker = {
+        id: 'attacker',
+        balance: 1,
+        angle: 0,
+        segments: [{ x: 0, y: 0 }, { x: -20, y: 0 }],
+    };
+    const blocker = {
+        id: 'blocker',
+        balance: 1,
+        angle: Math.PI / 2,
+        segments: Array.from({ length: 12 }, (_, index) => ({
+            x: bodyX,
+            y: -24 + index * 4,
+        })),
+    };
+
+    const frontDead = resolveAllSnakeCollisions([
+        { entity: attacker, isHuman: true },
+        { entity: blocker, isHuman: true },
+    ]);
+    assert.ok(!frontDead.has('attacker'), 'front edge must not kill before the rendered nose arrives');
+
+    attacker.angle = Math.PI / 2;
+    const sideDead = resolveAllSnakeCollisions([
+        { entity: attacker, isHuman: true },
+        { entity: blocker, isHuman: true },
+    ]);
+    assert.ok(sideDead.has('attacker'), 'the same distance at the side must remain lethal');
 });
 
 test('Slither uses a half-area circular arena and circular spawn distribution', () => {

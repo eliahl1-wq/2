@@ -52,6 +52,10 @@ export const SLITHER = {
     selfCollisionSkip: 4,
     // Slither-style combat: heads are non-lethal; the body core is slightly narrower than the rendered snake.
     bodyCollisionScale: 0.78,
+    // The renderer trails the authoritative server head by roughly one movement
+    // step. Pull only the forward-facing edge inward so the nose visually
+    // reaches a body before the server declares a hit; side collisions stay firm.
+    headFrontCollisionInsetScale: 0.28,
     // Ignore body points still visually inside the head/neck.
     lethalBodyStartRadius: 1.8,
 };
@@ -1523,6 +1527,7 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
     return dist(px, py, ax + t * dx, ay + t * dy);
 }
 
+
 function snakeMouthPoint(snake) {
     const head = snake.segments[0];
     const r = headRadiusForSnake(snake);
@@ -1571,10 +1576,21 @@ export function bodyCollisionThreshold(headRadius, bodyRadius) {
     return (Math.max(0, headRadius) + Math.max(0, bodyRadius)) * SLITHER.bodyCollisionScale;
 }
 
-function headHitsSnakeBody(head, headRadius, other, otherRadius) {
+export function bodyCollisionThresholdForApproach(headRadius, bodyRadius, forwardAlignment = 0) {
+    const base = bodyCollisionThreshold(headRadius, bodyRadius);
+    const forward = Math.max(0, Math.min(1, forwardAlignment));
+    // Square the alignment so a shallow diagonal/graze remains close to the
+    // normal side hitbox. The full inset applies only straight ahead.
+    const frontInset = Math.max(0, headRadius) * SLITHER.headFrontCollisionInsetScale * forward * forward;
+    return Math.max(0, base - frontInset);
+}
+
+function headHitsSnakeBody(snake, headRadius, other, otherRadius) {
+    const head = snake.segments[0];
     const segments = other.segments || [];
     const first = firstLethalBodySegment(other, otherRadius);
-    const threshold = bodyCollisionThreshold(headRadius, otherRadius);
+    const headingX = Math.cos(snake.angle ?? 0);
+    const headingY = Math.sin(snake.angle ?? 0);
     // Long snakes are sampled densely. Test short swept body chords instead of
     // every individual point: this keeps the hitbox continuous and halves the
     // hot collision loop without creating gaps between segments.
@@ -1582,7 +1598,24 @@ function headHitsSnakeBody(head, headRadius, other, otherRadius) {
     for (let i = first; i < segments.length; i += stride) {
         const a = segments[i];
         const b = segments[Math.min(segments.length - 1, i + stride)];
-        if (distPointToSegment(head.x, head.y, a.x, a.y, b.x, b.y) < threshold) return true;
+        const chordX = b.x - a.x;
+        const chordY = b.y - a.y;
+        const chordLengthSq = chordX * chordX + chordY * chordY;
+        const t = chordLengthSq > 1e-6
+            ? Math.max(0, Math.min(1, ((head.x - a.x) * chordX + (head.y - a.y) * chordY) / chordLengthSq))
+            : 0;
+        const dx = a.x + t * chordX - head.x;
+        const dy = a.y + t * chordY - head.y;
+        const distance = Math.hypot(dx, dy);
+        const forwardAlignment = distance > 1e-6
+            ? (headingX * dx + headingY * dy) / distance
+            : 1;
+        const threshold = bodyCollisionThresholdForApproach(
+            headRadius,
+            otherRadius,
+            forwardAlignment,
+        );
+        if (distance < threshold) return true;
     }
     return false;
 }
@@ -1607,7 +1640,7 @@ function checkSnakeCollisions(snake, allSnakes) {
             continue;
         }
 
-        if (headHitsSnakeBody(head, r, other, maxOtherR)) return other;
+        if (headHitsSnakeBody(snake, r, other, maxOtherR)) return other;
     }
     return null;
 }
@@ -1648,7 +1681,7 @@ export function resolveAllSnakeCollisions(allSnakes) {
                 continue;
             }
 
-            if (headHitsSnakeBody(head, r, other, maxOtherR)) {
+            if (headHitsSnakeBody(snake, r, other, maxOtherR)) {
                 bodyHit = other;
             }
             if (bodyHit) {
