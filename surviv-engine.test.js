@@ -216,7 +216,7 @@ test('surviv economy conserves the full entry and applies only the cashout fee',
     assert.equal(economy.entryFeeUsd, 5);
     assert.equal(economy.playerStartBalance, 0);
     assert.equal(economy.lootPoolOnJoin, 5);
-    assert.equal(economy.cashoutFeePct, 0.035);
+    assert.equal(economy.cashoutFeePct, 0.05);
     assert.equal(economy.cashoutPlayerPct + economy.cashoutFeePct, 1);
 });
 test('surviv join money crates vary amounts while preserving the pool', () => {

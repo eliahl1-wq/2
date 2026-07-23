@@ -1,3 +1,5 @@
+import { PLATFORM_CASHOUT_FEE_BPS } from './affiliate-config.js';
+
 /** Normal-mode entry tiers (USD). Battle Royale uses its own economy. */
 export const ALLOWED_ENTRY_FEES = [2, 5, 10, 20];
 export const DEFAULT_ENTRY_FEE = 10;
@@ -8,8 +10,8 @@ export const GOLDEN_BLOB_ENTRY_SHARE = 0.10;
 /** Server tick rate used for wealth-tax decay (matches processRoom interval). */
 export const ECONOMY_TICKS_PER_SECOND = 40;
 
-/** Platform cut on normal agar/slither cashouts (matches Slither Arena $5 tier). */
-export const NORMAL_CASHOUT_FEE_PCT = 0.035;
+/** Platform cut on all eligible Agar, Slither, and Surviv cashouts. */
+export const NORMAL_CASHOUT_FEE_PCT = PLATFORM_CASHOUT_FEE_BPS / 10_000;
 
 /** Baseline economy at $10 entry — all values scale linearly with entry fee. */
 const BASE = {
@@ -157,12 +159,6 @@ export const DEFAULT_COMPETITIVE_ENTRY_FEE = 5;
 export const SURVIV_ENTRY_FEES = [5];
 export const DEFAULT_SURVIV_ENTRY_FEE = 5;
 
-/** Platform cut on Slither Arena cashouts by entry tier ($5 keeps legacy 3.5%). */
-const COMPETITIVE_CASHOUT_FEE_PCT = {
-    1: 0.05,
-    2: 0.05,
-    5: 0.035,
-};
 
 export function normalizeCompetitiveEntryFee(fee) {
     const n = Number(fee);
@@ -177,7 +173,7 @@ export function normalizeSurvivEntryFee(fee) {
 /** Scaled Slither Arena economy for a given entry tier. */
 export function getCompetitiveEconomy(entryFeeUsd) {
     const entry = normalizeCompetitiveEntryFee(entryFeeUsd);
-    const cashoutFeePct = COMPETITIVE_CASHOUT_FEE_PCT[entry] ?? 0.035;
+    const cashoutFeePct = NORMAL_CASHOUT_FEE_PCT;
     return {
         entryFeeUsd: entry,
         dollarStart: entry,
@@ -192,7 +188,7 @@ export function getCompetitiveEconomy(entryFeeUsd) {
 /** Surviv economy - full entry becomes synchronized map loot; players start at $0. */
 export function getSurvivEconomy(entryFeeUsd) {
     const entry = normalizeSurvivEntryFee(entryFeeUsd);
-    const cashoutFeePct = 0.035;
+    const cashoutFeePct = NORMAL_CASHOUT_FEE_PCT;
     return {
         entryFeeUsd: entry,
         playerStartBalance: 0,

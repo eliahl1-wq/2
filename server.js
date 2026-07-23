@@ -110,6 +110,32 @@ import {
     calculateTournamentPrizes,
     serializeTournament,
 } from './tournament-system.js';
+import { calculateCashoutMoney, microsToUsd } from './affiliate-money.js';
+import {
+    AffiliatePayout,
+    createAffiliateCommissionForCashout,
+    createReferralAttribution,
+    ensureAffiliateProfile,
+    ensureAffiliateTiers,
+    getAdminAffiliateOverview,
+    getAffiliateCommissionHistory,
+    getAffiliateDashboard,
+    getAffiliatePayoutHistory,
+    getOutstandingAffiliateLiabilityUsdMicros,
+    hashReferralSignal,
+    recordReferralClick,
+    reconcileAffiliateCommissions,
+    rejectAffiliatePayout,
+    requestAffiliatePayout,
+    resolveAffiliateRiskFlag,
+    resolveReferralCode,
+    reverseAffiliateCommission,
+    scanAffiliateWalletRisk,
+    beginAffiliatePayout,
+    completeAffiliatePayout,
+    updateAffiliateProfileAdmin,
+} from './affiliate-system.js';
+import { getAffiliatePublicConfig } from './affiliate-config.js';
 
 // --- SOLANA KONFIGURATION ---
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
@@ -298,7 +324,7 @@ const UserSchema = new mongoose.Schema({
     tournamentRewardCreditIds: { type: [String], default: [] },
     lastDepositSourceSignature: { type: String, default: null },
     depositHistoryBackfilledAt: { type: Date, default: null },
-});
+}, { timestamps: true });
 
 const User = mongoose.model('User', UserSchema);
 
@@ -420,6 +446,34 @@ TransactionSchema.post('save', async function(doc) {
             { $unset: { 'meta.challengeProgressApplied': 1, 'meta.challengeProgressAppliedAt': 1 } },
         ).catch(() => {});
         console.error('Error in Transaction post-save challenge processing:', err.message);
+    }
+});
+
+TransactionSchema.post('save', async function createAffiliateCommissionHook(doc) {
+    try {
+        const result = await createAffiliateCommissionForCashout(doc);
+        if (result.created && result.commission) {
+            await mongoose.model('Transaction').updateOne(
+                { _id: doc._id },
+                {
+                    $set: {
+                        'meta.affiliateCommissionId': result.commission._id,
+                        'meta.affiliateCommissionCreatedAt': new Date().toISOString(),
+                    },
+                },
+            );
+        }
+    } catch (error) {
+        console.error('[Affiliate Commission] Cashout processing failed:', error.message);
+        await mongoose.model('Transaction').updateOne(
+            { _id: doc._id },
+            {
+                $set: {
+                    'meta.affiliateCommissionError': String(error.message || error).slice(0, 500),
+                    'meta.affiliateCommissionErrorAt': new Date().toISOString(),
+                },
+            },
+        ).catch(() => {});
     }
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
@@ -840,9 +894,11 @@ async function canReceiveSystemTransfer(address, lamports) {
 async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE;
-    const { cashoutPlayerPct, cashoutFeePct } = getCompetitiveEconomy(entryFeeUsd);
-    const playerPayout = dollarBalance * cashoutPlayerPct;
-    const platformFee = dollarBalance * cashoutFeePct;
+    const { cashoutFeePct } = getCompetitiveEconomy(entryFeeUsd);
+    const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
+    const cashoutMoney = calculateCashoutMoney(dollarBalance, cashoutFeeBps);
+    const playerPayout = cashoutMoney.playerPayoutUsd;
+    const platformFee = cashoutMoney.platformFeeUsd;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
 
@@ -857,6 +913,10 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
         playerPayout,
         platformFee,
         cashoutFeePct,
+        cashoutFeeBps,
+        grossCashoutUsdMicros: cashoutMoney.grossCashoutUsdMicros,
+        platformFeeUsdMicros: cashoutMoney.platformFeeUsdMicros,
+        playerPayoutUsdMicros: cashoutMoney.playerPayoutUsdMicros,
         playerId: mongoId,
         timestamp: new Date().toISOString(),
     };
@@ -976,9 +1036,11 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
 async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_SURVIV_ENTRY_FEE;
-    const { cashoutPlayerPct, cashoutFeePct } = getSurvivEconomy(entryFeeUsd);
-    const playerPayout = dollarBalance * cashoutPlayerPct;
-    const platformFee = dollarBalance * cashoutFeePct;
+    const { cashoutFeePct } = getSurvivEconomy(entryFeeUsd);
+    const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
+    const cashoutMoney = calculateCashoutMoney(dollarBalance, cashoutFeeBps);
+    const playerPayout = cashoutMoney.playerPayoutUsd;
+    const platformFee = cashoutMoney.platformFeeUsd;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
 
@@ -993,6 +1055,10 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
         playerPayout,
         platformFee,
         cashoutFeePct,
+        cashoutFeeBps,
+        grossCashoutUsdMicros: cashoutMoney.grossCashoutUsdMicros,
+        platformFeeUsdMicros: cashoutMoney.platformFeeUsdMicros,
+        playerPayoutUsdMicros: cashoutMoney.playerPayoutUsdMicros,
         playerId: mongoId,
         timestamp: new Date().toISOString(),
     };
@@ -1110,9 +1176,11 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     const requestedDollarBalance = arenaCashoutUsd(player);
     const dollarBalance = reserveArenaCashout(room, player, requestedDollarBalance);
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
-    const { cashoutPlayerPct, cashoutFeePct } = getEconomy(entryFeeUsd);
-    const playerPayout = dollarBalance * cashoutPlayerPct;
-    const platformFee = dollarBalance * cashoutFeePct;
+    const { cashoutFeePct } = getEconomy(entryFeeUsd);
+    const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
+    const cashoutMoney = calculateCashoutMoney(dollarBalance, cashoutFeeBps);
+    const playerPayout = cashoutMoney.playerPayoutUsd;
+    const platformFee = cashoutMoney.platformFeeUsd;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
     const gameMode = player.mode === 'slither' ? 'slither' : 'agar';
@@ -1128,6 +1196,10 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         playerPayout,
         platformFee,
         cashoutFeePct,
+        cashoutFeeBps,
+        grossCashoutUsdMicros: cashoutMoney.grossCashoutUsdMicros,
+        platformFeeUsdMicros: cashoutMoney.platformFeeUsdMicros,
+        playerPayoutUsdMicros: cashoutMoney.playerPayoutUsdMicros,
         playerId: mongoId,
         gameSessionId: player.gameSessionId || null,
         timestamp: new Date().toISOString(),
@@ -1446,13 +1518,24 @@ async function sweepHouseWalletOnReset() {
     }
     
     const reservedRewardSweepLamports = rewardSweepLamports;
+    const affiliateLiabilityUsdMicros = await getOutstandingAffiliateLiabilityUsdMicros();
+    const requestedAffiliateReserveLamports = Math.round(
+        (microsToUsd(affiliateLiabilityUsdMicros) / solPrice) * solanaWeb3.LAMPORTS_PER_SOL
+    );
+    const affiliateReserveLamports = Math.min(
+        Math.max(0, totalSweepLamports - reservedRewardSweepLamports),
+        Math.max(0, requestedAffiliateReserveLamports),
+    );
+    if (affiliateReserveLamports > 0) {
+        console.log(`Affiliate liability reserved in house wallet: ${affiliateReserveLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL`);
+    }
     if (rewardSweepLamports > 0
         && !await canReceiveSystemTransfer(REWARD_WALLET_ADDRESS, rewardSweepLamports)) {
         console.log('Reward sweep deferred until it can satisfy the destination rent minimum.');
         rewardSweepLamports = 0;
     }
 
-    let ownerSweepLamports = totalSweepLamports - reservedRewardSweepLamports;
+    let ownerSweepLamports = totalSweepLamports - reservedRewardSweepLamports - affiliateReserveLamports;
     if (ownerSweepLamports > 0
         && !await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, ownerSweepLamports)) {
         console.log('Owner sweep deferred until it can satisfy the destination rent minimum.');
@@ -1873,13 +1956,93 @@ setInterval(() => {
     const now = Date.now();
     for (const [key, value] of sensitiveRequestBuckets) if (value.resetAt <= now) sensitiveRequestBuckets.delete(key);
 }, 10 * 60_000).unref();
+
+function getReferralRequestSignals(req, deviceId = '') {
+    const directIp = req.ip || req.socket?.remoteAddress || '';
+    return {
+        ipHash: hashReferralSignal(directIp),
+        deviceHash: hashReferralSignal(deviceId),
+        userAgentHash: hashReferralSignal(req.get('user-agent') || ''),
+        visitorKey: hashReferralSignal(`${deviceId || 'no-device'}|${directIp || 'no-ip'}`),
+    };
+}
+
+function createGoogleReferralState(req) {
+    const referralCode = String(req.query.ref || '').trim();
+    const referralClickId = String(req.query.clickId || '').trim();
+    const referralDeviceId = String(req.query.deviceId || '').trim().slice(0, 200);
+    if (!referralCode) return undefined;
+    return jwt.sign(
+        {
+            purpose: 'google_referral',
+            referralCode,
+            referralClickId: mongoose.isValidObjectId(referralClickId) ? referralClickId : null,
+            referralDeviceId,
+        },
+        JWT_SECRET,
+        { expiresIn: '15m' },
+    );
+}
+
+function readGoogleReferralState(req) {
+    const state = String(req.query.state || '');
+    if (!state) return null;
+    try {
+        const payload = jwt.verify(state, JWT_SECRET);
+        return payload?.purpose === 'google_referral' ? payload : null;
+    } catch {
+        return null;
+    }
+}
+
+app.get('/api/affiliate/config', (req, res) => {
+    const config = getAffiliatePublicConfig();
+    res.json({
+        ...config,
+        minimumPayoutUsd: microsToUsd(config.minimumPayoutUsdMicros),
+    });
+});
+
+app.get('/api/referrals/resolve', sensitiveRateLimit({ limit: 60, windowMs: 60_000 }), async (req, res) => {
+    try {
+        const profile = await resolveReferralCode(req.query.code);
+        if (!profile) return res.status(404).json({ valid: false, message: 'Referral code not found' });
+        return res.json({ valid: true, referralCode: profile.referralCode });
+    } catch (error) {
+        return res.status(500).json({ valid: false, message: error.message });
+    }
+});
+
+app.post('/api/referrals/click', sensitiveRateLimit({ limit: 60, windowMs: 60_000 }), async (req, res) => {
+    try {
+        const deviceId = String(req.body?.deviceId || '').slice(0, 200);
+        const signals = getReferralRequestSignals(req, deviceId);
+        const result = await recordReferralClick({
+            code: req.body?.code,
+            visitorKey: signals.visitorKey,
+            ipHash: signals.ipHash,
+            deviceHash: signals.deviceHash,
+            userAgentHash: signals.userAgentHash,
+        });
+        return res.status(result.firstTouch ? 201 : 200).json({
+            referralCode: result.click.referralCode,
+            clickId: result.click._id,
+            expiresAt: result.click.expiresAt,
+            firstTouch: result.firstTouch,
+        });
+    } catch (error) {
+        return res.status(error.status || 400).json({ message: error.message, code: error.code });
+    }
+});
+
 // --- GOOGLE OAUTH KONFIGURATION ---
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID || "DIN_GOOGLE_CLIENT_ID",
     clientSecret: process.env.GOOGLE_CLIENT_SECRET || "DIN_GOOGLE_CLIENT_SECRET",
-    callbackURL: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`
+    callbackURL: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`,
+    passReqToCallback: true,
 },
-    async (accessToken, refreshToken, profile, done) => {
+    async (req, accessToken, refreshToken, profile, done) => {
         try {
             const profileEmail = profile.emails && profile.emails.length > 0 ? profile.emails[0].value : null;
             let user = await User.findOne({ $or: [{ googleId: profile.id }, { email: profileEmail }].filter(q => q.email || q.googleId) });
@@ -1896,6 +2059,19 @@ passport.use(new GoogleStrategy({
                     depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
                 });
                 await user.save();
+                await ensureAffiliateProfile(user);
+                const referralState = readGoogleReferralState(req);
+                if (referralState?.referralCode) {
+                    const signals = getReferralRequestSignals(req, referralState.referralDeviceId);
+                    await createReferralAttribution({
+                        referredUser: user,
+                        code: referralState.referralCode,
+                        source: 'google_oauth',
+                        referralClickId: referralState.referralClickId,
+                        registrationIpHash: signals.ipHash,
+                        deviceHash: signals.deviceHash,
+                    });
+                }
             } else if (!user.depositAddress || !user.depositSecret) {
                 await ensureUserDepositWallet(user);
             }
@@ -1907,7 +2083,13 @@ passport.use(new GoogleStrategy({
 ));
 
 // Google Auth Routes
-app.get('/api/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+app.get('/api/auth/google', (req, res, next) => {
+    const state = createGoogleReferralState(req);
+    passport.authenticate('google', {
+        scope: ['profile', 'email'],
+        ...(state ? { state } : {}),
+    })(req, res, next);
+});
 
 app.get('/api/auth/google/callback',
     passport.authenticate('google', { session: false, failureRedirect: '/login' }),
@@ -2046,6 +2228,62 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     }
 });
 
+app.get('/api/affiliate/dashboard', authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        const baseUrl = process.env.FRONTEND_URL || 'https://agararena.space';
+        return res.json(await getAffiliateDashboard(user, { baseUrl }));
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.get('/api/affiliate/commissions', authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        return res.json(await getAffiliateCommissionHistory(user, {
+            limit: req.query.limit,
+            before: req.query.before,
+        }));
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.get('/api/affiliate/payouts', authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        return res.json(await getAffiliatePayoutHistory(user));
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.post('/api/affiliate/enable', sensitiveRateLimit({ limit: 10, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        const profile = await ensureAffiliateProfile(user);
+        return res.json({ enabled: profile.enabled, referralCode: profile.referralCode });
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.post('/api/affiliate/payouts', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        const payout = await requestAffiliatePayout(user);
+        return res.status(201).json({ payout });
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
 app.post('/api/update-profile', authenticateToken, async (req, res) => {
     try {
         const user = await User.findById(req.user.id);
@@ -2082,6 +2320,11 @@ app.post('/api/update-profile', authenticateToken, async (req, res) => {
         }
 
         await user.save();
+        if (walletAddress !== undefined) {
+            await scanAffiliateWalletRisk(user).catch(error => {
+                console.error('[Affiliate Risk] Wallet scan failed:', error.message);
+            });
+        }
 
         const userObj = user.toObject();
         delete userObj.password;
@@ -2116,6 +2359,138 @@ const authenticateAdmin = (req, res, next) => {
         } catch (err) { res.sendStatus(500); }
     });
 };
+app.get('/api/admin/affiliates', authenticateAdmin, async (req, res) => {
+    try {
+        return res.json(await getAdminAffiliateOverview());
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.patch('/api/admin/affiliates/:profileId', authenticateAdmin, async (req, res) => {
+    try {
+        const profile = await updateAffiliateProfileAdmin(req.params.profileId, {
+            tierKey: req.body?.tierKey,
+            suspended: req.body?.suspended,
+            reason: req.body?.reason,
+            internalNotes: req.body?.internalNotes,
+            adminUserId: req.adminUser._id,
+        });
+        return res.json({ profile });
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.post('/api/admin/affiliate-commissions/:commissionId/reverse', authenticateAdmin, async (req, res) => {
+    try {
+        const commission = await reverseAffiliateCommission(req.params.commissionId, {
+            adminUserId: req.adminUser._id,
+            reason: req.body?.reason,
+        });
+        return res.json({ commission });
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.post('/api/admin/affiliate-risk-flags/:flagId/resolve', authenticateAdmin, async (req, res) => {
+    try {
+        const flag = await resolveAffiliateRiskFlag(req.params.flagId, {
+            status: req.body?.status,
+            notes: req.body?.notes,
+            adminUserId: req.adminUser._id,
+        });
+        return res.json({ flag });
+    } catch (error) {
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
+app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, async (req, res) => {
+    const action = String(req.body?.action || '');
+    try {
+        if (action === 'reject') {
+            const payout = await rejectAffiliatePayout(req.params.payoutId, {
+                adminUserId: req.adminUser._id,
+                reason: req.body?.reason,
+            });
+            return res.json({ payout });
+        }
+        if (action !== 'approve') return res.status(400).json({ message: 'Action must be approve or reject' });
+
+        let payout = await beginAffiliatePayout(req.params.payoutId, req.adminUser._id);
+        if (payout.status === 'completed') return res.json({ payout });
+        if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
+            return res.status(503).json({ message: 'House wallet is not configured; payout remains processing' });
+        }
+
+        const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+        );
+        const payoutSolPriceUsd = payout.signature && payout.solPriceUsd
+            ? payout.solPriceUsd
+            : SOL_PRICE_USD;
+        const lamports = payout.signature && payout.solAmount
+            ? Math.round(payout.solAmount * solanaWeb3.LAMPORTS_PER_SOL)
+            : Math.round(
+                (microsToUsd(payout.amountUsdMicros) / payoutSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL
+            );
+        if (lamports <= 0) return res.status(400).json({ message: 'Payout rounds to zero lamports' });
+
+        let signature = payout.signature;
+        if (!signature) {
+            const latest = await connection.getLatestBlockhash('confirmed');
+            const transaction = new solanaWeb3.Transaction({
+                feePayer: houseKeypair.publicKey,
+                recentBlockhash: latest.blockhash,
+            }).add(
+                solanaWeb3.SystemProgram.transfer({
+                    fromPubkey: houseKeypair.publicKey,
+                    toPubkey: new solanaWeb3.PublicKey(payout.destinationWallet),
+                    lamports,
+                })
+            );
+            transaction.sign(houseKeypair);
+            signature = await connection.sendRawTransaction(transaction.serialize(), {
+                skipPreflight: false,
+                maxRetries: 3,
+            });
+            await AffiliatePayout.updateOne(
+                { _id: payout._id, status: 'processing', signature: null },
+                { $set: { signature, solAmount: lamports / solanaWeb3.LAMPORTS_PER_SOL, solPriceUsd: payoutSolPriceUsd } },
+            );
+        }
+        const confirmation = await connection.confirmTransaction(signature, 'confirmed');
+        if (confirmation.value.err) throw new Error('Affiliate payout transaction failed on-chain');
+        payout = await completeAffiliatePayout(payout._id, {
+            adminUserId: req.adminUser._id,
+            signature,
+            solAmount: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+            solPriceUsd: payoutSolPriceUsd,
+        });
+        await Transaction.create({
+            userId: payout.affiliateUserId,
+            type: 'withdraw',
+            amount: microsToUsd(payout.amountUsdMicros),
+            currency: 'USD',
+            meta: {
+                event: 'affiliate_payout',
+                reason: 'Affiliate Commission Payout',
+                destination: payout.destinationWallet,
+                signature,
+                payoutId: payout._id,
+                solAmount: payout.solAmount,
+            },
+            status: 'confirmed',
+        });
+        return res.json({ payout });
+    } catch (error) {
+        await logSolanaTransactionError('[Affiliate Payout] Approval failed:', error);
+        return res.status(error.status || 500).json({ message: error.message, code: error.code });
+    }
+});
+
 function optionalAuthenticatedUserId(req) {
     const authHeader = req.headers.authorization;
     const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -2390,6 +2765,7 @@ app.get('/api/config', (req, res) => {
         brMaxPlayers: BR.maxPlayers,
         competitiveEntryFees: DEV_FREE_PLAY ? [0] : COMPETITIVE_SLITHER_ENTRY_FEES,
         competitiveDefaultEntryFee: DEFAULT_COMPETITIVE_ENTRY_FEE,
+        affiliate: getAffiliatePublicConfig(),
     });
 });
 
@@ -5278,10 +5654,21 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db"
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .then(async () => {
-        await hydrateRewardPoolState();
-        console.log("Ansluten till databasen och reward-poolen återställd!");
+        await Promise.all([
+            hydrateRewardPoolState(),
+            ensureAffiliateTiers(),
+        ]);
+        const reconciliation = await reconcileAffiliateCommissions(Transaction);
+        console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
     })
     .catch(err => console.error("Kunde inte ansluta:", err));
+
+setInterval(() => {
+    if (mongoose.connection.readyState !== 1) return;
+    reconcileAffiliateCommissions(Transaction).catch(error => {
+        console.error('[Affiliate Reconciliation] Failed:', error.message);
+    });
+}, 5 * 60_000).unref();
 
 // 3. REGISTRERING (Spara ny användare)
 app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), async (req, res) => {
@@ -5289,12 +5676,21 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
         const email = String(req.body?.email || '').trim().toLowerCase();
         const username = String(req.body?.username || '').trim();
         const password = String(req.body?.password || '');
+        const referralCode = String(req.body?.referralCode || '').trim();
+        const referralClickId = mongoose.isValidObjectId(req.body?.referralClickId)
+            ? req.body.referralClickId
+            : null;
+        const referralDeviceId = String(req.body?.referralDeviceId || '').slice(0, 200);
+        const referralSource = req.body?.referralSource === 'link' ? 'link' : 'manual';
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: 'Enter a valid email address' });
         if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) return res.status(400).json({ message: 'Username must be 3–20 letters, numbers, or underscores' });
         if (password.length < 8 || password.length > 128) return res.status(400).json({ message: 'Password must be at least 8 characters' });
 
         const existingUser = await User.findOne({ $or: [{ username }, { email }] });
         if (existingUser) return res.status(400).json({ message: 'Username or email already taken' });
+        if (referralCode && !await resolveReferralCode(referralCode)) {
+            return res.status(400).json({ message: 'Referral code is invalid or unavailable' });
+        }
         const keypair = solanaWeb3.Keypair.generate();
         const newUser = new User({
             email,
@@ -5305,10 +5701,25 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
             depositSecret: Buffer.from(keypair.secretKey).toString('hex'),
         });
         await newUser.save();
+        await ensureAffiliateProfile(newUser);
+        let referralAttributed = false;
+        if (referralCode) {
+            const signals = getReferralRequestSignals(req, referralDeviceId);
+            const result = await createReferralAttribution({
+                referredUser: newUser,
+                code: referralCode,
+                source: referralSource,
+                referralClickId,
+                registrationIpHash: signals.ipHash,
+                deviceHash: signals.deviceHash,
+            });
+            referralAttributed = result.created;
+        }
         return res.status(201).json({
             message: 'Account created!',
             userId: newUser._id.toString(),
             username: newUser.username,
+            referralAttributed,
         });
     } catch (err) {
         console.error('Registration error:', err.message);

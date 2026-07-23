@@ -7,6 +7,7 @@ import {
     getEconomy,
     getJoinPoolSplit,
     getRewardPoolSplit,
+    getSurvivEconomy,
 } from './economy.js';
 
 const populations = [1, 2, 3, 7, 8, 30];
@@ -19,9 +20,18 @@ test('Competitive Slither exposes separate $1, $2, and $5 economies', () => {
         assert.equal(eco.dollarStart, entryFeeUsd);
         assert.equal(eco.cashoutPlayerPct + eco.cashoutFeePct, 1);
     }
-    const oneDollar = getCompetitiveEconomy(1);
-    assert.equal(oneDollar.cashoutFeePct, 0.05);
-    assert.equal(oneDollar.dollarStart * oneDollar.cashoutPlayerPct, 0.95);
+});
+
+test('all eligible cashout modes use the global 5% platform fee', () => {
+    for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
+        assert.equal(getEconomy(entryFeeUsd).cashoutFeePct, 0.05);
+    }
+    for (const entryFeeUsd of COMPETITIVE_SLITHER_ENTRY_FEES) {
+        const economy = getCompetitiveEconomy(entryFeeUsd);
+        assert.equal(economy.cashoutFeePct, 0.05);
+        assert.equal(economy.cashoutPlayerPct, 0.95);
+    }
+    assert.equal(getSurvivEconomy(5).cashoutFeePct, 0.05);
 });
 
 for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
