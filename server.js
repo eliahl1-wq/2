@@ -113,11 +113,13 @@ import {
 import { calculateCashoutMoney, microsToUsd } from './affiliate-money.js';
 import {
     AffiliatePayout,
+    activateAffiliateProfile,
     createAffiliateCommissionForCashout,
     createReferralAttribution,
     ensureAffiliateProfile,
     ensureAffiliateTiers,
     getAdminAffiliateOverview,
+    getAffiliateStatus,
     getAffiliateCommissionHistory,
     getAffiliateDashboard,
     getAffiliatePayoutHistory,
@@ -127,6 +129,7 @@ import {
     reconcileAffiliateCommissions,
     rejectAffiliatePayout,
     requestAffiliatePayout,
+    releaseMatureAffiliateCommissions,
     resolveAffiliateRiskFlag,
     resolveReferralCode,
     reverseAffiliateCommission,
@@ -2221,6 +2224,9 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.personalFreePlay = await isPersonalFreePlayUser(user);
         userObj.freePlay = DEV_FREE_PLAY || userObj.personalFreePlay;
         userObj.isAdmin = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+        const affiliateStatus = await getAffiliateStatus(user);
+        userObj.affiliateActive = affiliateStatus.active;
+        userObj.affiliateRewardsAvailable = affiliateStatus.hasRewards;
 
         res.json(userObj);
     } catch (err) {
@@ -2266,8 +2272,13 @@ app.post('/api/affiliate/enable', sensitiveRateLimit({ limit: 10, windowMs: 60_0
     try {
         const user = await User.findById(req.user.id);
         if (!user) return res.status(404).json({ message: 'User not found' });
-        const profile = await ensureAffiliateProfile(user);
-        return res.json({ enabled: profile.enabled, referralCode: profile.referralCode });
+        const profile = await activateAffiliateProfile(user);
+        return res.json({
+            enabled: profile.enabled,
+            active: !!profile.activatedAt && profile.enabled && !profile.suspendedAt,
+            referralCode: profile.referralCode,
+            activatedAt: profile.activatedAt,
+        });
     } catch (error) {
         return res.status(error.status || 500).json({ message: error.message, code: error.code });
     }
@@ -5658,6 +5669,7 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
         ]);
+        await releaseMatureAffiliateCommissions();
         const reconciliation = await reconcileAffiliateCommissions(Transaction);
         console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
     })
@@ -5665,7 +5677,10 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
 
 setInterval(() => {
     if (mongoose.connection.readyState !== 1) return;
-    reconcileAffiliateCommissions(Transaction).catch(error => {
+    Promise.all([
+        releaseMatureAffiliateCommissions(),
+        reconcileAffiliateCommissions(Transaction),
+    ]).catch(error => {
         console.error('[Affiliate Reconciliation] Failed:', error.message);
     });
 }, 5 * 60_000).unref();
@@ -5755,6 +5770,7 @@ app.post('/api/login', async (req, res) => {
         // Skapa en JWT (Inloggningskvitto). Använd en hemlig nyckel från .env
         const secret = JWT_SECRET;
         const token = jwt.sign({ id: user._id, authVersion: user.authVersion || 0 }, secret, { expiresIn: '7d' });
+        const affiliateStatus = await getAffiliateStatus(user);
 
         console.log("✅ SUCCESS: Inloggning lyckades, skickar token för:", username);
         res.json({
@@ -5764,7 +5780,9 @@ app.post('/api/login', async (req, res) => {
                 username: user.username,
                 balanceSol: user.balance,
                 balanceUsd: user.balance * SOL_PRICE_USD,
-                solPrice: SOL_PRICE_USD
+                solPrice: SOL_PRICE_USD,
+                affiliateActive: affiliateStatus.active,
+                affiliateRewardsAvailable: affiliateStatus.hasRewards
             }
         });
     } catch (err) {

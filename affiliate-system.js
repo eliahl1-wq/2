@@ -30,7 +30,8 @@ const AffiliateProfileSchema = new Schema({
     referralCode: { type: String, required: true },
     referralCodeNormalized: { type: String, required: true, unique: true, index: true },
     tierKey: { type: String, default: 'standard', index: true },
-    enabled: { type: Boolean, default: true, index: true },
+    enabled: { type: Boolean, default: false, index: true },
+    activatedAt: { type: Date, default: null, index: true },
     suspendedAt: { type: Date, default: null },
     suspendedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     suspensionReason: { type: String, default: '' },
@@ -235,6 +236,8 @@ export async function ensureAffiliateProfile(user, { adminUsername = process.env
                 referralCode: normalized,
                 referralCodeNormalized: normalized,
                 tierKey: 'standard',
+                enabled: false,
+                activatedAt: null,
             });
         } catch (error) {
             if (error?.code !== 11000) throw error;
@@ -245,12 +248,48 @@ export async function ensureAffiliateProfile(user, { adminUsername = process.env
     throw serviceError('Could not allocate a unique referral code', 503, 'REFERRAL_CODE_UNAVAILABLE');
 }
 
+export async function getAffiliateStatus(user) {
+    if (!isAffiliateEligibleUser(user)) return { eligible: false, active: false };
+    const profile = await AffiliateProfile.findOne({ userId: user._id }).lean();
+    const active = !!profile?.activatedAt && !!profile.enabled && !profile.suspendedAt;
+    const hasRewards = active && await AffiliateCommission.exists({
+        affiliateProfileId: profile._id,
+        status: 'available',
+        payoutId: null,
+        riskFlagged: false,
+    });
+    return {
+        eligible: true,
+        active,
+        hasRewards: !!hasRewards,
+        referralCode: profile?.referralCode || null,
+    };
+}
+
+export async function activateAffiliateProfile(user) {
+    const profile = await ensureAffiliateProfile(user);
+    if (profile.suspendedAt) {
+        throw serviceError('This affiliate account is suspended', 403, 'AFFILIATE_SUSPENDED');
+    }
+    return AffiliateProfile.findByIdAndUpdate(
+        profile._id,
+        {
+            $set: {
+                enabled: true,
+                activatedAt: profile.activatedAt || new Date(),
+            },
+        },
+        { new: true },
+    );
+}
+
 export async function resolveReferralCode(code) {
     const normalized = normalizeReferralCode(code);
     if (!normalized) return null;
     return AffiliateProfile.findOne({
         referralCodeNormalized: normalized,
         enabled: true,
+        activatedAt: { $ne: null },
         suspendedAt: null,
     }).lean();
 }
@@ -520,6 +559,7 @@ export async function createAffiliateCommissionForCashout(cashout, {
     const profile = await AffiliateProfile.findOne({
         _id: attribution.affiliateProfileId,
         enabled: true,
+        activatedAt: { $ne: null },
         suspendedAt: null,
     }).lean();
     if (!profile) return { commission: null, created: false, reason: 'affiliate_inactive' };
@@ -730,6 +770,8 @@ export async function getAffiliateDashboard(user, { baseUrl = 'https://agararena
             tierName: tier?.name || profile.tierKey,
             commissionShareBps: tier?.shareBps ?? config.standardAffiliateShareBps,
             enabled: profile.enabled,
+            active: !!profile.activatedAt && profile.enabled && !profile.suspendedAt,
+            activatedAt: profile.activatedAt,
             suspended: !!profile.suspendedAt,
             payoutWallet: user.walletAddress || null,
         },
@@ -778,6 +820,7 @@ export async function getAffiliatePayoutHistory(user) {
 
 export async function requestAffiliatePayout(user) {
     const profile = await ensureAffiliateProfile(user);
+    if (!profile.activatedAt) throw serviceError('Activate your affiliate account first', 403, 'AFFILIATE_NOT_ACTIVE');
     if (!profile.enabled || profile.suspendedAt) throw serviceError('Affiliate payouts are suspended', 403, 'AFFILIATE_SUSPENDED');
     const destinationWallet = String(user.walletAddress || '').trim();
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(destinationWallet)) {
@@ -1028,7 +1071,7 @@ export async function scanAffiliateWalletRisk(user) {
 
 export async function getAdminAffiliateOverview() {
     await releaseMatureAffiliateCommissions();
-    const profiles = await AffiliateProfile.find()
+    const profiles = await AffiliateProfile.find({ activatedAt: { $ne: null } })
         .populate('userId', 'username email walletAddress')
         .sort({ createdAt: -1 })
         .lean();
