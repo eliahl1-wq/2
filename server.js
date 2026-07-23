@@ -8000,9 +8000,20 @@ io.on('connection', (socket) => {
 
     const emitGameSocial = (context, event, payload) => {
         const mode = context.player.mode;
-        for (const recipient of context.room.players || []) {
+        const spectators = context.room.isCompetitiveSlither
+            ? (context.room.competitiveSpectators || [])
+            : context.room.isSurviv || mode === 'slither'
+                ? (context.room.spectators || [])
+                : mode === 'agar'
+                    ? (context.room.agarSpectators || [])
+                    : [];
+        const recipients = [...(context.room.players || []), ...spectators];
+        const emitted = new Set();
+        for (const recipient of recipients) {
             if (!recipient?.id || recipient.isBot || recipient.disconnected) continue;
             if (!context.room.isBattleRoyale && mode && recipient.mode && recipient.mode !== mode) continue;
+            if (emitted.has(recipient.id)) continue;
+            emitted.add(recipient.id);
             io.to(recipient.id).emit(event, payload);
         }
     };
