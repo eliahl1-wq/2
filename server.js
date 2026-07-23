@@ -1844,6 +1844,38 @@ async function getTransactionWithFallback(signature) {
     }
 }
 
+const activeDepositHistoryScans = new Set();
+const depositHistoryQueue = [];
+let isProcessingDepositHistory = false;
+
+async function processDepositHistoryQueue() {
+    if (isProcessingDepositHistory || depositHistoryQueue.length === 0) return;
+    isProcessingDepositHistory = true;
+    const { userKey, pubKey } = depositHistoryQueue.shift();
+    try {
+        const freshUser = await User.findById(userKey);
+        if (freshUser?.depositAddress) {
+            await captureRecentDepositSources(freshUser, pubKey);
+        }
+    } catch (error) {
+        console.error(`Deposit history sync failed for ${userKey}:`, error.message);
+    } finally {
+        activeDepositHistoryScans.delete(userKey);
+        isProcessingDepositHistory = false;
+        if (depositHistoryQueue.length > 0) {
+            setImmediate(processDepositHistoryQueue);
+        }
+    }
+}
+
+function queueRecentDepositSourceCapture(user, pubKey) {
+    const userKey = String(user?._id || '');
+    if (!userKey || activeDepositHistoryScans.has(userKey)) return;
+    activeDepositHistoryScans.add(userKey);
+    depositHistoryQueue.push({ userKey, pubKey });
+    setImmediate(processDepositHistoryQueue);
+}
+
 async function captureRecentDepositSources(user, pubKey) {
     const signatures = await getSignaturesWithFallback(pubKey, { limit: 50 });
     const previousCursor = user.lastDepositSourceSignature;
@@ -1901,13 +1933,14 @@ async function scanDeposits() {
                 const lamports = await getBalanceWithFallback(pubKey);
                 const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-                // Scan by signature cursor even if the funds were already spent between scans.
-                await captureRecentDepositSources(user, pubKey);
-                if (Math.abs(user.balance - solOnChain) > 0.00001) {
+                // Credit the visible balance first. Signature/history analysis is slower
+                // and must never delay an already-confirmed on-chain deposit.
+                if (Math.abs(user.balance - solOnChain) > 0.000000001) {
                     user.balance = solOnChain;
                     await user.save();
                     console.log(`[scanDeposits] Updated ${user.username}: ${solOnChain.toFixed(6)} SOL`);
                 }
+                queueRecentDepositSourceCapture(user, pubKey);
             } catch (e) { console.error(`Sync error for ${user.username}:`, e.message); }
         }
     } catch (err) {
@@ -2173,14 +2206,16 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         if (user.depositAddress && !DEV_FREE_PLAY) {
             try {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                const lamports = await connection.getBalance(pubKey);
+                const lamports = await getBalanceWithFallback(pubKey);
                 solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-                await captureRecentDepositSources(user, pubKey);
-                if (Math.abs(user.balance - solOnChain) > 0.00001) {
+                // Make the confirmed balance visible immediately. Deposit-source audit
+                // logging runs independently so RPC history latency cannot block /api/me.
+                if (Math.abs(user.balance - solOnChain) > 0.000000001) {
                     user.balance = solOnChain;
                     await user.save();
                 }
+                queueRecentDepositSourceCapture(user, pubKey);
             } catch (e) {
                 // If Helius is rate-limiting, fall back to the public Solana RPC
                 if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests'))) {
@@ -3370,7 +3405,7 @@ app.post('/api/deposit-verify', sensitiveRateLimit({ limit: 20, windowMs: 60_000
             return res.json({ success: true, message: 'Already processed' });
         }
 
-        const txDetails = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        const txDetails = await getTransactionWithFallback(signature);
         if (!txDetails || txDetails.meta?.err) {
             return res.status(400).json({ message: 'Invalid on-chain transaction' });
         }
@@ -3398,7 +3433,7 @@ app.post('/api/deposit-verify', sensitiveRateLimit({ limit: 20, windowMs: 60_000
         const depositSource = extractNativeDeposit(txDetails, user.depositAddress);
         if (!depositSource) return res.status(400).json({ message: 'Could not identify the funding wallet' });
         const solReceived = creditedLamports / solanaWeb3.LAMPORTS_PER_SOL;
-        user.balance = (await connection.getBalance(depositPubkey)) / solanaWeb3.LAMPORTS_PER_SOL;
+        user.balance = (await getBalanceWithFallback(depositPubkey)) / solanaWeb3.LAMPORTS_PER_SOL;
         await user.save();
 
         if (existing) {
