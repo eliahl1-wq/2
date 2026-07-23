@@ -118,6 +118,7 @@ import {
     createReferralAttribution,
     ensureAffiliateProfile,
     ensureAffiliateTiers,
+    factoryResetAffiliateProgram,
     getAdminAffiliateOverview,
     getAffiliateStatus,
     getAffiliateCommissionHistory,
@@ -494,7 +495,7 @@ function buildGameCashoutTxFilter() {
             { 'meta.reason': { $regex: GAME_CASHOUT_REASON_RE } },
         ],
         'meta.destination': { $exists: false },
-        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
+        'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'] },
     };
 }
 
@@ -533,6 +534,7 @@ function isUserJoining(userId) {
     return [...joiningUsers].some(key => key === id || String(key).endsWith(`:${id}`));
 }
 let rewardPoolAdminResetting = false;
+let affiliatePoolAdminResetting = false;
 
 let GLOBAL_ARENA_START = Date.now();
 let globalArenaResetting = false;
@@ -2030,6 +2032,13 @@ function readGoogleReferralState(req) {
         return null;
     }
 }
+
+app.use('/api/affiliate', (req, res, next) => {
+    if (affiliatePoolAdminResetting) {
+        return res.status(503).json({ message: 'Affiliate pool maintenance is in progress.' });
+    }
+    return next();
+});
 
 app.get('/api/affiliate/config', (req, res) => {
     const config = getAffiliatePublicConfig();
@@ -3624,6 +3633,7 @@ const OWNER_EARNING_EVENTS = {
         { 'meta.event': 'br_owner_sweep' },
         { 'meta.event': 'reward_owner_surplus_sweep' },
         { 'meta.event': 'reward_pool_factory_reset' },
+        { 'meta.event': 'affiliate_pool_factory_reset' },
     ],
 };
 
@@ -3682,7 +3692,7 @@ function sortAdminUsers(users, sortKey) {
 function classifyTxActivity(tx) {
     const m = tx.meta || {};
     if (tx.type === 'deposit') return 'deposit';
-    if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'].includes(m.event)) return 'sweep';
+    if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'].includes(m.event)) return 'sweep';
     if (tx.type === 'game') {
         if (ADMIN_GAME_JOIN_EVENTS.includes(m.event)) return 'entry';
         if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated' || m.reason === 'Competitive Slither Death') return 'death';
@@ -3726,7 +3736,7 @@ function buildTxCategoryFilter(category) {
         case 'withdraw':
             return {
                 type: 'withdraw',
-                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
+                'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'] },
                 'meta.reason': { $not: { $regex: GAME_CASHOUT_REASON_RE } },
             };
         case 'entry':
@@ -3736,7 +3746,7 @@ function buildTxCategoryFilter(category) {
         case 'death':
             return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } };
         case 'sweep':
-            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }, { 'meta.event': 'reward_owner_surplus_sweep' }, { 'meta.event': 'reward_pool_factory_reset' }] };
+            return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }, { 'meta.event': 'reward_owner_surplus_sweep' }, { 'meta.event': 'reward_pool_factory_reset' }, { 'meta.event': 'affiliate_pool_factory_reset' }] };
         case 'game':
             return { type: 'game' };
         default:
@@ -3837,7 +3847,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
         const withdrawMatch = await reportedTxMatch({
             type: 'withdraw',
             status: 'confirmed',
-            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] },
+            'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'] },
         });
         const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, ownerAccountAgg, rewardPoolState] = await Promise.all([
             Transaction.aggregate([
@@ -4249,7 +4259,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 totalDepositedSol += tx.amount;
                 depositCount += 1;
             }
-            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'].includes(tx.meta?.event)) {
+            if (tx.type === 'withdraw' && tx.status === 'confirmed' && !['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'].includes(tx.meta?.event)) {
                 totalWithdrawnUsd += txAmountUsd(tx);
                 withdrawalCount += 1;
             }
@@ -4753,6 +4763,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
                 { 'meta.event': 'br_owner_sweep' },
                 { 'meta.event': 'reward_owner_surplus_sweep' },
                 { 'meta.event': 'reward_pool_factory_reset' },
+                { 'meta.event': 'affiliate_pool_factory_reset' },
                 { 'meta.reason': 'Room Reset Wallet Sweep' },
                 { 'meta.reason': 'BR Owner Cut Sweep' },
                 { 'meta.event': 'reset_start' },
@@ -4771,6 +4782,7 @@ app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
             if (tx.meta?.event === 'br_owner_sweep') kind = 'br_owner_sweep';
             else if (tx.meta?.event === 'reward_owner_surplus_sweep') kind = 'reward_owner_surplus_sweep';
             else if (tx.meta?.event === 'reward_pool_factory_reset') kind = 'reward_pool_factory_reset';
+            else if (tx.meta?.event === 'affiliate_pool_factory_reset') kind = 'affiliate_pool_factory_reset';
             else if (tx.meta?.event === 'reset_start') kind = 'reset_start';
             else if (tx.meta?.event === 'reset_complete') kind = 'reset_complete';
             else if (tx.meta?.reason === 'pool_sweep_failed' || tx.meta?.reason === 'br_owner_sweep_failed') kind = 'sweep_failed';
@@ -5417,6 +5429,133 @@ app.post('/api/admin/tournaments/trigger-sweep', authenticateAdmin, async (req, 
     } catch (err) {
         console.error('Tournament manual sweep failed:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/admin/affiliate-pool/factory-reset', sensitiveRateLimit({ limit: 3, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
+    if (req.body?.confirmation !== 'RESET AFFILIATE POOL') {
+        return res.status(400).json({ message: 'Exact confirmation phrase required.' });
+    }
+    if (affiliatePoolAdminResetting) {
+        return res.status(409).json({ message: 'Affiliate pool maintenance is already running.' });
+    }
+
+    affiliatePoolAdminResetting = true;
+    try {
+        if (joiningUsers.size > 0) {
+            return res.status(409).json({ message: 'Wait for current player joins to finish before resetting.' });
+        }
+        const activeHumans = [...rooms, ...competitiveSlitherRooms, ...survivRooms]
+            .reduce((total, room) => total + room.players.filter(player => !player.isBot).length, 0);
+        if (activeHumans > 0) {
+            return res.status(409).json({ message: 'Cannot reset while ' + activeHumans + ' human arena player(s) are still active.' });
+        }
+
+        const activePayouts = await AffiliatePayout.countDocuments({
+            status: { $in: ['requested', 'processing'] },
+        });
+        if (activePayouts > 0) {
+            return res.status(409).json({
+                message: 'Resolve ' + activePayouts + ' active affiliate payout(s) before resetting.',
+            });
+        }
+
+        const liabilityUsdMicros = await getOutstandingAffiliateLiabilityUsdMicros();
+        const liabilityUsd = microsToUsd(liabilityUsdMicros);
+        let signature = null;
+        let sweptLamports = 0;
+
+        if (liabilityUsdMicros > 0) {
+            if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
+                return res.status(400).json({ message: 'House wallet or owner vault is not configured.' });
+            }
+            const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+                Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+            );
+            if (houseKeypair.publicKey.toBase58() !== HOUSE_WALLET_ADDRESS) {
+                return res.status(500).json({ message: 'House wallet address does not match configured secret.' });
+            }
+
+            const rewardState = await hydrateRewardPoolState();
+            const pendingRewardUsd = Math.max(0, Number(rewardState.pendingHouseUsd) || 0);
+            const [walletLamports, blockhashInfo] = await Promise.all([
+                connection.getBalance(houseKeypair.publicKey),
+                connection.getLatestBlockhash('confirmed'),
+            ]);
+            const operatingBufferLamports = Math.ceil((1 / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+            const rewardReserveLamports = Math.ceil((pendingRewardUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+            sweptLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+
+            const feeProbe = new solanaWeb3.Transaction({
+                recentBlockhash: blockhashInfo.blockhash,
+                feePayer: houseKeypair.publicKey,
+            }).add(solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: Math.max(1, sweptLamports),
+            }));
+            const feeResult = await connection.getFeeForMessage(feeProbe.compileMessage(), 'confirmed');
+            const feeLamports = feeResult.value ?? 5_000;
+            const requiredLamports = sweptLamports + feeLamports + operatingBufferLamports + rewardReserveLamports;
+            if (walletLamports < requiredLamports) {
+                return res.status(409).json({
+                    message: 'House wallet cannot fully sweep the affiliate liability while preserving the $1 operating buffer and pending reward reserve.',
+                });
+            }
+            if (!await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, sweptLamports)) {
+                return res.status(409).json({
+                    message: 'The affiliate sweep is below Solana rent minimum for an empty owner vault.',
+                });
+            }
+
+            const transaction = new solanaWeb3.Transaction({
+                recentBlockhash: blockhashInfo.blockhash,
+                feePayer: houseKeypair.publicKey,
+            }).add(solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: sweptLamports,
+            }));
+            signature = await solanaWeb3.sendAndConfirmTransaction(
+                connection,
+                transaction,
+                [houseKeypair],
+                { commitment: 'confirmed', lastValidBlockHeight: blockhashInfo.lastValidBlockHeight, maxRetries: 3 },
+            );
+        }
+
+        const reset = await factoryResetAffiliateProgram(req.adminUser._id);
+        const sweptSol = sweptLamports / solanaWeb3.LAMPORTS_PER_SOL;
+        await Transaction.create({
+            userId: req.user.id,
+            type: 'withdraw',
+            amount: sweptSol,
+            currency: 'SOL',
+            meta: {
+                event: 'affiliate_pool_factory_reset',
+                reason: 'Admin Affiliate Pool Factory Reset',
+                signature: signature || 'no_transfer_required',
+                solAmount: sweptSol,
+                amountUsd: sweptSol * SOL_PRICE_USD,
+                discardedAffiliateRewardUsd: liabilityUsd,
+                resetCounts: reset,
+                from: HOUSE_WALLET_ADDRESS || null,
+                destination: OWNER_VAULT_ADDRESS || null,
+            },
+            status: 'confirmed',
+        }).catch(err => console.error('Affiliate pool reset audit log failed:', err.message));
+
+        return res.json({
+            success: true,
+            message: 'Affiliate program reset for ' + reset.profiles + ' profile(s). Swept $' + liabilityUsd.toFixed(2) + ' in unpaid affiliate rewards (' + sweptSol.toFixed(6) + ' SOL) to the owner vault. Financial audit history was preserved.',
+            signature,
+            reset,
+        });
+    } catch (err) {
+        await logSolanaTransactionError('Affiliate pool factory reset failed:', err);
+        return res.status(err.status || 500).json({ message: err.message, code: err.code });
+    } finally {
+        affiliatePoolAdminResetting = false;
     }
 });
 
@@ -6171,7 +6310,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
                     type: 'withdraw',
                     'meta.destination': { $exists: true },
                     'meta.reason': { $not: /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory|BR Refund/i },
-                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset'] }
+                    'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'] }
                 },
                 {
                     type: 'game',

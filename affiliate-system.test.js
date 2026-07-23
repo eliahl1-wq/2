@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import {
     AffiliateCommission,
     AffiliatePayout,
+    AffiliateProfile,
+    AffiliateRiskFlag,
     ReferralAttribution,
+    ReferralClick,
+    factoryResetAffiliateProgram,
     getCommissionEligibility,
     normalizeReferralCode,
     referralWindowExpiresAt,
@@ -139,4 +143,81 @@ test('database schemas enforce one attribution and commission per user/cashout p
     assert.ok(attributionIndexes.some(([keys, options]) => keys.referredUserId === 1 && options.unique));
     assert.ok(commissionIndexes.some(([keys, options]) => keys.cashoutTransactionId === 1 && options.unique));
     assert.ok(payoutIndexes.some(([keys, options]) => keys.activeLockKey === 1 && options.unique));
+});
+
+test('affiliate factory reset refuses to run while a payout is active', async () => {
+    const original = AffiliatePayout.countDocuments;
+    AffiliatePayout.countDocuments = async () => 1;
+    try {
+        await assert.rejects(
+            factoryResetAffiliateProgram('admin-id'),
+            error => error.code === 'ACTIVE_AFFILIATE_PAYOUTS' && error.status === 409,
+        );
+    } finally {
+        AffiliatePayout.countDocuments = original;
+    }
+});
+
+test('affiliate factory reset reverses unpaid commission and clears active program state', async () => {
+    const originals = {
+        payoutCount: AffiliatePayout.countDocuments,
+        profileCount: AffiliateProfile.countDocuments,
+        profileDelete: AffiliateProfile.deleteMany,
+        clickCount: ReferralClick.countDocuments,
+        clickDelete: ReferralClick.deleteMany,
+        attributionCount: ReferralAttribution.countDocuments,
+        attributionDelete: ReferralAttribution.deleteMany,
+        riskCount: AffiliateRiskFlag.countDocuments,
+        riskDelete: AffiliateRiskFlag.deleteMany,
+        commissionCount: AffiliateCommission.countDocuments,
+        commissionUpdate: AffiliateCommission.updateMany,
+    };
+    let commissionUpdate = null;
+    let deletes = 0;
+    AffiliatePayout.countDocuments = async () => 0;
+    AffiliateProfile.countDocuments = async () => 2;
+    ReferralClick.countDocuments = async () => 3;
+    ReferralAttribution.countDocuments = async () => 4;
+    AffiliateRiskFlag.countDocuments = async () => 5;
+    AffiliateCommission.countDocuments = async () => 6;
+    AffiliateCommission.updateMany = async (...args) => {
+        commissionUpdate = args;
+        return { modifiedCount: 6 };
+    };
+    for (const model of [AffiliateProfile, ReferralClick, ReferralAttribution, AffiliateRiskFlag]) {
+        model.deleteMany = async () => {
+            deletes += 1;
+            return { deletedCount: 1 };
+        };
+    }
+
+    try {
+        const result = await factoryResetAffiliateProgram('admin-id');
+        assert.deepEqual(
+            {
+                profiles: result.profiles,
+                clicks: result.clicks,
+                attributions: result.attributions,
+                risks: result.risks,
+                outstandingCommissions: result.outstandingCommissions,
+            },
+            { profiles: 2, clicks: 3, attributions: 4, risks: 5, outstandingCommissions: 6 },
+        );
+        assert.deepEqual(commissionUpdate[0], { status: { $in: ['pending', 'available'] } });
+        assert.equal(commissionUpdate[1][0].$set.previousStatus, '$status');
+        assert.equal(commissionUpdate[1][0].$set.status, 'reversed');
+        assert.equal(deletes, 4);
+    } finally {
+        AffiliatePayout.countDocuments = originals.payoutCount;
+        AffiliateProfile.countDocuments = originals.profileCount;
+        AffiliateProfile.deleteMany = originals.profileDelete;
+        ReferralClick.countDocuments = originals.clickCount;
+        ReferralClick.deleteMany = originals.clickDelete;
+        ReferralAttribution.countDocuments = originals.attributionCount;
+        ReferralAttribution.deleteMany = originals.attributionDelete;
+        AffiliateRiskFlag.countDocuments = originals.riskCount;
+        AffiliateRiskFlag.deleteMany = originals.riskDelete;
+        AffiliateCommission.countDocuments = originals.commissionCount;
+        AffiliateCommission.updateMany = originals.commissionUpdate;
+    }
 });

@@ -1042,6 +1042,49 @@ export async function getOutstandingAffiliateLiabilityUsdMicros() {
     return Number(rows[0]?.total || 0);
 }
 
+export async function factoryResetAffiliateProgram(adminUserId) {
+    const activePayouts = await AffiliatePayout.countDocuments({
+        status: { $in: ['requested', 'processing'] },
+    });
+    if (activePayouts > 0) {
+        throw serviceError(
+            `Resolve ${activePayouts} active affiliate payout(s) before resetting`,
+            409,
+            'ACTIVE_AFFILIATE_PAYOUTS',
+        );
+    }
+
+    const [profiles, clicks, attributions, risks, outstandingCommissions] = await Promise.all([
+        AffiliateProfile.countDocuments(),
+        ReferralClick.countDocuments(),
+        ReferralAttribution.countDocuments(),
+        AffiliateRiskFlag.countDocuments(),
+        AffiliateCommission.countDocuments({ status: { $in: ['pending', 'available'] } }),
+    ]);
+    const resetAt = new Date();
+    await AffiliateCommission.updateMany(
+        { status: { $in: ['pending', 'available'] } },
+        [{
+            $set: {
+                previousStatus: '$status',
+                status: 'reversed',
+                reversedAt: resetAt,
+                reversedBy: adminUserId,
+                reversalReason: 'Admin affiliate pool factory reset',
+                payoutId: null,
+            },
+        }],
+    );
+    await Promise.all([
+        ReferralClick.deleteMany({}),
+        ReferralAttribution.deleteMany({}),
+        AffiliateRiskFlag.deleteMany({}),
+        AffiliateProfile.deleteMany({}),
+    ]);
+
+    return { profiles, clicks, attributions, risks, outstandingCommissions, resetAt };
+}
+
 export async function scanAffiliateWalletRisk(user) {
     if (!user?._id || !user.walletAddress) return;
     const attribution = await ReferralAttribution.findOne({ referredUserId: user._id });
