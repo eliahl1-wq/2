@@ -637,6 +637,23 @@ function findCompetitiveSlitherRoomById(roomId) {
 // In-memory locks and maps for idempotency / processing
 const processingCashouts = new Set(); // mongoId strings
 
+function accountSocketRoom(userId) {
+    return userId ? `account:${String(userId)}` : null;
+}
+
+function emitPlayerAccountEvent(player, fallbackSocketId, fallbackUserId, eventName, payload) {
+    const socketId = player?.id || fallbackSocketId;
+    const userRoom = accountSocketRoom(player?.mongoId || fallbackUserId);
+    if (!socketId && !userRoom) return;
+    let target = socketId ? io.to(socketId) : io;
+    if (userRoom) target = target.to(userRoom);
+    target.emit(eventName, payload);
+}
+
+function emitCashoutSuccess(player, fallbackSocketId, fallbackUserId, payload) {
+    emitPlayerAccountEvent(player, fallbackSocketId, fallbackUserId, 'cashOutSuccess', payload);
+}
+
 /** USD balance used for HUD, leaderboard, and cashout (mass is stored on cells / snake.balance). */
 function arenaCashoutUsd(player) {
     if (player?.mode === 'slither' || player?.mode === 'agar' || !player?.mode) {
@@ -691,7 +708,7 @@ async function executeTournamentCashout(player, room) {
         }),
     ]);
 
-    io.to(playerId).emit('cashOutSuccess', {
+    emitCashoutSuccess(player, playerId, mongoId, {
         amount: scoreUsd,
         signature: 'tournament_score_saved',
         tournament: true,
@@ -811,7 +828,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'simulated' });
         return { playerPayout, platformFee, signature: 'simulated' };
     }
 
@@ -859,7 +876,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'sponsored_rent_fallback' });
         return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
@@ -904,7 +921,7 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     });
 
     console.log(`💰 COMPETITIVE CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
-    io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature });
+    emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
     return { playerPayout, platformFee, signature };
 }
 
@@ -946,7 +963,7 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'simulated' });
         return { playerPayout, platformFee, signature: 'simulated' };
     }
 
@@ -993,7 +1010,7 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'sponsored_rent_fallback' });
         return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
@@ -1037,7 +1054,7 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     });
 
     console.log(`💰 SURVIV CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
-    io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature });
+    emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
     return { playerPayout, platformFee, signature };
 }
 
@@ -1096,7 +1113,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             status: 'confirmed',
         });
         const signature = user.rewardsDisabled ? 'sponsored_blocked' : 'sponsored_locked';
-        io.to(playerId).emit('cashOutSuccess', { amount: creditedPayout, signature });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: creditedPayout, signature });
         commitArenaCashoutReservation(room, player);
         return { playerPayout: creditedPayout, platformFee, signature };
     }
@@ -1115,7 +1132,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'simulated' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'simulated' });
         commitArenaCashoutReservation(room, player);
         return { playerPayout, platformFee, signature: 'simulated' };
     }
@@ -1161,7 +1178,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'sponsored_rent_fallback' });
         commitArenaCashoutReservation(room, player);
         return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
@@ -1209,7 +1226,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     });
 
     console.log(`💰 ARENA CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
-    io.to(playerId).emit('cashOutSuccess', { amount: playerPayout, signature });
+    emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
     return { playerPayout, platformFee, signature };
 }
 
@@ -6154,6 +6171,16 @@ async function refundTournamentJoin(pending, reason) {
 }
 
 io.on('connection', (socket) => {
+    const socketToken = socket.handshake.auth?.token;
+    if (typeof socketToken === 'string' && socketToken.length > 0) {
+        verifyAccountToken(socketToken)
+            .then((decoded) => {
+                if (!socket.connected || !decoded?.id) return;
+                socket.accountUserId = String(decoded.id);
+                socket.join(accountSocketRoom(decoded.id));
+            })
+            .catch(() => {});
+    }
     const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
     touchSitePresence(socket.request, presenceId);
     const survivInputRate = { windowStartedAt: 0, count: 0 };
@@ -7661,7 +7688,7 @@ io.on('connection', (socket) => {
                     await executeTournamentCashout(activePlayer, activeRoom);
                 } catch (err) {
                     console.error('Tournament cashout error:', err);
-                    io.to(activePlayer.id).emit('error', err.message || 'Tournament cashout failed');
+                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', err.message || 'Tournament cashout failed');
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
                 } finally {
@@ -7674,7 +7701,7 @@ io.on('connection', (socket) => {
                     await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
                     await logSolanaTransactionError('❌ Surviv cashout error:', err);
-                    io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
+                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
                 } finally {
@@ -7688,7 +7715,7 @@ io.on('connection', (socket) => {
                     await executeCompetitiveCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
                     await logSolanaTransactionError('❌ Competitive cashout error:', err);
-                    io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
+                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
                 } finally {
@@ -7702,7 +7729,7 @@ io.on('connection', (socket) => {
             } catch (err) {
                 releaseArenaCashoutReservation(activeRoom, activePlayer);
                 await logSolanaTransactionError('❌ Cashout error:', err);
-                io.to(activePlayer.id).emit('error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
+                emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                 if (activePlayer) {
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
