@@ -210,6 +210,7 @@ function clearQueueGrace(key) {
 function scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps, personalFreePlay = false) {
     if (queueGrace.has(key)) return;
     const readyAt = Date.now();
+    const gracePeriodMs = personalFreePlay ? 3_000 : BR.gracePeriodMs;
     const timer = setTimeout(() => {
         queueGrace.delete(key);
         try {
@@ -218,16 +219,15 @@ function scheduleGraceLaunch(key, variant, entryFeeUsd, io, deps, personalFreePl
             console.error('BR launch failed after grace:', err);
             emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
         }
-    }, BR.gracePeriodMs);
-    queueGrace.set(key, { readyAt, timer });
+    }, gracePeriodMs);
+    queueGrace.set(key, { readyAt, gracePeriodMs, timer });
 }
-
 function emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay = false) {
     const q = getQueue(variant, entryFeeUsd, personalFreePlay);
     const fee = normalizeBREntryFee(entryFeeUsd);
     const key = queueKey(variant, entryFeeUsd, personalFreePlay);
     const grace = queueGrace.get(key);
-    const graceEndsAt = grace ? grace.readyAt + BR.gracePeriodMs : null;
+    const graceEndsAt = grace ? grace.readyAt + (grace.gracePeriodMs || BR.gracePeriodMs) : null;
     const graceRemainingMs = graceEndsAt ? Math.max(0, graceEndsAt - Date.now()) : null;
     const payload = {
         variant,
@@ -276,7 +276,7 @@ function tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay = false)
     }
 
     // Solo dev testing — skip grace wait once min players (incl. AI) are queued
-    if ((deps?.DEV_FREE_PLAY || personalFreePlay) && q.length >= BR.minPlayers) {
+    if (deps?.DEV_FREE_PLAY && q.length >= BR.minPlayers) {
         launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
         return;
     }
@@ -1261,7 +1261,7 @@ export function setupBattleRoyale(io, deps) {
                 const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
-                const personalFreePlay = !!deps.isPersonalFreePlayUser?.(user);
+                const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user));
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
                 if (mongoToMatch.has(user._id.toString())) {

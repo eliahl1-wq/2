@@ -339,6 +339,34 @@ test('Close side pass inside the visible edges survives', () => {
     assert.ok(!dead.has('A'), 'A should be able to skim close to B without dying');
     assert.ok(!dead.has('B'), 'B should survive the close parallel pass');
 });
+test('A slow sideways drift cannot cross through a parallel snake body between ticks', () => {
+    const attacker = {
+        id: 'side-drifter',
+        balance: 1,
+        angle: 0,
+        _prevHeadX: 0,
+        _prevHeadY: -12,
+        segments: [{ x: 0, y: 12 }, { x: -15, y: 12 }],
+    };
+    const blocker = {
+        id: 'parallel-blocker',
+        balance: 1,
+        angle: 0,
+        segments: Array.from({ length: 8 }, (_, index) => ({
+            x: 60 - index * 10,
+            y: 0,
+        })),
+    };
+
+    const dead = resolveAllSnakeCollisions([
+        { entity: attacker, isHuman: true },
+        { entity: blocker, isHuman: true },
+    ]);
+
+    assert.equal(dead.get(attacker.id)?.id, blocker.id);
+    assert.ok(!dead.has(blocker.id));
+});
+
 test('Head and neck crossing resolves as a single cut-off death', () => {
     const snakeA = { id: 'A', balance: 1.0, angle: 0, segments: [{ x: 8, y: 0 }, { x: 4, y: 0 }, { x: 0, y: 0 }, { x: -4, y: 0 }, { x: -8, y: 0 }] };
     const snakeB = { id: 'B', balance: 1.0, angle: Math.PI / 2, segments: [{ x: 0, y: 0 }, { x: 0, y: 4 }, { x: 0, y: 8 }, { x: 0, y: 12 }, { x: 0, y: 16 }] };

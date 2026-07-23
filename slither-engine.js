@@ -754,6 +754,8 @@ function hueFromColor(color) {
 function updateSnakeMovement(snake, room = null) {
     const head = snake.segments[0];
     rememberSnakeMouthBeforeMove(snake);
+    snake._prevHeadX = head.x;
+    snake._prevHeadY = head.y;
     const { dx, dy } = normalizeSnakeInput(snake);
 
     // slither.io-style turn-rate limit: heading rotates toward the cursor
@@ -1526,6 +1528,53 @@ function distPointToSegment(px, py, ax, ay, bx, by) {
     t = Math.max(0, Math.min(1, t));
     return dist(px, py, ax + t * dx, ay + t * dy);
 }
+function closestPointsBetweenSegments(headA, headB, bodyA, bodyB) {
+    const headDx = headB.x - headA.x;
+    const headDy = headB.y - headA.y;
+    const bodyDx = bodyB.x - bodyA.x;
+    const bodyDy = bodyB.y - bodyA.y;
+    const offsetX = headA.x - bodyA.x;
+    const offsetY = headA.y - bodyA.y;
+    const headLengthSq = headDx * headDx + headDy * headDy;
+    const bodyLengthSq = bodyDx * bodyDx + bodyDy * bodyDy;
+    const bodyOffsetDot = bodyDx * offsetX + bodyDy * offsetY;
+    let headT = 0;
+    let bodyT = 0;
+
+    if (headLengthSq <= 1e-9) {
+        bodyT = bodyLengthSq > 1e-9
+            ? Math.max(0, Math.min(1, bodyOffsetDot / bodyLengthSq))
+            : 0;
+    } else {
+        const headOffsetDot = headDx * offsetX + headDy * offsetY;
+        if (bodyLengthSq <= 1e-9) {
+            headT = Math.max(0, Math.min(1, -headOffsetDot / headLengthSq));
+        } else {
+            const directionsDot = headDx * bodyDx + headDy * bodyDy;
+            const denominator = headLengthSq * bodyLengthSq - directionsDot * directionsDot;
+            if (Math.abs(denominator) > 1e-9) {
+                headT = Math.max(0, Math.min(1,
+                    (directionsDot * bodyOffsetDot - headOffsetDot * bodyLengthSq) / denominator));
+            }
+            bodyT = (directionsDot * headT + bodyOffsetDot) / bodyLengthSq;
+            if (bodyT < 0) {
+                bodyT = 0;
+                headT = Math.max(0, Math.min(1, -headOffsetDot / headLengthSq));
+            } else if (bodyT > 1) {
+                bodyT = 1;
+                headT = Math.max(0, Math.min(1,
+                    (directionsDot - headOffsetDot) / headLengthSq));
+            }
+        }
+    }
+
+    return {
+        headX: headA.x + headDx * headT,
+        headY: headA.y + headDy * headT,
+        bodyX: bodyA.x + bodyDx * bodyT,
+        bodyY: bodyA.y + bodyDy * bodyT,
+    };
+}
 
 
 function snakeMouthPoint(snake) {
@@ -1587,6 +1636,10 @@ export function bodyCollisionThresholdForApproach(headRadius, bodyRadius, forwar
 
 function headHitsSnakeBody(snake, headRadius, other, otherRadius) {
     const head = snake.segments[0];
+    const previousHead = {
+        x: snake._prevHeadX ?? head.x,
+        y: snake._prevHeadY ?? head.y,
+    };
     const segments = other.segments || [];
     const first = firstLethalBodySegment(other, otherRadius);
     const headingX = Math.cos(snake.angle ?? 0);
@@ -1598,14 +1651,9 @@ function headHitsSnakeBody(snake, headRadius, other, otherRadius) {
     for (let i = first; i < segments.length; i += stride) {
         const a = segments[i];
         const b = segments[Math.min(segments.length - 1, i + stride)];
-        const chordX = b.x - a.x;
-        const chordY = b.y - a.y;
-        const chordLengthSq = chordX * chordX + chordY * chordY;
-        const t = chordLengthSq > 1e-6
-            ? Math.max(0, Math.min(1, ((head.x - a.x) * chordX + (head.y - a.y) * chordY) / chordLengthSq))
-            : 0;
-        const dx = a.x + t * chordX - head.x;
-        const dy = a.y + t * chordY - head.y;
+        const closest = closestPointsBetweenSegments(previousHead, head, a, b);
+        const dx = closest.bodyX - closest.headX;
+        const dy = closest.bodyY - closest.headY;
         const distance = Math.hypot(dx, dy);
         const forwardAlignment = distance > 1e-6
             ? (headingX * dx + headingY * dy) / distance
@@ -1671,12 +1719,14 @@ export function resolveAllSnakeCollisions(allSnakes) {
 
             // Bounding box check to cull segment collision checks
             const maxOtherR = headRadiusForSnake(other);
+            const previousHeadX = snake._prevHeadX ?? head.x;
+            const previousHeadY = snake._prevHeadY ?? head.y;
             const pad = r + maxOtherR + 10;
             if (other.minX !== undefined && (
-                head.x < other.minX - pad ||
-                head.x > other.maxX + pad ||
-                head.y < other.minY - pad ||
-                head.y > other.maxY + pad
+                Math.max(previousHeadX, head.x) < other.minX - pad ||
+                Math.min(previousHeadX, head.x) > other.maxX + pad ||
+                Math.max(previousHeadY, head.y) < other.minY - pad ||
+                Math.min(previousHeadY, head.y) > other.maxY + pad
             )) {
                 continue;
             }
@@ -2691,6 +2741,8 @@ function competitiveMinMass(entryFeeUsd) {
 function updateCompetitiveSnakeMovement(snake) {
     const head = snake.segments[0];
     rememberSnakeMouthBeforeMove(snake);
+    snake._prevHeadX = head.x;
+    snake._prevHeadY = head.y;
     const { dx, dy } = normalizeSnakeInput(snake);
     const massRef = competitiveMinMass(snake.entryFeeUsd);
 
