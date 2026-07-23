@@ -5024,6 +5024,14 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             aliveCount,
             dollarBalance,
             spectating,
+            ...(spectating ? {
+                spectateTargets: allPlayers.map(p => ({
+                    id: p.id,
+                    name: p.username || p.name || 'Player',
+                    x: p.x,
+                    y: p.y,
+                })),
+            } : {}),
             ...meta,
         });
     };

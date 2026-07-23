@@ -1388,6 +1388,44 @@ test('surviv alive count and leaderboard use the same active entities', () => {
     assert.equal(ticks[0].aliveCount, lbData.aliveCount);
 });
 
+test('surviv spectators receive lightweight targets for players outside the rendered view', () => {
+    const room = makeRoom();
+    room.loot = [];
+    const nearby = createSurvivPlayer('nearby-player', 'mongo-nearby', 'Nearby', '#fff', room);
+    const distant = createSurvivPlayer('distant-player', 'mongo-distant', 'Distant', '#fff', room);
+    nearby.x = -5000;
+    nearby.y = 0;
+    distant.x = 5000;
+    distant.y = 0;
+    room.players.push(nearby, distant);
+    room.spectators.push({ id: 'spectator', x: -5000, y: 0, dollarBalance: 0 });
+
+    const ticks = new Map();
+    const io = {
+        to(socketId) {
+            return {
+                emit(event, payload) {
+                    if (event === 'survivTick') ticks.set(socketId, payload);
+                },
+            };
+        },
+    };
+    const lbData = {
+        leaderboard: [],
+        aliveCount: 2,
+        zone: { x: 0, y: 0, radius: SURVIV.worldHalf },
+    };
+
+    broadcastSurvivState(room, io, lbData, {});
+
+    const spectatorTick = ticks.get('spectator');
+    assert.ok(spectatorTick.players.some(player => player.id === nearby.id));
+    assert.equal(spectatorTick.players.some(player => player.id === distant.id), false);
+    assert.deepEqual(
+        new Set(spectatorTick.spectateTargets.map(player => player.id)),
+        new Set([nearby.id, distant.id]),
+    );
+});
 
 test('safe zone covers the map before shrinking and closes before reset', () => {
     const resetAt = 1_000_000;

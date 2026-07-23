@@ -490,6 +490,7 @@ function createArenaRoom(entryFeeUsd) {
         food: [],
         slitherFood: [],
         spectators: [],
+        agarSpectators: [],
         viruses: [],
         ejected: [],
         foodPoolBalance: 0,
@@ -670,7 +671,26 @@ function emitCashoutSuccess(player, fallbackSocketId, fallbackUserId, payload) {
     emitPlayerAccountEvent(player, fallbackSocketId, fallbackUserId, 'cashOutSuccess', payload);
 }
 
-function keepNormalSlitherCashoutSpectator(room, player) {
+function keepAgarSpectator(room, player) {
+    if (!room.agarSpectators) room.agarSpectators = [];
+    room.agarSpectators = room.agarSpectators.filter(s => s.id !== player.id);
+    room.agarSpectators.push({
+        id: player.id,
+        username: player.username,
+        x: player.x ?? player.cells?.[0]?.x ?? c.worldWidth / 2,
+        y: player.y ?? player.cells?.[0]?.y ?? c.worldHeight / 2,
+        screenWidth: player.screenWidth || 1920,
+        screenHeight: player.screenHeight || 1080,
+        cells: [],
+        isAgarSpectator: true,
+    });
+}
+
+function keepArenaCashoutSpectator(room, player) {
+    if (player?.mode === 'agar') {
+        keepAgarSpectator(room, player);
+        return;
+    }
     if (player?.mode !== 'slither') return;
     const head = player.segments?.[0];
     if (!room.spectators) room.spectators = [];
@@ -1116,7 +1136,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 
     if (player.isFreeTicketPlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        keepNormalSlitherCashoutSpectator(room, player);
+        keepArenaCashoutSpectator(room, player);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const creditedPayout = user.rewardsDisabled ? 0 : playerPayout;
         if (creditedPayout > 0) user.sponsoredRewardsBalance += creditedPayout;
@@ -1149,7 +1169,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 
     if (DEV_FREE_PLAY || player.personalFreePlay) {
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        keepNormalSlitherCashoutSpectator(room, player);
+        keepArenaCashoutSpectator(room, player);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const payoutSol = playerPayout / SOL_PRICE_USD;
         if (DEV_FREE_PLAY) user.balance = (user.balance || 0) + payoutSol;
@@ -1195,7 +1215,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
         console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        keepNormalSlitherCashoutSpectator(room, player);
+        keepArenaCashoutSpectator(room, player);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         user.rentFallbackBalanceUsd += playerPayout;
         await user.save();
@@ -1238,7 +1258,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     commitArenaCashoutReservation(room, player);
 
     room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-    keepNormalSlitherCashoutSpectator(room, player);
+    keepArenaCashoutSpectator(room, player);
     user.playtime += (Date.now() - player.startTime);
     await user.save();
 
@@ -1389,6 +1409,8 @@ function resetRoomEntities(room) {
     room.slitherBots = [];
     room.food = [];
     room.slitherFood = [];
+    room.spectators = [];
+    room.agarSpectators = [];
     room.viruses = [];
     room.ejected = [];
     room.qt.clear();
@@ -2154,6 +2176,7 @@ async function settleTournament(tournamentId) {
         room.slitherBots = [];
         room.slitherFood = [];
         room.spectators = [];
+        room.agarSpectators = [];
         room.isResetting = true;
         tournamentRooms.delete(tournament._id.toString());
     }
@@ -7141,6 +7164,9 @@ io.on('connection', (socket) => {
             if (room.spectators) {
                 room.spectators = room.spectators.filter(s => s.id !== socket.id);
             }
+            if (room.agarSpectators) {
+                room.agarSpectators = room.agarSpectators.filter(s => s.id !== socket.id);
+            }
 
             const startMass = economy.massStartBalance;
             const startDollars = switchedDollarBalance ?? economy.playerStartBalance;
@@ -7781,6 +7807,9 @@ io.on('connection', (socket) => {
         if (room.spectators) {
             room.spectators = room.spectators.filter(spectator => spectator.id !== socket.id);
         }
+        if (room.agarSpectators) {
+            room.agarSpectators = room.agarSpectators.filter(spectator => spectator.id !== socket.id);
+        }
         if (room.isCompetitiveSlither) {
             removeCompetitiveSpectator(room, socket.id);
         }
@@ -7815,6 +7844,17 @@ io.on('connection', (socket) => {
             room.players = room.players.filter(candidate => candidate !== player);
             console.log(`🗑️ Removed disconnected player ${player.username} after timeout`);
         }, 5 * 60 * 1000);
+    });
+
+    socket.on('agarSpectateCam', ({ x, y, screenWidth, screenHeight }) => {
+        const room = getArenaRoomById(socket.roomId);
+        if (!room || room.isSurviv || room.isCompetitiveSlither) return;
+        const spectator = room.agarSpectators?.find(candidate => candidate.id === socket.id);
+        if (!spectator) return;
+        if (Number.isFinite(Number(x))) spectator.x = Math.max(0, Math.min(c.worldWidth, Number(x)));
+        if (Number.isFinite(Number(y))) spectator.y = Math.max(0, Math.min(c.worldHeight, Number(y)));
+        if (Number.isFinite(Number(screenWidth)) && Number(screenWidth) > 0) spectator.screenWidth = Number(screenWidth);
+        if (Number.isFinite(Number(screenHeight)) && Number(screenHeight) > 0) spectator.screenHeight = Number(screenHeight);
     });
 
     socket.on('slitherSpectateCam', ({ x, y }) => {
@@ -8252,7 +8292,7 @@ function processRoom(room) {
         const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
         const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
         if (agarInArena <= 0) {
-            room.food.length = 0;
+            if ((room.agarSpectators?.length || 0) === 0) room.food.length = 0;
         } else {
             const now = Date.now();
             if (!room._lastAgarFoodSync) room._lastAgarFoodSync = 0;
@@ -8598,6 +8638,7 @@ function processRoom(room) {
                                 victim.cells = victim.cells.filter(c => c.id !== otherCell.id);
                                 if (victim.cells.length === 0) {
                                     if (!victim.isBot) {
+                                        keepAgarSpectator(room, victim);
                                         io.to(victim.id).emit('RIP');
                                         const victimMongoId = victim.mongoId;
                                         const sessionPlaytime = Date.now() - victim.startTime;
@@ -8706,9 +8747,11 @@ function processRoom(room) {
         if (room.sandboxNetworkTick % 2 !== 0) return;
     }
 
-    room.players.forEach(p => {
-        if (p.mode === 'slither' || p.disconnected) return;
-
+    const agarReceivers = [
+        ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected),
+        ...(room.agarSpectators || []),
+    ];
+    agarReceivers.forEach(p => {
         io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
 
         // Spatial filtering — food range is wider than entity range to reduce edge pop-in.
@@ -8725,7 +8768,7 @@ function processRoom(room) {
         const visibleViruses = [];
         const visibleEjected = [];
         const visibleUsersSet = new Set();
-        if (!p.cashoutSettling) visibleUsersSet.add(p);
+        if (!p.cashoutSettling && !p.isAgarSpectator) visibleUsersSet.add(p);
         visibleItems.forEach(item => {
             if (item.type === 'virus') visibleViruses.push(item.data);
             else if (item.type === 'ejected') visibleEjected.push(item.data);
@@ -8785,6 +8828,15 @@ function processRoom(room) {
             resetTime: room.startTime + c.roomDuration,
             solPrice: SOL_PRICE_USD,
             minimap,
+            ...(p.isAgarSpectator ? {
+                spectating: true,
+                spectateTargets: allUsers.map(user => ({
+                    id: user.id,
+                    name: user.username || user.name || 'Player',
+                    x: user.x,
+                    y: user.y,
+                })),
+            } : {}),
             ...(isSandbox ? {
                 sandbox: true, zone: room.sandboxZone ? {
                     cx: room.sandboxZone.cx,
