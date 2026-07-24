@@ -140,6 +140,11 @@ import {
     updateAffiliateProfileAdmin,
 } from './affiliate-system.js';
 import { getAffiliatePublicConfig } from './affiliate-config.js';
+import { createAgarCommerceService } from './agar-commerce-service.js';
+import {
+    decryptWalletSecret,
+    encryptWalletSecret,
+} from './wallet-crypto.js';
 
 // --- SOLANA KONFIGURATION ---
 const HOUSE_WALLET_ADDRESS = process.env.HOUSE_WALLET_ADDRESS;
@@ -152,10 +157,6 @@ const TOURNAMENT_WALLET_SECRET = process.env.TOURNAMENT_WALLET_SECRET;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
-const AGAR_TOKEN_ENABLED = process.env.AGAR_TOKEN_ENABLED === 'true';
-const AGAR_TOKEN_MINT = process.env.AGAR_TOKEN_MINT?.trim() || '';
-const AGAR_TOKEN_DECIMALS = Number.parseInt(process.env.AGAR_TOKEN_DECIMALS || '9', 10);
-const AGAR_ACCOUNT_SWAP_ENABLED = process.env.AGAR_ACCOUNT_SWAP_ENABLED === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString('hex');
 if (!process.env.JWT_SECRET) {
     console.warn('JWT_SECRET is not configured; using a process-local development secret. Sessions will reset on restart.');
@@ -2105,7 +2106,7 @@ passport.use(new GoogleStrategy({
                     email: profileEmail,
                     password: await bcrypt.hash(Math.random().toString(36), 10), // Random lösenord för Google-användare
                     depositAddress: keypair.publicKey.toBase58(),
-                    depositSecret: Buffer.from(keypair.secretKey).toString('hex') // Spara secret (bör krypteras i produktion)
+                    depositSecret: encryptWalletSecret(keypair.secretKey) // Spara secret (bör krypteras i produktion)
                 });
                 await user.save();
                 await ensureAffiliateProfile(user);
@@ -2203,7 +2204,7 @@ async function ensureUserDepositWallet(user) {
     if (user.depositAddress && user.depositSecret) return user;
     const keypair = solanaWeb3.Keypair.generate();
     user.depositAddress = keypair.publicKey.toBase58();
-    user.depositSecret = Buffer.from(keypair.secretKey).toString('hex');
+    user.depositSecret = encryptWalletSecret(keypair.secretKey);
     await user.save();
     console.log(`🔑 Created deposit wallet for ${user.username}`);
     return user;
@@ -2973,7 +2974,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         }
 
         const userKeypair = solanaWeb3.Keypair.fromSecretKey(
-            Uint8Array.from(Buffer.from(reserved.depositSecret, 'hex'))
+            decryptWalletSecret(reserved.depositSecret)
         );
         record = await Transaction.create({
             userId: reserved._id,
@@ -3482,50 +3483,14 @@ app.post('/api/deposit-verify', sensitiveRateLimit({ limit: 20, windowMs: 60_000
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Account-linked AGAR swap boundary. The authenticated user's deposit wallet
-// is the only wallet that may be used; clients cannot supply a different signer.
-app.post('/api/agar/swap', sensitiveRateLimit({ limit: 20, windowMs: 60_000 }), authenticateToken, async (req, res) => {
-    if (!AGAR_TOKEN_ENABLED || !AGAR_TOKEN_MINT) {
-        return res.status(503).json({ message: 'AGAR has not launched yet.' });
-    }
-    if (!AGAR_ACCOUNT_SWAP_ENABLED) {
-        return res.status(503).json({ message: 'AGAR account swaps are not enabled yet.' });
-    }
-
-    const side = String(req.body?.side || '').toUpperCase();
-    const amount = Number(req.body?.amount);
-    if (!['BUY', 'SELL'].includes(side)) {
-        return res.status(400).json({ message: 'Swap side must be BUY or SELL.' });
-    }
-    if (!Number.isFinite(amount) || amount <= 0) {
-        return res.status(400).json({ message: 'A positive swap amount is required.' });
-    }
-
-    try {
-        new solanaWeb3.PublicKey(AGAR_TOKEN_MINT);
-    } catch {
-        return res.status(503).json({ message: 'AGAR mint configuration is invalid.' });
-    }
-
-    const user = await User.findById(req.user.id).select('depositAddress depositSecret balance');
-    if (!user?.depositAddress || !user?.depositSecret) {
-        return res.status(409).json({ message: 'Your AgarStake account wallet is not available.' });
-    }
-    if (req.body?.accountAddress && req.body.accountAddress !== user.depositAddress) {
-        return res.status(403).json({ message: 'Swap wallet must match the wallet linked to your account.' });
-    }
-
-    // TODO: Integrate Jupiter Swap V2 here. Build and simulate the transaction,
-    // sign only with this user's encrypted custodial deposit key, confirm it,
-    // then refresh both SOL and AGAR balances. Never return depositSecret.
-    return res.status(501).json({
-        message: 'Account-linked Jupiter execution is prepared but not connected yet.',
-        accountAddress: user.depositAddress,
-        side,
-        amount,
-        decimals: Number.isInteger(AGAR_TOKEN_DECIMALS) ? AGAR_TOKEN_DECIMALS : 9,
-    });
+// AGAR token, shop, entitlement, and account-linked Jupiter routes.
+const agarCommerce = createAgarCommerceService({
+    connection,
+    User,
+    authenticateToken,
+    sensitiveRateLimit,
 });
+agarCommerce.registerRoutes(app);
 
 // Entry fee info (client can request how much SOL to send and where)
 app.get('/api/entry-info', authenticateToken, async (req, res) => {
@@ -5936,7 +5901,7 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
             password: await bcrypt.hash(password, 10),
             balance: 0,
             depositAddress: keypair.publicKey.toBase58(),
-            depositSecret: Buffer.from(keypair.secretKey).toString('hex'),
+            depositSecret: encryptWalletSecret(keypair.secretKey),
         });
         await newUser.save();
         await ensureAffiliateProfile(newUser);
@@ -6896,7 +6861,7 @@ io.on('connection', (socket) => {
     const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammo', 'grenades', 'armor']);
     const survivAmmoTypes = new Set(['9mm', '12g', '556', '762']);
 
-    socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor }) => {
+    socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor, skinId }) => {
         let userKey = null;
         let paidJoin = null;
         let entryRecorded = false;
@@ -6905,6 +6870,10 @@ io.on('connection', (socket) => {
             let user = await User.findById(decoded.id);
             if (!user) throw new Error('User not found');
             user = await ensureUserDepositWallet(user);
+            const wantsRainbow = skinId === 'rainbow' || skinColor === 'random';
+            if (wantsRainbow && !await agarCommerce.hasSkinEntitlement(user._id, 'slither', 'rainbow')) {
+                throw new Error('Rainbow for Slither must be purchased in the AGAR shop first.');
+            }
             userKey = `tournament:${tournamentId}:${user._id}`;
             if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
             joiningUsers.add(userKey);
@@ -6972,7 +6941,7 @@ io.on('connection', (socket) => {
                     throw new Error('Insufficient SOL for the $1 tournament entry plus the Solana account reserve');
                 }
                 const userKeypair = solanaWeb3.Keypair.fromSecretKey(
-                    Uint8Array.from(Buffer.from(user.depositSecret, 'hex')),
+                    decryptWalletSecret(user.depositSecret),
                 );
                 const tournamentPubKey = new solanaWeb3.PublicKey(TOURNAMENT_WALLET_ADDRESS);
                 const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
@@ -7113,7 +7082,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, useFreeTicket }) => {
+    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket }) => {
         if (rewardPoolAdminResetting) {
             socket.emit('error', 'Reward pool maintenance is in progress. Try again shortly.');
             return;
@@ -7135,6 +7104,16 @@ io.on('connection', (socket) => {
             let user = await User.findById(decoded.id);
             if (!user) {
                 socket.emit('error', 'Account not found — please log in again.');
+                return;
+            }
+            const entitlementMode = mode === 'competitive-slither' || mode === 'slither'
+                ? 'slither'
+                : mode === 'agar'
+                    ? 'agar'
+                    : null;
+            const wantsRainbow = skinId === 'rainbow' || (skinColor === 'random' && entitlementMode);
+            if (wantsRainbow && !await agarCommerce.hasSkinEntitlement(user._id, entitlementMode, 'rainbow')) {
+                socket.emit('error', 'Rainbow for ' + (entitlementMode === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
                 return;
             }
             if (user.rewardsDisabled && useFreeTicket) {
@@ -7227,7 +7206,7 @@ io.on('connection', (socket) => {
                         return;
                     }
                     try {
-                        const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                        const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
                         const joinTx = new solanaWeb3.Transaction({
@@ -7392,7 +7371,7 @@ io.on('connection', (socket) => {
                         return;
                     }
                     try {
-                        const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                        const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
                         const joinTx = new solanaWeb3.Transaction({
@@ -7602,7 +7581,7 @@ io.on('connection', (socket) => {
 
                 // 2. Utför on-chain transfer: Deposit Address -> House Wallet
                 try {
-                    const userKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(user.depositSecret, 'hex')));
+                    const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                     const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
                     const joinTx = new solanaWeb3.Transaction({
@@ -8809,6 +8788,7 @@ function getBattleRoyaleDeps() {
         connection,
         ensureUserDepositWallet,
         OWNER_VAULT_ADDRESS,
+        hasSkinEntitlement: agarCommerce.hasSkinEntitlement,
     };
 }
 

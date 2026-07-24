@@ -1251,7 +1251,7 @@ export function findBRPlayerByMongo(mongoId) {
 
 export function setupBattleRoyale(io, deps) {
     io.on('connection', (socket) => {
-        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor }) => {
+        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId }) => {
             try {
                 if (variant !== 'agar' && variant !== 'slither') {
                     socket.emit('error', 'Invalid battle royale variant.');
@@ -1261,6 +1261,11 @@ export function setupBattleRoyale(io, deps) {
                 const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
+                const wantsRainbow = skinId === 'rainbow' || skinColor === 'random';
+                if (wantsRainbow && !await deps.hasSkinEntitlement?.(user._id, variant, 'rainbow')) {
+                    socket.emit('error', 'Rainbow for ' + (variant === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
+                    return;
+                }
                 const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user));
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
