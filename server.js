@@ -152,6 +152,10 @@ const TOURNAMENT_WALLET_SECRET = process.env.TOURNAMENT_WALLET_SECRET;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
+const AGAR_TOKEN_ENABLED = process.env.AGAR_TOKEN_ENABLED === 'true';
+const AGAR_TOKEN_MINT = process.env.AGAR_TOKEN_MINT?.trim() || '';
+const AGAR_TOKEN_DECIMALS = Number.parseInt(process.env.AGAR_TOKEN_DECIMALS || '9', 10);
+const AGAR_ACCOUNT_SWAP_ENABLED = process.env.AGAR_ACCOUNT_SWAP_ENABLED === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString('hex');
 if (!process.env.JWT_SECRET) {
     console.warn('JWT_SECRET is not configured; using a process-local development secret. Sessions will reset on restart.');
@@ -3476,6 +3480,51 @@ app.post('/api/deposit-verify', sensitiveRateLimit({ limit: 20, windowMs: 60_000
 
         res.json({ success: true, balance: user.balance, solReceived, rewardsReview: securityAlert?.status === 'pending' });
     } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Account-linked AGAR swap boundary. The authenticated user's deposit wallet
+// is the only wallet that may be used; clients cannot supply a different signer.
+app.post('/api/agar/swap', sensitiveRateLimit({ limit: 20, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+    if (!AGAR_TOKEN_ENABLED || !AGAR_TOKEN_MINT) {
+        return res.status(503).json({ message: 'AGAR has not launched yet.' });
+    }
+    if (!AGAR_ACCOUNT_SWAP_ENABLED) {
+        return res.status(503).json({ message: 'AGAR account swaps are not enabled yet.' });
+    }
+
+    const side = String(req.body?.side || '').toUpperCase();
+    const amount = Number(req.body?.amount);
+    if (!['BUY', 'SELL'].includes(side)) {
+        return res.status(400).json({ message: 'Swap side must be BUY or SELL.' });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ message: 'A positive swap amount is required.' });
+    }
+
+    try {
+        new solanaWeb3.PublicKey(AGAR_TOKEN_MINT);
+    } catch {
+        return res.status(503).json({ message: 'AGAR mint configuration is invalid.' });
+    }
+
+    const user = await User.findById(req.user.id).select('depositAddress depositSecret balance');
+    if (!user?.depositAddress || !user?.depositSecret) {
+        return res.status(409).json({ message: 'Your AgarStake account wallet is not available.' });
+    }
+    if (req.body?.accountAddress && req.body.accountAddress !== user.depositAddress) {
+        return res.status(403).json({ message: 'Swap wallet must match the wallet linked to your account.' });
+    }
+
+    // TODO: Integrate Jupiter Swap V2 here. Build and simulate the transaction,
+    // sign only with this user's encrypted custodial deposit key, confirm it,
+    // then refresh both SOL and AGAR balances. Never return depositSecret.
+    return res.status(501).json({
+        message: 'Account-linked Jupiter execution is prepared but not connected yet.',
+        accountAddress: user.depositAddress,
+        side,
+        amount,
+        decimals: Number.isInteger(AGAR_TOKEN_DECIMALS) ? AGAR_TOKEN_DECIMALS : 9,
+    });
 });
 
 // Entry fee info (client can request how much SOL to send and where)
