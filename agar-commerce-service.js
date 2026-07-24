@@ -306,9 +306,15 @@ export function createAgarCommerceService({
     }
 
     async function hasSkinEntitlement(userId, gameMode, skinId) {
-        if (skinId !== 'rainbow') return true;
-        if (!['agar', 'slither'].includes(gameMode)) return false;
-        return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
+        if (skinId === 'flags') {
+            if (!['agar', 'slither', 'all'].includes(gameMode)) return false;
+            return !!(await SkinEntitlement.exists({ userId, gameMode: 'all', skinId: 'flags' }));
+        }
+        if (skinId === 'rainbow') {
+            if (!['agar', 'slither'].includes(gameMode)) return false;
+            return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
+        }
+        return true;
     }
 
     function registerRoutes(app) {

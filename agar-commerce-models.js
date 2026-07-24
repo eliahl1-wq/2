@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 const SkinEntitlementSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    gameMode: { type: String, enum: ['agar', 'slither'], required: true },
+    gameMode: { type: String, enum: ['agar', 'slither', 'all'], required: true },
     skinId: { type: String, required: true },
     productId: { type: String, required: true },
     purchaseId: { type: mongoose.Schema.Types.ObjectId, ref: 'SkinPurchase', default: null },
@@ -13,7 +13,7 @@ SkinEntitlementSchema.index({ userId: 1, gameMode: 1, skinId: 1 }, { unique: tru
 const SkinPurchaseSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     productId: { type: String, required: true },
-    gameMode: { type: String, enum: ['agar', 'slither'], required: true },
+    gameMode: { type: String, enum: ['agar', 'slither', 'all'], required: true },
     skinId: { type: String, required: true },
     usdPrice: { type: Number, required: true },
     tokenPriceUsd: { type: Number, required: true },

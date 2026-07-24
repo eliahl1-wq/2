@@ -3492,6 +3492,12 @@ const agarCommerce = createAgarCommerceService({
 });
 agarCommerce.registerRoutes(app);
 
+const FLAG_SKIN_COLOR_RE = /^flag:(se|us|gb|de|fr|es|it|br|ca|jp|no|fi|dk|nl|pl|ua)$/;
+
+function isFlagSkinColor(value) {
+    return typeof value === 'string' && FLAG_SKIN_COLOR_RE.test(value);
+}
+
 async function hasSkinAccess(user, gameMode, skinId) {
     if (user && process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME) return true;
     return agarCommerce.hasSkinEntitlement(user?._id || user, gameMode, skinId);
@@ -6875,9 +6881,16 @@ io.on('connection', (socket) => {
             let user = await User.findById(decoded.id);
             if (!user) throw new Error('User not found');
             user = await ensureUserDepositWallet(user);
-            const wantsRainbow = skinId === 'rainbow' || skinColor === 'random';
+            const tournamentSkinColor = typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))
+                ? skinColor
+                : util.randomSlitherColor();
+            const wantsRainbow = skinId === 'rainbow' || tournamentSkinColor === 'random';
             if (wantsRainbow && !await hasSkinAccess(user, 'slither', 'rainbow')) {
                 throw new Error('Rainbow for Slither must be purchased in the AGAR shop first.');
+            }
+            const wantsFlags = skinId === 'flags' || isFlagSkinColor(tournamentSkinColor);
+            if (wantsFlags && !await hasSkinAccess(user, 'slither', 'flags')) {
+                throw new Error('Flag Pack must be purchased in the AGAR shop first.');
             }
             userKey = `tournament:${tournamentId}:${user._id}`;
             if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
@@ -7030,7 +7043,7 @@ io.on('connection', (socket) => {
                 socket.id,
                 user._id,
                 username || user.username,
-                typeof skinColor === 'string' ? skinColor : util.randomSlitherColor(),
+                tournamentSkinColor,
                 room,
                 economy.massStartBalance,
                 economy.playerStartBalance,
@@ -7102,7 +7115,7 @@ io.on('connection', (socket) => {
                 return;
             }
             let validatedSkinColor = null;
-            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
+            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || isFlagSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
             const decoded = await verifyAccountToken(token);
@@ -7116,9 +7129,15 @@ io.on('connection', (socket) => {
                 : mode === 'agar'
                     ? 'agar'
                     : null;
+            if (!entitlementMode && isFlagSkinColor(validatedSkinColor)) validatedSkinColor = null;
             const wantsRainbow = skinId === 'rainbow' || (skinColor === 'random' && entitlementMode);
             if (wantsRainbow && !await hasSkinAccess(user, entitlementMode, 'rainbow')) {
                 socket.emit('error', 'Rainbow for ' + (entitlementMode === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
+                return;
+            }
+            const wantsFlags = skinId === 'flags' || isFlagSkinColor(validatedSkinColor);
+            if (wantsFlags && (!entitlementMode || !await hasSkinAccess(user, entitlementMode, 'flags'))) {
+                socket.emit('error', 'Flag Pack must be purchased in the AGAR shop first.');
                 return;
             }
             if (user.rewardsDisabled && useFreeTicket) {
@@ -7841,6 +7860,9 @@ io.on('connection', (socket) => {
                     color: (() => {
                         if (validatedSkinColor === 'random') {
                             return { fill: 'rainbow', border: 'rainbow' };
+                        }
+                        if (isFlagSkinColor(validatedSkinColor)) {
+                            return { fill: validatedSkinColor, border: '#16161d' };
                         }
                         if (validatedSkinColor === 'random_color') {
                             const randColor = util.randomColor();

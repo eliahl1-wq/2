@@ -27,6 +27,13 @@ export function splitAtomicAmount(totalAtomic, treasuryBps = 9000, ownerBps = 10
 
 export const AGAR_SHOP_PRODUCTS = Object.freeze([
     Object.freeze({
+        id: 'flags:bundle',
+        gameMode: 'all',
+        skinId: 'flags',
+        name: 'Flag Pack',
+        usdPrice: 1,
+    }),
+    Object.freeze({
         id: 'agar:rainbow',
         gameMode: 'agar',
         skinId: 'rainbow',

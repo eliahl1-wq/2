@@ -31,10 +31,11 @@ test('revenue shares must total 10000 bps', () => {
     assert.throws(() => splitAtomicAmount(100n, 8000, 1000), /10000/);
 });
 
-test('only Agar and Slither Rainbow products are sold for $3', () => {
+test('shop sells one $1 flag bundle plus Agar and Slither Rainbow for $3', () => {
     assert.deepEqual(
         AGAR_SHOP_PRODUCTS.map(({ id, usdPrice }) => ({ id, usdPrice })),
         [
+            { id: 'flags:bundle', usdPrice: 1 },
             { id: 'agar:rainbow', usdPrice: 3 },
             { id: 'slither:rainbow', usdPrice: 3 },
         ],

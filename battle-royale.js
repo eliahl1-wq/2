@@ -33,6 +33,9 @@ export const BR = {
     agarWorld: 6000,
 };
 
+const FLAG_SKIN_COLOR_RE = /^flag:(se|us|gb|de|fr|es|it|br|ca|jp|no|fi|dk|nl|pl|ua)$/;
+const isFlagSkinColor = (value) => typeof value === 'string' && FLAG_SKIN_COLOR_RE.test(value);
+
 const queues = new Map();
 const matches = new Map();
 const socketToMatch = new Map();
@@ -1057,6 +1060,9 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
                 if (entry.skinColor === 'random') {
                     return { fill: 'rainbow', border: 'rainbow' };
                 }
+                if (isFlagSkinColor(entry.skinColor)) {
+                    return { fill: entry.skinColor, border: '#16161d' };
+                }
                 if (entry.skinColor) {
                     const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(entry.skinColor);
                     if (c) {
@@ -1266,6 +1272,11 @@ export function setupBattleRoyale(io, deps) {
                     socket.emit('error', 'Rainbow for ' + (variant === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
                     return;
                 }
+                const wantsFlags = skinId === 'flags' || isFlagSkinColor(skinColor);
+                if (wantsFlags && !await deps.hasSkinEntitlement?.(user, variant, 'flags')) {
+                    socket.emit('error', 'Flag Pack must be purchased in the AGAR shop first.');
+                    return;
+                }
                 const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user));
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
@@ -1297,7 +1308,7 @@ export function setupBattleRoyale(io, deps) {
                 }
 
                 let validatedSkinColor = null;
-                if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
+                if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                     validatedSkinColor = skinColor;
                 }
 
