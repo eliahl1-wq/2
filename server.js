@@ -3492,6 +3492,11 @@ const agarCommerce = createAgarCommerceService({
 });
 agarCommerce.registerRoutes(app);
 
+async function hasSkinAccess(user, gameMode, skinId) {
+    if (user && process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME) return true;
+    return agarCommerce.hasSkinEntitlement(user?._id || user, gameMode, skinId);
+}
+
 // Entry fee info (client can request how much SOL to send and where)
 app.get('/api/entry-info', authenticateToken, async (req, res) => {
     try {
@@ -6871,7 +6876,7 @@ io.on('connection', (socket) => {
             if (!user) throw new Error('User not found');
             user = await ensureUserDepositWallet(user);
             const wantsRainbow = skinId === 'rainbow' || skinColor === 'random';
-            if (wantsRainbow && !await agarCommerce.hasSkinEntitlement(user._id, 'slither', 'rainbow')) {
+            if (wantsRainbow && !await hasSkinAccess(user, 'slither', 'rainbow')) {
                 throw new Error('Rainbow for Slither must be purchased in the AGAR shop first.');
             }
             userKey = `tournament:${tournamentId}:${user._id}`;
@@ -7112,7 +7117,7 @@ io.on('connection', (socket) => {
                     ? 'agar'
                     : null;
             const wantsRainbow = skinId === 'rainbow' || (skinColor === 'random' && entitlementMode);
-            if (wantsRainbow && !await agarCommerce.hasSkinEntitlement(user._id, entitlementMode, 'rainbow')) {
+            if (wantsRainbow && !await hasSkinAccess(user, entitlementMode, 'rainbow')) {
                 socket.emit('error', 'Rainbow for ' + (entitlementMode === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
                 return;
             }
@@ -8788,7 +8793,7 @@ function getBattleRoyaleDeps() {
         connection,
         ensureUserDepositWallet,
         OWNER_VAULT_ADDRESS,
-        hasSkinEntitlement: agarCommerce.hasSkinEntitlement,
+        hasSkinEntitlement: hasSkinAccess,
     };
 }
 

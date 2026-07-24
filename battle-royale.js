@@ -1262,7 +1262,7 @@ export function setupBattleRoyale(io, deps) {
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
                 const wantsRainbow = skinId === 'rainbow' || skinColor === 'random';
-                if (wantsRainbow && !await deps.hasSkinEntitlement?.(user._id, variant, 'rainbow')) {
+                if (wantsRainbow && !await deps.hasSkinEntitlement?.(user, variant, 'rainbow')) {
                     socket.emit('error', 'Rainbow for ' + (variant === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
                     return;
                 }
