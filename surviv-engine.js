@@ -204,7 +204,10 @@ const WEAPON_RARITY_POOLS = {
 const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
 const SURVIV_OBSTACLE_CELL = 700;
 const SURVIV_LOOT_CELL = 600;
-const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 1500;
+// Socket.IO is reliable and ordered, so static world data only needs a sparse
+// safety refresh while stationary. Movement and obstacle revisions still send
+// immediately.
+const SURVIV_STATIC_PAYLOAD_INTERVAL_MS = 10000;
 const SURVIV_STATIC_PAYLOAD_MOVE_THRESHOLD = 320;
 const SURVIV_DESTRUCTIBLE_OBSTACLE_HP = Object.freeze({
     bush: 18,
