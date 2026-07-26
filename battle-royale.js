@@ -1283,7 +1283,7 @@ export function setupBattleRoyale(io, deps) {
                 }
                 const wantsAgarStake = skinId === 'agarstake' || isAgarStakeSkinColor(skinColor);
                 if (wantsAgarStake && (variant !== 'slither' || !await deps.hasSkinEntitlement?.(user, 'slither', 'agarstake'))) {
-                    socket.emit('error', 'AgarStake Charm must be purchased in the AGAR shop first.');
+                    socket.emit('error', 'The AGAR skin must be purchased in the AGAR shop first.');
                     return;
                 }
                 const specialSlitherSkinId = getSpecialSlitherSkinId(skinId) || getSpecialSlitherSkinId(skinColor);

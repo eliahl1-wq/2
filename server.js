@@ -6908,7 +6908,7 @@ io.on('connection', (socket) => {
             }
             const wantsAgarStake = skinId === 'agarstake' || isAgarStakeSkinColor(tournamentSkinColor);
             if (wantsAgarStake && !await hasSkinAccess(user, 'slither', 'agarstake')) {
-                throw new Error('AgarStake Charm must be purchased in the AGAR shop first.');
+                throw new Error('The AGAR skin must be purchased in the AGAR shop first.');
             }
             if (wantsAgarStake) tournamentSkinColor = 'agarstake';
             const tournamentSpecialSkinId = getSpecialSlitherSkinId(skinId) || getSpecialSlitherSkinId(tournamentSkinColor);
@@ -7167,7 +7167,7 @@ io.on('connection', (socket) => {
             }
             const wantsAgarStake = skinId === 'agarstake' || isAgarStakeSkinColor(validatedSkinColor);
             if (wantsAgarStake && (entitlementMode !== 'slither' || !await hasSkinAccess(user, 'slither', 'agarstake'))) {
-                socket.emit('error', 'AgarStake Charm must be purchased in the AGAR shop first.');
+                socket.emit('error', 'The AGAR skin must be purchased in the AGAR shop first.');
                 return;
             }
             if (wantsAgarStake) validatedSkinColor = 'agarstake';
