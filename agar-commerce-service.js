@@ -24,6 +24,7 @@ import {
     releaseWalletOperation,
 } from './agar-commerce-models.js';
 import { fetchAgarMarketPrice } from './agar-market.js';
+import { fetchAgarCandles } from './agar-candles.js';
 import {
     decryptWalletSecret,
     hasWalletEncryptionKey,
@@ -314,12 +315,30 @@ export function createAgarCommerceService({
             if (!['agar', 'slither'].includes(gameMode)) return false;
             return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
         }
+        if (['agarstake', 'aurora', 'eclipse'].includes(skinId)) {
+            if (gameMode !== 'slither') return false;
+            return !!(await SkinEntitlement.exists({ userId, gameMode: 'slither', skinId }));
+        }
         return true;
     }
 
     function registerRoutes(app) {
         app.get('/api/agar/config', async (_req, res) => {
             res.json(await publicConfig());
+        });
+
+        app.get('/api/agar/candles', async (req, res) => {
+            if (!config.enabled || !config.mint) {
+                return res.status(503).json({ message: 'AGAR has not launched yet.' });
+            }
+            try {
+                return res.json(await fetchAgarCandles({
+                    mint: config.mint,
+                    range: req.query.range,
+                }));
+            } catch (error) {
+                return res.status(error.status || 502).json({ message: error.message });
+            }
         });
 
         app.get('/api/shop/catalog', async (_req, res) => {

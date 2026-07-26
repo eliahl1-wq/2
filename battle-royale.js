@@ -35,6 +35,10 @@ export const BR = {
 
 const FLAG_SKIN_COLOR_RE = /^flag:(se|us|gb|de|fr|es|it|br|ca|jp|no|fi|dk|nl|pl|ua)$/;
 const isFlagSkinColor = (value) => typeof value === 'string' && FLAG_SKIN_COLOR_RE.test(value);
+const isAgarStakeSkinColor = (value) => value === 'agarstake';
+const SPECIAL_SLITHER_SKIN_IDS = new Set(['aurora', 'eclipse']);
+const getSpecialSlitherSkinId = (value) => typeof value === 'string' && SPECIAL_SLITHER_SKIN_IDS.has(value) ? value : null;
+const isSpecialSlitherSkinColor = (value) => getSpecialSlitherSkinId(value) !== null;
 
 const queues = new Map();
 const matches = new Map();
@@ -1277,6 +1281,16 @@ export function setupBattleRoyale(io, deps) {
                     socket.emit('error', 'Flag Pack must be purchased in the AGAR shop first.');
                     return;
                 }
+                const wantsAgarStake = skinId === 'agarstake' || isAgarStakeSkinColor(skinColor);
+                if (wantsAgarStake && (variant !== 'slither' || !await deps.hasSkinEntitlement?.(user, 'slither', 'agarstake'))) {
+                    socket.emit('error', 'AgarStake Charm must be purchased in the AGAR shop first.');
+                    return;
+                }
+                const specialSlitherSkinId = getSpecialSlitherSkinId(skinId) || getSpecialSlitherSkinId(skinColor);
+                if (specialSlitherSkinId && (variant !== 'slither' || !await deps.hasSkinEntitlement?.(user, 'slither', specialSlitherSkinId))) {
+                    socket.emit('error', (specialSlitherSkinId === 'aurora' ? 'Aurora Veil' : 'Solar Eclipse') + ' must be purchased in the AGAR shop first.');
+                    return;
+                }
                 const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user));
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
@@ -1308,9 +1322,11 @@ export function setupBattleRoyale(io, deps) {
                 }
 
                 let validatedSkinColor = null;
-                if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
+                if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || isAgarStakeSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                     validatedSkinColor = skinColor;
                 }
+                if (wantsAgarStake) validatedSkinColor = 'agarstake';
+                if (specialSlitherSkinId) validatedSkinColor = specialSlitherSkinId;
 
                 removeFromQueue(socket.id);
                 getQueue(variant, entryFeeUsd, personalFreePlay).push({

@@ -47,6 +47,27 @@ export const AGAR_SHOP_PRODUCTS = Object.freeze([
         name: 'Rainbow',
         usdPrice: 3,
     }),
+    Object.freeze({
+        id: 'slither:agarstake',
+        gameMode: 'slither',
+        skinId: 'agarstake',
+        name: 'AgarStake Charm',
+        usdPrice: 1,
+    }),
+    Object.freeze({
+        id: 'slither:aurora',
+        gameMode: 'slither',
+        skinId: 'aurora',
+        name: 'Aurora Veil',
+        usdPrice: 2,
+    }),
+    Object.freeze({
+        id: 'slither:eclipse',
+        gameMode: 'slither',
+        skinId: 'eclipse',
+        name: 'Solar Eclipse',
+        usdPrice: 2,
+    }),
 ]);
 
 export function getAgarShopProduct(productId) {
