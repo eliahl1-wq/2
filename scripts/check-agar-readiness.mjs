@@ -8,7 +8,11 @@ import {
     getAssociatedTokenAddressSync,
     getMint,
 } from '@solana/spl-token';
-import { hasWalletEncryptionKey, isEncryptedWalletSecret } from '../wallet-crypto.js';
+import {
+    decryptWalletSecret,
+    hasWalletEncryptionKey,
+    isEncryptedWalletSecret,
+} from '../wallet-crypto.js';
 import { fetchAgarMarketPrice } from '../agar-market.js';
 
 const checks = [];
@@ -73,7 +77,20 @@ if (hasWalletEncryptionKey()) {
             depositSecret: { $type: 'string', $ne: '' },
         }, { projection: { depositSecret: 1 } }).toArray();
         const legacy = users.filter((user) => !isEncryptedWalletSecret(user.depositSecret));
-        check('Encrypted account wallets', legacy.length === 0, `${legacy.length} legacy secrets`);
+        const unreadable = users.filter((user) => {
+            if (!isEncryptedWalletSecret(user.depositSecret)) return false;
+            try {
+                decryptWalletSecret(user.depositSecret, { allowLegacy: false });
+                return false;
+            } catch {
+                return true;
+            }
+        });
+        check(
+            'Encrypted account wallets',
+            legacy.length === 0 && unreadable.length === 0,
+            `${legacy.length} legacy, ${unreadable.length} undecryptable secrets`,
+        );
     } catch (error) {
         check('Encrypted account wallets', false, error.message);
     } finally {
