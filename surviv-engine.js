@@ -43,7 +43,9 @@ export const SURVIV = {
     grenadeMinRange: 70,
     grenadeMaxRange: 440,
     grenadeRadius: 145,
-    grenadeDamage: 62,
+    grenadeDamage: 140,
+    grenadeMinDamage: 10,
+    grenadeFalloffExponent: 1.7,
 };
 
 export const WEAPONS = {
@@ -4140,8 +4142,11 @@ function detonateGrenade(room, grenade, entitiesById) {
         if (target.hp <= 0 || target._eliminated) continue;
         const distance = dist(grenade.x, grenade.y, target.x, target.y);
         if (distance > SURVIV.grenadeRadius) continue;
-        const falloff = 1 - distance / SURVIV.grenadeRadius;
-        applyDamage(target, Math.max(8, grenade.damage * falloff), attacker);
+        const proximity = clamp(1 - distance / SURVIV.grenadeRadius, 0, 1);
+        const minimumDamage = SURVIV.grenadeMinDamage;
+        const blastDamage = minimumDamage
+            + (grenade.damage - minimumDamage) * Math.pow(proximity, SURVIV.grenadeFalloffExponent);
+        applyDamage(target, blastDamage, attacker);
         if (target.hp <= 0) eliminateSurvivPlayer(room, target, room._io, attacker);
     }
     for (const obstacle of queryObstacles(room, grenade.x, grenade.y, SURVIV.grenadeRadius, true)) {

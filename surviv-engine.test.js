@@ -1023,6 +1023,59 @@ test('grenades follow crosshair distance within the server range limit', () => {
     assert.equal(cappedThrow?.throwDistance, SURVIV.grenadeMaxRange);
     assert.ok(Math.hypot(shortThrow.vx, shortThrow.vy) < Math.hypot(longThrow.vx, longThrow.vy));
 });
+
+test('grenade damage is lethal at the center and falls off sharply with distance', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+
+    const attacker = createSurvivPlayer('grenade-attacker', 'mongo-grenade-attacker', 'Grenadier', '#fff', room);
+    attacker.x = 500;
+    attacker.y = 0;
+
+    const makeTarget = (id, x, armor = 0) => {
+        const target = createSurvivPlayer(id, `mongo-${id}`, id, '#fff', room);
+        target.x = x;
+        target.y = 0;
+        target.hp = 100;
+        target.armor = armor;
+        return target;
+    };
+    const direct = makeTarget('grenade-direct', 0, 20);
+    const near = makeTarget('grenade-near', 45);
+    const middle = makeTarget('grenade-middle', 105);
+    const edge = makeTarget('grenade-edge', 140);
+    room.players.push(attacker, direct, near, middle, edge);
+
+    room.bullets.push({
+        id: 'grenade-falloff-test',
+        ownerId: attacker.id,
+        x: 0,
+        y: 0,
+        vx: 0,
+        vy: 0,
+        damage: SURVIV.grenadeDamage,
+        weaponType: 'grenade',
+        isGrenade: true,
+        bornAt: 0,
+        detonateAt: 0,
+    });
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    const nearDamage = 100 - near.hp;
+    const middleDamage = 100 - middle.hp;
+    const edgeDamage = 100 - edge.hp;
+    assert.ok(direct.hp <= 0, 'standing on the grenade should kill through light armor');
+    assert.equal(direct.armor, 0);
+    assert.ok(nearDamage > 70, `near blast should hurt heavily, got ${nearDamage}`);
+    assert.ok(middleDamage > 20 && middleDamage < 40, `mid-range blast should be reduced, got ${middleDamage}`);
+    assert.ok(edgeDamage >= SURVIV.grenadeMinDamage && edgeDamage < 15, `blast edge should do low damage, got ${edgeDamage}`);
+    assert.ok(nearDamage > middleDamage && middleDamage > edgeDamage);
+});
 test('fast bullets hit and eliminate bots along their full travel path', () => {
     const room = makeRoom();
     room.obstacles = [];
