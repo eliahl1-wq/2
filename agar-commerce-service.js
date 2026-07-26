@@ -341,6 +341,19 @@ export function createAgarCommerceService({
             }
         });
 
+        app.get('/api/agar/balance', authenticateToken, async (req, res) => {
+            if (!config.enabled) return res.json({ balance: 0, launched: false });
+            try {
+                const context = await loadTokenContext();
+                const user = await User.findById(req.user.id).select('depositAddress');
+                if (!user?.depositAddress) return res.status(404).json({ message: 'Account wallet is not available.' });
+                const balances = await readWalletBalances(user.depositAddress, context);
+                return res.json({ balance: balances.agar, launched: true });
+            } catch (error) {
+                console.error('[AGAR balance]', error);
+                return res.status(502).json({ message: 'AGAR balance is temporarily unavailable.' });
+            }
+        });
         app.get('/api/shop/catalog', async (_req, res) => {
             const shop = await shopReadiness();
             const priceUsd = shop.market?.priceUsd || null;
@@ -448,7 +461,9 @@ export function createAgarCommerceService({
                     throw Object.assign(new Error('Account wallet must be migrated to encrypted storage before AGAR purchases.'), { status: 503 });
                 }
                 const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret, { allowLegacy: false }));
+
                 if (keypair.publicKey.toBase58() !== user.depositAddress) throw new Error('Account wallet key does not match its address');
+
                 const context = await loadTokenContext({ requireDestinations: true });
                 const balances = await readWalletBalances(user.depositAddress, context);
                 const totalAtomic = BigInt(purchase.tokenAmountAtomic);
@@ -534,8 +549,10 @@ export function createAgarCommerceService({
                 return res.status(409).json({ message: 'Another wallet operation is already processing.' });
             }
             let record = null;
+            let stage = 'configuration';
             try {
                 const context = await loadTokenContext();
+                stage = 'account_wallet';
                 const user = await User.findById(req.user.id).select('depositAddress depositSecret balance');
                 if (!user?.depositAddress || !isEncryptedWalletSecret(user.depositSecret)) {
                     throw Object.assign(new Error('Account wallet must be encrypted before AGAR swaps.'), { status: 503 });
@@ -544,6 +561,9 @@ export function createAgarCommerceService({
                     throw Object.assign(new Error('Swap wallet must match the wallet linked to your account.'), { status: 403 });
                 }
                 const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret, { allowLegacy: false }));
+                if (keypair.publicKey.toBase58() !== user.depositAddress) {
+                    throw Object.assign(new Error('The encrypted account wallet does not match the account address.'), { status: 503 });
+                }
                 const inputMint = side === 'BUY' ? WRAPPED_SOL_MINT : config.mint;
                 const outputMint = side === 'BUY' ? config.mint : WRAPPED_SOL_MINT;
                 const inputDecimals = side === 'BUY' ? 9 : context.mintInfo.decimals;
@@ -556,6 +576,7 @@ export function createAgarCommerceService({
                 orderUrl.searchParams.set('outputMint', outputMint);
                 orderUrl.searchParams.set('amount', amountAtomic.toString());
                 orderUrl.searchParams.set('taker', user.depositAddress);
+                stage = 'jupiter_order';
                 const orderResponse = await fetch(orderUrl, {
                     headers: { 'x-api-key': config.jupiterApiKey, Accept: 'application/json' },
                 });
@@ -572,8 +593,10 @@ export function createAgarCommerceService({
                     outputAmountAtomic: String(order.outAmount || ''),
                     requestId: order.requestId,
                 });
+                stage = 'transaction_signing';
                 const transaction = solanaWeb3.VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
                 transaction.sign([keypair]);
+                stage = 'jupiter_execute';
                 const executeResponse = await fetch(`${config.jupiterBaseUrl}/execute`, {
                     method: 'POST',
                     headers: {
@@ -594,6 +617,7 @@ export function createAgarCommerceService({
                 record.signature = result.signature;
                 record.outputAmountAtomic = String(result.outputAmountResult || result.totalOutputAmount || order.outAmount || '');
                 await record.save();
+                stage = 'balance_refresh';
                 const balances = await readWalletBalances(user.depositAddress, context);
                 user.balance = balances.sol;
                 await user.save();
@@ -606,12 +630,22 @@ export function createAgarCommerceService({
                     balance: { sol: balances.sol, agar: balances.agar },
                 });
             } catch (error) {
+                console.error(`[AGAR swap:${stage}]`, error);
                 if (record) {
                     record.status = record.signature ? 'needs_review' : 'failed';
                     record.error = String(error.message || error).slice(0, 500);
                     await record.save().catch(() => {});
                 }
-                res.status(error.status || 500).json({ message: error.status ? error.message : 'AGAR swap failed.' });
+                const fallbackByStage = {
+                    configuration: 'AGAR or the Solana RPC is not ready.',
+                    account_wallet: 'The account wallet could not be decrypted or loaded.',
+                    transaction_signing: 'The Jupiter transaction could not be signed.',
+                    balance_refresh: 'The swap may have completed, but balances could not be refreshed.',
+                };
+                res.status(error.status || (stage === 'configuration' ? 503 : 500)).json({
+                    message: error.status ? error.message : (fallbackByStage[stage] || 'AGAR swap failed.'),
+                    stage,
+                });
             } finally {
                 await releaseWalletOperation(req.user.id, operationId).catch(() => {});
             }
