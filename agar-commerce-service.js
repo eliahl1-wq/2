@@ -642,9 +642,13 @@ export function createAgarCommerceService({
                     transaction_signing: 'The Jupiter transaction could not be signed.',
                     balance_refresh: 'The swap may have completed, but balances could not be refreshed.',
                 };
-                res.status(error.status || (stage === 'configuration' ? 503 : 500)).json({
-                    message: error.status ? error.message : (fallbackByStage[stage] || 'AGAR swap failed.'),
+                const walletDecryptFailed = error.code === 'WALLET_DECRYPT_FAILED';
+                res.status(error.status || (walletDecryptFailed || stage === 'configuration' ? 503 : 500)).json({
+                    message: walletDecryptFailed
+                        ? 'Account wallet encryption is temporarily unavailable. No transaction was submitted.'
+                        : (error.status ? error.message : (fallbackByStage[stage] || 'AGAR swap failed.')),
                     stage,
+                    ...(walletDecryptFailed ? { code: error.code } : {}),
                 });
             } finally {
                 await releaseWalletOperation(req.user.id, operationId).catch(() => {});
