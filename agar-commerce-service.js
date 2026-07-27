@@ -564,19 +564,25 @@ export function createAgarCommerceService({
                 if (keypair.publicKey.toBase58() !== user.depositAddress) {
                     throw Object.assign(new Error('The encrypted account wallet does not match the account address.'), { status: 503 });
                 }
+                stage = 'amount_validation';
                 const inputMint = side === 'BUY' ? WRAPPED_SOL_MINT : config.mint;
                 const outputMint = side === 'BUY' ? config.mint : WRAPPED_SOL_MINT;
                 const inputDecimals = side === 'BUY' ? 9 : context.mintInfo.decimals;
-                const amountAtomic = decimalToAtomic(req.body?.amount, inputDecimals);
-                if (side === 'BUY' && amountAtomic > 100n * solanaWeb3.LAMPORTS_PER_SOL) {
+                let amountAtomic;
+                try {
+                    amountAtomic = decimalToAtomic(req.body?.amount, inputDecimals);
+                } catch (error) {
+                    throw Object.assign(error, { status: 400 });
+                }
+                if (side === 'BUY' && amountAtomic > 100n * BigInt(solanaWeb3.LAMPORTS_PER_SOL)) {
                     throw Object.assign(new Error('Swap amount exceeds the configured limit.'), { status: 400 });
                 }
+                stage = 'jupiter_order';
                 const orderUrl = new URL(`${config.jupiterBaseUrl}/order`);
                 orderUrl.searchParams.set('inputMint', inputMint);
                 orderUrl.searchParams.set('outputMint', outputMint);
                 orderUrl.searchParams.set('amount', amountAtomic.toString());
                 orderUrl.searchParams.set('taker', user.depositAddress);
-                stage = 'jupiter_order';
                 const orderResponse = await fetch(orderUrl, {
                     headers: { 'x-api-key': config.jupiterApiKey, Accept: 'application/json' },
                 });
@@ -639,6 +645,7 @@ export function createAgarCommerceService({
                 const fallbackByStage = {
                     configuration: 'AGAR or the Solana RPC is not ready.',
                     account_wallet: 'The account wallet could not be decrypted or loaded.',
+                    amount_validation: 'The swap amount could not be validated.',
                     transaction_signing: 'The Jupiter transaction could not be signed.',
                     balance_refresh: 'The swap may have completed, but balances could not be refreshed.',
                 };
