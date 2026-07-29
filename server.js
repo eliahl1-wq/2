@@ -8791,12 +8791,12 @@ function getArenaRoomById(roomId) {
 function processCompetitiveSlitherTick() {
     for (const room of competitiveSlitherRooms) {
         if (room.isResetting) continue;
-        const liveEntities = room.players.filter(
-            p => p.mode === 'competitive-slither' && p.segments?.length
-        ).length;
+
         const activeHumans = room.players.filter(p => !p.isBot && !p.disconnected).length;
         const spectatorCount = room.competitiveSpectators?.length ?? 0;
-        if (liveEntities === 0 && spectatorCount === 0) continue;
+        // Bots can remain funded between visits, but simulating invisible rooms
+        // steals time from active Slither rooms on the same 40 Hz event loop.
+        if (activeHumans === 0 && spectatorCount === 0) continue;
 
         const resetTime = room.startTime + c.roomDuration;
         syncCompetitiveSlitherFood(room, activeHumans);
@@ -8953,6 +8953,13 @@ function processRoom(room) {
             }
         }
     }
+
+    // Do not spend the shared 40 Hz budget simulating funded bots in rooms that
+    // nobody can currently see. State resumes on the next join/spectator tick.
+    const roomViewerCount = activeHumans
+        + (room.spectators?.length || 0)
+        + (room.agarSpectators?.length || 0);
+    if (roomViewerCount === 0) return;
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
     if (!isSandbox || room.sandboxAutoBots) {

@@ -2528,7 +2528,9 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
         if (visibleFood) tickPayload.food = visibleFood;
         if (minimap) tickPayload.minimap = minimap;
 
-        io.to(r.id).emit('slitherTick', tickPayload);
+        // State snapshots supersede older snapshots. Volatile delivery prevents
+        // a slow client/transport from building an ever-growing latency queue.
+        io.to(r.id).volatile.emit('slitherTick', tickPayload);
     });
 }
 
@@ -3144,7 +3146,7 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         if (visibleFood) tickPayload.food = visibleFood;
         if (minimap) tickPayload.minimap = minimap;
 
-        io.to(socketId).emit('slitherTick', tickPayload);
+        io.to(socketId).volatile.emit('slitherTick', tickPayload);
     };
 
     compPlayers.forEach(p => {

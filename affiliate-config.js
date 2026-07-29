@@ -1,5 +1,7 @@
+const runtimeEnv = typeof process !== 'undefined' && process?.env ? process.env : {};
+
 function readInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
-    const raw = process.env[name];
+    const raw = runtimeEnv[name];
     if (raw == null || raw === '') return fallback;
     const value = Number(raw);
     if (!Number.isSafeInteger(value) || value < min || value > max) {
@@ -10,7 +12,7 @@ function readInteger(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } 
 }
 
 function readUsdMicros(name, fallbackUsd) {
-    const raw = process.env[name];
+    const raw = runtimeEnv[name];
     const value = raw == null || raw === '' ? fallbackUsd : Number(raw);
     if (!Number.isFinite(value) || value < 0 || value > 1_000_000) {
         console.warn(`[Affiliate Config] Ignoring invalid ${name}=${raw}; using ${fallbackUsd}.`);
