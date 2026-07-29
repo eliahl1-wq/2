@@ -1130,6 +1130,34 @@ test('firearm range depends on travelled distance instead of delayed wall-clock 
     assert.equal(room.bullets.length, 1, 'a delayed tick must not expire a barely-travelled bullet');
     assert.ok(room.bullets[0].distanceTravelled > 0 && room.bullets[0].distanceTravelled < 100);
 });
+test('firearms work throughout the square map outside the old circular projectile boundary', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+
+    const player = createSurvivPlayer('south-shot', 'south-shot-mongo', 'South Shooter', '#fff', room);
+    player.x = 7600;
+    player.y = 6500;
+    player.aimAngle = 0;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['pistol'];
+    player.shooting = true;
+    room.players.push(player);
+
+    const target = spawnSurvivBotNear(room, 7690, 6500, { adminSpawned: true });
+    target.botThinkAt = Number.POSITIVE_INFINITY;
+    const firedAt = Date.now() + 600000;
+
+    processSurvivRoom(room, silentIo, firedAt);
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, firedAt + 25);
+    processSurvivRoom(room, silentIo, firedAt + 50);
+
+    assert.ok(target.hp < target.maxHp, 'a shot inside the square map must not disappear at the old circular edge');
+});
 test('firearms retain enough range to damage destructible trees', () => {
     const room = makeRoom();
     room.loot = [];

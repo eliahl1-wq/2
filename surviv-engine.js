@@ -4332,7 +4332,9 @@ function updateBullets(room, now, effectiveRadius) {
         if (bullet.isGrenade) {
             bullet.vx *= 0.96;
             bullet.vy *= 0.96;
-            if (now >= bullet.detonateAt || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
+            if (now >= bullet.detonateAt
+                || Math.abs(bullet.x) > SURVIV.worldHalf
+                || Math.abs(bullet.y) > SURVIV.worldHalf) {
                 detonateGrenade(room, bullet, entitiesById);
                 room.bullets.splice(i, 1);
             }
@@ -4346,7 +4348,9 @@ function updateBullets(room, now, effectiveRadius) {
         const rangeExceeded = bullet.distanceTravelled >= maxDistance;
         // Distance, rather than wall-clock time, owns firearm range. A delayed
         // server tick must never make a round expire early after travelling less.
-        if (now - bullet.bornAt > 8000 || Math.hypot(bullet.x, bullet.y) > SURVIV.worldHalf) {
+        if (now - bullet.bornAt > 8000
+            || Math.abs(bullet.x) > SURVIV.worldHalf
+            || Math.abs(bullet.y) > SURVIV.worldHalf) {
             room.bullets.splice(i, 1);
             continue;
         }
