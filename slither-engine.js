@@ -1,5 +1,9 @@
 import * as util from './utils.js';
 import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy } from './economy.js';
+import {
+    FREE_TICKET_MAX_BOTS_PER_MODE,
+    getFreeTicketBotTarget,
+} from './free-ticket-bots.js';
 
 export const SLITHER = {
     // A 2400-radius circle is approximately half the playable area of the old
@@ -422,10 +426,19 @@ export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
 }
 
 export function addSlitherBots(room, n, botStake = SLITHER.botStartBalance) {
-    const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botStake));
+    const isRewardFunded = room.isFreeTicketRoom === true;
+    const automaticBotCount = room.slitherBots.filter(bot => !bot.adminSpawned).length;
+    const requestedCount = isRewardFunded
+        ? Math.min(n, Math.max(0, FREE_TICKET_MAX_BOTS_PER_MODE - automaticBotCount))
+        : n;
+    const spawnCount = isRewardFunded
+        ? requestedCount
+        : Math.min(requestedCount, Math.floor(room.aiBudgetBalance / botStake));
     for (let i = 0; i < spawnCount; i++) {
-        room.aiBudgetBalance -= botStake;
-        room.slitherBots.push(createSlitherBot(room, botStake));
+        if (!isRewardFunded) room.aiBudgetBalance -= botStake;
+        const bot = createSlitherBot(room, botStake);
+        bot.freeTicketRewardFunded = isRewardFunded;
+        room.slitherBots.push(bot);
     }
 }
 
@@ -435,7 +448,9 @@ export function trimSlitherBots(room, targetCount) {
         const index = room.slitherBots.findIndex(b => !b.adminSpawned);
         if (index === -1) break; // Only admin-spawned bots left
         const [removed] = room.slitherBots.splice(index, 1);
-        room.aiBudgetBalance += removed?.botStake ?? SLITHER.botStartBalance;
+        if (!removed?.freeTicketRewardFunded) {
+            room.aiBudgetBalance += removed?.botStake ?? SLITHER.botStartBalance;
+        }
     }
 }
 
@@ -2246,7 +2261,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 }
 
                 // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
-                const isFreePlay = room.isSandbox || process.env.DEV_FREE_PLAY === 'true';
+                const isFreePlay = room.isSandbox || room.isFreeTicketRoom || process.env.DEV_FREE_PLAY === 'true';
                 if (!isFreePlay) {
                     if (snake.isCashingOut) {
                         if (Date.now() >= snake.cashOutEndTime) {
@@ -2348,7 +2363,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         } else if (!isBR && respawnBot) {
             const humansInArena = room.players.filter(p => p.mode === 'slither').length;
             const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);
-            const targetBots = getSlitherTargetBots(effectiveHumans);
+            const targetBots = room.isFreeTicketRoom
+                ? getFreeTicketBotTarget(room, 'slither')
+                : getSlitherTargetBots(effectiveHumans);
             const activeSlitherBots = room.slitherBots.length + (room.pendingSlitherBotSpawns || 0);
             if (activeSlitherBots < targetBots) {
                 addSlitherBots(room, targetBots - activeSlitherBots, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);

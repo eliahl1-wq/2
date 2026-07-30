@@ -142,6 +142,12 @@ import {
 import { getAffiliatePublicConfig } from './affiliate-config.js';
 import { createAgarCommerceService } from './agar-commerce-service.js';
 import {
+    FREE_TICKET_MAX_BOTS_PER_MODE,
+    getFreeTicketBotTarget,
+    registerFreeTicketBotJoin,
+    resetFreeTicketBotTargets,
+} from './free-ticket-bots.js';
+import {
     decryptWalletSecret,
     encryptWalletSecret,
 } from './wallet-crypto.js';
@@ -572,7 +578,11 @@ function createArenaRoom(entryFeeUsd) {
 
 const rooms = [
     ...ALLOWED_ENTRY_FEES.map(fee => createArenaRoom(fee)),
-    Object.assign(createArenaRoom(5), { id: 'arena-free-ticket', isFreeTicketRoom: true })
+    Object.assign(createArenaRoom(5), {
+        id: 'arena-free-ticket',
+        isFreeTicketRoom: true,
+        freeTicketBotTargets: { agar: 0, slither: 0 },
+    })
 ];
 
 const tournamentRooms = new Map();
@@ -1503,6 +1513,7 @@ function resetRoomEntities(room) {
     room.fundedEntryUsd = 0;
     room.reservedCashoutUsd = 0;
     room.paidCashoutUsd = 0;
+    resetFreeTicketBotTargets(room);
 }
 
 async function sweepHouseWalletOnReset() {
@@ -6599,17 +6610,25 @@ function addBots(room, n, botStake = null) {
     const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
     const botCost = botStake ?? botStakeForRoom(room);
     const startMass = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
-    const spawnCount = Math.min(n, Math.floor(room.aiBudgetBalance / botCost));
+    const isRewardFunded = room.isFreeTicketRoom === true;
+    const automaticBotCount = room.bots.filter(bot => !bot.adminSpawned).length;
+    const requestedCount = isRewardFunded
+        ? Math.min(n, Math.max(0, FREE_TICKET_MAX_BOTS_PER_MODE - automaticBotCount))
+        : n;
+    const spawnCount = isRewardFunded
+        ? requestedCount
+        : Math.min(requestedCount, Math.floor(room.aiBudgetBalance / botCost));
     for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
         const randomName = botNames[Math.floor(Math.random() * botNames.length)];
-        room.aiBudgetBalance -= botCost;
+        if (!isRewardFunded) room.aiBudgetBalance -= botCost;
         room.bots.push({
             id: id,
             username: randomName,
             balance: botCost,
             dollarBalance: botCost,
             botStake: botCost,
+            freeTicketRewardFunded: isRewardFunded,
             kills: 0,
             color: util.randomColor(),
             isBot: true,
@@ -6643,7 +6662,9 @@ function trimAgarBots(room, targetCount) {
         const index = room.bots.findIndex(b => !b.adminSpawned);
         if (index === -1) break; // Only admin-spawned bots left
         const [removed] = room.bots.splice(index, 1);
-        room.aiBudgetBalance += removed?.dollarBalance ?? removed?.botStake ?? removed?.cells?.[0]?.balance ?? stake;
+        if (!removed?.freeTicketRewardFunded) {
+            room.aiBudgetBalance += removed?.dollarBalance ?? removed?.botStake ?? removed?.cells?.[0]?.balance ?? stake;
+        }
     }
 }
 
@@ -6789,6 +6810,7 @@ async function rollbackJoinEconomy(pending, reason) {
     room.ownerBalance = pending.ownerBalance;
     room.bots.splice(0, room.bots.length, ...pending.bots);
     room.slitherBots.splice(0, room.slitherBots.length, ...pending.slitherBots);
+    room.freeTicketBotTargets = { ...pending.freeTicketBotTargets };
 
     if (pending.rewardFundingUsd > 0) {
         await reducePendingRewardUsd(pending.rewardFundingUsd);
@@ -7769,13 +7791,17 @@ io.on('connection', (socket) => {
                 ownerBalance: room.ownerBalance,
                 bots: [...room.bots],
                 slitherBots: [...room.slitherBots],
+                freeTicketBotTargets: { ...(room.freeTicketBotTargets || { agar: 0, slither: 0 }) },
                 rewardFundingUsd: 0,
             };
 
             // Bot budget: if room already has >1 bot, only 10% of AI allocation funds bots
             const existingBotCount = gameMode === 'slither' ? room.slitherBots.length : room.bots.length;
             if (!switchingNormalMode) {
-                if (existingBotCount > 1) {
+                if (isFreeTicketPlay) {
+                    // Reward-funded free-ticket bots never consume the arena's AI or food balance.
+                    room.foodPoolBalance += foodToPool + aiAlloc;
+                } else if (existingBotCount > 1) {
                     const usableAi = aiToAdd * 0.10;
                     const overflowAi = aiToAdd - usableAi;
                     room.aiBudgetBalance += usableAi;
@@ -7829,14 +7855,20 @@ io.on('connection', (socket) => {
                 }
             }
 
-            // DYNAMIC BOT SCALING (mode-specific, max 1 bot spawned per entry)
-            let targetBots = gameMode === 'slither'
-                ? getSlitherTargetBots(modeHumansAfterJoin)
-                : getTargetBots(modeHumansAfterJoin);
+            // Free-ticket joins receive four reward-funded bots, capped at ten
+            // automatic bots for the selected game mode. Rejoins returned above.
+            let targetBots = isFreeTicketPlay
+                ? registerFreeTicketBotJoin(room, gameMode)
+                : gameMode === 'slither'
+                    ? getSlitherTargetBots(modeHumansAfterJoin)
+                    : getTargetBots(modeHumansAfterJoin);
 
             if (gameMode === 'slither') {
                 targetBots += room.slitherBots.filter(b => b.adminSpawned).length;
-                const botsToSpawn = Math.min(1, Math.max(0, targetBots - room.slitherBots.length));
+                const botsToSpawn = Math.min(
+                    isFreeTicketPlay ? 4 : 1,
+                    Math.max(0, targetBots - room.slitherBots.length),
+                );
                 if (botsToSpawn > 0) {
                     addSlitherBots(room, botsToSpawn, joinBotStake);
                 } else if (room.slitherBots.length > targetBots) {
@@ -7844,7 +7876,10 @@ io.on('connection', (socket) => {
                 }
             } else {
                 targetBots += room.bots.filter(b => b.adminSpawned).length;
-                const botsToSpawn = Math.min(1, Math.max(0, targetBots - room.bots.length));
+                const botsToSpawn = Math.min(
+                    isFreeTicketPlay ? 4 : 1,
+                    Math.max(0, targetBots - room.bots.length),
+                );
                 if (botsToSpawn > 0) {
                     addBots(room, botsToSpawn, joinBotStake);
                 } else if (room.bots.length > targetBots) {
@@ -8930,16 +8965,24 @@ function processRoom(room) {
         }
         if (Date.now() - room.lastHumanTime >= 10 * 60 * 1000) {
             const botsCount = room.bots.length + room.slitherBots.length;
-            if (botsCount > 0 || room.aiBudgetBalance > 0) {
+            const hasFreeTicketBotTargets = room.isFreeTicketRoom && (
+                getFreeTicketBotTarget(room, 'agar') > 0
+                || getFreeTicketBotTarget(room, 'slither') > 0
+            );
+            if (botsCount > 0 || room.aiBudgetBalance > 0 || hasFreeTicketBotTargets) {
                 console.log(`⏳ Room ${room.id} has been empty of humans for 10 minutes. Despawning bots and reclaiming balances.`);
-                let totalReclaimed = room.aiBudgetBalance;
+                let totalReclaimed = room.isFreeTicketRoom ? 0 : room.aiBudgetBalance;
 
                 room.bots.forEach(b => {
-                    totalReclaimed += b.dollarBalance ?? b.botStake ?? b.balance ?? 0;
+                    if (!b.freeTicketRewardFunded) {
+                        totalReclaimed += b.dollarBalance ?? b.botStake ?? b.balance ?? 0;
+                    }
                 });
 
                 room.slitherBots.forEach(b => {
-                    totalReclaimed += b.dollarBalance ?? b.botStake ?? 0;
+                    if (!b.freeTicketRewardFunded) {
+                        totalReclaimed += b.dollarBalance ?? b.botStake ?? 0;
+                    }
                 });
 
                 room.bots = [];
@@ -8947,6 +8990,7 @@ function processRoom(room) {
                 room.aiBudgetBalance = 0;
                 room.savedAgarTarget = 0;
                 room.savedSlitherTarget = 0;
+                resetFreeTicketBotTargets(room);
 
                 room.foodPoolBalance += totalReclaimed;
                 console.log(`💰 Reclaimed $${totalReclaimed.toFixed(2)} from idle room bots/budget to foodPool.`);
@@ -8966,7 +9010,9 @@ function processRoom(room) {
         const agarHumansInArena = effectiveHumanCountForBots(room, 'agar');
         const slitherHumansInArena = effectiveHumanCountForBots(room, 'slither');
 
-        let agarTargetBots = getTargetBots(agarHumansInArena);
+        let agarTargetBots = room.isFreeTicketRoom
+            ? getFreeTicketBotTarget(room, 'agar')
+            : getTargetBots(agarHumansInArena);
         if (agarHumansInArena > 0) room.savedAgarTarget = agarTargetBots;
         else agarTargetBots = room.savedAgarTarget || 0;
         agarTargetBots += room.bots.filter(b => b.adminSpawned).length;
@@ -8981,7 +9027,9 @@ function processRoom(room) {
             trimAgarBots(room, agarTargetBots);
         }
 
-        let slitherTargetBots = getSlitherTargetBots(slitherHumansInArena);
+        let slitherTargetBots = room.isFreeTicketRoom
+            ? getFreeTicketBotTarget(room, 'slither')
+            : getSlitherTargetBots(slitherHumansInArena);
         if (slitherHumansInArena > 0) room.savedSlitherTarget = slitherTargetBots;
         else slitherTargetBots = room.savedSlitherTarget || 0;
         slitherTargetBots += room.slitherBots.filter(b => b.adminSpawned).length;
@@ -8993,7 +9041,7 @@ function processRoom(room) {
             trimSlitherBots(room, slitherTargetBots);
         }
 
-        capAiBudget(room);
+        if (!room.isFreeTicketRoom) capAiBudget(room);
     }
 
     // Food spawn — funded from pool (entry fees on join), same rules for agar + slither
@@ -9065,7 +9113,7 @@ function processRoom(room) {
             }
 
             // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
-            const isFreePlay = room.isSandbox || process.env.DEV_FREE_PLAY === 'true';
+            const isFreePlay = room.isSandbox || room.isFreeTicketRoom || process.env.DEV_FREE_PLAY === 'true';
             if (!isFreePlay) {
                 if (player.isCashingOut) {
                     if (Date.now() >= player.cashOutEndTime) {
