@@ -69,7 +69,7 @@ test('affiliate configuration defaults match the business requirements', () => {
     assert.equal(PLATFORM_CASHOUT_FEE_BPS, 500);
     assert.equal(AFFILIATE_STANDARD_SHARE_BPS, 3_000);
     assert.equal(AFFILIATE_HOLD_DAYS, 7);
-    assert.equal(AFFILIATE_MIN_PAYOUT_USD_MICROS, 25_000_000);
+    assert.equal(AFFILIATE_MIN_PAYOUT_USD_MICROS, 2_000_000);
     assert.equal(REFERRAL_ATTRIBUTION_DAYS, 60);
 });
 

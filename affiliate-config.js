@@ -52,7 +52,7 @@ export const AFFILIATE_HOLD_DAYS = readInteger(
 );
 export const AFFILIATE_MIN_PAYOUT_USD_MICROS = readUsdMicros(
     'AFFILIATE_MIN_PAYOUT_USD',
-    25,
+    2,
 );
 export const REFERRAL_ATTRIBUTION_DAYS = readInteger(
     'REFERRAL_ATTRIBUTION_DAYS',

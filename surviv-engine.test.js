@@ -70,9 +70,13 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 19);
+    assert.equal(map.landmarks.length, 23);
     assert.ok(houses.length >= 100);
     assert.ok(chests.length < houses.length);
+    assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
+        'wood_crate', 'supply_crate', 'ammo_crate', 'medical_crate', 'armory_crate',
+    ]));
+    assert.ok(chests.every(item => item.hp > 0 && item.hp === item.maxHp && item.hitRadius > 0));
     assert.equal(groundLoot.length, 22);
     for (const item of groundLoot) {
         const floor = houses.find(house => house.id === item.houseId);
@@ -528,8 +532,8 @@ test('farm, research campus, and hamlets use purposeful road-facing layouts', ()
     assert.deepEqual(new Set(farmBuildings.map(building => building.role)), new Set(['barn', 'farmhouse', 'shed', 'greenhouse']));
     assert.equal(labBuildings.length, 3);
     assert.deepEqual(new Set(labBuildings.map(building => building.label)), new Set(['LAB A', 'LAB B', 'POWER']));
-    assert.equal(hamletFields.length, 5);
-    assert.equal(hamletHomes.length, 15);
+    assert.ok(hamletFields.length >= 3);
+    assert.equal(hamletHomes.length, hamletFields.length * 3);
     assert.ok([...farmBuildings, ...labBuildings, ...hamletHomes].every(building => doorsByHouse.has(building.id)));
 
     const farmRoad = map.obstacles.find(obstacle => obstacle.kind === 'road' && obstacle.landmarkType === 'farm' && obstacle.role === 'driveway');
@@ -743,22 +747,28 @@ test('the dedicated melee slot stays available and G drops the held gun', () => 
     assert.equal(dropped.ammo, 9);
 });
 
-test('holding a chest open drops every item onto the ground after two seconds', () => {
+test('melee-breaking a crate bursts every item onto the ground', () => {
     const room = makeRoom();
     room.obstacles = [];
     room.loot = [];
     room.spawnPoints = [];
     room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
-    const player = createSurvivPlayer('human-hold-chest', 'mongo-hold-chest', 'Opener', '#fff', room);
+    const player = createSurvivPlayer('human-break-crate', 'mongo-break-crate', 'Opener', '#fff', room);
     player.x = 0;
     player.y = 0;
+    player.aimAngle = 0;
+    player.shooting = true;
     room.players.push(player);
     room.loot.push({
-        id: 'hold-chest',
+        id: 'break-crate',
         type: 'chest',
-        x: 0,
+        containerType: 'supply_crate',
+        x: 45,
         y: 0,
         tier: 'rare',
+        hp: 18,
+        maxHp: 18,
+        hitRadius: 24,
         contents: {
             weaponType: 'shotgun',
             ammo: 3,
@@ -772,17 +782,14 @@ test('holding a chest open drops every item onto the ground after two seconds', 
         },
     });
 
-    player.chestHoldId = 'hold-chest';
-    player.chestHoldStartedAt = Date.now() - 2100;
-    player.chestHoldSeenAt = Date.now();
     processSurvivRoom(room, silentIo, Date.now() + 600000);
 
-    assert.equal(room.loot.some(item => item.id === 'hold-chest'), false);
+    assert.equal(room.loot.some(item => item.id === 'break-crate'), false);
     assert.deepEqual(new Set(room.loot.map(item => item.type)), new Set([
         'weapon', 'money', 'medkit', 'ammo', 'grenade', 'armor',
     ]));
     assert.ok(room.loot.every(item => item.source === 'chest'));
-    assert.ok(room.loot.every(item => item.spawnX === 0 && item.spawnY === 0));
+    assert.ok(room.loot.every(item => item.spawnX === 45 && item.spawnY === 0));
     assert.ok(room.loot.every(item => Number.isFinite(item.spawnedAt)));
     assert.ok(room.loot.every(item => item.pickupAfter - item.spawnedAt === 700));
     assert.deepEqual(room.loot.map(item => item.burstIndex).sort((a, b) => a - b), [0, 1, 2, 3, 4, 5]);
@@ -793,8 +800,7 @@ test('holding a chest open drops every item onto the ground after two seconds', 
     assert.equal(player.inventory.chestsOpened, 1);
     assert.equal(player.openedContainer, null);
 });
-
-test('indoor chest drops stay inside the house when opened beside a corner', () => {
+test('indoor crate drops stay inside the house when broken beside a corner', () => {
     const room = makeRoom();
     room.loot = [];
     room.spawnPoints = [];
@@ -804,8 +810,10 @@ test('indoor chest drops stay inside the house when opened beside a corner', () 
         { id: 'corner-room', kind: 'roomZone', x: 0, y: 0, w: 200, h: 200, rotation: 0, collidable: false, houseId: 'corner-house', variant: 'main' },
     ];
     const player = createSurvivPlayer('corner-opener', 'mongo-corner-opener', 'Corner Opener', '#fff', room);
-    player.x = 72;
-    player.y = 72;
+    player.x = 52;
+    player.y = 84;
+    player.aimAngle = 0;
+    player.shooting = true;
     room.players.push(player);
     room.loot.push({
         id: 'corner-chest',
@@ -813,6 +821,10 @@ test('indoor chest drops stay inside the house when opened beside a corner', () 
         x: 84,
         y: 84,
         tier: 'rare',
+        containerType: 'armory_crate',
+        hp: 18,
+        maxHp: 18,
+        hitRadius: 26,
         houseId: 'corner-house',
         room: 'main',
         contents: {
@@ -827,9 +839,6 @@ test('indoor chest drops stay inside the house when opened beside a corner', () 
         },
     });
 
-    player.chestHoldId = 'corner-chest';
-    player.chestHoldStartedAt = Date.now() - 2100;
-    player.chestHoldSeenAt = Date.now();
     processSurvivRoom(room, silentIo, Date.now() + 600000);
 
     assert.equal(room.loot.length, 6);
@@ -1180,6 +1189,38 @@ test('firearms retain enough range to damage destructible trees', () => {
 
     assert.equal(room.obstacles[0].hp, 73, 'a pistol round should damage a destructible tree');
 });
+test('bullets break loot crates and release their contents', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.spawnPoints = [];
+    room.loot = [{
+        id: 'shot-crate',
+        type: 'chest',
+        containerType: 'ammo_crate',
+        x: 68,
+        y: 0,
+        tier: 'common',
+        hp: 11,
+        maxHp: 11,
+        hitRadius: 23,
+        contents: { ammoType: '9mm', ammoAmount: 30 },
+    }];
+    const player = createSurvivPlayer('human-crate-shot', 'mongo-crate-shot', 'Crate Shooter', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['pistol'];
+    player.shooting = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.loot.some(item => item.id === 'shot-crate'), false);
+    assert.equal(room.loot.find(item => item.type === 'ammo')?.amount, 30);
+    assert.equal(player.inventory.chestsOpened, 1);
+});
+
 test('melee attacks destroy weak Surviv obstacles', () => {
     const room = makeRoom();
     room.loot = [];
@@ -1283,7 +1324,18 @@ test('surviv bots prioritize useful chests and loot their contents', () => {
     room.obstacles = [];
     room.loot = [
         { id: 'near-medkit', type: 'medkit', x: 0, y: 80, amount: 1, tier: 'common' },
-        { id: 'priority-chest', type: 'chest', x: 120, y: 0, tier: 'rare', contents: { weaponType: 'assault', money: 1, rarity: 'rare' } },
+        {
+            id: 'priority-chest',
+            type: 'chest',
+            containerType: 'armory_crate',
+            x: 120,
+            y: 0,
+            tier: 'rare',
+            hp: 18,
+            maxHp: 18,
+            hitRadius: 26,
+            contents: { weaponType: 'assault', money: 1, rarity: 'rare' },
+        },
     ];
     room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
     const player = createSurvivPlayer('loot-observer', 'loot-observer-mongo', 'Observer', '#fff', room);
@@ -1292,14 +1344,10 @@ test('surviv bots prioritize useful chests and loot their contents', () => {
     room.players.push(player);
     const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
 
-    for (let tick = 0; tick < 12; tick++) {
-        bot.botThinkAt = 0;
-        processSurvivRoom(room, silentIo, Date.now() + 600000);
-    }
-    bot.x = 120;
+    bot.x = 70;
     bot.y = 0;
-    bot.chestHoldStartedAt = Date.now() - 2100;
     bot.botThinkAt = 0;
+    bot.weapon.lastShotAt = 0;
     processSurvivRoom(room, silentIo, Date.now() + 600000);
     for (const item of room.loot) item.pickupAfter = 0;
     for (let tick = 0; tick < 32; tick++) {
@@ -1307,7 +1355,7 @@ test('surviv bots prioritize useful chests and loot their contents', () => {
         processSurvivRoom(room, silentIo, Date.now() + 600000);
     }
 
-    assert.ok(bot.inventory.weapons.includes('assault'), 'bot should open and pick up the dropped chest weapon');
+    assert.ok(bot.inventory.weapons.includes('assault'), 'bot should break and pick up the dropped crate weapon');
     assert.ok(bot.dollarBalance >= 1, 'bot should continue looting money from the opened chest');
 });
 
@@ -1391,6 +1439,9 @@ test('surviv static terrain payload is retained between periodic sends', () => {
 
     assert.ok(Array.isArray(ticks[0].obstacles));
     assert.ok(ticks[0].minimap);
+    assert.equal(ticks[0].obstaclePatch.x, player.x);
+    assert.equal(ticks[0].obstaclePatch.y, player.y);
+    assert.ok(ticks[0].obstaclePatch.retainRange > ticks[0].obstaclePatch.range);
     const animatedDrop = ticks[0].loot.find(item => item.id === 'animated-chest-drop');
     assert.ok(animatedDrop);
     assert.equal(animatedDrop.spawnX, 0);
