@@ -1221,6 +1221,50 @@ test('bullets break loot crates and release their contents', () => {
     assert.equal(player.inventory.chestsOpened, 1);
 });
 
+test('loot crates block movement until they are destroyed', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.loot = [{
+        id: 'solid-crate',
+        type: 'chest',
+        containerType: 'wood_crate',
+        x: 50,
+        y: 0,
+        tier: 'common',
+        hp: 18,
+        maxHp: 18,
+        hitRadius: 24,
+        contents: {},
+    }];
+    const player = createSurvivPlayer('solid-crate-player', 'solid-crate-mongo', 'Blocked', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 1;
+    player.inputDy = 0;
+    room.players.push(player);
+
+    for (let tick = 0; tick < 8; tick++) {
+        processSurvivRoom(room, silentIo, Date.now() + 600000 + tick);
+    }
+
+    assert.ok(player.x <= 12.01, 'the player should stop at the crate collision radius');
+    assert.equal(room.loot.some(item => item.id === 'solid-crate'), true);
+
+    player.aimAngle = 0;
+    player.shooting = true;
+    player.weapon.lastShotAt = 0;
+    processSurvivRoom(room, silentIo, Date.now() + 601000);
+    assert.equal(room.loot.some(item => item.id === 'solid-crate'), false);
+
+    player.shooting = false;
+    for (let tick = 0; tick < 8; tick++) {
+        processSurvivRoom(room, silentIo, Date.now() + 602000 + tick);
+    }
+    assert.ok(player.x > 20, 'movement should continue after the crate is broken');
+});
+
 test('melee attacks destroy weak Surviv obstacles', () => {
     const room = makeRoom();
     room.loot = [];

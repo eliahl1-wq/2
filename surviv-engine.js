@@ -3603,6 +3603,33 @@ function querySurvivLoot(room, x, y, range) {
     return out;
 }
 
+function isSolidLootContainer(item) {
+    return item?.type === 'chest' || item?.type === 'deathCrate';
+}
+
+function getLootContainerHitRadius(item) {
+    return Number(item?.hitRadius)
+        || CONTAINER_PROFILES[item?.containerType]?.hitRadius
+        || 24;
+}
+
+function resolveCircleLootContainer(cx, cy, radius, item, fallbackDx = 1, fallbackDy = 0) {
+    const itemRadius = getLootContainerHitRadius(item);
+    const dx = cx - item.x;
+    const dy = cy - item.y;
+    const distance = Math.hypot(dx, dy);
+    const minimumDistance = radius + itemRadius;
+    if (distance >= minimumDistance) return { x: cx, y: cy };
+    if (distance < 0.0001) {
+        const fallback = normalize(-fallbackDx, -fallbackDy);
+        const pushX = fallback.dx || 1;
+        const pushY = fallback.dy || 0;
+        return { x: item.x + pushX * minimumDistance, y: item.y + pushY * minimumDistance };
+    }
+    const scale = minimumDistance / distance;
+    return { x: item.x + dx * scale, y: item.y + dy * scale };
+}
+
 function addSurvivLoot(room, item) {
     room.loot.push(item);
     markSurvivLootChanged(room);
@@ -3621,6 +3648,10 @@ function isPositionBlocked(room, x, y, r) {
     for (const o of queryObstacles(room, x, y, r + 80, true)) {
         if (circleRectCollision(x, y, r, o)) return true;
     }
+    for (const { item } of querySurvivLoot(room, x, y, r + 32)) {
+        if (!isSolidLootContainer(item)) continue;
+        if (dist(x, y, item.x, item.y) < r + getLootContainerHitRadius(item)) return true;
+    }
     return false;
 }
 
@@ -3632,6 +3663,10 @@ function isSurvivSpawnPositionSafe(room, x, y, radius) {
             || obstacle.kind === 'river';
         if (!forbiddenSurface && obstacle.collidable === false) continue;
         if (circleRectCollision(x, y, radius, obstacle)) return false;
+    }
+    for (const { item } of querySurvivLoot(room, x, y, radius + 32)) {
+        if (!isSolidLootContainer(item)) continue;
+        if (dist(x, y, item.x, item.y) < radius + getLootContainerHitRadius(item)) return false;
     }
     return true;
 }
@@ -3656,6 +3691,13 @@ function moveEntity(entity, room, dx, dy, speed) {
             newX = resolved.x;
             newY = resolved.y;
         }
+    }
+
+    for (const { item } of querySurvivLoot(room, newX, newY, r + 40)) {
+        if (!isSolidLootContainer(item)) continue;
+        const resolved = resolveCircleLootContainer(newX, newY, r, item, nx, ny);
+        newX = resolved.x;
+        newY = resolved.y;
     }
 
     entity.x = newX;
