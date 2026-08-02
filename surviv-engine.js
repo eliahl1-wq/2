@@ -3845,6 +3845,7 @@ function dropDeathLoot(room, entity) {
 export function eliminateSurvivPlayer(room, player, io, attacker = null) {
     if (player._eliminated) return;
     player._eliminated = true;
+    const eliminatedDollarBalance = Number(player.dollarBalance) || 0;
     if (!Array.isArray(room.deathMarkers)) room.deathMarkers = [];
     room.deathMarkers.push({
         id: `grave:${player.id}:${Date.now()}:${randId()}`,
@@ -3884,6 +3885,10 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null) {
         room.bots = room.bots.filter(b => b.id !== player.id);
     } else {
         room.players = room.players.filter(p => p.id !== player.id);
+        Promise.resolve(room.onHumanEliminated?.(player, {
+            attacker,
+            dollarBalance: eliminatedDollarBalance,
+        })).catch(error => console.error('Surviv elimination callback failed:', error));
     }
 }
 

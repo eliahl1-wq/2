@@ -98,6 +98,7 @@ export function createAgarCommerceService({
     sensitiveRateLimit,
 }) {
     const config = {
+        adminOnly: process.env.AGAR_ADMIN_ONLY !== 'false',
         enabled: envBoolean('AGAR_TOKEN_ENABLED'),
         shopEnabled: envBoolean('AGAR_SHOP_ENABLED'),
         swapEnabled: envBoolean('AGAR_ACCOUNT_SWAP_ENABLED'),
@@ -115,6 +116,19 @@ export function createAgarCommerceService({
     const agarBalanceCache = new Map();
     const agarBalanceInFlight = new Map();
     const agarBalanceCacheMs = Math.max(5_000, Number(process.env.AGAR_BALANCE_RPC_CACHE_MS || 30_000));
+
+    async function hasAgarAccess(userId) {
+        if (!config.adminOnly) return true;
+        const adminUsername = process.env.ADMIN_USERNAME?.trim();
+        if (!adminUsername || !userId) return false;
+        return !!(await User.exists({ _id: userId, username: adminUsername }));
+    }
+
+    async function requireAgarAccess(req, res) {
+        if (await hasAgarAccess(req.user?.id)) return true;
+        res.status(503).json({ message: 'AGAR is coming soon.' });
+        return false;
+    }
 
     async function loadTokenContext({ requireDestinations = false } = {}) {
         if (!config.enabled) throw new Error('AGAR has not launched yet');
@@ -280,7 +294,27 @@ export function createAgarCommerceService({
         }
     }
 
-    async function publicConfig() {
+    async function publicConfig({ accessGranted = false } = {}) {
+        if (!accessGranted) {
+            return {
+                accessGranted: false,
+                adminOnly: config.adminOnly,
+                enabled: false,
+                mint: '',
+                decimals: config.configuredDecimals,
+                name: 'AGARSTAKE',
+                symbol: 'AGAR',
+                shopEnabled: false,
+                shopReady: false,
+                shopReason: 'AGAR is coming soon.',
+                swapEnabled: false,
+                swapReady: false,
+                swapReason: 'AGAR is coming soon.',
+                treasuryBps: config.treasuryBps,
+                ownerBps: config.ownerBps,
+                market: null,
+            };
+        }
         const shop = await shopReadiness();
         let tokenReady = false;
         let tokenReason = '';
@@ -291,6 +325,8 @@ export function createAgarCommerceService({
             tokenReason = error.message;
         }
         return {
+            accessGranted: true,
+            adminOnly: config.adminOnly,
             enabled: config.enabled,
             mint: config.enabled ? config.mint : '',
             decimals: config.configuredDecimals,
@@ -350,11 +386,13 @@ export function createAgarCommerceService({
     }
 
     function registerRoutes(app) {
-        app.get('/api/agar/config', async (_req, res) => {
-            res.json(await publicConfig());
+        app.get('/api/agar/config', authenticateToken, async (req, res) => {
+            const accessGranted = await hasAgarAccess(req.user.id);
+            res.json(await publicConfig({ accessGranted }));
         });
 
-        app.get('/api/agar/candles', async (req, res) => {
+        app.get('/api/agar/candles', authenticateToken, async (req, res) => {
+            if (!await requireAgarAccess(req, res)) return;
             if (!config.enabled || !config.mint) {
                 return res.status(503).json({ message: 'AGAR has not launched yet.' });
             }
@@ -369,6 +407,7 @@ export function createAgarCommerceService({
         });
 
         app.get('/api/agar/balance', authenticateToken, async (req, res) => {
+            if (!await hasAgarAccess(req.user.id)) return res.json({ balance: 0, launched: false });
             if (!config.enabled) return res.json({ balance: 0, launched: false });
             try {
                 const context = await loadTokenContext();
@@ -381,7 +420,15 @@ export function createAgarCommerceService({
                 return res.status(502).json({ message: 'AGAR balance is temporarily unavailable.' });
             }
         });
-        app.get('/api/shop/catalog', async (_req, res) => {
+        app.get('/api/shop/catalog', authenticateToken, async (req, res) => {
+            if (!await hasAgarAccess(req.user.id)) {
+                return res.json({
+                    ready: false,
+                    reason: 'AGAR is coming soon.',
+                    currency: 'AGAR',
+                    products: AGAR_SHOP_PRODUCTS.map((product) => ({ ...product, estimatedAgar: null })),
+                });
+            }
             const shop = await shopReadiness();
             const priceUsd = shop.market?.priceUsd || null;
             res.json({
@@ -411,6 +458,7 @@ export function createAgarCommerceService({
         });
 
         app.post('/api/shop/quote', sensitiveRateLimit({ limit: 20, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+            if (!await requireAgarAccess(req, res)) return;
             const readiness = await shopReadiness();
             if (!readiness.ready) return res.status(503).json({ message: readiness.reason });
             const product = getAgarShopProduct(String(req.body?.productId || ''));
@@ -450,6 +498,7 @@ export function createAgarCommerceService({
         });
 
         app.post('/api/shop/purchase', sensitiveRateLimit({ limit: 10, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+            if (!await requireAgarAccess(req, res)) return;
             const quoteId = String(req.body?.quoteId || '');
             const idempotencyKey = String(req.body?.idempotencyKey || '').trim();
             if (!/^[a-zA-Z0-9:_-]{8,128}$/.test(idempotencyKey)) {
@@ -566,6 +615,7 @@ export function createAgarCommerceService({
         });
 
         app.post('/api/agar/swap', sensitiveRateLimit({ limit: 20, windowMs: 60_000 }), authenticateToken, async (req, res) => {
+            if (!await requireAgarAccess(req, res)) return;
             if (!config.enabled) return res.status(503).json({ message: 'AGAR has not launched yet.' });
             if (!config.swapEnabled) return res.status(503).json({ message: 'AGAR account swaps are not enabled yet.' });
             if (!config.jupiterApiKey) return res.status(503).json({ message: 'Jupiter is not configured.' });

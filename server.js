@@ -142,6 +142,7 @@ import {
 import { getAffiliatePublicConfig } from './affiliate-config.js';
 import { createAgarCommerceService } from './agar-commerce-service.js';
 import { createCachedBalanceReader } from './solana-rpc-cache.js';
+import { isQualifyingFreeTicketCompletion } from './free-ticket-challenge.js';
 import {
     FREE_TICKET_MAX_BOTS_PER_MODE,
     getFreeTicketBotTarget,
@@ -325,8 +326,11 @@ const UserSchema = new mongoose.Schema({
     isOwnerAccount: { type: Boolean, default: false, index: true },
     personalFreePlay: { type: Boolean, default: false },
     sponsoredRewardsCompleted: { type: Boolean, default: false },
-    hasFreeTicket: { type: Boolean, default: true },
+    hasFreeTicket: { type: Boolean, default: false },
     freeTicketUsed: { type: Boolean, default: false },
+    freeTicketChallengeCompleted: { type: Boolean, default: false },
+    freeTicketChallengeCompletedAt: { type: Date, default: null },
+    freeTicketChallengeCheckedAt: { type: Date, default: null },
     completedFiveDollarNormalGames: { type: Number, default: 0 },
     completedTenDollarNormalGames: { type: Number, default: 0 },
     sponsoredRewardsUnlocked: { type: Boolean, default: false },
@@ -401,25 +405,57 @@ function getDynamicChallengeReqs(sponsoredRewardsBalance) {
 
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed' || doc.excludedFromReports || doc.meta?.simulated) return;
+    const TransactionMod = mongoose.model('Transaction');
+    const UserMod = mongoose.model('User');
+    const userId = doc.userId;
+
+    if (userId && isQualifyingFreeTicketCompletion(doc)) {
+        try {
+            const ticketMarker = await TransactionMod.updateOne(
+                { _id: doc._id, 'meta.freeTicketChallengeApplied': { $ne: true } },
+                { $set: { 'meta.freeTicketChallengeApplied': true, 'meta.freeTicketChallengeAppliedAt': new Date().toISOString() } },
+            );
+            if (ticketMarker.modifiedCount) {
+                const currentTicketState = await UserMod.findById(userId)
+                    .select('freeTicketUsed freeTicketChallengeCompleted rewardsDisabled')
+                    .lean();
+                if (currentTicketState && !currentTicketState.freeTicketChallengeCompleted) {
+                    await UserMod.updateOne(
+                        { _id: userId, freeTicketChallengeCompleted: { $ne: true } },
+                        { $set: {
+                            freeTicketChallengeCompleted: true,
+                            freeTicketChallengeCompletedAt: new Date(),
+                            freeTicketChallengeCheckedAt: new Date(),
+                            ...(!currentTicketState.freeTicketUsed && !currentTicketState.rewardsDisabled ? { hasFreeTicket: true } : {}),
+                        } },
+                    );
+                }
+            }
+        } catch (error) {
+            await TransactionMod.updateOne(
+                { _id: doc._id },
+                { $unset: { 'meta.freeTicketChallengeApplied': 1, 'meta.freeTicketChallengeAppliedAt': 1 } },
+            ).catch(() => {});
+            console.error('Error unlocking free-ticket challenge:', error.message);
+        }
+    }
+
     const isNormalGameDeath = doc.type === 'game' && doc.meta?.event === 'death' && doc.meta?.reason === 'Arena Death';
     const isNormalGameCashout = doc.type === 'withdraw'
         && (doc.meta?.reason === 'Arena Cashout' || doc.meta?.reason === 'Auto Room Reset to Account Address');
     if (!isNormalGameDeath && !isNormalGameCashout) return;
 
-    const userId = doc.userId;
     const entryFeeUsd = Number(doc.meta?.entryFeeUsd);
     const mode = doc.meta?.mode;
     if (!userId || !['agar', 'slither'].includes(mode) || doc.meta?.isFreeTicketPlay || ![5, 10].includes(entryFeeUsd)) return;
 
-    const TransactionMod = mongoose.model('Transaction');
-    const marker = await TransactionMod.updateOne(
+    const challengeMarker = await TransactionMod.updateOne(
         { _id: doc._id, 'meta.challengeProgressApplied': { $ne: true } },
         { $set: { 'meta.challengeProgressApplied': true, 'meta.challengeProgressAppliedAt': new Date().toISOString() } },
     );
-    if (!marker.modifiedCount) return;
+    if (!challengeMarker.modifiedCount) return;
 
     try {
-        const UserMod = mongoose.model('User');
         const current = await UserMod.findOne({
             _id: userId,
             sponsoredRewardsUnlocked: { $ne: true },
@@ -500,6 +536,29 @@ TransactionSchema.post('save', async function createAffiliateCommissionHook(doc)
     }
 });
 const Transaction = mongoose.model('Transaction', TransactionSchema);
+
+async function ensureFreeTicketChallengeState(user) {
+    if (!user || user.freeTicketChallengeCompleted || user.freeTicketChallengeCheckedAt) return user;
+    const priorCompletion = await Transaction.findOne({
+        userId: user._id,
+        status: 'confirmed',
+        excludedFromReports: { $ne: true },
+        'meta.simulated': { $ne: true },
+        'meta.isFreeTicketPlay': { $ne: true },
+        'meta.mode': { $in: ['agar', 'slither', 'surviv'] },
+        $or: [
+            { type: 'game', 'meta.event': 'death', 'meta.reason': { $in: ['Arena Death', 'Surviv Death'] } },
+            { type: 'withdraw', 'meta.reason': { $in: ['Arena Cashout', 'Auto Room Reset', 'Auto Room Reset to Account Address'] } },
+        ],
+    }).select('_id createdAt').lean();
+
+    user.freeTicketChallengeCheckedAt = new Date();
+    user.freeTicketChallengeCompleted = !!priorCompletion;
+    user.freeTicketChallengeCompletedAt = priorCompletion?.createdAt || null;
+    user.hasFreeTicket = !!priorCompletion && !user.freeTicketUsed && !user.rewardsDisabled;
+    await user.save();
+    return user;
+}
 
 /** In-game cashouts only — excludes account withdrawals to external wallets. */
 const GAME_CASHOUT_REASON_RE = /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i;
@@ -649,6 +708,24 @@ function createSurvivRoom(entryFeeUsd) {
         lootPoolBalance: 0,
         spectators: [],
         deathMarkers: [],
+        onHumanEliminated: async (player, { dollarBalance = 0 } = {}) => {
+            if (!player?.mongoId) return;
+            await Transaction.create({
+                userId: player.mongoId,
+                type: 'game',
+                amount: dollarBalance,
+                meta: {
+                    reason: 'Surviv Death',
+                    event: 'death',
+                    mode: 'surviv',
+                    entryFeeUsd: player.entryFeeUsd ?? entryFeeUsd,
+                    inGameBalanceUsd: dollarBalance,
+                    ...(player.personalFreePlay ? { simulated: true } : {}),
+                },
+                excludedFromReports: !!player.personalFreePlay,
+                status: 'confirmed',
+            });
+        },
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
     };
@@ -2238,6 +2315,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         let user = await User.findById(req.user.id).select('-password');
         if (!user) return res.status(404).json({ message: "Användare hittades ej" });
         user = await ensureUserDepositWallet(user);
+        user = await ensureFreeTicketChallengeState(user);
 
         let solOnChain = Number(user.balance) || 0;
         if (user.depositAddress && !DEV_FREE_PLAY) {
@@ -4175,7 +4253,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime email hasFreeTicket freeTicketUsed completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const depositTotals = await Transaction.aggregate([
             { $match: depositMatch },
@@ -4205,6 +4283,8 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 isOwnerAccount: !!u.isOwnerAccount,
                 hasFreeTicket: !!u.hasFreeTicket,
                 freeTicketUsed: !!u.freeTicketUsed,
+                freeTicketChallengeCompleted: !!u.freeTicketChallengeCompleted,
+                freeTicketChallengeCompletedAt: u.freeTicketChallengeCompletedAt || null,
                 completedFiveDollarNormalGames: u.completedFiveDollarNormalGames ?? 0,
                 completedTenDollarNormalGames: u.completedTenDollarNormalGames ?? 0,
                 sponsoredRewardsCompleted: !!u.sponsoredRewardsCompleted,
@@ -4507,6 +4587,8 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             rewards: {
                 hasFreeTicket: !!user.hasFreeTicket,
                 freeTicketUsed: !!user.freeTicketUsed,
+                freeTicketChallengeCompleted: !!user.freeTicketChallengeCompleted,
+                freeTicketChallengeCompletedAt: user.freeTicketChallengeCompletedAt || null,
                 freeTicketGamesPlayed: freeTicketGames.length,
                 freeTicketCashouts: freeTicketCashouts.length,
                 freeTicketDeaths: freeTicketDeaths.length,
@@ -4574,6 +4656,9 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
             }
             user.hasFreeTicket = true;
             user.freeTicketUsed = false;
+            user.freeTicketChallengeCompleted = true;
+            user.freeTicketChallengeCompletedAt = new Date();
+            user.freeTicketChallengeCheckedAt = new Date();
             await user.save();
             return res.json({ success: true, message: 'Free ticket granted successfully.', user });
         } else if (action === 'revoke_ticket') {
@@ -5718,8 +5803,11 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
         }
 
         await User.updateMany({ rewardsDisabled: { $ne: true } }, { $set: {
-            hasFreeTicket: true,
+            hasFreeTicket: false,
             freeTicketUsed: false,
+            freeTicketChallengeCompleted: false,
+            freeTicketChallengeCompletedAt: null,
+            freeTicketChallengeCheckedAt: new Date(),
             completedFiveDollarNormalGames: 0,
             completedTenDollarNormalGames: 0,
             sponsoredRewardsUnlocked: false,
@@ -5735,6 +5823,9 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
         await User.updateMany({ rewardsDisabled: true }, { $set: {
             hasFreeTicket: false,
             freeTicketUsed: true,
+            freeTicketChallengeCompleted: false,
+            freeTicketChallengeCompletedAt: null,
+            freeTicketChallengeCheckedAt: new Date(),
             completedFiveDollarNormalGames: 0,
             completedTenDollarNormalGames: 0,
             sponsoredRewardsUnlocked: false,
@@ -5749,8 +5840,10 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
         await RewardSecurityAlert.updateMany(
             { 'snapshots.0': { $exists: true } },
             { $set: {
-                'snapshots.$[].hasFreeTicket': true,
+                'snapshots.$[].hasFreeTicket': false,
                 'snapshots.$[].freeTicketUsed': false,
+                'snapshots.$[].freeTicketChallengeCompleted': false,
+                'snapshots.$[].freeTicketChallengeCompletedAt': null,
                 'snapshots.$[].completedFiveDollarNormalGames': 0,
                 'snapshots.$[].completedTenDollarNormalGames': 0,
                 'snapshots.$[].sponsoredRewardsUnlocked': false,
@@ -7575,6 +7668,9 @@ io.on('connection', (socket) => {
 
             if (isFreeTicketPlay && !existing) {
                 // First time joining with a free ticket
+                if (!user.freeTicketChallengeCompleted) {
+                    throw new Error('Complete one Normal game before using your free ticket. Slither Arena does not count.');
+                }
                 if (!user.hasFreeTicket || user.freeTicketUsed) {
                     throw new Error('You do not have an active free ticket or it has already been used.');
                 }
@@ -7716,7 +7812,7 @@ io.on('connection', (socket) => {
                 if (isFreeTicketPlay) {
                     // Atomically consume the ticket across every server instance.
                     const consumedTicket = await User.findOneAndUpdate(
-                        { _id: user._id, hasFreeTicket: true, freeTicketUsed: { $ne: true }, rewardsDisabled: { $ne: true } },
+                        { _id: user._id, freeTicketChallengeCompleted: true, hasFreeTicket: true, freeTicketUsed: { $ne: true }, rewardsDisabled: { $ne: true } },
                         { $set: { hasFreeTicket: false, freeTicketUsed: true } },
                         { new: true },
                     );
