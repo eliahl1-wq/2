@@ -141,6 +141,7 @@ import {
 } from './affiliate-system.js';
 import { getAffiliatePublicConfig } from './affiliate-config.js';
 import { createAgarCommerceService } from './agar-commerce-service.js';
+import { createCachedBalanceReader } from './solana-rpc-cache.js';
 import {
     FREE_TICKET_MAX_BOTS_PER_MODE,
     getFreeTicketBotTarget,
@@ -162,6 +163,13 @@ const TOURNAMENT_WALLET_ADDRESS = process.env.TOURNAMENT_WALLET_ADDRESS;
 const TOURNAMENT_WALLET_SECRET = process.env.TOURNAMENT_WALLET_SECRET;
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || solanaWeb3.clusterApiUrl('mainnet-beta');
 const connection = new solanaWeb3.Connection(SOLANA_RPC_URL, 'confirmed');
+const fallbackRpcConnection = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+const ACCOUNT_BALANCE_RPC_CACHE_MS = Math.max(1_000, Number(process.env.ACCOUNT_BALANCE_RPC_CACHE_MS || 12_000));
+const balanceReader = createCachedBalanceReader({
+    primaryConnection: connection,
+    fallbackConnection: fallbackRpcConnection,
+    shouldUseFallback: error => /429|too many requests|rate/i.test(String(error?.message || error)),
+});
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString('hex');
 if (!process.env.JWT_SECRET) {
@@ -1823,19 +1831,15 @@ async function logPersonalAccountDeposit({
     );
 }
 
-// Helper: get balance with automatic fallback to public RPC on rate-limit
-async function getBalanceWithFallback(pubKey) {
-    try {
-        return await connection.getBalance(pubKey);
-    } catch (e) {
-        if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests') || e.message.includes('rate'))) {
-            const fallback = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
-            return await fallback.getBalance(pubKey);
-        }
-        throw e;
-    }
+// Cached and deduplicated account-balance reader. Financial transfers still use
+// direct RPC reads; this cache is only for UI/deposit synchronization.
+async function getBalanceStateWithFallback(pubKey, options = {}) {
+    return balanceReader.read(pubKey, options);
 }
 
+async function getBalanceWithFallback(pubKey, options = {}) {
+    return (await getBalanceStateWithFallback(pubKey, options)).lamports;
+}
 // Helper: get signatures with fallback
 async function getSignaturesWithFallback(pubKey, opts) {
     try {
@@ -1948,17 +1952,20 @@ async function scanDeposits() {
             if (!user.depositAddress) continue;
             try {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                const lamports = await getBalanceWithFallback(pubKey);
+                const previousBalance = Number(user.balance) || 0;
+                const lamports = await getBalanceWithFallback(pubKey, { force: true });
                 const solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+                const balanceChanged = Math.abs(previousBalance - solOnChain) > 0.000000001;
+                const balanceIncreased = solOnChain > previousBalance + 0.000000001;
 
-                // Credit the visible balance first. Signature/history analysis is slower
-                // and must never delay an already-confirmed on-chain deposit.
-                if (Math.abs(user.balance - solOnChain) > 0.000000001) {
+                if (balanceChanged) {
                     user.balance = solOnChain;
                     await user.save();
                     console.log(`[scanDeposits] Updated ${user.username}: ${solOnChain.toFixed(6)} SOL`);
                 }
-                queueRecentDepositSourceCapture(user, pubKey);
+                if (balanceIncreased || !user.depositHistoryBackfilledAt) {
+                    queueRecentDepositSourceCapture(user, pubKey);
+                }
             } catch (e) { console.error(`Sync error for ${user.username}:`, e.message); }
         }
     } catch (err) {
@@ -1968,10 +1975,15 @@ async function scanDeposits() {
     }
 }
 
-// Starta scannern var 5:e sekund
-setInterval(async () => {
-    if (!isScanningDeposits) await scanDeposits();
-}, 5000);
+// Background scanning is opt-in. Active clients already synchronize through
+// /api/me, so scanning every stored wallet continuously wastes RPC credits.
+if (process.env.DEPOSIT_BACKGROUND_SCANNER_ENABLED === 'true') {
+    const intervalMs = Math.max(30_000, Number(process.env.DEPOSIT_SCAN_INTERVAL_MS || 60_000));
+    const depositScanner = setInterval(async () => {
+        if (!isScanningDeposits) await scanDeposits();
+    }, intervalMs);
+    depositScanner.unref?.();
+}
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -2227,45 +2239,41 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         if (!user) return res.status(404).json({ message: "Användare hittades ej" });
         user = await ensureUserDepositWallet(user);
 
-        let solOnChain = 0;
+        let solOnChain = Number(user.balance) || 0;
         if (user.depositAddress && !DEV_FREE_PLAY) {
             try {
                 const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                const lamports = await getBalanceWithFallback(pubKey);
-                solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+                const previousBalance = Number(user.balance) || 0;
+                const balanceState = await getBalanceStateWithFallback(pubKey, {
+                    maxAgeMs: ACCOUNT_BALANCE_RPC_CACHE_MS,
+                });
+                const rpcBalance = balanceState.lamports / solanaWeb3.LAMPORTS_PER_SOL;
 
-                // Make the confirmed balance visible immediately. Deposit-source audit
-                // logging runs independently so RPC history latency cannot block /api/me.
-                if (Math.abs(user.balance - solOnChain) > 0.000000001) {
-                    user.balance = solOnChain;
-                    await user.save();
-                }
-                queueRecentDepositSourceCapture(user, pubKey);
-            } catch (e) {
-                // If Helius is rate-limiting, fall back to the public Solana RPC
-                if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests'))) {
-                    try {
-                        const fallbackConn = new solanaWeb3.Connection('https://api.mainnet-beta.solana.com', 'confirmed');
-                        const pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                        const lamports = await fallbackConn.getBalance(pubKey);
-                        solOnChain = lamports / solanaWeb3.LAMPORTS_PER_SOL;
-                        if (Math.abs(user.balance - solOnChain) > 0.00001) {
-                            user.balance = solOnChain;
-                            await user.save();
-                        }
-                    } catch (fallbackErr) {
-                        console.error('Sync error in /api/me (fallback):', fallbackErr.message);
-                        solOnChain = user.balance || 0;
+                // A cached pre-transaction value must never overwrite a newer balance
+                // already persisted by a join, cashout, swap, or withdrawal.
+                solOnChain = balanceState.fromCache
+                    && Math.abs(previousBalance - rpcBalance) > 0.000000001
+                    ? previousBalance
+                    : rpcBalance;
+
+                if (!balanceState.fromCache) {
+                    const balanceChanged = Math.abs(previousBalance - rpcBalance) > 0.000000001;
+                    const balanceIncreased = rpcBalance > previousBalance + 0.000000001;
+                    if (balanceChanged) {
+                        user.balance = rpcBalance;
+                        await user.save();
                     }
-                } else {
-                    console.error('Sync error in /api/me:', e.message);
-                    solOnChain = user.balance || 0;
+                    // Transaction-history calls are expensive. Scan only for a possible
+                    // incoming deposit or the account's one-time bounded backfill.
+                    if (balanceIncreased || !user.depositHistoryBackfilledAt) {
+                        queueRecentDepositSourceCapture(user, pubKey);
+                    }
                 }
+            } catch (error) {
+                console.error('Sync error in /api/me:', error.message);
+                solOnChain = Number(user.balance) || 0;
             }
-        } else if (DEV_FREE_PLAY) {
-            solOnChain = user.balance || 0;
         }
-
         const userObj = user.toObject();
         delete userObj.depositSecret;
         // Lägg till onChainBalance för frontend att visa, men ändra INTE DB-balansen här
@@ -3458,7 +3466,7 @@ app.post('/api/deposit-verify', sensitiveRateLimit({ limit: 20, windowMs: 60_000
         const depositSource = extractNativeDeposit(txDetails, user.depositAddress);
         if (!depositSource) return res.status(400).json({ message: 'Could not identify the funding wallet' });
         const solReceived = creditedLamports / solanaWeb3.LAMPORTS_PER_SOL;
-        user.balance = (await getBalanceWithFallback(depositPubkey)) / solanaWeb3.LAMPORTS_PER_SOL;
+        user.balance = (await getBalanceWithFallback(depositPubkey, { force: true })) / solanaWeb3.LAMPORTS_PER_SOL;
         await user.save();
 
         if (existing) {

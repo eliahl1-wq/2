@@ -112,11 +112,14 @@ export function createAgarCommerceService({
         jupiterBaseUrl: process.env.JUPITER_SWAP_API_URL?.trim() || 'https://api.jup.ag/swap/v2',
     };
     let tokenContextCache = null;
+    const agarBalanceCache = new Map();
+    const agarBalanceInFlight = new Map();
+    const agarBalanceCacheMs = Math.max(5_000, Number(process.env.AGAR_BALANCE_RPC_CACHE_MS || 30_000));
 
     async function loadTokenContext({ requireDestinations = false } = {}) {
         if (!config.enabled) throw new Error('AGAR has not launched yet');
         if (!hasWalletEncryptionKey()) throw new Error('Wallet encryption is not configured');
-        if (tokenContextCache && Date.now() - tokenContextCache.loadedAt < 30_000) {
+        if (tokenContextCache && Date.now() - tokenContextCache.loadedAt < 5 * 60_000) {
             if (requireDestinations && !tokenContextCache.destinationsReady) {
                 throw new Error(tokenContextCache.destinationError || 'AGAR destinations are not ready');
             }
@@ -181,22 +184,46 @@ export function createAgarCommerceService({
         return tokenContextCache;
     }
 
+    async function readAgarTokenBalance(address, context, { force = false } = {}) {
+        const wallet = publicKey(address, 'Account wallet');
+        const key = `${context.mint.toBase58()}:${wallet.toBase58()}`;
+        const cached = agarBalanceCache.get(key);
+        if (!force && cached && Date.now() - cached.loadedAt <= agarBalanceCacheMs) return cached.value;
+        if (!force && agarBalanceInFlight.has(key)) return agarBalanceInFlight.get(key);
+
+        const request = (async () => {
+            const ata = getAssociatedTokenAddressSync(context.mint, wallet, false, context.tokenProgram);
+            const tokenAccount = await getTokenAccount(
+                connection, ata, 'confirmed', context.tokenProgram,
+            ).catch(() => null);
+            const value = {
+                agarAtomic: tokenAccount?.amount || 0n,
+                agar: atomicToDecimal(tokenAccount?.amount || 0n, context.mintInfo.decimals),
+                ata,
+                tokenAccount,
+            };
+            agarBalanceCache.set(key, { value, loadedAt: Date.now() });
+            return value;
+        })();
+        agarBalanceInFlight.set(key, request);
+        try {
+            return await request;
+        } finally {
+            if (agarBalanceInFlight.get(key) === request) agarBalanceInFlight.delete(key);
+        }
+    }
+
     async function readWalletBalances(address, context) {
         const wallet = publicKey(address, 'Account wallet');
-        const ata = getAssociatedTokenAddressSync(context.mint, wallet, false, context.tokenProgram);
-        const [lamports, tokenAccount] = await Promise.all([
+        const [lamports, tokenValue] = await Promise.all([
             connection.getBalance(wallet, 'confirmed'),
-            getTokenAccount(connection, ata, 'confirmed', context.tokenProgram).catch(() => null),
+            readAgarTokenBalance(address, context, { force: true }),
         ]);
         return {
             sol: lamports / solanaWeb3.LAMPORTS_PER_SOL,
-            agarAtomic: tokenAccount?.amount || 0n,
-            agar: atomicToDecimal(tokenAccount?.amount || 0n, context.mintInfo.decimals),
-            ata,
-            tokenAccount,
+            ...tokenValue,
         };
     }
-
     async function grantEntitlement(purchase) {
         const entitlement = await SkinEntitlement.findOneAndUpdate(
             {
@@ -347,8 +374,8 @@ export function createAgarCommerceService({
                 const context = await loadTokenContext();
                 const user = await User.findById(req.user.id).select('depositAddress');
                 if (!user?.depositAddress) return res.status(404).json({ message: 'Account wallet is not available.' });
-                const balances = await readWalletBalances(user.depositAddress, context);
-                return res.json({ balance: balances.agar, launched: true });
+                const balance = await readAgarTokenBalance(user.depositAddress, context);
+                return res.json({ balance: balance.agar, launched: true });
             } catch (error) {
                 console.error('[AGAR balance]', error);
                 return res.status(502).json({ message: 'AGAR balance is temporarily unavailable.' });
