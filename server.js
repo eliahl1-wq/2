@@ -8498,8 +8498,21 @@ io.on('connection', (socket) => {
             player.cashoutHoldActive = true;
             player.cashoutHoldStartedAt = now;
             player.cashoutHoldCompletedAt = 0;
-            // Slither alone locks steering during the hold. Keep its last heading
-            // and disable boost; Agar and Surviv retain their normal controls.
+            if (player.mode === 'surviv' || room?.isSurviv) {
+                player.inputDx = 0;
+                player.inputDy = 0;
+                player.shooting = false;
+                player.useMedkit = false;
+                player.pickupWeaponPending = false;
+                player.equipSlotPending = null;
+                player.throwGrenadePending = false;
+                player.swapWeaponSlots = null;
+                player.dropItemPending = null;
+                player.openChestId = null;
+                player.takeChestItem = null;
+            }
+            // Slither keeps its last heading with boost disabled. Surviv is frozen
+            // above because its hold is an exposed, interruptible gameplay action.
             if (player.mode === 'slither' || player.mode === 'competitive-slither') {
                 player.boost = false;
             }
@@ -8775,6 +8788,13 @@ io.on('connection', (socket) => {
             closeChest,
             dropItem,
         } = payload;
+
+        if (player.cashoutHoldActive) {
+            player.inputDx = 0;
+            player.inputDy = 0;
+            player.shooting = false;
+            return;
+        }
 
         player.inputDx = finiteClamp(dx, -1, 1);
         player.inputDy = finiteClamp(dy, -1, 1);

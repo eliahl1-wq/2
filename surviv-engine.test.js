@@ -7,6 +7,7 @@ import {
     beginSurvivReload,
     broadcastSurvivState,
     createSurvivPlayer,
+    eliminateSurvivPlayer,
     equipSurvivWeaponSlot,
     generateSurvivMap,
     getSurvivZone,
@@ -70,7 +71,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 23);
+    assert.equal(map.landmarks.length, 26);
     assert.ok(houses.length >= 100);
     assert.ok(chests.length < houses.length);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
@@ -277,6 +278,89 @@ test('surviv town roads stay centered between rows and doors face the road', () 
     }
 });
 
+test('planned towns include useful civic buildings and readable side lanes', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const shops = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.role === 'townShop');
+    const clinics = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.role === 'townClinic');
+    const lanes = map.obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'townLane');
+    const townMainRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.variant === 'dirt'
+        && obstacle.w >= 1900
+        && obstacle.h === 120
+    ));
+
+    assert.equal(shops.length, 3);
+    assert.equal(clinics.length, 3);
+    assert.equal(lanes.length, 6);
+    assert.ok(lanes.every(lane => lane.collidable === false));
+    assert.ok(lanes.every(lane => townMainRoads.some(road => rectsOverlap(
+        lane.x, lane.y, lane.w, lane.h,
+        road.x, road.y, road.w, road.h,
+    ))), 'every side lane should join its town main street');
+
+    for (const shop of shops) {
+        const rooms = new Set(map.obstacles
+            .filter(obstacle => obstacle.kind === 'roomZone' && obstacle.houseId === shop.id)
+            .map(room => room.variant));
+        assert.deepEqual(rooms, new Set(['shop-front', 'stockroom']));
+    }
+    for (const clinic of clinics) {
+        const rooms = new Set(map.obstacles
+            .filter(obstacle => obstacle.kind === 'roomZone' && obstacle.houseId === clinic.id)
+            .map(room => room.variant));
+        assert.deepEqual(rooms, new Set(['living-room', 'bedroom']));
+    }
+});
+
+test('new roadside landmarks have distinct buildings and connect to the highway network', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmarkTypes = new Set(map.landmarks.map(landmark => landmark.type));
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+    const networkRoads = roads.filter(road => road.role === 'networkRoad');
+    const doorsByHouse = new Map(map.obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(door => [door.houseId, door]));
+
+    for (const type of ['services', 'fire-station', 'orchard']) assert.ok(landmarkTypes.has(type));
+
+    const services = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.landmarkType === 'services');
+    const fireStation = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.landmarkType === 'fire-station');
+    const orchard = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.landmarkType === 'orchard');
+    assert.deepEqual(new Set(services.map(building => building.role)), new Set(['diner', 'store', 'garage']));
+    assert.deepEqual(new Set(fireStation.map(building => building.role)), new Set(['engineHall', 'watchHouse']));
+    assert.deepEqual(new Set(orchard.map(building => building.role)), new Set(['farmhouse', 'ciderBarn', 'packingShed']));
+
+    const expectedDoors = new Map([
+        ['diner', 'south'], ['store', 'south'], ['garage', 'north'],
+        ['engineHall', 'west'], ['watchHouse', 'north'],
+        ['farmhouse', 'south'], ['ciderBarn', 'north'], ['packingShed', 'south'],
+    ]);
+    for (const building of [...services, ...fireStation, ...orchard]) {
+        assert.equal(doorsByHouse.get(building.id)?.role, expectedDoors.get(building.role));
+    }
+
+    assert.ok(networkRoads.some(road => pointInRect(-700, -4000, road, 2)), 'service stop should sit on the north highway');
+    for (const role of ['driveway', 'orchardLane']) {
+        const approach = roads.find(road => road.role === role);
+        assert.ok(approach);
+        assert.ok(networkRoads.some(road => rectsOverlap(
+            approach.x, approach.y, approach.w, approach.h,
+            road.x, road.y, road.w, road.h,
+        )), role + ' should connect to a highway');
+    }
+
+    const interiorVariants = new Set(map.obstacles
+        .filter(obstacle => obstacle.kind === 'roomZone' && [...services, ...fireStation, ...orchard].some(building => building.id === obstacle.houseId))
+        .map(room => room.variant));
+    for (const variant of ['shop-front', 'stockroom', 'living-room', 'bedroom']) {
+        assert.ok(interiorVariants.has(variant), 'missing new interior type ' + variant);
+    }
+
+    const fireHall = fireStation.find(building => building.role === 'engineHall');
+    const medicalCrate = map.loot.find(item => item.houseId === fireHall.id && item.containerType === 'medical_crate');
+    assert.ok(medicalCrate, 'fire station should keep its medical supplies indoors');
+});
 test('surviv network roads do not run through buildings or walls', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad');
@@ -1084,6 +1168,10 @@ test('grenade damage is lethal at the center and falls off sharply with distance
     assert.ok(middleDamage > 20 && middleDamage < 40, `mid-range blast should be reduced, got ${middleDamage}`);
     assert.ok(edgeDamage >= SURVIV.grenadeMinDamage && edgeDamage < 15, `blast edge should do low damage, got ${edgeDamage}`);
     assert.ok(nearDamage > middleDamage && middleDamage > edgeDamage);
+    assert.equal(near._damageTaken.kind, 'grenade');
+    assert.equal(near._damageTaken.sourceX, 0);
+    assert.equal(near._damageTaken.sourceY, 0);
+    assert.notEqual(near._damageTaken.sourceX, attacker.x, 'damage direction should point to the blast, not the thrower');
 });
 test('fast bullets hit and eliminate bots along their full travel path', () => {
     const room = makeRoom();
@@ -1219,6 +1307,169 @@ test('bullets break loot crates and release their contents', () => {
     assert.equal(room.loot.some(item => item.id === 'shot-crate'), false);
     assert.equal(room.loot.find(item => item.type === 'ammo')?.amount, 30);
     assert.equal(player.inventory.chestsOpened, 1);
+});
+
+test('hit and damage feedback is private, accurate, and emitted once', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+
+    const shooter = createSurvivPlayer('feedback-shooter', 'mongo-feedback-shooter', 'Shooter', '#fff', room);
+    shooter.x = 0;
+    shooter.y = 0;
+    shooter.aimAngle = 0;
+    shooter.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    shooter.inventory.weapons = ['pistol'];
+    shooter.shooting = true;
+
+    const target = createSurvivPlayer('feedback-target', 'mongo-feedback-target', 'Target', '#fff', room);
+    target.x = 68;
+    target.y = 0;
+    room.players.push(shooter, target);
+
+    let lbData;
+    for (let tick = 0; tick < 3; tick++) {
+        lbData = processSurvivRoom(room, silentIo, Date.now() + 600000 + tick);
+        if (shooter._hitConfirm) break;
+    }
+    assert.ok(shooter._hitConfirm, 'the projectile should produce authoritative hit feedback');
+    const ticksBySocket = new Map();
+    const io = {
+        to(socketId) {
+            return {
+                emit(event, payload) {
+                    if (event !== 'survivTick') return;
+                    const ticks = ticksBySocket.get(socketId) || [];
+                    ticks.push(payload);
+                    ticksBySocket.set(socketId, ticks);
+                },
+            };
+        },
+    };
+
+    broadcastSurvivState(room, io, lbData, {});
+    const shooterTick = ticksBySocket.get(shooter.id)[0];
+    const targetTick = ticksBySocket.get(target.id)[0];
+    assert.equal(shooterTick.hitConfirm.targetId, target.id);
+    assert.equal(shooterTick.hitConfirm.damage, 11);
+    assert.equal(shooterTick.hitConfirm.kill, false);
+    assert.equal(Object.hasOwn(shooterTick, 'damageTaken'), false);
+    assert.equal(targetTick.damageTaken.sourceId, shooter.id);
+    assert.equal(targetTick.damageTaken.kind, 'player');
+    assert.equal(targetTick.damageTaken.sourceX, shooter.x);
+    assert.equal(targetTick.damageTaken.damage, 11);
+    assert.equal(Object.hasOwn(targetTick, 'hitConfirm'), false);
+
+    broadcastSurvivState(room, io, lbData, {});
+    assert.equal(Object.hasOwn(ticksBySocket.get(shooter.id)[1], 'hitConfirm'), false);
+    assert.equal(Object.hasOwn(ticksBySocket.get(target.id)[1], 'damageTaken'), false);
+});
+test('eliminations produce one global kill-feed event for players and spectators', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+
+    const attacker = createSurvivPlayer('kill-feed-attacker', 'mongo-kill-feed-attacker', 'Winner', '#fff', room);
+    attacker.weapon = { type: 'shotgun', ammo: 5, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    attacker.inventory.weapons = ['shotgun'];
+    const victim = createSurvivPlayer('kill-feed-victim', 'mongo-kill-feed-victim', 'Victim', '#fff', room);
+    room.players.push(attacker, victim);
+    eliminateSurvivPlayer(room, victim, silentIo, attacker);
+
+    const ticksBySocket = new Map();
+    const io = {
+        to(socketId) {
+            return {
+                emit(event, payload) {
+                    if (event !== 'survivTick') return;
+                    const ticks = ticksBySocket.get(socketId) || [];
+                    ticks.push(payload);
+                    ticksBySocket.set(socketId, ticks);
+                },
+            };
+        },
+    };
+    const lbData = {
+        leaderboard: [{ id: attacker.id }],
+        aliveCount: 1,
+        zone: { x: 0, y: 0, radius: SURVIV.worldHalf },
+    };
+
+    broadcastSurvivState(room, io, lbData, {});
+    for (const socketId of [attacker.id, victim.id]) {
+        const event = ticksBySocket.get(socketId)[0].killFeed[0];
+        assert.equal(event.killer, 'Winner');
+        assert.equal(event.victim, 'Victim');
+        assert.equal(event.weapon, 'shotgun');
+    }
+
+    broadcastSurvivState(room, io, lbData, {});
+    assert.equal(Object.hasOwn(ticksBySocket.get(attacker.id)[1], 'killFeed'), false);
+    assert.equal(Object.hasOwn(ticksBySocket.get(victim.id)[1], 'killFeed'), false);
+});
+test('cashout hold freezes movement and discards queued gameplay actions', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('cashout-hold-player', 'mongo-cashout-hold', 'Holding', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 1;
+    player.inputDy = 1;
+    player.shooting = true;
+    player.useMedkit = true;
+    player.pickupWeaponPending = true;
+    player.equipSlotPending = 1;
+    player.throwGrenadePending = true;
+    player.swapWeaponSlots = { fromSlot: 0, toSlot: 1 };
+    player.dropItemPending = { itemKey: 'grenades' };
+    player.openChestId = 'stale-chest';
+    player.takeChestItem = { chestId: 'stale-chest', itemKey: 'weapon' };
+    player.cashoutHoldActive = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(player.x, 0);
+    assert.equal(player.y, 0);
+    assert.equal(player.inputDx, 0);
+    assert.equal(player.inputDy, 0);
+    assert.equal(player.shooting, false);
+    assert.equal(player.useMedkit, false);
+    assert.equal(player.pickupWeaponPending, false);
+    assert.equal(player.equipSlotPending, null);
+    assert.equal(player.throwGrenadePending, false);
+    assert.equal(player.swapWeaponSlots, null);
+    assert.equal(player.dropItemPending, null);
+    assert.equal(player.openChestId, null);
+    assert.equal(player.takeChestItem, null);
+});
+test('analog movement strength matches mobile client prediction', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('analog-player', 'analog-mongo', 'Analog', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 0.5;
+    player.inputDy = 0;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.ok(Math.abs(player.x - SURVIV.playerSpeed * 0.5) < 0.001);
+
+    const halfSpeedX = player.x;
+    player.inputDx = 1;
+    processSurvivRoom(room, silentIo, Date.now() + 600001);
+    assert.ok(Math.abs((player.x - halfSpeedX) - SURVIV.playerSpeed) < 0.001);
 });
 
 test('loot crates block movement until they are destroyed', () => {

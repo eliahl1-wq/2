@@ -897,8 +897,57 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
 
     addDoor(obstacles, houseId, doorX, doorY, doorW, doorH, variant, doorSide, opts.entranceRole || 'mainEntrance');
 
-    const large = opts.layout === 'corridor' || (opts.layout !== 'open' && (w >= 430 || h >= 330 || variant === 'mansion'));
-    if (large) {
+    const layout = opts.layout || 'auto';
+    const large = layout === 'corridor' || (layout === 'auto' && (w >= 430 || h >= 330 || variant === 'mansion'));
+    if (layout === 'shop') {
+        // Road-facing shops keep a large readable public room with a smaller
+        // stock room at the back. The centered opening prevents dead-end loot.
+        if (horizontalDoor) {
+            const entryDirection = doorSide === 'south' ? 1 : -1;
+            const dividerY = y - entryDirection * h * 0.18;
+            addRoomZone(obstacles, houseId, x, y + entryDirection * h * 0.18, w - wall * 3, h * 0.48, 'shop-front');
+            addRoomZone(obstacles, houseId, x, y - entryDirection * h * 0.34, w - wall * 3, h * 0.22, 'stockroom');
+            addHorizontalInteriorWallSegments(obstacles, x, dividerY, w - wall * 2, wall, [
+                { center: 0, size: clamp(w * 0.24, 72, 104) },
+            ], variant, { houseId });
+            addObstacle(obstacles, 'furniture', x, dividerY + entryDirection * 42, clamp(w * 0.42, 90, 180), 30, {
+                collidable: false, variant: 'workbench', role: 'counter', houseId,
+            });
+        } else {
+            const entryDirection = doorSide === 'east' ? 1 : -1;
+            const dividerX = x - entryDirection * w * 0.18;
+            addRoomZone(obstacles, houseId, x + entryDirection * w * 0.18, y, w * 0.48, h - wall * 3, 'shop-front');
+            addRoomZone(obstacles, houseId, x - entryDirection * w * 0.34, y, w * 0.22, h - wall * 3, 'stockroom');
+            addVerticalInteriorWallSegments(obstacles, dividerX, y, h - wall * 2, wall, [
+                { center: 0, size: clamp(h * 0.24, 72, 104) },
+            ], variant, { houseId });
+            addObstacle(obstacles, 'furniture', dividerX + entryDirection * 42, y, 30, clamp(h * 0.42, 90, 180), {
+                collidable: false, variant: 'workbench', role: 'counter', houseId,
+            });
+        }
+    } else if (layout === 'split') {
+        // Two-room homes offer a short flank around their center wall without
+        // turning a small building into a cramped corridor maze.
+        if (w >= h) {
+            addRoomZone(obstacles, houseId, x - w * 0.25, y, w * 0.43, h - wall * 3, 'living-room');
+            addRoomZone(obstacles, houseId, x + w * 0.25, y, w * 0.43, h - wall * 3, 'bedroom');
+            addVerticalInteriorWallSegments(obstacles, x, y, h - wall * 2, wall, [
+                { center: doorSide === 'north' ? -h * 0.16 : h * 0.16, size: 78 },
+            ], variant, { houseId });
+        } else {
+            addRoomZone(obstacles, houseId, x, y - h * 0.25, w - wall * 3, h * 0.43, 'living-room');
+            addRoomZone(obstacles, houseId, x, y + h * 0.25, w - wall * 3, h * 0.43, 'bedroom');
+            addHorizontalInteriorWallSegments(obstacles, x, y, w - wall * 2, wall, [
+                { center: doorSide === 'west' ? -w * 0.16 : w * 0.16, size: 78 },
+            ], variant, { houseId });
+        }
+        addObstacle(obstacles, 'furniture', x - w * 0.24, y - h * 0.16, 48, 28, {
+            collidable: false, variant: 'table', houseId,
+        });
+        addObstacle(obstacles, 'furniture', x + w * 0.24, y + h * 0.16, 42, 30, {
+            collidable: false, variant: 'bed', houseId,
+        });
+    } else if (large) {
         const hallW = clamp(w * 0.22, 98, 170);
         const wingW = (w - hallW - wall * 4) / 2;
         addRoomZone(obstacles, houseId, x, y, hallW, h - wall * 3.5, 'hallway');
@@ -932,10 +981,12 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     }
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
-    const primaryChestChance = large ? 0.84 : 0.46;
+    const primaryChestChance = large ? 0.84 : layout === 'shop' ? 0.7 : layout === 'split' ? 0.62 : 0.46;
     if (Math.random() < primaryChestChance) {
         loot.push(makeChest(x + w * 0.24, y - h * 0.22, chestTier, null, 'map', {
-            houseId, landmarkType: opts.landmarkType || null, room: large ? 'north-room' : null,
+            houseId,
+            landmarkType: opts.landmarkType || null,
+            room: large ? 'north-room' : layout === 'shop' ? 'stockroom' : layout === 'split' ? 'bedroom' : null,
         }));
     }
     if (large && Math.random() < 0.24) {
@@ -948,6 +999,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     else if (doorSide === 'south') spawnPoints.push({ x: doorX, y: y + h / 2 + spawnOffset });
     else if (doorSide === 'west') spawnPoints.push({ x: x - w / 2 - spawnOffset, y: doorY });
     else spawnPoints.push({ x: x + w / 2 + spawnOffset, y: doorY });
+    return floor;
 }
 
 function addMansion(obstacles, loot, spawnPoints, x, y) {
@@ -1219,13 +1271,17 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
     for (let i = 0; i < housesNorth; i++) {
         const hx = x - roadLength / 2 + spacingN * (i + 1);
         const hy = y - 210;
-        const w = 190 + Math.random() * 40;
-        const h = 170 + Math.random() * 30;
+        const civic = i === Math.floor(housesNorth / 2);
+        const w = civic ? 300 : 190 + Math.random() * 40;
+        const h = civic ? 210 : 170 + Math.random() * 30;
         addHouse(obstacles, loot, spawnPoints, hx, hy, w, h, {
-            hue: 18 + Math.floor(Math.random() * 28),
+            hue: civic ? 34 : 18 + Math.floor(Math.random() * 28),
             variant: 'town',
-            tier: Math.random() > 0.86 ? 'rare' : 'common',
+            tier: civic ? 'rare' : Math.random() > 0.86 ? 'rare' : 'common',
             doorSide: 'south',
+            layout: civic ? 'shop' : (i % 2 === 0 ? 'split' : 'open'),
+            label: civic ? 'GENERAL STORE' : null,
+            role: civic ? 'townShop' : 'residence',
         });
         
         addDestructibleBarrier(obstacles, hx, hy - h / 2 - 20, w + 40, 10, 'stone');
@@ -1237,13 +1293,17 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
     for (let i = 0; i < housesSouth; i++) {
         const hx = x - roadLength / 2 + spacingS * (i + 1);
         const hy = y + 210;
-        const w = 190 + Math.random() * 40;
-        const h = 170 + Math.random() * 30;
+        const civic = i === 0;
+        const w = civic ? 280 : 190 + Math.random() * 40;
+        const h = civic ? 205 : 170 + Math.random() * 30;
         addHouse(obstacles, loot, spawnPoints, hx, hy, w, h, {
-            hue: 18 + Math.floor(Math.random() * 28),
+            hue: civic ? 8 : 18 + Math.floor(Math.random() * 28),
             variant: 'town',
-            tier: Math.random() > 0.86 ? 'rare' : 'common',
+            tier: civic ? 'rare' : Math.random() > 0.86 ? 'rare' : 'common',
             doorSide: 'north',
+            layout: civic ? 'split' : (i % 2 === 0 ? 'open' : 'split'),
+            label: civic ? 'CLINIC' : null,
+            role: civic ? 'townClinic' : 'residence',
         });
         
         addDestructibleBarrier(obstacles, hx, hy + h / 2 + 20, w + 40, 10, 'stone');
@@ -1251,6 +1311,27 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
         addDestructibleBarrier(obstacles, hx + w / 2 + 20, hy, 10, h + 40, 'stone');
     }
     
+    // Short side lanes end between houses instead of cutting through backyards.
+    // They create rotations off the main street while keeping every facade legible.
+    if (housesNorth >= 2) {
+        const northLaneX = x - roadLength / 2 + spacingN * 1.5;
+        addObstacle(obstacles, 'road', northLaneX, y - 170, 66, 340, {
+            collidable: false, variant: 'dirt', role: 'townLane', landmarkType: 'town',
+        });
+    }
+    if (housesSouth >= 2) {
+        const southLaneX = x - roadLength / 2 + spacingS * (housesSouth - 0.5);
+        addObstacle(obstacles, 'road', southLaneX, y + 170, 66, 340, {
+            collidable: false, variant: 'dirt', role: 'townLane', landmarkType: 'town',
+        });
+    }
+    addObstacle(obstacles, 'signpost', x - roadLength / 2 + 55, y - 86, 30, 30, {
+        collidable: false, variant: 'townMarker', role: 'townEntrance', landmarkType: 'town',
+    });
+    addObstacle(obstacles, 'signpost', x + roadLength / 2 - 55, y + 86, 30, 30, {
+        collidable: false, variant: 'townMarker', role: 'townEntrance', landmarkType: 'town',
+    });
+
     for (let i = 0; i < size; i++) {
         const cx = x - roadLength / 2 + 100 + i * 260;
         if (Math.random() > 0.4) {
@@ -1584,6 +1665,140 @@ function addRoadsideHamlet(obstacles, loot, spawnPoints, x, y, orientation = 'ho
     spawnPoints.push(horizontal ? { x: x + 520, y, role: 'hamlet-road' } : { x, y: y + 520, role: 'hamlet-road' });
 }
 
+function addRoadsideServices(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1480, 820, {
+        collidable: false, variant: 'town', role: 'serviceStop', landmarkType: 'services',
+        label: 'CROSSROADS',
+    });
+    addObstacle(obstacles, 'field', x, y, 1120, 360, {
+        collidable: false, variant: 'courtyard', role: 'parkingLot', landmarkType: 'services',
+    });
+
+    addHouse(obstacles, loot, spawnPoints, x - 310, y - 245, 430, 230, {
+        variant: 'house', hue: 18, tier: 'rare', doorSide: 'south', layout: 'shop',
+        landmarkType: 'services', label: 'DINER', role: 'diner',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 300, y - 245, 310, 220, {
+        variant: 'house', hue: 42, tier: 'common', doorSide: 'south', layout: 'shop',
+        landmarkType: 'services', label: 'STORE', role: 'store',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 170, y + 245, 520, 250, {
+        variant: 'warehouse', hue: 202, tier: 'rare', doorSide: 'north', layout: 'open',
+        landmarkType: 'services', label: 'AUTO SHOP', role: 'garage', entranceRole: 'garageEntrance',
+    });
+
+    addObstacle(obstacles, 'signpost', x - 650, y - 115, 34, 34, {
+        collidable: false, variant: 'roadMarker', role: 'serviceSign', landmarkType: 'services',
+        label: 'CROSSROADS',
+    });
+    addObstacle(obstacles, 'barrel', x + 610, y + 250, 36, 36, {
+        hue: 15, variant: 'fuel', role: 'serviceProp', landmarkType: 'services',
+    });
+    addObstacle(obstacles, 'barrel', x + 610, y + 310, 36, 36, {
+        hue: 205, variant: 'water', role: 'serviceProp', landmarkType: 'services',
+    });
+    addObstacle(obstacles, 'crate', x - 620, y + 280, 46, 46, {
+        rotation: 0.12, role: 'serviceProp', landmarkType: 'services',
+    });
+
+    spawnPoints.push({ x: x - 720, y, role: 'services-road' });
+    spawnPoints.push({ x: x + 720, y, role: 'services-road' });
+}
+
+function addFireStation(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1500, 1050, {
+        collidable: false, variant: 'industrial', role: 'fireStation', landmarkType: 'fire-station',
+        label: 'FIRE STATION',
+    });
+    const drivewayStartX = 2500;
+    const buildingWestEdge = x - 650 / 2;
+    addObstacle(obstacles, 'road', (drivewayStartX + buildingWestEdge) / 2, y, buildingWestEdge - drivewayStartX, 112, {
+        collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'fire-station',
+    });
+    addObstacle(obstacles, 'field', x - 280, y, 470, 310, {
+        collidable: false, variant: 'courtyard', role: 'apron', landmarkType: 'fire-station',
+    });
+
+    const engineHall = addHouse(obstacles, loot, spawnPoints, x, y, 650, 340, {
+        variant: 'warehouse', hue: 6, tier: 'military', doorSide: 'west', layout: 'shop', wall: 16,
+        landmarkType: 'fire-station', label: 'FIRE STATION', role: 'engineHall',
+        entranceRole: 'garageEntrance',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 430, y + 370, 280, 220, {
+        variant: 'house', hue: 25, tier: 'rare', doorSide: 'north', layout: 'split',
+        landmarkType: 'fire-station', label: 'WATCH', role: 'watchHouse',
+    });
+
+    addObstacle(obstacles, 'container', x - 430, y + 330, 125, 54, {
+        hue: 12, variant: 'red', role: 'trainingYard', landmarkType: 'fire-station',
+    });
+    addObstacle(obstacles, 'barrel', x - 515, y + 405, 36, 36, {
+        hue: 205, variant: 'water', role: 'trainingYard', landmarkType: 'fire-station',
+    });
+    addObstacle(obstacles, 'sandbag', x - 360, y - 360, 76, 28, {
+        rotation: 0.08, variant: 'training', role: 'trainingYard', landmarkType: 'fire-station',
+    });
+    addObstacle(obstacles, 'signpost', x - 610, y - 115, 34, 34, {
+        collidable: false, variant: 'roadMarker', role: 'stationSign', landmarkType: 'fire-station',
+        label: 'FIRE',
+    });
+
+    loot.push(makeChest(x + 190, y - 70, 'military', null, 'map', {
+        houseId: engineHall.id,
+        landmarkType: 'fire-station',
+        room: 'stockroom',
+        containerType: 'medical_crate',
+    }));
+    spawnPoints.push({ x: drivewayStartX + 90, y: y - 150, role: 'fire-road' });
+    spawnPoints.push({ x: drivewayStartX + 90, y: y + 150, role: 'fire-road' });
+}
+
+function addOrchardCooperative(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1900, 1280, {
+        collidable: false, variant: 'farm', role: 'orchard', landmarkType: 'orchard',
+        label: 'OLD ORCHARD',
+    });
+    const laneWest = x - 980;
+    const laneEast = -2500;
+    addObstacle(obstacles, 'road', (laneWest + laneEast) / 2, y, laneEast - laneWest, 92, {
+        collidable: false, variant: 'dirt', role: 'orchardLane', landmarkType: 'orchard',
+    });
+
+    addHouse(obstacles, loot, spawnPoints, x + 410, y - 255, 350, 235, {
+        variant: 'house', hue: 26, tier: 'rare', doorSide: 'south', layout: 'split',
+        landmarkType: 'orchard', label: 'FARMHOUSE', role: 'farmhouse',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 260, y + 275, 500, 270, {
+        variant: 'barn', hue: 8, tier: 'rare', doorSide: 'north', layout: 'open',
+        landmarkType: 'orchard', label: 'CIDER BARN', role: 'ciderBarn',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 650, y - 250, 310, 220, {
+        variant: 'warehouse', hue: 34, tier: 'common', doorSide: 'south', layout: 'shop',
+        landmarkType: 'orchard', label: 'PACKING', role: 'packingShed',
+    });
+
+    for (const rowY of [y - 500, y + 520]) {
+        for (let treeX = x - 720; treeX <= x + 650; treeX += 220) {
+            if (isMapPositionBlocked(obstacles, treeX, rowY, 28)) continue;
+            addObstacle(obstacles, 'tree', treeX, rowY, 46, 46, {
+                hue: 88 + Math.floor((treeX - x + 800) / 220) * 3,
+                variant: 'orchard', role: 'orchardTree', landmarkType: 'orchard',
+            });
+        }
+    }
+    addObstacle(obstacles, 'hayBale', x + 760, y + 310, 72, 40, {
+        hue: 34, variant: 'twine', role: 'orchardProp', landmarkType: 'orchard',
+    });
+    addObstacle(obstacles, 'wildflowers', x + 760, y - 440, 58, 52, {
+        collidable: false, hue: 42, variant: 'sunflowers', role: 'orchardProp', landmarkType: 'orchard',
+    });
+    addObstacle(obstacles, 'barrel', x - 760, y + 350, 36, 36, {
+        hue: 205, variant: 'water', role: 'orchardProp', landmarkType: 'orchard',
+    });
+
+    spawnPoints.push({ x: laneEast - 120, y: y - 150, role: 'orchard-road' });
+    spawnPoints.push({ x: laneWest + 120, y: y + 150, role: 'orchard-road' });
+}
 function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1900, 1320, {
         collidable: false, variant: 'village', role: 'marketVillage', landmarkType: 'market',
@@ -2598,6 +2813,9 @@ export function generateSurvivMap(worldHalf) {
     const eastCachePos = { x: 8600, y: 3600, w: 620, h: 420 };
     const southCachePos = { x: -1200, y: 8500, w: 620, h: 420 };
     const checkpointPos = { x: 4100, y: -2700, w: 620, h: 420 };
+    const servicesPos = { x: -700, y: -4000, w: 1480, h: 820 };
+    const fireStationPos = { x: 3350, y: 4300, w: 1500, h: 1050 };
+    const orchardPos = { x: -3900, y: 5000, w: 1900, h: 1280 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
@@ -2605,6 +2823,7 @@ export function generateSurvivMap(worldHalf) {
         farmPos, bunkerPos, campPos, neTownPos, seLabPos,
         swTownPos, nwMansionPos, ironworksPos, marketPos,
         northCachePos, eastCachePos, southCachePos, checkpointPos,
+        servicesPos, fireStationPos, orchardPos,
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2719,6 +2938,13 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'South Smuggler Cache', x: southCachePos.x, y: southCachePos.y, type: 'supply-cache' });
     addSupplyCacheSite(obstacles, loot, spawnPoints, checkpointPos.x, checkpointPos.y, 'checkpoint');
     landmarks.push({ name: 'East Road Checkpoint', x: checkpointPos.x, y: checkpointPos.y, type: 'supply-cache' });
+
+    addRoadsideServices(obstacles, loot, spawnPoints, servicesPos.x, servicesPos.y);
+    landmarks.push({ name: 'Crossroads Services', x: servicesPos.x, y: servicesPos.y, type: 'services' });
+    addFireStation(obstacles, loot, spawnPoints, fireStationPos.x, fireStationPos.y);
+    landmarks.push({ name: 'South Fire Station', x: fireStationPos.x, y: fireStationPos.y, type: 'fire-station' });
+    addOrchardCooperative(obstacles, loot, spawnPoints, orchardPos.x, orchardPos.y);
+    landmarks.push({ name: 'Old Orchard Cooperative', x: orchardPos.x, y: orchardPos.y, type: 'orchard' });
 
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
@@ -3332,6 +3558,7 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room.bullets = [];
     room.spectators = [];
     room.deathMarkers = [];
+    room._pendingKillFeed = [];
     room.lootPoolBalance = 0;
     room.loot = [...(nextMap.loot || [])];
     room.obstacles = nextMap.obstacles || [];
@@ -3676,9 +3903,14 @@ function getNearbyObstacles(room, x, y, range) {
 }
 
 function moveEntity(entity, room, dx, dy, speed) {
-    const { dx: nx, dy: ny } = normalize(dx, dy);
-    let newX = entity.x + nx * speed;
-    let newY = entity.y + ny * speed;
+    const inputX = Number(dx) || 0;
+    const inputY = Number(dy) || 0;
+    const inputLength = Math.hypot(inputX, inputY);
+    const inputMagnitude = Math.min(1, inputLength);
+    const nx = inputLength > 0.0001 ? inputX / inputLength : 0;
+    const ny = inputLength > 0.0001 ? inputY / inputLength : 0;
+    let newX = entity.x + nx * speed * inputMagnitude;
+    let newY = entity.y + ny * speed * inputMagnitude;
 
     const r = entity.radius || SURVIV.playerRadius;
     const wh = SURVIV.worldHalf - r;
@@ -3817,7 +4049,8 @@ function tryShoot(entity, room, now) {
     }
 }
 
-function applyDamage(target, damage, attacker) {
+function applyDamage(target, damage, attacker, source = null) {
+    const hpBefore = Number(target.hp) || 0;
     let remaining = damage;
     if (target.armor > 0) {
         const absorbed = Math.min(target.armor, remaining * 0.7);
@@ -3825,6 +4058,30 @@ function applyDamage(target, damage, attacker) {
         remaining -= absorbed * 0.5;
     }
     target.hp -= remaining;
+    const damageDealt = Math.max(0, hpBefore - target.hp);
+    if (damageDealt > 0 && attacker && attacker.id !== target.id) {
+        const previous = attacker._hitConfirm;
+        const sameTarget = previous?.targetId === target.id;
+        attacker._hitConfirm = {
+            targetId: target.id,
+            targetX: target.x,
+            targetY: target.y,
+            damage: damageDealt + (sameTarget ? Number(previous.damage) || 0 : 0),
+            kill: target.hp <= 0,
+        };
+        const sourceX = Number.isFinite(source?.x) ? source.x : attacker.x;
+        const sourceY = Number.isFinite(source?.y) ? source.y : attacker.y;
+        const sourceKind = source?.kind || 'player';
+        const previousDamage = target._damageTaken;
+        const sameSource = previousDamage?.sourceId === attacker.id && previousDamage?.kind === sourceKind;
+        target._damageTaken = {
+            sourceId: attacker.id,
+            sourceX,
+            sourceY,
+            kind: sourceKind,
+            damage: damageDealt + (sameSource ? Number(previousDamage.damage) || 0 : 0),
+        };
+    }
     if (target.hp <= 0 && attacker && attacker.id !== target.id) {
         attacker.kills = (attacker.kills || 0) + 1;
     }
@@ -3899,6 +4156,13 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null) {
         killerName: attacker?.username || null,
         weaponType: attacker?.weapon?.type || 'fists',
         createdAt: Date.now(),
+    });
+    if (!Array.isArray(room._pendingKillFeed)) room._pendingKillFeed = [];
+    room._pendingKillFeed.push({
+        id: 'kill:' + player.id + ':' + Date.now() + ':' + randId(),
+        killer: attacker?.username || (attacker?.isBot ? 'Bot' : 'Zone'),
+        victim: player.username || (player.isBot ? 'Bot' : 'Player'),
+        weapon: attacker?.weapon?.type || (attacker ? 'fists' : 'zone'),
     });
     dropDeathLoot(room, player);
     const socketId = player.id;
@@ -4332,7 +4596,7 @@ function detonateGrenade(room, grenade, entitiesById) {
         const minimumDamage = SURVIV.grenadeMinDamage;
         const blastDamage = minimumDamage
             + (grenade.damage - minimumDamage) * Math.pow(proximity, SURVIV.grenadeFalloffExponent);
-        applyDamage(target, blastDamage, attacker);
+        applyDamage(target, blastDamage, attacker, { x: grenade.x, y: grenade.y, kind: 'grenade' });
         if (target.hp <= 0) eliminateSurvivPlayer(room, target, room._io, attacker);
     }
     for (const obstacle of queryObstacles(room, grenade.x, grenade.y, SURVIV.grenadeRadius, true)) {
@@ -4933,6 +5197,13 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.inputDy = 0;
         entity.shooting = false;
         entity.useMedkit = false;
+        entity.pickupWeaponPending = false;
+        entity.equipSlotPending = null;
+        entity.throwGrenadePending = false;
+        entity.swapWeaponSlots = null;
+        entity.dropItemPending = null;
+        entity.openChestId = null;
+        entity.takeChestItem = null;
         checkZoneDamage(entity, zone, now);
         if (entity.hp <= 0) eliminateSurvivPlayer(room, entity, room._io);
         return;
@@ -5179,6 +5450,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     }
 
     const allPlayers = getActiveSurvivEntities(room);
+    const pendingKillFeed = Array.isArray(room._pendingKillFeed) ? room._pendingKillFeed : [];
     const aliveCount = Number.isFinite(lbData.aliveCount) ? lbData.aliveCount : allPlayers.length;
     room.deathMarkers = (room.deathMarkers || []).filter(marker => now - marker.createdAt < 30000).slice(-40);
 
@@ -5258,9 +5530,10 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             };
         }
 
+        const viewerEntity = youId ? allPlayers.find(player => player.id === youId) : null;
         io.to(socketId).emit('survivTick', {
             you: youId ? serializePlayer(
-                allPlayers.find(p => p.id === youId) || { id: youId, x: viewX, y: viewY, dollarBalance, hp: 0 },
+                viewerEntity || { id: youId, x: viewX, y: viewY, dollarBalance, hp: 0 },
                 true,
             ) : null,
             players: visiblePlayers,
@@ -5272,6 +5545,9 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             aliveCount,
             dollarBalance,
             spectating,
+            ...(pendingKillFeed.length ? { killFeed: pendingKillFeed.map(entry => ({ ...entry })) } : {}),
+            ...(viewerEntity?._hitConfirm ? { hitConfirm: { ...viewerEntity._hitConfirm } } : {}),
+            ...(viewerEntity?._damageTaken ? { damageTaken: { ...viewerEntity._damageTaken } } : {}),
             ...(spectating ? {
                 spectateTargets: allPlayers.map(p => ({
                     id: p.id,
@@ -5291,6 +5567,11 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     for (const spec of room.spectators || []) {
         emitToViewer(spec.id, spec.x, spec.y, null, spec.dollarBalance, true);
     }
+    for (const entity of allPlayers) {
+        entity._hitConfirm = null;
+        entity._damageTaken = null;
+    }
+    room._pendingKillFeed = [];
     pruneSurvivViewerPayloadCache(room, now);
 }
 
