@@ -378,6 +378,14 @@ async function isPersonalFreePlayUser(user) {
 const SiteDisplaySettingsSchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
     pregamePlayingOverride: { type: Number, default: null },
+    pregamePlayingOffsets: {
+        agar: { type: Number, default: 0 },
+        slither: { type: Number, default: 0 },
+        competitiveSlither: { type: Number, default: 0 },
+        surviv: { type: Number, default: 0 },
+        brAgar: { type: Number, default: 0 },
+        brSlither: { type: Number, default: 0 },
+    },
 }, { timestamps: true });
 
 const SiteDisplaySettings = mongoose.model('SiteDisplaySettings', SiteDisplaySettingsSchema);
@@ -3943,10 +3951,19 @@ async function buildAdminTxQuery({ userId, showExcluded, type, category, search 
     return clauses.length === 1 ? clauses[0] : { $and: clauses };
 }
 
+const PREGAME_PLAYING_KEYS = ['agar', 'slither', 'competitiveSlither', 'surviv', 'brAgar', 'brSlither'];
+
+function normalizePregamePlayingOffsets(value) {
+    return Object.fromEntries(PREGAME_PLAYING_KEYS.map(key => {
+        const number = Number(value?.[key] ?? 0);
+        return [key, Number.isInteger(number) && number >= 0 ? number : 0];
+    }));
+}
+
 app.get('/api/pregame/display-settings', async (req, res) => {
     try {
         const settings = await SiteDisplaySettings.findOne({ key: 'pregame' }).lean();
-        res.json({ playingOverride: settings?.pregamePlayingOverride ?? null });
+        res.json({ playingOffsets: normalizePregamePlayingOffsets(settings?.pregamePlayingOffsets) });
     } catch (err) {
         console.error('Pregame display settings error:', err);
         res.status(500).json({ error: 'Could not load pregame display settings' });
@@ -3955,22 +3972,26 @@ app.get('/api/pregame/display-settings', async (req, res) => {
 
 app.put('/api/admin/pregame/display-settings', authenticateAdmin, async (req, res) => {
     try {
-        const rawValue = req.body?.playingOverride;
-        const playingOverride = rawValue === null || rawValue === '' || rawValue === undefined
-            ? null
-            : Number(rawValue);
-
-        if (playingOverride !== null && (!Number.isInteger(playingOverride) || playingOverride < 0 || playingOverride > 999999)) {
-            return res.status(400).json({ message: 'Playing must be a whole number between 0 and 999999, or empty for automatic.' });
+        const rawOffsets = req.body?.playingOffsets;
+        if (!rawOffsets || typeof rawOffsets !== 'object' || Array.isArray(rawOffsets)) {
+            return res.status(400).json({ message: 'Playing values must be supplied per gamemode.' });
         }
+
+        const invalidKey = PREGAME_PLAYING_KEYS.find(key => {
+            const value = Number(rawOffsets[key] ?? 0);
+            return !Number.isInteger(value) || value < 0 || value > 999999;
+        });
+        if (invalidKey) return res.status(400).json({ message: 'Each Playing base must be a whole number between 0 and 999999.' });
+
+        const playingOffsets = normalizePregamePlayingOffsets(rawOffsets);
 
         const settings = await SiteDisplaySettings.findOneAndUpdate(
             { key: 'pregame' },
-            { pregamePlayingOverride: playingOverride },
+            { $set: { pregamePlayingOffsets: playingOffsets, pregamePlayingOverride: null } },
             { new: true, upsert: true, setDefaultsOnInsert: true },
         ).lean();
 
-        res.json({ success: true, playingOverride: settings.pregamePlayingOverride ?? null });
+        res.json({ success: true, playingOffsets: normalizePregamePlayingOffsets(settings.pregamePlayingOffsets) });
     } catch (err) {
         console.error('Update pregame display settings error:', err);
         res.status(500).json({ error: 'Could not update pregame display settings' });
@@ -9746,4 +9767,3 @@ app.use((err, req, res, next) => {
 });
 
 httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
-
