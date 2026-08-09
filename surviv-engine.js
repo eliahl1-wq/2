@@ -578,15 +578,24 @@ function makeChest(x, y, tier = 'common', contents = null, source = 'map', optio
         room: options.room || null,
     };
 }
+function normalizeAmmoGroundLoot(item) {
+    if (!item || item.type !== 'ammo') return item;
+    const ammoType = SURVIV_AMMO[item.ammoType] ? item.ammoType : '9mm';
+    const amount = Math.floor(Number(item.amount));
+    item.ammoType = ammoType;
+    item.amount = amount > 0 ? amount : SURVIV_AMMO[ammoType].pickup;
+    return item;
+}
+
 function makeGroundLoot(type, x, y, extra = {}) {
-    return {
+    return normalizeAmmoGroundLoot({
         id: randId(),
         type,
         x,
         y,
         source: extra.source || 'ground',
         ...extra,
-    };
+    });
 }
 
 function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
@@ -1998,6 +2007,191 @@ function addLumberWorks(obstacles, loot, spawnPoints, x, y) {
     spawnPoints.push({ x: x + 900, y: y + 115, role: 'mill-yard' });
 }
 
+function addUrbanBorough(obstacles, loot, spawnPoints, x, y, opts = {}) {
+    const landmarkType = opts.landmarkType || 'borough';
+    const label = opts.label || 'BOROUGH';
+    const roadVariant = opts.roadVariant || 'asphalt';
+    addObstacle(obstacles, 'field', x, y, 2240, 1540, {
+        collidable: false, variant: 'town', role: 'urbanDistrict', landmarkType, label,
+    });
+    addObstacle(obstacles, 'road', x, y, 2120, 112, {
+        collidable: false, variant: roadVariant, role: 'boroughMainStreet', landmarkType,
+    });
+    addObstacle(obstacles, 'road', x, y, 96, 1420, {
+        collidable: false, variant: roadVariant, role: 'boroughCrossStreet', landmarkType,
+    });
+    addObstacle(obstacles, 'field', x, y, 520, 340, {
+        collidable: false, variant: 'courtyard', role: 'boroughSquare', landmarkType,
+    });
+
+    const names = opts.buildingLabels || [
+        'BAKERY', 'ROW HOMES', 'GROCERY', 'WATCH HOUSE',
+        'APARTMENTS', 'PUB', 'WORKSHOP', 'BOARDING HOUSE',
+    ];
+    const variants = opts.variants || ['brick', 'brick', 'house', 'brick', 'house', 'brick', 'garage', 'lodge'];
+    const offsets = [-790, -270, 270, 790];
+    const buildings = [];
+    for (const [rowIndex, rowY] of [-455, 455].entries()) {
+        for (const [columnIndex, offsetX] of offsets.entries()) {
+            const index = rowIndex * offsets.length + columnIndex;
+            const commercial = index === 0 || index === 2 || index === 5 || index === 6;
+            const width = columnIndex % 2 === 0 ? 350 : 330;
+            const height = commercial ? 255 : 275;
+            buildings.push(addHouse(obstacles, loot, spawnPoints, x + offsetX, y + rowY, width, height, {
+                variant: variants[index % variants.length],
+                hue: (opts.baseHue || 12) + index * 5,
+                tier: commercial || index === 3 ? 'rare' : 'common',
+                doorSide: rowIndex === 0 ? 'south' : 'north',
+                layout: commercial ? 'shop' : 'split',
+                landmarkType,
+                label: names[index] || `BLOCK ${index + 1}`,
+                role: commercial ? 'boroughBusiness' : 'boroughHome',
+            }));
+        }
+    }
+
+    for (const [dx, dy, kind] of [
+        [-520, -135, 'crate'], [520, 145, 'barrel'], [-145, 590, 'tree'], [155, -600, 'tree'],
+    ]) {
+        addObstacle(obstacles, kind, x + dx, y + dy, kind === 'tree' ? 46 : 38, kind === 'tree' ? 46 : 38, {
+            hue: kind === 'barrel' ? 205 : kind === 'tree' ? 108 : 28,
+            rotation: kind === 'crate' ? 0.12 : 0,
+            variant: kind === 'barrel' ? 'water' : kind === 'tree' ? 'streetTree' : 'marketCrate',
+            role: 'boroughProp', landmarkType,
+        });
+    }
+    addObstacle(obstacles, 'signpost', x - 1010, y - 95, 40, 40, {
+        collidable: false, variant: 'roadMarker', role: 'boroughSign', landmarkType, label,
+    });
+    spawnPoints.push({ x: x - 1160, y, role: 'borough-road' });
+    spawnPoints.push({ x: x + 1160, y, role: 'borough-road' });
+    spawnPoints.push({ x, y: y + 790, role: 'borough-cross-street' });
+    return buildings;
+}
+
+function addWestportVillage(obstacles, loot, spawnPoints, x, y) {
+    const landmarkType = 'westport';
+    addObstacle(obstacles, 'field', x, y, 1940, 1420, {
+        collidable: false, variant: 'village', role: 'harborVillage', landmarkType, label: 'WESTPORT',
+    });
+    addObstacle(obstacles, 'road', x, y + 80, 1840, 102, {
+        collidable: false, variant: 'dirt', role: 'harborRoad', landmarkType,
+    });
+    addObstacle(obstacles, 'road', x, y - 285, 88, 730, {
+        collidable: false, variant: 'dirt', role: 'ferryLane', landmarkType,
+    });
+    addObstacle(obstacles, 'field', x, y + 80, 430, 300, {
+        collidable: false, variant: 'courtyard', role: 'harborSquare', landmarkType,
+    });
+
+    const homes = [
+        { dx: -720, dy: -390, w: 310, h: 240, side: 'south', variant: 'cabin', label: 'NET HOUSE', role: 'fisherHome' },
+        { dx: -245, dy: -410, w: 330, h: 260, side: 'south', variant: 'brick', label: 'FERRY INN', role: 'ferryInn', shop: true },
+        { dx: 245, dy: -410, w: 330, h: 260, side: 'south', variant: 'house', label: 'BAKERY', role: 'harborShop', shop: true },
+        { dx: 720, dy: -390, w: 310, h: 240, side: 'south', variant: 'cabin', label: 'LIGHT HOUSE', role: 'fisherHome' },
+        { dx: -600, dy: 470, w: 360, h: 260, side: 'north', variant: 'barn', label: 'BOAT SHED', role: 'boatShed' },
+        { dx: 0, dy: 475, w: 370, h: 270, side: 'north', variant: 'brick', label: 'FISH MARKET', role: 'fishMarket', shop: true },
+        { dx: 610, dy: 465, w: 350, h: 255, side: 'north', variant: 'garage', label: 'REPAIR', role: 'repairShop', shop: true },
+    ];
+    for (const [index, home] of homes.entries()) {
+        addHouse(obstacles, loot, spawnPoints, x + home.dx, y + home.dy, home.w, home.h, {
+            variant: home.variant, hue: 16 + index * 7, tier: home.shop ? 'rare' : 'common',
+            doorSide: home.side, layout: home.shop ? 'shop' : 'split', landmarkType,
+            label: home.label, role: home.role,
+        });
+    }
+    for (const dx of [-180, -60, 60, 180]) {
+        addObstacle(obstacles, 'crate', x + dx, y - 70, 42, 42, {
+            hue: 28, variant: 'marketStall', role: 'harborCrate', landmarkType,
+        });
+    }
+    addObstacle(obstacles, 'signpost', x - 895, y - 15, 38, 38, {
+        collidable: false, variant: 'roadMarker', role: 'harborSign', landmarkType, label: 'WESTPORT',
+    });
+    spawnPoints.push({ x: x - 1040, y: y + 80, role: 'westport-road' });
+    spawnPoints.push({ x: x + 1040, y: y + 80, role: 'westport-road' });
+}
+
+function addRailDepot(obstacles, loot, spawnPoints, x, y) {
+    const landmarkType = 'rail-depot';
+    addObstacle(obstacles, 'field', x, y, 1860, 1320, {
+        collidable: false, variant: 'industrial', role: 'railYard', landmarkType, label: 'SOUTH RAIL DEPOT',
+    });
+    for (const offsetY of [-105, 105]) {
+        addObstacle(obstacles, 'road', x, y + offsetY, 1740, 62, {
+            collidable: false, variant: 'dirt', role: 'railTrack', landmarkType,
+        });
+    }
+    addObstacle(obstacles, 'road', x - 920, y + 250, 92, 1000, {
+        collidable: false, variant: 'asphalt', role: 'depotApproach', landmarkType,
+    });
+
+    const freightHall = addHouse(obstacles, loot, spawnPoints, x + 360, y - 410, 760, 300, {
+        variant: 'warehouse', hue: 202, tier: 'military', doorSide: 'south', layout: 'corridor',
+        landmarkType, label: 'FREIGHT HALL', role: 'freightHall',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 610, y - 400, 320, 250, {
+        variant: 'brick', hue: 12, tier: 'rare', doorSide: 'south', layout: 'shop',
+        landmarkType, label: 'STATION', role: 'stationHouse',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 620, y + 440, 330, 250, {
+        variant: 'lodge', hue: 105, tier: 'common', doorSide: 'north', layout: 'split',
+        landmarkType, label: 'CREW HOUSE', role: 'crewHouse',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 60, y + 440, 390, 250, {
+        variant: 'garage', hue: 205, tier: 'rare', doorSide: 'north', layout: 'shop',
+        landmarkType, label: 'ENGINE SHOP', role: 'engineShop',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 650, y + 435, 330, 240, {
+        variant: 'warehouse', hue: 34, tier: 'rare', doorSide: 'north', layout: 'open',
+        landmarkType, label: 'PARCEL SHED', role: 'parcelShed',
+    });
+    for (const [dx, dy, hue] of [[-360, -100, 205], [-120, 105, 8], [330, 100, 34], [650, -105, 195]]) {
+        addObstacle(obstacles, 'container', x + dx, y + dy, 155, 54, {
+            hue, variant: hue === 8 ? 'red' : 'rust', role: 'freightCar', landmarkType,
+        });
+    }
+    loot.push(makeChest(x + 360, y - 410, 'military', null, 'map', {
+        houseId: freightHall.id, landmarkType, room: 'hallway',
+    }));
+    spawnPoints.push({ x: x - 980, y: y + 350, role: 'depot-road' });
+    spawnPoints.push({ x: x + 960, y, role: 'rail-yard' });
+}
+
+function addCivicQuarter(obstacles, loot, spawnPoints, x, y) {
+    const landmarkType = 'civic-quarter';
+    addObstacle(obstacles, 'field', x, y, 1900, 1500, {
+        collidable: false, variant: 'town', role: 'civicQuarter', landmarkType, label: 'CIVIC QUARTER',
+    });
+    addObstacle(obstacles, 'road', x, y + 50, 1800, 108, {
+        collidable: false, variant: 'asphalt', role: 'civicStreet', landmarkType,
+    });
+    addObstacle(obstacles, 'field', x, y + 50, 470, 320, {
+        collidable: false, variant: 'courtyard', role: 'civicPlaza', landmarkType,
+    });
+    const buildings = [
+        { dx: -610, dy: -430, w: 430, h: 285, label: 'SCHOOL', role: 'school', variant: 'brick', shop: false },
+        { dx: 0, dy: -435, w: 420, h: 290, label: 'LIBRARY', role: 'library', variant: 'brick', shop: true },
+        { dx: 610, dy: -425, w: 390, h: 270, label: 'TOWN HALL', role: 'townHall', variant: 'brick', shop: true },
+        { dx: -610, dy: 485, w: 370, h: 260, label: 'TEACHER HOMES', role: 'civicHome', variant: 'house', shop: false },
+        { dx: 0, dy: 490, w: 400, h: 270, label: 'CHAPEL', role: 'chapel', variant: 'lodge', shop: false },
+        { dx: 610, dy: 480, w: 380, h: 260, label: 'POST OFFICE', role: 'postOffice', variant: 'brick', shop: true },
+    ];
+    for (const [index, building] of buildings.entries()) {
+        addHouse(obstacles, loot, spawnPoints, x + building.dx, y + building.dy, building.w, building.h, {
+            variant: building.variant, hue: 12 + index * 6, tier: index < 3 ? 'rare' : 'common',
+            doorSide: building.dy < 0 ? 'south' : 'north',
+            layout: building.shop ? 'shop' : 'split', landmarkType,
+            label: building.label, role: building.role,
+        });
+    }
+    addObstacle(obstacles, 'signpost', x - 850, y - 20, 40, 40, {
+        collidable: false, variant: 'roadMarker', role: 'civicSign', landmarkType, label: 'CIVIC QUARTER',
+    });
+    spawnPoints.push({ x: x - 1000, y: y + 50, role: 'civic-road' });
+    spawnPoints.push({ x: x + 1000, y: y + 50, role: 'civic-road' });
+}
+
 function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1900, 1320, {
         collidable: false, variant: 'village', role: 'marketVillage', landmarkType: 'market',
@@ -2369,7 +2563,7 @@ const WILDERNESS_TRAIL_PLANS = [
     ], opts: { width: 58, label: 'Estate Walk' } },
     { points: [
         { x: -8950, y: -5250 }, { x: -8240, y: -5150 }, { x: -7420, y: -5200 },
-        { x: -6500, y: -5200 }, { x: -5570, y: -4650 }, { x: -5380, y: -4200 },
+        { x: -6500, y: -5200 }, { x: -6100, y: -4700 }, { x: -5900, y: -4200 },
     ], opts: { width: 62, variant: 'forest', label: 'Pine Trail' } },
     { points: [
         { x: -7700, y: -6760 }, { x: -6940, y: -6480 }, { x: -6120, y: -6200 },
@@ -2519,6 +2713,32 @@ function addPondDetails(obstacles) {
             });
         }
     }
+}
+
+function addCanopyInfill(obstacles, worldHalf, targetCount = 80) {
+    let added = 0;
+    const margin = 850;
+    const step = 1450;
+    for (let gx = -worldHalf + margin; gx <= worldHalf - margin && added < targetCount; gx += step) {
+        for (let gy = -worldHalf + margin; gy <= worldHalf - margin && added < targetCount; gy += step) {
+            if (Math.hypot(gx, gy) < 1900) continue;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                const x = clamp(gx + (Math.random() - 0.5) * 760, -worldHalf + 620, worldHalf - 620);
+                const y = clamp(gy + (Math.random() - 0.5) * 760, -worldHalf + 620, worldHalf - 620);
+                const size = 38 + Math.random() * 24;
+                if (isMapPositionBlocked(obstacles, x, y, size / 2 + 18)) continue;
+                addObstacle(obstacles, 'tree', x, y, size, size, {
+                    hue: y < -4800 ? 112 : 96 + Math.floor(Math.random() * 34),
+                    rotation: Math.random() * Math.PI,
+                    variant: y < -4800 ? 'pine' : y > 4300 ? 'scrub' : 'grove',
+                    role: 'canopyInfill',
+                });
+                added++;
+                break;
+            }
+        }
+    }
+    return added;
 }
 
 function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
@@ -2937,8 +3157,8 @@ function addSparseAreaFill(obstacles, loot, spawnPoints, worldHalf, placedPositi
     candidates.sort((a, b) => a.score - b.score || a.y - b.y || a.x - b.x);
     let housesAdded = 0;
     let detailClustersAdded = 0;
-    const houseLimit = 14;
-    const detailClusterLimit = 18;
+    const houseLimit = 20;
+    const detailClusterLimit = 22;
 
     for (const candidate of candidates) {
         if (housesAdded >= houseLimit && detailClustersAdded >= detailClusterLimit) break;
@@ -3018,6 +3238,11 @@ export function generateSurvivMap(worldHalf) {
     const motelPos = { x: 6000, y: -5200, w: 1700, h: 1180 };
     const rangerLodgePos = { x: -4700, y: -8000, w: 1600, h: 1100 };
     const lumberworksPos = { x: 5200, y: 8200, w: 1750, h: 1200 };
+    const riversidePos = { x: -600, y: -2700, w: 2240, h: 1540 };
+    const eastgatePos = { x: 5200, y: -300, w: 2240, h: 1540 };
+    const westportPos = { x: -7000, y: 200, w: 1940, h: 1420 };
+    const railDepotPos = { x: 700, y: 8200, w: 1860, h: 1320 };
+    const civicQuarterPos = { x: -900, y: 3600, w: 1900, h: 1500 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
@@ -3027,6 +3252,7 @@ export function generateSurvivMap(worldHalf) {
         northCachePos, eastCachePos, southCachePos, checkpointPos,
         servicesPos, fireStationPos, orchardPos,
         motelPos, rangerLodgePos, lumberworksPos,
+        riversidePos, eastgatePos, westportPos, railDepotPos, civicQuarterPos,
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -3069,7 +3295,7 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'SW Radio Tower', x: towerPos.x, y: towerPos.y, type: 'tower' });
 
     // Pine Town
-    addSettlement(obstacles, loot, spawnPoints, townPos.x, townPos.y, 8, 'town');
+    addSettlement(obstacles, loot, spawnPoints, townPos.x, townPos.y, 11, 'town');
     landmarks.push({ name: 'NW Pine Town', x: townPos.x, y: townPos.y, type: 'town' });
 
     // Outer POIs
@@ -3111,7 +3337,7 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'West Forest Camp', x: campPos.x, y: campPos.y, type: 'camp' });
 
     // NE Town
-    addSettlement(obstacles, loot, spawnPoints, neTownPos.x, neTownPos.y, 7, 'town');
+    addSettlement(obstacles, loot, spawnPoints, neTownPos.x, neTownPos.y, 10, 'town');
     landmarks.push({ name: 'NE Town', x: neTownPos.x, y: neTownPos.y, type: 'town' });
 
     // SE Lab
@@ -3119,7 +3345,7 @@ export function generateSurvivMap(worldHalf) {
     landmarks.push({ name: 'SE Lab', x: seLabPos.x, y: seLabPos.y, type: 'lab' });
 
     // SW Town
-    addSettlement(obstacles, loot, spawnPoints, swTownPos.x, swTownPos.y, 7, 'town');
+    addSettlement(obstacles, loot, spawnPoints, swTownPos.x, swTownPos.y, 10, 'town');
     landmarks.push({ name: 'SW Town', x: swTownPos.x, y: swTownPos.y, type: 'town' });
 
     // NW Mansion
@@ -3156,6 +3382,24 @@ export function generateSurvivMap(worldHalf) {
     addLumberWorks(obstacles, loot, spawnPoints, lumberworksPos.x, lumberworksPos.y);
     landmarks.push({ name: 'South Lumberworks', x: lumberworksPos.x, y: lumberworksPos.y, type: 'lumberworks' });
 
+    addUrbanBorough(obstacles, loot, spawnPoints, riversidePos.x, riversidePos.y, {
+        landmarkType: 'riverside', label: 'RIVERSIDE BOROUGH', baseHue: 10,
+        buildingLabels: ['RIVER CAFE', 'ROW HOMES', 'BAKERY', 'WATCH HOUSE', 'APARTMENTS', 'THE ANCHOR', 'WORKSHOP', 'BOARDING HOUSE'],
+    });
+    landmarks.push({ name: 'Riverside Borough', x: riversidePos.x, y: riversidePos.y, type: 'riverside' });
+    addUrbanBorough(obstacles, loot, spawnPoints, eastgatePos.x, eastgatePos.y, {
+        landmarkType: 'eastgate', label: 'EASTGATE', baseHue: 20,
+        variants: ['brick', 'house', 'brick', 'lodge', 'house', 'brick', 'garage', 'brick'],
+        buildingLabels: ['GROCERY', 'EASTGATE HOMES', 'PHARMACY', 'APARTMENTS', 'DINER', 'LAUNDRY', 'AUTO GARAGE', 'ROW HOMES'],
+    });
+    landmarks.push({ name: 'Eastgate District', x: eastgatePos.x, y: eastgatePos.y, type: 'eastgate' });
+    addWestportVillage(obstacles, loot, spawnPoints, westportPos.x, westportPos.y);
+    landmarks.push({ name: 'Westport Village', x: westportPos.x, y: westportPos.y, type: 'westport' });
+    addRailDepot(obstacles, loot, spawnPoints, railDepotPos.x, railDepotPos.y);
+    landmarks.push({ name: 'South Rail Depot', x: railDepotPos.x, y: railDepotPos.y, type: 'rail-depot' });
+    addCivicQuarter(obstacles, loot, spawnPoints, civicQuarterPos.x, civicQuarterPos.y);
+    landmarks.push({ name: 'Civic Quarter', x: civicQuarterPos.x, y: civicQuarterPos.y, type: 'civic-quarter' });
+
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
     // ─────────────────────────────────────────────────────────────────────────
@@ -3169,6 +3413,9 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, -wh * 0.9, 2000, wh * 0.9, 2000, roadW);
     // North East-West Highway
     addRoad(obstacles, -wh * 0.9, -4000, wh * 0.9, -4000, roadW);
+    // Secondary cross-map routes reduce the long empty rotations in the outer rings.
+    addRoad(obstacles, -wh * 0.9, -6100, wh * 0.9, -6100, roadW);
+    addRoad(obstacles, -wh * 0.9, 6200, wh * 0.9, 6200, roadW);
 
     // Branch connectors linking compounds to the highways
     addRoad(obstacles, 0, 0, 0, 2000, roadW);             // Old Estate to E-W Highway
@@ -3189,6 +3436,11 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, motelPos.x, -4000, motelPos.x, motelPos.y + 590, roadW); // Sunset Motel approach
     addRoad(obstacles, -2500, rangerLodgePos.y + 500, rangerLodgePos.x + 800, rangerLodgePos.y + 500, roadW); // Ranger lodge forest road
     addRoad(obstacles, 2500, lumberworksPos.y + 520, lumberworksPos.x - 875, lumberworksPos.y + 520, roadW); // Lumberworks freight road
+    addRoad(obstacles, riversidePos.x, -4000, riversidePos.x, riversidePos.y, roadW); // Riverside cross street
+    addRoad(obstacles, 2500, eastgatePos.y, eastgatePos.x - 1120, eastgatePos.y, roadW); // Eastgate avenue
+    addRoad(obstacles, -2500, westportPos.y + 80, westportPos.x + 920, westportPos.y + 80, roadW); // Westport road
+    addRoad(obstacles, railDepotPos.x - 920, 6200, railDepotPos.x - 920, railDepotPos.y, roadW); // Rail depot approach
+    addRoad(obstacles, -2500, civicQuarterPos.y + 50, civicQuarterPos.x - 900, civicQuarterPos.y + 50, roadW); // Civic boulevard
 
     addObstacle(obstacles, 'road', swTownPos.x, 1900, roadW, 200, {
         collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'town',
@@ -3241,6 +3493,13 @@ export function generateSurvivMap(worldHalf) {
         { x: 4200, y: -8300, orientation: 'vertical' },
         { x: 7000, y: 3000, orientation: 'horizontal' },
         { x: 700, y: 3600, orientation: 'horizontal' },
+        { x: 1500, y: 1000, orientation: 'horizontal' },
+        { x: -4000, y: 500, orientation: 'horizontal' },
+        { x: -4300, y: 3000, orientation: 'horizontal' },
+        { x: 4000, y: 7000, orientation: 'horizontal' },
+        { x: -3500, y: -2000, orientation: 'horizontal' },
+        { x: 8500, y: 1000, orientation: 'vertical' },
+        { x: -6500, y: 8500, orientation: 'horizontal' },
     ];
     for (const plan of hamletPlans) {
         const w = plan.orientation === 'horizontal' ? 1040 : 720;
@@ -3272,8 +3531,8 @@ export function generateSurvivMap(worldHalf) {
     }
 
     // Standalone filler houses, microsites, and cover patches.
-    const fillStep = 2750;
-    const fillMargin = 1700;
+    const fillStep = 2350;
+    const fillMargin = 1550;
     for (let gx = -wh + fillMargin; gx <= wh - fillMargin; gx += fillStep) {
         for (let gy = -wh + fillMargin; gy <= wh - fillMargin; gy += fillStep) {
             const x = clamp(gx + (Math.random() - 0.5) * 1050, -wh + 1200, wh - 1200);
@@ -3285,9 +3544,9 @@ export function generateSurvivMap(worldHalf) {
             
             placedPositions.push({ x, y, w: 1000, h: 820 });
             const roll = Math.random();
-            if (roll < 0.5) {
+            if (roll < 0.62) {
                 addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-            } else if (roll < 0.82) {
+            } else if (roll < 0.88) {
                 addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
             } else {
                 addCoverPatch(obstacles, loot, spawnPoints, x, y, { radius: 260, variant: 'woods' });
@@ -3298,7 +3557,7 @@ export function generateSurvivMap(worldHalf) {
     // Countryside scatter: loose trees and occasional single houses so the long crossings
     // still feel natural without turning every open field into a dense compound.
     let countrysideHouses = 0;
-    const countrysideHouseLimit = 16;
+    const countrysideHouseLimit = 28;
     const scatterStep = 1250;
     const scatterMargin = 950;
     for (let gx = -wh + scatterMargin; gx <= wh - scatterMargin; gx += scatterStep) {
@@ -3310,7 +3569,7 @@ export function generateSurvivMap(worldHalf) {
             if (Math.hypot(x, y) < 1700) continue;
             if (isAreaOverlapping(x, y, 330, 330, 115, placedPositions)) continue;
 
-            if (countrysideHouses < countrysideHouseLimit && Math.random() < 0.16) {
+            if (countrysideHouses < countrysideHouseLimit && Math.random() < 0.23) {
                 addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
                 placedPositions.push({ x, y, w: 560, h: 520 });
                 countrysideHouses++;
@@ -3337,6 +3596,7 @@ export function generateSurvivMap(worldHalf) {
 
     // Add small points of interest only where the completed layout is still sparse.
     addSparseAreaFill(obstacles, loot, spawnPoints, wh, placedPositions);
+    addCanopyInfill(obstacles, wh);
     addNaturalDetailScatter(obstacles, wh, POI_LIST);
     addScatteredGroundLoot(obstacles, loot);
     clearInvalidBuildingProps(obstacles);
@@ -4071,7 +4331,7 @@ function resolveCircleLootContainer(cx, cy, radius, item, fallbackDx = 1, fallba
 }
 
 function addSurvivLoot(room, item) {
-    room.loot.push(item);
+    room.loot.push(normalizeAmmoGroundLoot(item));
     markSurvivLootChanged(room);
     return item;
 }
@@ -4926,6 +5186,7 @@ function pickupLoot(entity, room) {
 
     for (const candidate of nearbyLoot) {
         const item = candidate.item;
+        normalizeAmmoGroundLoot(item);
         let index = candidate.index;
         if (room.loot[index] !== item) {
             index = room.loot.indexOf(item);
@@ -5678,7 +5939,9 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             .map(p => serializePlayer(p, false));
 
         const visibleLoot = querySurvivLoot(room, viewX, viewY, range)
-            .map(({ item: l }) => ({
+            .map(({ item: l }) => {
+                normalizeAmmoGroundLoot(l);
+                return {
                 id: l.id,
                 type: l.type,
                 x: l.x,
@@ -5701,7 +5964,8 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                     burstCount: l.burstCount,
                     burstRemainingMs: Math.max(0, 700 - (now - l.spawnedAt)),
                 } : {}),
-            }));
+            };
+            });
 
         const visibleBullets = room.bullets
             .filter(b => b.ownerId === youId || isInView(viewX, viewY, b.x, b.y, range + 300))

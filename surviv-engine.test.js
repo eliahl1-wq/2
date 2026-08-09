@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
     SURVIV,
+    SURVIV_AMMO,
     WEAPONS,
     beginSurvivReload,
     broadcastSurvivState,
@@ -71,8 +72,8 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 29);
-    assert.ok(houses.length >= 100);
+    assert.equal(map.landmarks.length, 34);
+    assert.ok(houses.length >= 160);
     assert.ok(chests.length < houses.length);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
         'wood_crate', 'supply_crate', 'ammo_crate', 'medical_crate', 'armory_crate',
@@ -416,6 +417,45 @@ test('motel, ranger lodge, and lumberworks add distinct connected combat distric
     assert.ok(map.loot.filter(item => item.landmarkType === 'motel' && item.type === 'chest').length >= 4);
     assert.ok(map.loot.filter(item => item.landmarkType === 'ranger-lodge' && item.type === 'chest').length >= 3);
     assert.ok(map.loot.filter(item => item.landmarkType === 'lumberworks' && item.type === 'chest').length >= 3);
+});
+
+test('urban expansion adds five dense and distinct road-connected districts', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmarkTypes = new Set(map.landmarks.map(landmark => landmark.type));
+    const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+    const networkRoads = roads.filter(road => road.role === 'networkRoad');
+    const junctions = map.obstacles.filter(obstacle => obstacle.kind === 'roadJunction');
+    const doorsByHouse = new Map(map.obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(door => [door.houseId, door]));
+    const expectedDistricts = new Map([
+        ['riverside', { buildings: 8, approachRole: 'boroughCrossStreet' }],
+        ['eastgate', { buildings: 8, approachRole: 'boroughMainStreet' }],
+        ['westport', { buildings: 7, approachRole: 'harborRoad' }],
+        ['rail-depot', { buildings: 5, approachRole: 'depotApproach' }],
+        ['civic-quarter', { buildings: 6, approachRole: 'civicStreet' }],
+    ]);
+
+    assert.ok(houses.length >= 160);
+    assert.ok(roads.length >= 75);
+    assert.ok(junctions.length >= 25);
+    for (const [landmarkType, expected] of expectedDistricts) {
+        assert.ok(landmarkTypes.has(landmarkType), `missing expanded district ${landmarkType}`);
+        const districtBuildings = houses.filter(house => house.landmarkType === landmarkType);
+        assert.equal(districtBuildings.length, expected.buildings);
+        assert.ok(districtBuildings.every(building => doorsByHouse.has(building.id)));
+        assert.ok(new Set(districtBuildings.map(building => building.variant)).size >= 2);
+
+        const approach = roads.find(road => (
+            road.landmarkType === landmarkType && road.role === expected.approachRole
+        ));
+        assert.ok(approach, `${landmarkType} should have its own approach street`);
+        assert.ok(networkRoads.some(road => rectsOverlap(
+            approach.x, approach.y, approach.w + 24, approach.h + 24,
+            road.x, road.y, road.w, road.h,
+        )), `${landmarkType} should connect to the highway network`);
+    }
 });
 test('surviv network roads do not run through buildings or walls', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
@@ -1121,6 +1161,21 @@ test('ground loot creates a pickup summary for the player', () => {
     assert.equal(player.lastLoot.items.ammoType, '762');
     assert.equal(player.lastLoot.items.ammoAmount, 15);
     assert.equal(player.lastLoot.items.medkits, 1);
+});
+
+test('legacy ground ammo without a caliber is repaired and can be picked up', () => {
+    const room = makeRoom();
+    const player = createSurvivPlayer('human-legacy-ammo', 'mongo-legacy-ammo', 'Collector', '#fff', room);
+    room.players.push(player);
+    room.loot = [
+        { id: 'legacy-ammo-drop', type: 'ammo', x: player.x, y: player.y, amount: 0, tier: 'common' },
+    ];
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.loot.length, 0);
+    assert.equal(player.inventory.ammoReserves['9mm'], SURVIV_AMMO['9mm'].pickup);
+    assert.equal(player.lastLoot.items.ammoType, '9mm');
 });
 test('medkits heal only after the server timer completes', () => {
     const room = makeRoom();
