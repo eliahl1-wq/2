@@ -71,7 +71,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 26);
+    assert.equal(map.landmarks.length, 29);
     assert.ok(houses.length >= 100);
     assert.ok(chests.length < houses.length);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
@@ -360,6 +360,62 @@ test('new roadside landmarks have distinct buildings and connect to the highway 
     const fireHall = fireStation.find(building => building.role === 'engineHall');
     const medicalCrate = map.loot.find(item => item.houseId === fireHall.id && item.containerType === 'medical_crate');
     assert.ok(medicalCrate, 'fire station should keep its medical supplies indoors');
+});
+
+test('motel, ranger lodge, and lumberworks add distinct connected combat districts', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmarkTypes = new Set(map.landmarks.map(landmark => landmark.type));
+    const networkRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road' && obstacle.role === 'networkRoad'
+    ));
+    const doorsByHouse = new Map(map.obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(door => [door.houseId, door]));
+
+    for (const type of ['motel', 'ranger-lodge', 'lumberworks']) {
+        assert.ok(landmarkTypes.has(type), 'missing landmark ' + type);
+    }
+
+    const buildingsFor = landmarkType => map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.landmarkType === landmarkType
+    ));
+    const motel = buildingsFor('motel');
+    const lodge = buildingsFor('ranger-lodge');
+    const lumberworks = buildingsFor('lumberworks');
+    assert.equal(motel.length, 5);
+    assert.deepEqual(new Set(motel.map(building => building.role)), new Set([
+        'northWing', 'westWing', 'eastWing', 'reception', 'laundry',
+    ]));
+    assert.equal(lodge.length, 4);
+    assert.deepEqual(new Set(lodge.map(building => building.role)), new Set([
+        'mainLodge', 'guestCabin', 'gearShed',
+    ]));
+    assert.equal(lumberworks.length, 4);
+    assert.deepEqual(new Set(lumberworks.map(building => building.role)), new Set([
+        'sawmill', 'millOffice', 'workshop', 'dryingShed',
+    ]));
+    assert.ok([...motel, ...lodge, ...lumberworks].every(building => doorsByHouse.has(building.id)));
+
+    const expectedConnections = [
+        { x: 6000, y: -4300, name: 'motel' },
+        { x: -3200, y: -7500, name: 'ranger lodge' },
+        { x: 3500, y: 8720, name: 'lumberworks' },
+    ];
+    for (const connection of expectedConnections) {
+        assert.ok(networkRoads.some(road => pointInRect(connection.x, connection.y, road, 2)), (
+            connection.name + ' should connect to the highway network'
+        ));
+    }
+
+    assert.ok(map.obstacles.some(obstacle => (
+        obstacle.kind === 'water' && obstacle.variant === 'pool' && obstacle.landmarkType === 'motel'
+    )));
+    assert.ok(map.obstacles.filter(obstacle => (
+        obstacle.kind === 'fallenLog' && obstacle.landmarkType === 'lumberworks'
+    )).length >= 6);
+    assert.ok(map.loot.filter(item => item.landmarkType === 'motel' && item.type === 'chest').length >= 4);
+    assert.ok(map.loot.filter(item => item.landmarkType === 'ranger-lodge' && item.type === 'chest').length >= 3);
+    assert.ok(map.loot.filter(item => item.landmarkType === 'lumberworks' && item.type === 'chest').length >= 3);
 });
 test('surviv network roads do not run through buildings or walls', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);

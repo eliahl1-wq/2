@@ -1799,6 +1799,205 @@ function addOrchardCooperative(obstacles, loot, spawnPoints, x, y) {
     spawnPoints.push({ x: laneEast - 120, y: y - 150, role: 'orchard-road' });
     spawnPoints.push({ x: laneWest + 120, y: y + 150, role: 'orchard-road' });
 }
+function addSunsetMotel(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1700, 1180, {
+        collidable: false, variant: 'town', role: 'motelGrounds', landmarkType: 'motel',
+        label: 'SUNSET MOTEL',
+    });
+    addObstacle(obstacles, 'field', x, y + 80, 1060, 560, {
+        collidable: false, variant: 'courtyard', role: 'parkingCourt', landmarkType: 'motel',
+    });
+    addObstacle(obstacles, 'road', x, y + 535, 1120, 90, {
+        collidable: false, variant: 'asphalt', role: 'motelDrive', landmarkType: 'motel',
+    });
+
+    // A U-shaped set of buildings makes the parking court useful for short
+    // rotations while every wing still has a direct exterior escape.
+    const northWing = addHouse(obstacles, loot, spawnPoints, x, y - 390, 720, 260, {
+        variant: 'brick', tier: 'rare', hue: 10, doorSide: 'south', layout: 'split',
+        landmarkType: 'motel', label: 'ROOMS 1-8', role: 'northWing',
+    });
+    const westWing = addHouse(obstacles, loot, spawnPoints, x - 590, y + 65, 300, 500, {
+        variant: 'brick', tier: 'rare', hue: 12, doorSide: 'east', layout: 'split',
+        landmarkType: 'motel', label: 'ROOMS 9-12', role: 'westWing',
+    });
+    const eastWing = addHouse(obstacles, loot, spawnPoints, x + 590, y + 65, 300, 500, {
+        variant: 'brick', tier: 'rare', hue: 8, doorSide: 'west', layout: 'split',
+        landmarkType: 'motel', label: 'ROOMS 13-16', role: 'eastWing',
+    });
+    const reception = addHouse(obstacles, loot, spawnPoints, x - 250, y + 430, 360, 190, {
+        variant: 'brick', tier: 'rare', hue: 14, doorSide: 'north', layout: 'shop',
+        landmarkType: 'motel', label: 'RECEPTION', role: 'reception',
+    });
+    addHouse(obstacles, loot, spawnPoints, x + 300, y + 430, 300, 190, {
+        variant: 'garage', tier: 'common', hue: 205, doorSide: 'north', layout: 'shop',
+        landmarkType: 'motel', label: 'LAUNDRY', role: 'laundry',
+    });
+
+    addObstacle(obstacles, 'water', x, y + 120, 280, 155, {
+        collidable: false, variant: 'pool', role: 'motelPool', landmarkType: 'motel',
+    });
+    addObstacle(obstacles, 'signpost', x - 760, y + 465, 42, 42, {
+        collidable: false, variant: 'roadMarker', role: 'motelSign',
+        landmarkType: 'motel', label: 'SUNSET MOTEL',
+    });
+    const parkedCars = [
+        { dx: -360, dy: 105, hue: 4, rotation: 0.04 },
+        { dx: 345, dy: -30, hue: 208, rotation: -0.05 },
+        { dx: 365, dy: 230, hue: 42, rotation: 0.03 },
+    ];
+    for (const car of parkedCars) {
+        addObstacle(obstacles, 'container', x + car.dx, y + car.dy, 112, 50, {
+            hue: car.hue, rotation: car.rotation, variant: 'car',
+            role: 'parkedCar', landmarkType: 'motel',
+        });
+    }
+
+    loot.push(makeChest(x + 210, y - 390, 'rare', null, 'map', {
+        houseId: northWing.id, landmarkType: 'motel', room: 'bedroom',
+    }));
+    loot.push(makeChest(x - 590, y - 25, 'common', null, 'map', {
+        houseId: westWing.id, landmarkType: 'motel', room: 'living-room',
+    }));
+    loot.push(makeChest(x + 590, y + 160, 'rare', null, 'map', {
+        houseId: eastWing.id, landmarkType: 'motel', room: 'bedroom',
+    }));
+    loot.push(makeChest(x - 250, y + 430, 'rare', null, 'map', {
+        houseId: reception.id, landmarkType: 'motel', room: 'stockroom',
+    }));
+    spawnPoints.push({ x: x - 740, y: y + 535, role: 'motel-road' });
+    spawnPoints.push({ x: x + 740, y: y + 535, role: 'motel-road' });
+}
+
+function addRangerLodge(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1600, 1100, {
+        collidable: false, variant: 'woods', role: 'rangerGrounds', landmarkType: 'ranger-lodge',
+        label: 'CEDAR LODGE',
+    });
+    addObstacle(obstacles, 'field', x, y + 235, 520, 280, {
+        collidable: false, variant: 'courtyard', role: 'campCircle', landmarkType: 'ranger-lodge',
+    });
+    addObstacle(obstacles, 'road', x + 400, y + 500, 800, 88, {
+        collidable: false, variant: 'dirt', role: 'lodgeDrive', landmarkType: 'ranger-lodge',
+    });
+    addObstacle(obstacles, 'road', x, y + 375, 88, 250, {
+        collidable: false, variant: 'dirt', role: 'lodgeDrive', landmarkType: 'ranger-lodge',
+    });
+
+    const lodge = addHouse(obstacles, loot, spawnPoints, x, y - 220, 650, 380, {
+        variant: 'lodge', tier: 'military', hue: 116, wall: 16, doorSide: 'south', layout: 'corridor',
+        landmarkType: 'ranger-lodge', label: 'CEDAR LODGE', role: 'mainLodge',
+    });
+    const westCabin = addHouse(obstacles, loot, spawnPoints, x - 555, y + 235, 270, 220, {
+        variant: 'cabin', tier: 'rare', hue: 24, doorSide: 'east', layout: 'split',
+        landmarkType: 'ranger-lodge', label: 'CABIN A', role: 'guestCabin',
+    });
+    const eastCabin = addHouse(obstacles, loot, spawnPoints, x + 555, y + 235, 270, 220, {
+        variant: 'cabin', tier: 'rare', hue: 20, doorSide: 'west', layout: 'split',
+        landmarkType: 'ranger-lodge', label: 'CABIN B', role: 'guestCabin',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 555, y - 300, 250, 190, {
+        variant: 'garage', tier: 'rare', hue: 105, doorSide: 'south', layout: 'shop',
+        landmarkType: 'ranger-lodge', label: 'GEAR SHED', role: 'gearShed',
+    });
+
+    // A small stone fire ring and wood piles give the courtyard readable cover.
+    for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        addObstacle(obstacles, 'rock', x + Math.cos(angle) * 58, y + 235 + Math.sin(angle) * 58, 26, 22, {
+            hue: 220, variant: 'fireRing', role: 'campCover', landmarkType: 'ranger-lodge',
+        });
+    }
+    addObstacle(obstacles, 'fallenLog', x - 235, y + 260, 96, 25, {
+        rotation: 0.12, variant: 'birch', role: 'campCover', landmarkType: 'ranger-lodge',
+    });
+    addObstacle(obstacles, 'fallenLog', x + 235, y + 260, 96, 25, {
+        rotation: -0.12, variant: 'mossy', role: 'campCover', landmarkType: 'ranger-lodge',
+    });
+    for (const [dx, dy] of [[-710, -420], [700, -390], [-720, 430], [710, 435]]) {
+        addObstacle(obstacles, 'tree', x + dx, y + dy, 52, 52, {
+            hue: 108, variant: 'pine', role: 'lodgeTree', landmarkType: 'ranger-lodge',
+        });
+    }
+
+    loot.push(makeChest(x + 205, y - 230, 'military', null, 'map', {
+        houseId: lodge.id, landmarkType: 'ranger-lodge', room: 'north-room',
+    }));
+    loot.push(makeChest(x - 555, y + 235, 'rare', null, 'map', {
+        houseId: westCabin.id, landmarkType: 'ranger-lodge', room: 'bedroom',
+    }));
+    loot.push(makeChest(x + 555, y + 235, 'rare', null, 'map', {
+        houseId: eastCabin.id, landmarkType: 'ranger-lodge', room: 'bedroom',
+    }));
+    spawnPoints.push({ x: x + 820, y: y + 500, role: 'lodge-road' });
+}
+
+function addLumberWorks(obstacles, loot, spawnPoints, x, y) {
+    addObstacle(obstacles, 'field', x, y, 1750, 1200, {
+        collidable: false, variant: 'industrial', role: 'lumberYard', landmarkType: 'lumberworks',
+        label: 'SOUTH LUMBERWORKS',
+    });
+    addObstacle(obstacles, 'field', x, y + 105, 1420, 430, {
+        collidable: false, variant: 'courtyard', role: 'millYard', landmarkType: 'lumberworks',
+    });
+    addObstacle(obstacles, 'road', x - 75, y + 115, 1420, 96, {
+        collidable: false, variant: 'dirt', role: 'serviceLane', landmarkType: 'lumberworks',
+    });
+    addObstacle(obstacles, 'road', x - 720, y + 350, 90, 470, {
+        collidable: false, variant: 'dirt', role: 'serviceLane', landmarkType: 'lumberworks',
+    });
+
+    const sawmill = addHouse(obstacles, loot, spawnPoints, x + 220, y - 310, 720, 340, {
+        variant: 'warehouse', tier: 'military', hue: 28, wall: 16, doorSide: 'south', layout: 'corridor',
+        landmarkType: 'lumberworks', label: 'SAWMILL', role: 'sawmill',
+    });
+    const office = addHouse(obstacles, loot, spawnPoints, x - 620, y - 315, 300, 230, {
+        variant: 'lodge', tier: 'rare', hue: 106, doorSide: 'south', layout: 'shop',
+        landmarkType: 'lumberworks', label: 'OFFICE', role: 'millOffice',
+    });
+    addHouse(obstacles, loot, spawnPoints, x - 410, y + 410, 380, 250, {
+        variant: 'garage', tier: 'rare', hue: 34, doorSide: 'north', layout: 'shop',
+        landmarkType: 'lumberworks', label: 'WORKSHOP', role: 'workshop',
+    });
+    const dryingShed = addHouse(obstacles, loot, spawnPoints, x + 570, y + 410, 430, 250, {
+        variant: 'barn', tier: 'rare', hue: 12, doorSide: 'north', layout: 'split',
+        landmarkType: 'lumberworks', label: 'DRYING SHED', role: 'dryingShed',
+    });
+
+    const logStacks = [
+        { dx: -655, dy: 55, rotation: 0 }, { dx: -655, dy: 95, rotation: 0 },
+        { dx: 720, dy: -80, rotation: Math.PI / 2 }, { dx: 760, dy: -80, rotation: Math.PI / 2 },
+        { dx: 80, dy: 350, rotation: 0.04 }, { dx: 80, dy: 390, rotation: -0.03 },
+    ];
+    for (const log of logStacks) {
+        addObstacle(obstacles, 'fallenLog', x + log.dx, y + log.dy, 118, 28, {
+            rotation: log.rotation, variant: 'millStack', role: 'logStack', landmarkType: 'lumberworks',
+        });
+    }
+    addObstacle(obstacles, 'container', x + 730, y + 300, 125, 54, {
+        hue: 32, variant: 'rust', role: 'millCover', landmarkType: 'lumberworks',
+    });
+    addObstacle(obstacles, 'crate', x - 120, y + 260, 48, 48, {
+        variant: 'industrial', role: 'millCover', landmarkType: 'lumberworks',
+    });
+    addObstacle(obstacles, 'signpost', x - 815, y + 520, 38, 38, {
+        collidable: false, variant: 'roadMarker', role: 'millSign',
+        landmarkType: 'lumberworks', label: 'LUMBERWORKS',
+    });
+
+    loot.push(makeChest(x + 235, y - 315, 'military', null, 'map', {
+        houseId: sawmill.id, landmarkType: 'lumberworks', room: 'hallway',
+    }));
+    loot.push(makeChest(x - 620, y - 315, 'rare', null, 'map', {
+        houseId: office.id, landmarkType: 'lumberworks', room: 'stockroom',
+    }));
+    loot.push(makeChest(x + 570, y + 410, 'rare', null, 'map', {
+        houseId: dryingShed.id, landmarkType: 'lumberworks', room: 'bedroom',
+    }));
+    spawnPoints.push({ x: x - 900, y: y + 520, role: 'mill-road' });
+    spawnPoints.push({ x: x + 900, y: y + 115, role: 'mill-yard' });
+}
+
 function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1900, 1320, {
         collidable: false, variant: 'village', role: 'marketVillage', landmarkType: 'market',
@@ -2816,6 +3015,9 @@ export function generateSurvivMap(worldHalf) {
     const servicesPos = { x: -700, y: -4000, w: 1480, h: 820 };
     const fireStationPos = { x: 3350, y: 4300, w: 1500, h: 1050 };
     const orchardPos = { x: -3900, y: 5000, w: 1900, h: 1280 };
+    const motelPos = { x: 6000, y: -5200, w: 1700, h: 1180 };
+    const rangerLodgePos = { x: -4700, y: -8000, w: 1600, h: 1100 };
+    const lumberworksPos = { x: 5200, y: 8200, w: 1750, h: 1200 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
@@ -2824,6 +3026,7 @@ export function generateSurvivMap(worldHalf) {
         swTownPos, nwMansionPos, ironworksPos, marketPos,
         northCachePos, eastCachePos, southCachePos, checkpointPos,
         servicesPos, fireStationPos, orchardPos,
+        motelPos, rangerLodgePos, lumberworksPos,
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2946,6 +3149,13 @@ export function generateSurvivMap(worldHalf) {
     addOrchardCooperative(obstacles, loot, spawnPoints, orchardPos.x, orchardPos.y);
     landmarks.push({ name: 'Old Orchard Cooperative', x: orchardPos.x, y: orchardPos.y, type: 'orchard' });
 
+    addSunsetMotel(obstacles, loot, spawnPoints, motelPos.x, motelPos.y);
+    landmarks.push({ name: 'Sunset Motel', x: motelPos.x, y: motelPos.y, type: 'motel' });
+    addRangerLodge(obstacles, loot, spawnPoints, rangerLodgePos.x, rangerLodgePos.y);
+    landmarks.push({ name: 'Cedar Ranger Lodge', x: rangerLodgePos.x, y: rangerLodgePos.y, type: 'ranger-lodge' });
+    addLumberWorks(obstacles, loot, spawnPoints, lumberworksPos.x, lumberworksPos.y);
+    landmarks.push({ name: 'South Lumberworks', x: lumberworksPos.x, y: lumberworksPos.y, type: 'lumberworks' });
+
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
     // ─────────────────────────────────────────────────────────────────────────
@@ -2976,6 +3186,9 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, 2500, seLabPos.y, seLabPos.x - 850, seLabPos.y, roadW); // Research campus avenue
     addRoad(obstacles, nwMansionPos.x, -4000, nwMansionPos.x, nwMansionPos.y + 590, roadW); // NW Mansion gate
     addRoad(obstacles, marketPos.x, 2000, marketPos.x, marketPos.y + 390, roadW); // Grand Market main street
+    addRoad(obstacles, motelPos.x, -4000, motelPos.x, motelPos.y + 590, roadW); // Sunset Motel approach
+    addRoad(obstacles, -2500, rangerLodgePos.y + 500, rangerLodgePos.x + 800, rangerLodgePos.y + 500, roadW); // Ranger lodge forest road
+    addRoad(obstacles, 2500, lumberworksPos.y + 520, lumberworksPos.x - 875, lumberworksPos.y + 520, roadW); // Lumberworks freight road
 
     addObstacle(obstacles, 'road', swTownPos.x, 1900, roadW, 200, {
         collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'town',
@@ -5574,4 +5787,3 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     room._pendingKillFeed = [];
     pruneSurvivViewerPayloadCache(room, now);
 }
-

@@ -6320,11 +6320,15 @@ app.get('/api/stats', (req, res) => {
             0,
         );
         const survivHumanCount = survivRooms.reduce(
-            (sum, room) => sum + (room.isPersonalFreePlay ? 0 : room.players.filter(p => !p.disconnected && p.hp > 0).length),
+            (sum, room) => sum + room.players.filter(
+                player => !player.disconnected && !player._eliminated && player.hp > 0,
+            ).length,
             0,
         );
         const survivBotCount = survivRooms.reduce(
-            (sum, room) => sum + (room.isPersonalFreePlay ? 0 : room.bots.filter(bot => bot.hp > 0).length),
+            (sum, room) => sum + room.bots.filter(
+                bot => !bot.disconnected && !bot._eliminated && bot.hp > 0,
+            ).length,
             0,
         );
         playersByGamemode.surviv = survivHumanCount + survivBotCount;
