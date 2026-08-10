@@ -1675,6 +1675,37 @@ test('melee attacks destroy weak Surviv obstacles', () => {
     assert.ok(room._survivObstacleRevision > 0);
 });
 
+test('one held human melee press produces only one attack', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'single-press-target', kind: 'bush', x: 48, y: 0, w: 30, h: 30,
+        collidable: true, destructible: true, hp: 100, maxHp: 100,
+    }];
+    const player = createSurvivPlayer('single-press-player', 'single-press-mongo', 'Boxer', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.shooting = true;
+    room.players.push(player);
+
+    const resetAt = Date.now() + 600000;
+    processSurvivRoom(room, silentIo, resetAt);
+    player.weapon.lastShotAt = 0;
+    processSurvivRoom(room, silentIo, resetAt);
+    assert.equal(room.obstacles[0].hp, 82, 'holding one press must not trigger a second punch');
+
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, resetAt);
+    player.shooting = true;
+    player.weapon.lastShotAt = 0;
+    processSurvivRoom(room, silentIo, resetAt);
+    assert.equal(room.obstacles[0].hp, 64, 'a new press should trigger the next punch');
+});
+
 test('bullets damage and eventually destroy durable Surviv obstacles', () => {
     const room = makeRoom();
     room.loot = [];

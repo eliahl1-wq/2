@@ -5906,8 +5906,21 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     moveEntity(entity, room, entity.inputDx, entity.inputDy, SURVIV.playerSpeed);
     entity.angle = entity.aimAngle ?? entity.angle;
 
+    const activeWeaponDef = WEAPONS[entity.weapon?.type] || WEAPONS.fists;
     if (entity.shooting) {
-        tryShoot(entity, room, now);
+        if (activeWeaponDef.melee && !entity.isBot) {
+            // Human melee is semi-automatic: one press produces exactly one
+            // attack. Pointer packets can remain true for several simulation
+            // ticks, which previously caused an unintended second punch as
+            // soon as the melee cooldown elapsed.
+            if (!entity._meleeInputLatched) tryShoot(entity, room, now);
+            entity._meleeInputLatched = true;
+        } else {
+            tryShoot(entity, room, now);
+            entity._meleeInputLatched = false;
+        }
+    } else {
+        entity._meleeInputLatched = false;
     }
 
     pickupLoot(entity, room);
