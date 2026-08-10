@@ -414,7 +414,7 @@ const BLOCKED_KINDS = new Set([
     'houseFloor', 'wall', 'interiorWall', 'door', 'furniture', 'container', 'house',
     'road', 'water', 'river', 'bridge',
     'tree', 'bush', 'rock', 'stump', 'fallenLog', 'signpost', 'hayBale',
-    'crate', 'barrel', 'sandbag', 'tent',
+    'crate', 'barrel', 'sandbag', 'tent', 'lampPost', 'bench', 'mailbox', 'roadMarker', 'picnicTable',
 ]);
 function isMapPositionBlocked(obstacles, x, y, radius = 30) {
     if (isNearRoadOrRiver(x, y, radius) || isNearPlannedTrail(x, y, radius)) return true;
@@ -1270,7 +1270,9 @@ function addForest(obstacles, loot, spawnPoints, x, y, count = 34, radius = 680)
 
 function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
     const roadLength = size * 260 + 180;
-    addObstacle(obstacles, 'road', x, y, roadLength, 120, { collidable: false, variant: 'dirt' });
+    addObstacle(obstacles, 'road', x, y, roadLength, 120, {
+        collidable: false, variant: 'cobblestone', role: 'townMainStreet', landmarkType: 'town',
+    });
     addObstacle(obstacles, 'field', x, y, roadLength + 100, 680, { collidable: false, variant: 'town' });
 
     const housesNorth = Math.ceil(size / 2);
@@ -1325,13 +1327,13 @@ function addPlannedTown(obstacles, loot, spawnPoints, x, y, size = 6) {
     if (housesNorth >= 2) {
         const northLaneX = x - roadLength / 2 + spacingN * 1.5;
         addObstacle(obstacles, 'road', northLaneX, y - 170, 66, 340, {
-            collidable: false, variant: 'dirt', role: 'townLane', landmarkType: 'town',
+            collidable: false, variant: 'cobblestone', role: 'townLane', landmarkType: 'town',
         });
     }
     if (housesSouth >= 2) {
         const southLaneX = x - roadLength / 2 + spacingS * (housesSouth - 0.5);
         addObstacle(obstacles, 'road', southLaneX, y + 170, 66, 340, {
-            collidable: false, variant: 'dirt', role: 'townLane', landmarkType: 'town',
+            collidable: false, variant: 'cobblestone', role: 'townLane', landmarkType: 'town',
         });
     }
     addObstacle(obstacles, 'signpost', x - roadLength / 2 + 55, y - 86, 30, 30, {
@@ -1770,7 +1772,7 @@ function addOrchardCooperative(obstacles, loot, spawnPoints, x, y) {
     const laneWest = x - 980;
     const laneEast = -2500;
     addObstacle(obstacles, 'road', (laneWest + laneEast) / 2, y, laneEast - laneWest, 92, {
-        collidable: false, variant: 'dirt', role: 'orchardLane', landmarkType: 'orchard',
+        collidable: false, variant: 'gravel', role: 'orchardLane', landmarkType: 'orchard',
     });
 
     addHouse(obstacles, loot, spawnPoints, x + 410, y - 255, 350, 235, {
@@ -1887,10 +1889,10 @@ function addRangerLodge(obstacles, loot, spawnPoints, x, y) {
         collidable: false, variant: 'courtyard', role: 'campCircle', landmarkType: 'ranger-lodge',
     });
     addObstacle(obstacles, 'road', x + 400, y + 500, 800, 88, {
-        collidable: false, variant: 'dirt', role: 'lodgeDrive', landmarkType: 'ranger-lodge',
+        collidable: false, variant: 'gravel', role: 'lodgeDrive', landmarkType: 'ranger-lodge',
     });
     addObstacle(obstacles, 'road', x, y + 375, 88, 250, {
-        collidable: false, variant: 'dirt', role: 'lodgeDrive', landmarkType: 'ranger-lodge',
+        collidable: false, variant: 'gravel', role: 'lodgeDrive', landmarkType: 'ranger-lodge',
     });
 
     const lodge = addHouse(obstacles, loot, spawnPoints, x, y - 220, 650, 380, {
@@ -1950,10 +1952,10 @@ function addLumberWorks(obstacles, loot, spawnPoints, x, y) {
         collidable: false, variant: 'courtyard', role: 'millYard', landmarkType: 'lumberworks',
     });
     addObstacle(obstacles, 'road', x - 75, y + 115, 1420, 96, {
-        collidable: false, variant: 'dirt', role: 'serviceLane', landmarkType: 'lumberworks',
+        collidable: false, variant: 'service', role: 'serviceLane', landmarkType: 'lumberworks',
     });
     addObstacle(obstacles, 'road', x - 720, y + 350, 90, 470, {
-        collidable: false, variant: 'dirt', role: 'serviceLane', landmarkType: 'lumberworks',
+        collidable: false, variant: 'service', role: 'serviceLane', landmarkType: 'lumberworks',
     });
 
     const sawmill = addHouse(obstacles, loot, spawnPoints, x + 220, y - 310, 720, 340, {
@@ -2075,10 +2077,10 @@ function addWestportVillage(obstacles, loot, spawnPoints, x, y) {
         collidable: false, variant: 'village', role: 'harborVillage', landmarkType, label: 'WESTPORT',
     });
     addObstacle(obstacles, 'road', x, y + 80, 1840, 102, {
-        collidable: false, variant: 'dirt', role: 'harborRoad', landmarkType,
+        collidable: false, variant: 'gravel', role: 'harborRoad', landmarkType,
     });
     addObstacle(obstacles, 'road', x, y - 285, 88, 730, {
-        collidable: false, variant: 'dirt', role: 'ferryLane', landmarkType,
+        collidable: false, variant: 'gravel', role: 'ferryLane', landmarkType,
     });
     addObstacle(obstacles, 'field', x, y + 80, 430, 300, {
         collidable: false, variant: 'courtyard', role: 'harborSquare', landmarkType,
@@ -2119,7 +2121,7 @@ function addRailDepot(obstacles, loot, spawnPoints, x, y) {
     });
     for (const offsetY of [-105, 105]) {
         addObstacle(obstacles, 'road', x, y + offsetY, 1740, 62, {
-            collidable: false, variant: 'dirt', role: 'railTrack', landmarkType,
+            collidable: false, variant: 'rail', role: 'railTrack', landmarkType,
         });
     }
     addObstacle(obstacles, 'road', x - 920, y + 250, 92, 1000, {
@@ -2164,7 +2166,7 @@ function addCivicQuarter(obstacles, loot, spawnPoints, x, y) {
         collidable: false, variant: 'town', role: 'civicQuarter', landmarkType, label: 'CIVIC QUARTER',
     });
     addObstacle(obstacles, 'road', x, y + 50, 1800, 108, {
-        collidable: false, variant: 'asphalt', role: 'civicStreet', landmarkType,
+        collidable: false, variant: 'cobblestone', role: 'civicStreet', landmarkType,
     });
     addObstacle(obstacles, 'field', x, y + 50, 470, 320, {
         collidable: false, variant: 'courtyard', role: 'civicPlaza', landmarkType,
@@ -2198,7 +2200,7 @@ function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
         label: 'GRAND MARKET',
     });
     addObstacle(obstacles, 'road', x, y + 390, 1760, 110, {
-        collidable: false, variant: 'dirt', role: 'mainStreet', landmarkType: 'market',
+        collidable: false, variant: 'cobblestone', role: 'mainStreet', landmarkType: 'market',
     });
     addObstacle(obstacles, 'field', x, y + 250, 680, 330, {
         collidable: false, variant: 'courtyard', role: 'marketSquare', landmarkType: 'market',
@@ -2797,6 +2799,169 @@ function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
     }
 }
 
+function addLandmarkTrees(obstacles, worldHalf, targetCount = 38) {
+    let added = 0;
+    const margin = 920;
+    const step = 1480;
+    for (let gx = -worldHalf + margin; gx <= worldHalf - margin && added < targetCount; gx += step) {
+        for (let gy = -worldHalf + margin; gy <= worldHalf - margin && added < targetCount; gy += step) {
+            if (Math.hypot(gx, gy) < 1550) continue;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                const x = clamp(gx + (Math.random() - 0.5) * 820, -worldHalf + 520, worldHalf - 520);
+                const y = clamp(gy + (Math.random() - 0.5) * 820, -worldHalf + 520, worldHalf - 520);
+                const size = 82 + Math.random() * 42;
+                if (isMapPositionBlocked(obstacles, x, y, size * 0.46 + 24)) continue;
+
+                let variant = 'ancientOak';
+                let hue = 104 + Math.floor(Math.random() * 18);
+                if (y < -4400) {
+                    variant = 'giantPine';
+                    hue = 116 + Math.floor(Math.random() * 12);
+                } else if (Math.abs(y + 1500) < 1400 || added % 7 === 2) {
+                    variant = 'willowTree';
+                    hue = 88 + Math.floor(Math.random() * 16);
+                } else if ((added + Math.round(x / step)) % 4 === 0) {
+                    variant = 'birch';
+                    hue = 96 + Math.floor(Math.random() * 18);
+                }
+                addObstacle(obstacles, 'tree', x, y, size, size, {
+                    hue, rotation: Math.random() * Math.PI, variant, role: 'landmarkTree',
+                });
+                added++;
+                break;
+            }
+        }
+    }
+    return added;
+}
+
+function addWorldFurnitureDetails(obstacles) {
+    const roadMarkers = [];
+    const lamps = [];
+    const mailboxes = [];
+    const picnicTables = [];
+    const benches = [];
+    const networkRoads = obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'networkRoad'
+        && Math.max(obstacle.w, obstacle.h) >= 900
+    ));
+
+    // Sparse mile markers make long rotations readable without becoming
+    // expensive clutter. Positions are anchored to each road segment.
+    for (const [roadIndex, road] of networkRoads.entries()) {
+        const horizontal = road.w > road.h;
+        const length = horizontal ? road.w : road.h;
+        const width = horizontal ? road.h : road.w;
+        const count = Math.min(5, Math.floor(length / 1850));
+        for (let index = 0; index < count; index++) {
+            const axis = -length / 2 + ((index + 1) / (count + 1)) * length;
+            const side = (roadIndex + index) % 2 === 0 ? -1 : 1;
+            const offset = width / 2 + 42;
+            const x = horizontal ? road.x + axis : road.x + side * offset;
+            const y = horizontal ? road.y + side * offset : road.y + axis;
+            if (isMapPositionBlocked(obstacles, x, y, 9)) continue;
+            roadMarkers.push(addObstacle(obstacles, 'roadMarker', x, y, 18, 34, {
+                collidable: false,
+                rotation: horizontal ? 0 : Math.PI / 2,
+                variant: index % 3 === 0 ? 'reflector' : 'milestone',
+                role: 'roadsideDetail',
+            }));
+        }
+    }
+
+    const urbanTypes = new Set(['riverside', 'eastgate', 'westport', 'civic-quarter', 'motel']);
+    const urbanRoads = obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && urbanTypes.has(obstacle.landmarkType)
+        && Math.max(obstacle.w, obstacle.h) >= 500
+    ));
+    for (const [roadIndex, road] of urbanRoads.entries()) {
+        const horizontal = road.w > road.h;
+        const length = horizontal ? road.w : road.h;
+        const width = horizontal ? road.h : road.w;
+        const count = Math.min(5, Math.max(2, Math.floor(length / 430)));
+        for (let index = 0; index < count; index++) {
+            const axis = -length / 2 + 120 + index * Math.max(180, (length - 240) / Math.max(1, count - 1));
+            const side = index % 2 === 0 ? -1 : 1;
+            const offset = width / 2 + 34;
+            const x = horizontal ? road.x + axis : road.x + side * offset;
+            const y = horizontal ? road.y + side * offset : road.y + axis;
+            if (isMapPositionBlocked(obstacles, x, y, 10)) continue;
+            lamps.push(addObstacle(obstacles, 'lampPost', x, y, 22, 42, {
+                collidable: false, rotation: horizontal ? 0 : Math.PI / 2,
+                variant: roadIndex % 2 === 0 ? 'streetLamp' : 'industrialLamp',
+                role: 'streetFurniture', landmarkType: road.landmarkType,
+            }));
+        }
+    }
+
+    const doorsByHouse = new Map(obstacles
+        .filter(obstacle => obstacle.kind === 'door')
+        .map(door => [door.houseId, door]));
+    const mailboxHomes = obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && ['house', 'cabin', 'town', 'lodge', 'brick'].includes(obstacle.variant)
+        && doorsByHouse.has(obstacle.id)
+    ));
+    for (let index = 0; index < mailboxHomes.length && mailboxes.length < 24; index += 5) {
+        const home = mailboxHomes[index];
+        const door = doorsByHouse.get(home.id);
+        const side = door.role;
+        const lateral = 145;
+        const outward = 64;
+        const x = side === 'east' ? home.x + home.w / 2 + outward
+            : side === 'west' ? home.x - home.w / 2 - outward
+                : door.x + (side === 'south' ? lateral : -lateral);
+        const y = side === 'south' ? home.y + home.h / 2 + outward
+            : side === 'north' ? home.y - home.h / 2 - outward
+                : door.y + (side === 'east' ? lateral : -lateral);
+        const blockedByOtherStructure = obstacles.some(obstacle => {
+            if (!BLOCKED_KINDS.has(obstacle.kind) || obstacle.id === home.id || obstacle.houseId === home.id) return false;
+            if (obstacle.kind === 'road' || obstacle.kind === 'trail_path') return false;
+            const pad = 18;
+            return x >= obstacle.x - obstacle.w / 2 - pad && x <= obstacle.x + obstacle.w / 2 + pad
+                && y >= obstacle.y - obstacle.h / 2 - pad && y <= obstacle.y + obstacle.h / 2 + pad;
+        });
+        if (blockedByOtherStructure) continue;
+        mailboxes.push(addObstacle(obstacles, 'mailbox', x, y, 28, 34, {
+            collidable: false,
+            rotation: side === 'east' || side === 'west' ? Math.PI / 2 : 0,
+            variant: index % 2 === 0 ? 'rural' : 'painted',
+            hue: 8 + (index * 17) % 210,
+            role: 'homeDetail', houseId: home.id,
+        }));
+    }
+
+    const landmarkTrees = obstacles.filter(obstacle => obstacle.kind === 'tree' && obstacle.role === 'landmarkTree');
+    for (let index = 0; index < landmarkTrees.length && picnicTables.length < 8; index += 5) {
+        const tree = landmarkTrees[index];
+        const angle = (index * 2.399) % (Math.PI * 2);
+        const distance = Math.max(tree.w, tree.h) / 2 + 112;
+        const x = tree.x + Math.cos(angle) * distance;
+        const y = tree.y + Math.sin(angle) * distance;
+        if (isMapPositionBlocked(obstacles, x, y, 34)) continue;
+        picnicTables.push(addObstacle(obstacles, 'picnicTable', x, y, 70, 48, {
+            collidable: false, rotation: angle, variant: 'wood', role: 'scenicDetail',
+        }));
+        const benchX = x - Math.sin(angle) * 96;
+        const benchY = y + Math.cos(angle) * 96;
+        if (!isMapPositionBlocked(obstacles, benchX, benchY, 28)) {
+            benches.push(addObstacle(obstacles, 'bench', benchX, benchY, 62, 26, {
+                collidable: false, rotation: angle, variant: 'park', role: 'scenicDetail',
+            }));
+        }
+    }
+
+    return {
+        roadMarkers: roadMarkers.length,
+        lamps: lamps.length,
+        mailboxes: mailboxes.length,
+        picnicTables: picnicTables.length,
+        benches: benches.length,
+    };
+}
+
 // --- Rivers & Bridges ---
 
 function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12) {
@@ -3013,6 +3178,7 @@ function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
 
 const CLEARABLE_MAP_PROP_KINDS = new Set([
     'tree', 'bush', 'rock', 'stump', 'fallenLog', 'signpost', 'hayBale', 'reeds', 'grassTuft', 'wildflowers', 'mushrooms', 'crate', 'barrel', 'container', 'sandbag', 'tent',
+    'lampPost', 'bench', 'mailbox', 'roadMarker', 'picnicTable',
 ]);
 
 function getDoorApproachRect(door) {
@@ -3384,11 +3550,13 @@ export function generateSurvivMap(worldHalf) {
 
     addUrbanBorough(obstacles, loot, spawnPoints, riversidePos.x, riversidePos.y, {
         landmarkType: 'riverside', label: 'RIVERSIDE BOROUGH', baseHue: 10,
+        roadVariant: 'cobblestone',
         buildingLabels: ['RIVER CAFE', 'ROW HOMES', 'BAKERY', 'WATCH HOUSE', 'APARTMENTS', 'THE ANCHOR', 'WORKSHOP', 'BOARDING HOUSE'],
     });
     landmarks.push({ name: 'Riverside Borough', x: riversidePos.x, y: riversidePos.y, type: 'riverside' });
     addUrbanBorough(obstacles, loot, spawnPoints, eastgatePos.x, eastgatePos.y, {
         landmarkType: 'eastgate', label: 'EASTGATE', baseHue: 20,
+        roadVariant: 'service',
         variants: ['brick', 'house', 'brick', 'lodge', 'house', 'brick', 'garage', 'brick'],
         buildingLabels: ['GROCERY', 'EASTGATE HOMES', 'PHARMACY', 'APARTMENTS', 'DINER', 'LAUNDRY', 'AUTO GARAGE', 'ROW HOMES'],
     });
@@ -3477,6 +3645,8 @@ export function generateSurvivMap(worldHalf) {
     addPondDetails(obstacles);
 
     addWildernessTrailNetwork(obstacles);
+    addLandmarkTrees(obstacles, wh);
+    addWorldFurnitureDetails(obstacles);
 
     // ─────────────────────────────────────────────────────────────────────────
     // BIOME COVER & ROAD MARKERS

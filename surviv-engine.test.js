@@ -246,9 +246,8 @@ test('surviv town roads stay centered between rows and doors face the road', () 
     const map = generateSurvivMap(SURVIV.worldHalf);
     const plannedTownRoads = map.obstacles.filter(obstacle => (
         obstacle.kind === 'road'
-        && obstacle.variant === 'dirt'
-        && obstacle.w >= 1900
-        && obstacle.h === 120
+        && obstacle.role === 'townMainStreet'
+        && obstacle.variant === 'cobblestone'
     ));
     const townHouses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.variant === 'town');
     const doorsByHouse = new Map(map.obstacles
@@ -286,9 +285,8 @@ test('planned towns include useful civic buildings and readable side lanes', () 
     const lanes = map.obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'townLane');
     const townMainRoads = map.obstacles.filter(obstacle => (
         obstacle.kind === 'road'
-        && obstacle.variant === 'dirt'
-        && obstacle.w >= 1900
-        && obstacle.h === 120
+        && obstacle.role === 'townMainStreet'
+        && obstacle.variant === 'cobblestone'
     ));
 
     assert.equal(shops.length, 3);
@@ -312,6 +310,35 @@ test('planned towns include useful civic buildings and readable side lanes', () 
             .map(room => room.variant));
         assert.deepEqual(rooms, new Set(['living-room', 'bedroom']));
     }
+});
+
+test('surviv roads, landmark trees, and world furniture add varied readable detail within budget', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+    const roadVariants = new Set(roads.map(road => road.variant));
+    const landmarkTrees = map.obstacles.filter(obstacle => obstacle.kind === 'tree' && obstacle.role === 'landmarkTree');
+    const treeVariants = new Set(landmarkTrees.map(tree => tree.variant));
+    const countKind = kind => map.obstacles.filter(obstacle => obstacle.kind === kind).length;
+
+    for (const variant of ['asphalt', 'dirt', 'gravel', 'cobblestone', 'service', 'rail']) {
+        assert.ok(roadVariants.has(variant), 'missing road surface ' + variant);
+    }
+    assert.ok(landmarkTrees.length >= 30);
+    assert.ok(landmarkTrees.every(tree => tree.w >= 82 && tree.h >= 82));
+    for (const variant of ['ancientOak', 'giantPine', 'willowTree', 'birch']) {
+        assert.ok(treeVariants.has(variant), 'missing landmark tree ' + variant);
+    }
+
+    assert.ok(countKind('roadMarker') >= 30);
+    assert.ok(countKind('lampPost') >= 16);
+    assert.ok(countKind('mailbox') >= 10);
+    assert.ok(countKind('bench') >= 3);
+    assert.ok(countKind('picnicTable') >= 5);
+    const decorKinds = new Set(['roadMarker', 'lampPost', 'mailbox', 'bench', 'picnicTable']);
+    assert.ok(map.obstacles
+        .filter(obstacle => decorKinds.has(obstacle.kind))
+        .every(obstacle => obstacle.collidable === false));
+    assert.ok(map.obstacles.length < 4700, 'static map detail should stay inside the performance budget');
 });
 
 test('new roadside landmarks have distinct buildings and connect to the highway network', () => {
