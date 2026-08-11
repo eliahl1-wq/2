@@ -17,7 +17,7 @@ import {
     spawnLootFromPool,
     spawnSurvivBotNear,
 } from './surviv-engine.js';
-import { getSurvivEconomy } from './economy.js';
+import { getSurvivEconomy, getSurvivJoinLootFunding } from './economy.js';
 
 function makeRoom() {
     const map = generateSurvivMap(SURVIV.worldHalf);
@@ -224,6 +224,16 @@ test('surviv economy conserves the full entry and applies only the cashout fee',
     assert.equal(economy.lootPoolOnJoin, 5);
     assert.equal(economy.cashoutFeePct, 0.05);
     assert.equal(economy.cashoutPlayerPct + economy.cashoutFeePct, 1);
+});
+test('admin public Surviv entry contributes no map money', () => {
+    assert.equal(getSurvivJoinLootFunding(5), 5);
+    assert.equal(getSurvivJoinLootFunding(5, { adminFreeEntry: true }), 0);
+
+    const room = makeRoom();
+    room.loot = [];
+    spawnLootFromPool(room, getSurvivJoinLootFunding(5, { adminFreeEntry: true }));
+    assert.deepEqual(room.loot, []);
+    assert.equal(room.lootPoolBalance || 0, 0);
 });
 test('surviv join money crates vary amounts while preserving the pool', () => {
     const room = makeRoom();

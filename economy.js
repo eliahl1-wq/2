@@ -197,3 +197,8 @@ export function getSurvivEconomy(entryFeeUsd) {
         cashoutPlayerPct: 1 - cashoutFeePct,
     };
 }
+
+export function getSurvivJoinLootFunding(entryFeeUsd, { adminFreeEntry = false } = {}) {
+    if (adminFreeEntry) return 0;
+    return getSurvivEconomy(entryFeeUsd).lootPoolOnJoin;
+}

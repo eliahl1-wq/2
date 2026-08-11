@@ -50,6 +50,7 @@ import {
     getEconomy,
     getCompetitiveEconomy,
     getSurvivEconomy,
+    getSurvivJoinLootFunding,
     getJoinPoolSplit,
     getRewardPoolSplit,
     getGoldenBlobValue,
@@ -1174,9 +1175,17 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
         playerPayoutUsdMicros: cashoutMoney.playerPayoutUsdMicros,
         playerId: mongoId,
         timestamp: new Date().toISOString(),
+        ...(player.adminFreeSurvivEntry ? { adminFreeEntry: true, fundedEntryUsd: 0 } : {}),
     };
 
     if (DEV_FREE_PLAY || player.personalFreePlay) {
+        // A free admin in the public room never withdraws value funded by paid
+        // players. Put collected dollars back onto the map before ending the
+        // simulated session so the public match economy stays conserved.
+        if (player.adminFreeSurvivEntry && dollarBalance > 0) {
+            spawnLootFromPool(room, dollarBalance);
+            player.dollarBalance = 0;
+        }
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
         const payoutSol = playerPayout / SOL_PRICE_USD;
@@ -7272,7 +7281,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket }) => {
+    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket, adminFreeSurvivEntry }) => {
         if (rewardPoolAdminResetting) {
             socket.emit('error', 'Reward pool maintenance is in progress. Try again shortly.');
             return;
@@ -7334,6 +7343,10 @@ io.on('connection', (socket) => {
             const personalFreePlay = personalFreePlayContext.enabled;
             const personalFreePlayOwnerId = personalFreePlayContext.ownerId;
             const freePlay = DEV_FREE_PLAY || personalFreePlay;
+            const isAdminAccount = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+            const useAdminFreeSurvivEntry = mode === 'surviv'
+                && adminFreeSurvivEntry === true
+                && isAdminAccount;
 
 
             if (getBRMatchForMongo(user._id.toString())) {
@@ -7519,7 +7532,9 @@ io.on('connection', (socket) => {
             // ── Surviv ($5 pool) ──
             if (mode === 'surviv') {
                 const entryFeeUsd = normalizeSurvivEntryFee(rawEntryFee);
-                const room = personalFreePlay
+                const room = useAdminFreeSurvivEntry
+                    ? getSurvivRoom(entryFeeUsd)
+                    : personalFreePlay
                     ? getPersonalFreePlayRoom(personalFreePlayOwnerId, 'surviv', entryFeeUsd)
                     : getSurvivRoom(entryFeeUsd);
                 removeSurvivSpectator(room, socket.id);
@@ -7560,6 +7575,7 @@ io.on('connection', (socket) => {
                         mode: 'surviv',
                         rejoin: true,
                         entryFeeUsd: existingPlayer.entryFeeUsd ?? activeRoom.entryFeeUsd,
+                        adminFreeSurvivEntry: !!existingPlayer.adminFreeSurvivEntry,
                         solPrice: SOL_PRICE_USD,
                         surviv: true,
                         zone: getSurvivZone(activeRoom.startTime + c.roomDuration),
@@ -7570,7 +7586,7 @@ io.on('connection', (socket) => {
 
                 const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
-                if (!freePlay) {
+                if (!freePlay && !useAdminFreeSurvivEntry) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
@@ -7607,6 +7623,8 @@ io.on('connection', (socket) => {
                         socket.emit('error', 'Blockchain transfer failed. Please try again.');
                         return;
                     }
+                } else if (useAdminFreeSurvivEntry) {
+                    console.log(`ADMIN FREE SURVIV: ${user.username} joined public $${entryFeeUsd} Surviv with $0 funding`);
                 } else {
                     if (DEV_FREE_PLAY) {
                         user.balance = Math.max(0, user.balance - entryFeeInSol);
@@ -7618,15 +7636,16 @@ io.on('connection', (socket) => {
                 await Transaction.create({
                     userId: user._id,
                     type: 'game',
-                    amount: entryFeeInSol,
+                    amount: useAdminFreeSurvivEntry ? 0 : entryFeeInSol,
                     meta: {
                         event: 'join',
                         roomId: room.id,
                         entryFeeUsd,
                         mode: 'surviv',
+                        ...(useAdminFreeSurvivEntry ? { adminFreeEntry: true, fundedEntryUsd: 0, simulated: true } : {}),
                         ...(freePlay ? { simulated: true } : {}),
                     },
-                    excludedFromReports: personalFreePlay,
+                    excludedFromReports: personalFreePlay || useAdminFreeSurvivEntry,
                     status: 'confirmed',
                 });
 
@@ -7658,6 +7677,7 @@ io.on('connection', (socket) => {
                         mode: 'surviv',
                         rejoin: true,
                         entryFeeUsd,
+                        adminFreeSurvivEntry: !!raced.adminFreeSurvivEntry,
                         solPrice: SOL_PRICE_USD,
                         surviv: true,
                         zone: getSurvivZone(room.startTime + c.roomDuration),
@@ -7665,9 +7685,13 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                const eco = getSurvivEconomy(entryFeeUsd);
-                spawnLootFromPool(room, eco.lootPoolOnJoin);
-                newPlayer.personalFreePlay = personalFreePlay;
+                const joinLootFunding = getSurvivJoinLootFunding(entryFeeUsd, {
+                    adminFreeEntry: useAdminFreeSurvivEntry,
+                });
+                spawnLootFromPool(room, joinLootFunding);
+                newPlayer.personalFreePlay = personalFreePlay || useAdminFreeSurvivEntry;
+                newPlayer.adminFreeSurvivEntry = useAdminFreeSurvivEntry;
+                newPlayer.fundedEntryUsd = useAdminFreeSurvivEntry ? 0 : entryFeeUsd;
                 room.players.push(newPlayer);
                 pendingPaidJoin = null;
 
@@ -7677,6 +7701,7 @@ io.on('connection', (socket) => {
                     mode: 'surviv',
                     rejoin: false,
                     entryFeeUsd,
+                    adminFreeSurvivEntry: useAdminFreeSurvivEntry,
                     solPrice: SOL_PRICE_USD,
                     surviv: true,
                     zone: getSurvivZone(room.startTime + c.roomDuration),
