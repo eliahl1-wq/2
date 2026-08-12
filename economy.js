@@ -200,5 +200,6 @@ export function getSurvivEconomy(entryFeeUsd) {
 
 export function getSurvivJoinLootFunding(entryFeeUsd, { adminFreeEntry = false } = {}) {
     if (adminFreeEntry) return 0;
-    return getSurvivEconomy(entryFeeUsd).lootPoolOnJoin;
+    const fundedEntry = getSurvivEconomy(entryFeeUsd).lootPoolOnJoin;
+    return Math.round(fundedEntry * 100) / 100;
 }

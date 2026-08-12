@@ -163,22 +163,17 @@ test('pond sites and the west forest camp keep readable spacing', () => {
     assert.ok(pondCount > 0, 'expected at least one sampled pond site');
 });
 
-test('surviv chests roll varied money across map loot', () => {
-    const moneyAmounts = [];
+test('static surviv map loot never creates unfunded money', () => {
     let chestCount = 0;
     for (let i = 0; i < 8; i++) {
         const map = generateSurvivMap(SURVIV.worldHalf);
         const chests = map.loot.filter(item => item.type === 'chest' && item.source === 'map');
         chestCount += chests.length;
-        for (const chest of chests) {
-            if (chest.contents?.money) moneyAmounts.push(Number(chest.contents.money));
-        }
+        assert.ok(chests.every(chest => !(Number(chest.contents?.money) > 0)));
+        assert.ok(map.loot.every(item => item.type !== 'money' || !(Number(item.dollarValue) > 0)));
     }
 
     assert.ok(chestCount > 80);
-    assert.ok(moneyAmounts.length >= 12);
-    assert.ok(moneyAmounts.every(amount => amount >= 0.2 && amount <= 2));
-    assert.ok(new Set(moneyAmounts.map(amount => amount.toFixed(2))).size >= 6);
 });
 
 test('surviv runtime reset clears old arena state and caches', () => {
@@ -230,10 +225,35 @@ test('admin public Surviv entry contributes no map money', () => {
     assert.equal(getSurvivJoinLootFunding(5, { adminFreeEntry: true }), 0);
 
     const room = makeRoom();
-    room.loot = [];
+    const originalLootCount = room.loot.length;
+    assert.ok(room.loot.every(item => !(Number(item.contents?.money) > 0)));
+    assert.ok(room.loot.every(item => item.type !== 'money' || !(Number(item.dollarValue) > 0)));
     spawnLootFromPool(room, getSurvivJoinLootFunding(5, { adminFreeEntry: true }));
-    assert.deepEqual(room.loot, []);
+    assert.equal(room.loot.length, originalLootCount);
     assert.equal(room.lootPoolBalance || 0, 0);
+});
+test('each paid Surviv entry adds exactly five dollars and admin adds zero', () => {
+    const room = makeRoom();
+    const mapMoneyCents = () => room.loot.reduce((total, item) => {
+        const dollars = item.type === 'money'
+            ? Number(item.dollarValue || 0)
+            : Number(item.contents?.money || 0);
+        return total + Math.round(dollars * 100);
+    }, 0);
+
+    assert.equal(getSurvivJoinLootFunding(5), 5);
+    assert.equal(getSurvivJoinLootFunding(999), 5);
+    assert.equal(getSurvivJoinLootFunding(null), 5);
+    assert.equal(mapMoneyCents(), 0);
+
+    spawnLootFromPool(room, getSurvivJoinLootFunding(5));
+    assert.equal(mapMoneyCents(), 500);
+
+    spawnLootFromPool(room, getSurvivJoinLootFunding(5, { adminFreeEntry: true }));
+    assert.equal(mapMoneyCents(), 500);
+
+    spawnLootFromPool(room, getSurvivJoinLootFunding(5));
+    assert.equal(mapMoneyCents(), 1000);
 });
 test('surviv join money crates vary amounts while preserving the pool', () => {
     const room = makeRoom();
