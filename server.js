@@ -19,6 +19,7 @@ import {
     createSlitherPlayer,
     createCompetitiveSlitherPlayer,
     createCompetitiveSlitherAdminBot,
+    eliminateCompetitiveSnake,
     addSlitherBots,
     getSlitherTargetBots,
     trimSlitherBots,
@@ -8737,10 +8738,24 @@ io.on('connection', (socket) => {
             return;
         }
 
+        const disconnectGraceMs = room.isCompetitiveSlither || player.mode === 'competitive-slither'
+            ? 30_000
+            : 5 * 60 * 1000;
+
         player.removeTimeout = setTimeout(() => {
+            if (!player.disconnected || !room.players.includes(player)) return;
+            if (room.isCompetitiveSlither || player.mode === 'competitive-slither') {
+                // A disconnected Arena snake cannot keep a paid round paused
+                // indefinitely. Preserve a brief rejoin window, then settle it
+                // exactly like an in-game death so the session no longer shows
+                // as rejoinable and its value returns to the Arena food pool.
+                eliminateCompetitiveSnake(room, player, null, io, User, Transaction);
+                console.log(`🗑️ Eliminated disconnected Competitive Slither player ${player.username} after reconnect grace`);
+                return;
+            }
             room.players = room.players.filter(candidate => candidate !== player);
             console.log(`🗑️ Removed disconnected player ${player.username} after timeout`);
-        }, 5 * 60 * 1000);
+        }, disconnectGraceMs);
     });
 
     socket.on('agarSpectateCam', ({ x, y, screenWidth, screenHeight }) => {

@@ -2862,7 +2862,7 @@ function dropCompetitiveSnakeAsFood(room, snake) {
     }
 }
 
-function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
+export function eliminateCompetitiveSnake(room, snake, killer, io, User, Transaction) {
     if (killer && killer.id !== snake.id) {
         killer.kills = (killer.kills || 0) + 1;
     }
