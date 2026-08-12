@@ -537,6 +537,66 @@ test('surviv network roads do not run through buildings or walls', () => {
     }
 });
 
+test('all Surviv roads and houses keep physically coherent spacing', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
+    const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+
+    for (const road of roads) {
+        for (const house of houses) {
+            assert.equal(
+                rectsOverlap(road.x, road.y, road.w, road.h, house.x, house.y, house.w, house.h),
+                false,
+                `${road.role || road.variant} road should not pass through ${house.role || house.variant}`,
+            );
+        }
+    }
+    for (let first = 0; first < houses.length; first++) {
+        for (let second = first + 1; second < houses.length; second++) {
+            assert.equal(
+                rectsOverlap(
+                    houses[first].x, houses[first].y, houses[first].w, houses[first].h,
+                    houses[second].x, houses[second].y, houses[second].w, houses[second].h,
+                ),
+                false,
+                'generated houses should never occupy the same ground',
+            );
+        }
+    }
+
+    const gasForecourt = map.obstacles.find(obstacle => obstacle.role === 'gasForecourt');
+    assert.equal(gasForecourt?.kind, 'field', 'the gas station apron is a lot, not a giant road');
+    assert.equal(gasForecourt?.variant, 'parkingLot');
+});
+
+test('remote supply structures connect back to the main road network with safe trails', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const networkRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road' && obstacle.role === 'networkRoad'
+    ));
+    const accessTrails = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'trail_path'
+        && obstacle.role === 'supplyAccess'
+        && obstacle.landmarkType === 'supply-cache'
+    ));
+    const cacheGrounds = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'field' && obstacle.role === 'supplyCache'
+    ));
+
+    assert.equal(accessTrails.length, 4);
+    assert.equal(cacheGrounds.length, 4);
+    for (const trail of accessTrails) {
+        const start = trail.points[0];
+        const end = trail.points.at(-1);
+        assert.ok(cacheGrounds.some(cache => pointInRect(start.x, start.y, cache, 4)), (
+            `${trail.label} should begin at a supply structure`
+        ));
+        assert.ok(networkRoads.some(road => pointInRect(end.x, end.y, road, 8)), (
+            `${trail.label} should end at the main road network`
+        ));
+    }
+});
+
 test('straight surviv roads do not create extra square asphalt stubs', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const squareAsphaltRoads = map.obstacles.filter(obstacle => (
@@ -576,7 +636,7 @@ test('surviv adds curved trails and varied natural detail without another buildi
         .filter(obstacle => obstacle.kind === 'bush' && obstacle.variant)
         .map(obstacle => obstacle.variant));
 
-    assert.equal(trails.length, 11);
+    assert.equal(trails.length, 15);
     assert.ok(trails.every(trail => trail.collidable === false));
     assert.ok(trails.every(trail => trail.points.length >= 5 && trail.width >= 48));
     assert.ok(trails.some(trail => trail.variant === 'boardwalk'));
@@ -663,7 +723,7 @@ test('surviv landmark approaches survive road clipping without tiny fragments', 
         { x: 6950, y: 7200, name: 'research campus' },
         { x: -7500, y: -6810, name: 'north-west mansion' },
         { x: -2500, y: 7300, name: 'ironworks' },
-        { x: -7200, y: 1900, name: 'south-west town' },
+        { x: -6505, y: 1900, name: 'south-west town' },
         { x: -7800, y: -3900, name: 'forest camp' },
         { x: 2450, y: 7490, name: 'bunker' },
     ];

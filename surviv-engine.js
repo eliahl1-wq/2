@@ -1806,7 +1806,7 @@ function addSunsetMotel(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y + 80, 1060, 560, {
         collidable: false, variant: 'courtyard', role: 'parkingCourt', landmarkType: 'motel',
     });
-    addObstacle(obstacles, 'road', x, y + 535, 1120, 90, {
+    addObstacle(obstacles, 'road', x, y + 585, 1120, 90, {
         collidable: false, variant: 'asphalt', role: 'motelDrive', landmarkType: 'motel',
     });
 
@@ -1864,8 +1864,8 @@ function addSunsetMotel(obstacles, loot, spawnPoints, x, y) {
     loot.push(makeChest(x - 250, y + 430, 'rare', null, 'map', {
         houseId: reception.id, landmarkType: 'motel', room: 'stockroom',
     }));
-    spawnPoints.push({ x: x - 740, y: y + 535, role: 'motel-road' });
-    spawnPoints.push({ x: x + 740, y: y + 535, role: 'motel-road' });
+    spawnPoints.push({ x: x - 740, y: y + 585, role: 'motel-road' });
+    spawnPoints.push({ x: x + 740, y: y + 585, role: 'motel-road' });
 }
 
 function addRangerLodge(obstacles, loot, spawnPoints, x, y) {
@@ -2187,7 +2187,7 @@ function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
         collidable: false, variant: 'village', role: 'marketVillage', landmarkType: 'market',
         label: 'GRAND MARKET',
     });
-    addObstacle(obstacles, 'road', x, y + 390, 1760, 110, {
+    addObstacle(obstacles, 'road', x, y + 550, 1760, 110, {
         collidable: false, variant: 'cobblestone', role: 'mainStreet', landmarkType: 'market',
     });
     addObstacle(obstacles, 'field', x, y + 250, 680, 330, {
@@ -2225,8 +2225,8 @@ function addMarketVillage(obstacles, loot, spawnPoints, x, y) {
     }
     loot.push(makeChest(x - 300, y - 300, 'military'));
     loot.push(makeChest(x + 300, y - 300, 'rare'));
-    spawnPoints.push({ x: x - 1040, y: y + 390, role: 'market-road' });
-    spawnPoints.push({ x: x + 1040, y: y + 390, role: 'market-road' });
+    spawnPoints.push({ x: x - 1040, y: y + 550, role: 'market-road' });
+    spawnPoints.push({ x: x + 1040, y: y + 550, role: 'market-road' });
 }
 
 function addSupplyCacheSite(obstacles, loot, spawnPoints, x, y, theme = 'supply') {
@@ -2353,7 +2353,9 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
 }
 
 function addGasStation(obstacles, loot, spawnPoints, x, y) {
-    addObstacle(obstacles, 'road', x, y, 1200, 800, { collidable: false, variant: 'asphalt' });
+    addObstacle(obstacles, 'field', x, y, 1200, 800, {
+        collidable: false, variant: 'parkingLot', role: 'gasForecourt', landmarkType: 'gas',
+    });
 
     // Store — all chests inside
     addHouse(obstacles, loot, spawnPoints, x, y - 200, 450, 250, { variant: 'warehouse', tier: 'rare', hue: 10, wall: 12 });
@@ -2547,6 +2549,22 @@ function addTrailPath(obstacles, points, opts = {}) {
 }
 
 const WILDERNESS_TRAIL_PLANS = [
+    { points: [
+        { x: 700, y: -7200 }, { x: 790, y: -7010 }, { x: 860, y: -6840 },
+        { x: 1080, y: -6460 }, { x: 1200, y: -6100 },
+    ], opts: { width: 58, variant: 'gravel', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Ranger Cache Track' } },
+    { points: [
+        { x: 8600, y: 3600 }, { x: 8460, y: 3440 }, { x: 8320, y: 3260 },
+        { x: 8120, y: 2700 }, { x: 8000, y: 2000 },
+    ], opts: { width: 56, variant: 'gravel', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Aid Station Track' } },
+    { points: [
+        { x: -1200, y: 8500 }, { x: -1300, y: 8240 }, { x: -1400, y: 7950 },
+        { x: -1680, y: 7100 }, { x: -1900, y: 6200 },
+    ], opts: { width: 54, variant: 'forest', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Smuggler Trail' } },
+    { points: [
+        { x: 4100, y: -2700 }, { x: 3990, y: -2870 }, { x: 3890, y: -3060 },
+        { x: 3540, y: -3500 }, { x: 3200, y: -4000 },
+    ], opts: { width: 58, variant: 'gravel', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Checkpoint Track' } },
     { points: [
         { x: -870, y: 520 }, { x: -1120, y: 920 }, { x: -980, y: 1370 },
         { x: -520, y: 1680 }, { x: -200, y: 1940 },
@@ -3588,7 +3606,7 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, 2500, neTownPos.y, neTownPos.x - 1000, neTownPos.y, roadW); // NE Town main street
     addRoad(obstacles, 2500, seLabPos.y, seLabPos.x - 850, seLabPos.y, roadW); // Research campus avenue
     addRoad(obstacles, nwMansionPos.x, -4000, nwMansionPos.x, nwMansionPos.y + 590, roadW); // NW Mansion gate
-    addRoad(obstacles, marketPos.x, 2000, marketPos.x, marketPos.y + 390, roadW); // Grand Market main street
+    addRoad(obstacles, marketPos.x, 2000, marketPos.x, marketPos.y + 550, roadW); // Grand Market main street
     addRoad(obstacles, motelPos.x, -4000, motelPos.x, motelPos.y + 590, roadW); // Sunset Motel approach
     addRoad(obstacles, -2500, rangerLodgePos.y + 500, rangerLodgePos.x + 800, rangerLodgePos.y + 500, roadW); // Ranger lodge forest road
     addRoad(obstacles, 2500, lumberworksPos.y + 520, lumberworksPos.x - 875, lumberworksPos.y + 520, roadW); // Lumberworks freight road
@@ -3598,9 +3616,8 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, railDepotPos.x - 920, 6200, railDepotPos.x - 920, railDepotPos.y, roadW); // Rail depot approach
     addRoad(obstacles, -2500, civicQuarterPos.y + 50, civicQuarterPos.x - 900, civicQuarterPos.y + 50, roadW); // Civic boulevard
 
-    addObstacle(obstacles, 'road', swTownPos.x, 1900, roadW, 200, {
-        collidable: false, variant: 'asphalt', role: 'driveway', landmarkType: 'town',
-    });
+    // SW Town's south cobblestone lane already reaches the cross-map highway.
+    // A second center driveway used to cut straight through a residence.
     addObstacle(obstacles, 'road', campPos.x, -3900, roadW, 200, {
         collidable: false, variant: 'dirt', role: 'path', landmarkType: 'camp',
     });
