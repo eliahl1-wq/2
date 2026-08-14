@@ -624,6 +624,7 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         landmarkType: options.landmarkType || null,
         entranceRole: options.entranceRole || null,
         orientation: options.orientation || null,
+        ...(kind === 'door' ? { isOpen: !!options.isOpen } : {}),
         points: Array.isArray(options.points) ? options.points : null,
         width: Number.isFinite(options.width) ? options.width : null,
         widths: Array.isArray(options.widths) ? options.widths : null,
@@ -804,7 +805,9 @@ function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
 
 function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south', entranceRole = 'mainEntrance') {
     return addObstacle(obstacles, 'door', x, y, w, h, {
-        collidable: false,
+        collidable: true,
+        destructible: false,
+        isOpen: false,
         variant,
         houseId,
         role: side,
@@ -4324,6 +4327,7 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         useMedkit: false,
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
+        toggleDoorId: null,
         openChestId: null,
         chestHoldId: null,
         chestHoldStartedAt: 0,
@@ -4669,7 +4673,16 @@ function moveEntity(entity, room, dx, dy, speed) {
     newY = clamp(newY, -wh, wh);
 
     for (const o of getNearbyObstacles(room, newX, newY, 220)) {
+        if (o.kind === 'door' && o.isOpen) continue;
         if (circleRectCollision(newX, newY, r, o)) {
+            // Bots should understand doorways instead of getting pinned against
+            // a closed door forever. Human players deliberately use F.
+            if (o.kind === 'door' && entity.isBot) {
+                o.isOpen = true;
+                o.doorChangedAt = Date.now();
+                markSurvivObstaclesChanged(room);
+                continue;
+            }
             const resolved = resolveCircleRect(newX, newY, r, o);
             newX = resolved.x;
             newY = resolved.y;
@@ -5571,6 +5584,7 @@ function updateBullets(room, now, effectiveRadius) {
         let nearestObstacle = null;
         let obstacleHitT = Infinity;
         for (const obstacle of getNearbyObstacles(room, midX, midY, queryRange)) {
+            if (obstacle.kind === 'door' && obstacle.isOpen) continue;
             const hitT = segmentRectHitT(previousX, previousY, bullet.x, bullet.y, obstacle);
             if (hitT != null && hitT < obstacleHitT) {
                 nearestObstacle = obstacle;
@@ -5639,6 +5653,42 @@ function updateBullets(room, now, effectiveRadius) {
         }
         if (rangeExceeded) room.bullets.splice(i, 1);
     }
+}
+
+function distanceToObstacleRect(entity, obstacle) {
+    const local = toRectLocal(entity.x, entity.y, obstacle);
+    const dx = Math.max(0, Math.abs(local.x) - obstacle.w / 2);
+    const dy = Math.max(0, Math.abs(local.y) - obstacle.h / 2);
+    return Math.hypot(dx, dy);
+}
+
+export function toggleSurvivDoor(entity, room, now) {
+    const requestedId = entity.toggleDoorId;
+    entity.toggleDoorId = null;
+    if (!requestedId || now - (entity._lastDoorToggleAt || 0) < 220) return false;
+
+    const door = queryObstacles(room, entity.x, entity.y, 150, false)
+        .find(obstacle => obstacle.id === requestedId && obstacle.kind === 'door');
+    if (!door || distanceToObstacleRect(entity, door) > 58) return false;
+
+    if (door.isOpen) {
+        const occupants = [
+            ...room.players.filter(player => !player.cashoutSettling && !player._eliminated),
+            ...room.bots.filter(bot => !bot._eliminated),
+        ];
+        if (occupants.some(candidate => candidate.hp > 0 && circleRectCollision(
+            candidate.x,
+            candidate.y,
+            candidate.radius || SURVIV.playerRadius,
+            door,
+        ))) return false;
+    }
+
+    door.isOpen = !door.isOpen;
+    door.doorChangedAt = now;
+    entity._lastDoorToggleAt = now;
+    markSurvivObstaclesChanged(room);
+    return true;
 }
 
 function checkZoneDamage(entity, zone, now) {
@@ -5952,6 +6002,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.shooting = false;
         entity.useMedkit = false;
         entity.pickupWeaponPending = false;
+        entity.toggleDoorId = null;
         entity.equipSlotPending = null;
         entity.throwGrenadePending = false;
         entity.swapWeaponSlots = null;
@@ -5968,6 +6019,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.shooting = false;
         entity.useMedkit = false;
         entity.pickupWeaponPending = false;
+        entity.toggleDoorId = null;
         entity.openChestId = null;
         entity.takeChestItem = null;
     }
@@ -5990,6 +6042,9 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     if (!entity.isCashingOut && entity.pickupWeaponPending) {
         pickupGroundWeapon(entity, room);
         entity.pickupWeaponPending = false;
+    }
+    if (!entity.isCashingOut && entity.toggleDoorId) {
+        toggleSurvivDoor(entity, room, now);
     }
     if (!entity.isCashingOut && entity.equipSlotPending != null) {
         equipSurvivWeaponSlot(entity, entity.equipSlotPending);
@@ -6144,6 +6199,7 @@ function serializeSurvivObstacle(o) {
         ...(o.landmarkType ? { landmarkType: o.landmarkType } : {}),
         ...(o.entranceRole ? { entranceRole: o.entranceRole } : {}),
         ...(o.orientation ? { orientation: o.orientation } : {}),
+        ...(o.kind === 'door' ? { isOpen: !!o.isOpen } : {}),
         ...(Array.isArray(o.points) ? { points: o.points } : {}),
         ...(Number.isFinite(o.width) ? { width: o.width } : {}),
         ...(Array.isArray(o.widths) ? { widths: o.widths } : {}),

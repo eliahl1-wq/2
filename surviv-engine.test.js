@@ -16,6 +16,7 @@ import {
     resetSurvivRoomRuntime,
     spawnLootFromPool,
     spawnSurvivBotNear,
+    toggleSurvivDoor,
 } from './surviv-engine.js';
 import { getSurvivEconomy, getSurvivJoinLootFunding } from './economy.js';
 
@@ -893,8 +894,9 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
     assert.ok(interiorDoors.length >= 30, 'split and corridor buildings should expose real interior doors');
     assert.ok(interiorDoors.every(door => {
         const house = floors.find(floor => floor.id === door.houseId);
-        return door.collidable === false && house && pointInRect(door.x, door.y, house, 2);
-    }), 'interior doors should stay non-blocking and inside their owning building');
+        return door.collidable !== false && door.isOpen === false
+            && house && pointInRect(door.x, door.y, house, 2);
+    }), 'interior doors should start closed, solid, and inside their owning building');
 
     for (const door of doors) {
         const horizontal = door.role === 'north' || door.role === 'south';
@@ -978,6 +980,31 @@ test('river spline metadata survives generation and bridges hit both highways ex
         assert.ok(rails.every(rail => Math.abs(rail.rotation - bridge.rotation) < 1e-9));
         assert.ok(rails.every(rail => Math.abs(rail.w - bridge.w) < 1e-9));
     }
+});
+
+test('surviv doors open with interaction and cannot close through a player', () => {
+    const room = makeRoom();
+    const door = room.obstacles.find(obstacle => obstacle.kind === 'door');
+    const player = createSurvivPlayer('door-player', null, 'Door player', '#55aaff', room);
+    room.players.push(player);
+    room.bots = [];
+
+    player.x = door.x;
+    player.y = door.y + door.h / 2 + 42;
+    player.toggleDoorId = door.id;
+    assert.equal(toggleSurvivDoor(player, room, 1000), true);
+    assert.equal(door.isOpen, true);
+
+    player.x = door.x;
+    player.y = door.y;
+    player.toggleDoorId = door.id;
+    assert.equal(toggleSurvivDoor(player, room, 1300), false);
+    assert.equal(door.isOpen, true, 'an occupied doorway must stay open');
+
+    player.x = door.x + door.w / 2 + 100;
+    player.y = door.y + door.h / 2 + 100;
+    player.toggleDoorId = door.id;
+    assert.equal(toggleSurvivDoor(player, room, 1600), false, 'remote door requests must be rejected');
 });
 
 test('bridge rails block movement along their full rotated length', () => {

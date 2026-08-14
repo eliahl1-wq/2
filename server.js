@@ -8845,6 +8845,7 @@ io.on('connection', (socket) => {
             reload,
             useMedkit,
             pickupWeapon,
+            toggleDoorId,
             equipSlot,
             throwGrenade,
             openChestId,
@@ -8877,6 +8878,8 @@ io.on('connection', (socket) => {
         player.shooting = shooting === true;
         if (useMedkit === true) player.useMedkit = true;
         if (pickupWeapon === true) player.pickupWeaponPending = true;
+        const requestedDoorId = safeId(toggleDoorId);
+        if (requestedDoorId) player.toggleDoorId = requestedDoorId;
         if (throwGrenade === true) player.throwGrenadePending = true;
 
         const requestedChestId = safeId(openChestId);
