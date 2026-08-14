@@ -27,6 +27,7 @@ export const SURVIV = {
 
     playerRadius: 14,
     playerSpeed: 5.2,
+    waterMoveMultiplier: 0.68,
     viewRange: 1200,
     botMinCount: 2,
     botMaxCount: 8,
@@ -846,6 +847,21 @@ function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], va
         cursor = Math.max(cursor, gapMax);
     }
     if (max - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + max) / 2, wall, max - cursor, variant, opts);
+    if (opts.houseId) {
+        for (const gap of sorted) {
+            addDoor(
+                obstacles,
+                opts.houseId,
+                x,
+                y + gap.center,
+                wall * 2.15,
+                gap.size * 0.68,
+                opts.doorVariant || variant,
+                'east',
+                'interiorDoor',
+            );
+        }
+    }
 }
 
 function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], variant = 'plaster', opts = {}) {
@@ -860,6 +876,21 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
         cursor = Math.max(cursor, gapMax);
     }
     if (max - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + max) / 2, y, max - cursor, wall, variant, opts);
+    if (opts.houseId) {
+        for (const gap of sorted) {
+            addDoor(
+                obstacles,
+                opts.houseId,
+                x + gap.center,
+                y,
+                gap.size * 0.68,
+                wall * 2.15,
+                opts.doorVariant || variant,
+                'south',
+                'interiorDoor',
+            );
+        }
+    }
 }
 function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const wall = opts.wall || 14;
@@ -909,6 +940,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
 
     const layout = opts.layout || 'auto';
     const large = layout === 'corridor' || (layout === 'auto' && (w >= 430 || h >= 330 || variant === 'mansion'));
+    const compactSplit = layout === 'auto' && !large && w >= 230 && h >= 190;
     if (layout === 'shop') {
         // Road-facing shops keep a large readable public room with a smaller
         // stock room at the back. The centered opening prevents dead-end loot.
@@ -935,7 +967,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
                 collidable: false, variant: 'workbench', role: 'counter', houseId,
             });
         }
-    } else if (layout === 'split') {
+    } else if (layout === 'split' || compactSplit) {
         // Two-room homes offer a short flank around their center wall without
         // turning a small building into a cramped corridor maze.
         if (w >= h) {
@@ -971,32 +1003,45 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
             { center: -h * 0.27, size: 82 },
             { center: h * 0.02, size: 82 },
             { center: h * 0.31, size: 82 },
-        ], variant);
+        ], variant, { houseId });
         addVerticalInteriorWallSegments(obstacles, x + hallW / 2, y, h - wall * 4, wall, [
             { center: -h * 0.27, size: 82 },
             { center: h * 0.02, size: 82 },
             { center: h * 0.31, size: 82 },
-        ], variant);
+        ], variant, { houseId });
         addHorizontalInteriorWallSegments(obstacles, x - hallW / 2 - wingW / 2 - wall, y - h * 0.125, wingW, wall, [], variant);
         addHorizontalInteriorWallSegments(obstacles, x - hallW / 2 - wingW / 2 - wall, y + h * 0.175, wingW, wall, [], variant);
         addHorizontalInteriorWallSegments(obstacles, x + hallW / 2 + wingW / 2 + wall, y - h * 0.125, wingW, wall, [], variant);
         addHorizontalInteriorWallSegments(obstacles, x + hallW / 2 + wingW / 2 + wall, y + h * 0.175, wingW, wall, [], variant);
-        addObstacle(obstacles, 'furniture', x - w * 0.32, y - h * 0.28, 54, 32, { collidable: false, variant: 'table' });
-        addObstacle(obstacles, 'furniture', x + w * 0.33, y + h * 0.27, 48, 34, { collidable: false, variant: 'bed' });
-        addObstacle(obstacles, 'furniture', x - w * 0.31, y + h * 0.06, 42, 30, { collidable: false, variant: 'bed' });
+        addObstacle(obstacles, 'furniture', x - w * 0.32, y - h * 0.28, 54, 32, { collidable: false, variant: 'table', houseId });
+        addObstacle(obstacles, 'furniture', x + w * 0.33, y + h * 0.27, 48, 34, { collidable: false, variant: 'bed', houseId });
+        addObstacle(obstacles, 'furniture', x - w * 0.31, y + h * 0.06, 42, 30, { collidable: false, variant: 'bed', houseId });
+        const industrialInterior = ['warehouse', 'metal', 'ironworks'].includes(variant);
+        addObstacle(obstacles, 'furniture', x + w * 0.31, y - h * 0.28, 58, 28, {
+            collidable: false,
+            variant: industrialInterior ? 'locker' : 'workbench',
+            role: industrialInterior ? 'storage' : 'kitchen-counter',
+            houseId,
+        });
+        addObstacle(obstacles, 'furniture', x + w * 0.30, y + h * 0.02, 48, 28, {
+            collidable: false,
+            variant: industrialInterior ? 'workbench' : 'table',
+            role: industrialInterior ? 'maintenance' : 'side-table',
+            houseId,
+        });
     } else {
         // Small houses: no rooms, no interior walls — single open space
-        addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, { collidable: false, variant: 'table' });
-        addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, { collidable: false, variant: 'bed' });
+        addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, { collidable: false, variant: 'table', houseId });
+        addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, { collidable: false, variant: 'bed', houseId });
     }
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
-    const primaryChestChance = large ? 0.84 : layout === 'shop' ? 0.7 : layout === 'split' ? 0.62 : 0.46;
+    const primaryChestChance = large ? 0.84 : layout === 'shop' ? 0.7 : (layout === 'split' || compactSplit) ? 0.62 : 0.46;
     if (Math.random() < primaryChestChance) {
         loot.push(makeChest(x + w * 0.24, y - h * 0.22, chestTier, null, 'map', {
             houseId,
             landmarkType: opts.landmarkType || null,
-            room: large ? 'north-room' : layout === 'shop' ? 'stockroom' : layout === 'split' ? 'bedroom' : null,
+            room: large ? 'north-room' : layout === 'shop' ? 'stockroom' : (layout === 'split' || compactSplit) ? 'bedroom' : null,
         }));
     }
     if (large && Math.random() < 0.24) {
@@ -2916,7 +2961,7 @@ function addWorldFurnitureDetails(obstacles) {
     }
 
     const doorsByHouse = new Map(obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(door => [door.houseId, door]));
     const mailboxHomes = obstacles.filter(obstacle => (
         obstacle.kind === 'houseFloor'
@@ -3220,7 +3265,7 @@ function clearInvalidBuildingProps(obstacles) {
     const floors = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
     const networkRoads = obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad');
     const approaches = obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(getDoorApproachRect);
 
     for (let i = obstacles.length - 1; i >= 0; i--) {
@@ -4584,6 +4629,30 @@ function getNearbyObstacles(room, x, y, range) {
     return queryObstacles(room, x, y, range, true);
 }
 
+function getEntitySurfaceKind(room, entity) {
+    const nearby = queryObstacles(room, entity.x, entity.y, 40, false);
+    // A bridge must override the river pieces beneath it or crossing a bridge
+    // would incorrectly slow the player and play water footsteps.
+    if (nearby.some(obstacle => obstacle.kind === 'bridge' && pointInRect(entity.x, entity.y, obstacle))) {
+        return 'ground';
+    }
+    const inWater = nearby.some(obstacle => {
+        if (obstacle.kind === 'river') return pointInRect(entity.x, entity.y, obstacle);
+        if (obstacle.kind !== 'water') return false;
+        if (obstacle.variant !== 'pond') return pointInRect(entity.x, entity.y, obstacle);
+        const rx = Math.max(1, obstacle.w * 0.46);
+        const ry = Math.max(1, obstacle.h * 0.46);
+        const nx = (entity.x - obstacle.x) / rx;
+        const ny = (entity.y - obstacle.y) / ry;
+        return nx * nx + ny * ny <= 1;
+    });
+    if (inWater) return 'water';
+    if (nearby.some(obstacle => obstacle.kind === 'houseFloor' && pointInRect(entity.x, entity.y, obstacle))) {
+        return 'indoor';
+    }
+    return 'ground';
+}
+
 function moveEntity(entity, room, dx, dy, speed) {
     const inputX = Number(dx) || 0;
     const inputY = Number(dy) || 0;
@@ -5719,7 +5788,9 @@ function getBotLootWaypoint(bot, item, room) {
     if (!house || pointInRect(bot.x, bot.y, house)) return item;
     const doorRange = Math.max(house.w || 0, house.h || 0) / 2 + 120;
     const door = queryObstacles(room, house.x, house.y, doorRange, false)
-        .find(obstacle => obstacle.kind === 'door' && obstacle.houseId === house.id);
+        .find(obstacle => obstacle.kind === 'door'
+            && obstacle.houseId === house.id
+            && obstacle.entranceRole !== 'interiorDoor');
     return door || item;
 }
 
@@ -5949,10 +6020,12 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         && Number(entity.weapon?.ammo) > 0
         && !entity.weapon?.reloading
     );
-    const movementSpeed = SURVIV.playerSpeed * (
-        firingAutomaticWeapon ? activeWeaponDef.firingMoveMultiplier || 0.75 : 1
-    );
+    const movementSurface = getEntitySurfaceKind(room, entity);
+    const movementSpeed = SURVIV.playerSpeed
+        * (movementSurface === 'water' ? SURVIV.waterMoveMultiplier : 1)
+        * (firingAutomaticWeapon ? activeWeaponDef.firingMoveMultiplier || 0.75 : 1);
     moveEntity(entity, room, entity.inputDx, entity.inputDy, movementSpeed);
+    entity.surface = getEntitySurfaceKind(room, entity);
     entity.angle = entity.aimAngle ?? entity.angle;
 
     if (entity.shooting) {
@@ -6031,6 +6104,7 @@ function serializePlayer(p, isYou) {
         cashoutHoldStartedAt: p.cashoutHoldStartedAt || 0,
         isCashingOut: !!p.isCashingOut,
         outsideZone: !!p.outsideZone,
+        surface: p.surface || 'ground',
 
         activeWeaponSlot: Number.isInteger(p.activeWeaponSlot) ? p.activeWeaponSlot : 0,
         weaponSlotAmmo: ensureWeaponSlotAmmo(p),

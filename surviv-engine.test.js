@@ -281,7 +281,7 @@ test('surviv town roads stay centered between rows and doors face the road', () 
     ));
     const townHouses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor' && obstacle.variant === 'town');
     const doorsByHouse = new Map(map.obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(door => [door.houseId, door]));
 
     assert.equal(plannedTownRoads.length, 3);
@@ -377,7 +377,7 @@ test('new roadside landmarks have distinct buildings and connect to the highway 
     const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
     const networkRoads = roads.filter(road => road.role === 'networkRoad');
     const doorsByHouse = new Map(map.obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(door => [door.houseId, door]));
 
     for (const type of ['services', 'fire-station', 'orchard']) assert.ok(landmarkTypes.has(type));
@@ -427,7 +427,7 @@ test('motel, ranger lodge, and lumberworks add distinct connected combat distric
         obstacle.kind === 'road' && obstacle.role === 'networkRoad'
     ));
     const doorsByHouse = new Map(map.obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(door => [door.houseId, door]));
 
     for (const type of ['motel', 'ranger-lodge', 'lumberworks']) {
@@ -484,7 +484,7 @@ test('urban expansion adds five dense and distinct road-connected districts', ()
     const networkRoads = roads.filter(road => road.role === 'networkRoad');
     const junctions = map.obstacles.filter(obstacle => obstacle.kind === 'roadJunction');
     const doorsByHouse = new Map(map.obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(door => [door.houseId, door]));
     const expectedDistricts = new Map([
         ['riverside', { buildings: 8, approachRole: 'boroughCrossStreet' }],
@@ -753,10 +753,13 @@ test('Ironworks is a multi-entry indoor combat landmark with loop routes', () =>
     assert.ok(floor.w >= 1600 && floor.h >= 1100);
 
     const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door' && obstacle.houseId === floor.id);
-    assert.equal(doors.length, 4);
-    assert.deepEqual(new Set(doors.map(door => door.role)), new Set(['north', 'south', 'east', 'west']));
-    assert.ok(doors.some(door => door.entranceRole === 'mainEntrance'));
-    assert.ok(doors.some(door => door.entranceRole === 'loadingEntrance'));
+    const exteriorDoors = doors.filter(door => door.entranceRole !== 'interiorDoor');
+    const interiorDoors = doors.filter(door => door.entranceRole === 'interiorDoor');
+    assert.equal(exteriorDoors.length, 4);
+    assert.ok(interiorDoors.length >= 8);
+    assert.deepEqual(new Set(exteriorDoors.map(door => door.role)), new Set(['north', 'south', 'east', 'west']));
+    assert.ok(exteriorDoors.some(door => door.entranceRole === 'mainEntrance'));
+    assert.ok(exteriorDoors.some(door => door.entranceRole === 'loadingEntrance'));
 
     const rooms = map.obstacles.filter(obstacle => obstacle.kind === 'roomZone' && obstacle.houseId === floor.id);
     const roomVariants = new Set(rooms.map(room => room.variant));
@@ -811,7 +814,7 @@ test('Ironworks is a multi-entry indoor combat landmark with loop routes', () =>
 test('farm, research campus, and hamlets use purposeful road-facing layouts', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const doorsByHouse = new Map(map.obstacles
-        .filter(obstacle => obstacle.kind === 'door')
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor')
         .map(door => [door.houseId, door]));
 
     const farmBuildings = map.obstacles.filter(obstacle => (
@@ -878,9 +881,20 @@ test('Grand Market forms a large indoor village rotation', () => {
 test('generated doors, props, and player spawns keep clear traversal space', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const floors = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
-    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door');
+    const doors = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'door' && obstacle.entranceRole !== 'interiorDoor'
+    ));
+    const interiorDoors = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'door' && obstacle.entranceRole === 'interiorDoor'
+    ));
     const propKinds = new Set(['tree', 'bush', 'rock', 'crate', 'barrel', 'container', 'sandbag', 'tent']);
     const props = map.obstacles.filter(obstacle => propKinds.has(obstacle.kind));
+
+    assert.ok(interiorDoors.length >= 30, 'split and corridor buildings should expose real interior doors');
+    assert.ok(interiorDoors.every(door => {
+        const house = floors.find(floor => floor.id === door.houseId);
+        return door.collidable === false && house && pointInRect(door.x, door.y, house, 2);
+    }), 'interior doors should stay non-blocking and inside their owning building');
 
     for (const door of doors) {
         const horizontal = door.role === 'north' || door.role === 'south';
@@ -1747,6 +1761,47 @@ test('analog movement strength matches mobile client prediction', () => {
     player.inputDx = 1;
     processSurvivRoom(room, silentIo, Date.now() + 600001);
     assert.ok(Math.abs((player.x - halfSpeedX) - SURVIV.playerSpeed) < 0.001);
+});
+
+test('water slows movement while bridges and indoor floors report the correct surface', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('surface-player', 'surface-mongo', 'Wader', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 1;
+    player.inputDy = 0;
+    room.players.push(player);
+
+    room.obstacles = [{
+        id: 'test-water', kind: 'water', variant: 'pond', x: 0, y: 0,
+        w: 300, h: 220, rotation: 0, collidable: false,
+    }];
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.ok(Math.abs(player.x - SURVIV.playerSpeed * SURVIV.waterMoveMultiplier) < 0.001);
+    assert.equal(player.surface, 'water');
+
+    player.x = 0;
+    player.y = 0;
+    room.obstacles = [
+        ...room.obstacles,
+        { id: 'test-bridge', kind: 'bridge', x: 0, y: 0, w: 180, h: 60, rotation: 0, collidable: false },
+    ];
+    processSurvivRoom(room, silentIo, Date.now() + 600001);
+    assert.ok(Math.abs(player.x - SURVIV.playerSpeed) < 0.001);
+    assert.equal(player.surface, 'ground');
+
+    player.x = 0;
+    player.y = 0;
+    room.obstacles = [{
+        id: 'test-house', kind: 'houseFloor', x: 0, y: 0,
+        w: 240, h: 180, rotation: 0, collidable: false,
+    }];
+    processSurvivRoom(room, silentIo, Date.now() + 600002);
+    assert.ok(Math.abs(player.x - SURVIV.playerSpeed) < 0.001);
+    assert.equal(player.surface, 'indoor');
 });
 
 test('full-auto fire slows movement while semi-auto fire does not', () => {
