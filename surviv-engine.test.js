@@ -989,11 +989,13 @@ test('surviv doors open with interaction and cannot close through a player', () 
     room.players.push(player);
     room.bots = [];
 
-    player.x = door.x;
-    player.y = door.y + door.h / 2 + 42;
+    const horizontal = door.w >= door.h;
+    player.x = horizontal ? door.x : door.x + door.w / 2 + 42;
+    player.y = horizontal ? door.y + door.h / 2 + 42 : door.y;
     player.toggleDoorId = door.id;
     assert.equal(toggleSurvivDoor(player, room, 1000), true);
     assert.equal(door.isOpen, true);
+    assert.equal(door.openDirection, horizontal ? -1 : 1, 'the door should swing away from the interacting player');
 
     player.x = door.x;
     player.y = door.y;
@@ -2010,6 +2012,8 @@ test('duplicate packets with the same fire press id cannot create a second melee
     const now = Date.now() + 600000;
     processSurvivRoom(room, silentIo, now);
     assert.equal(room.obstacles[0].hp, 82);
+    assert.equal(player.meleeAttackId, 1);
+    const firstHand = player.meleeHand;
 
     player.shooting = false;
     processSurvivRoom(room, silentIo, now + 1);
@@ -2017,11 +2021,15 @@ test('duplicate packets with the same fire press id cannot create a second melee
     player.weapon.lastShotAt = 0;
     processSurvivRoom(room, silentIo, now + 1000);
     assert.equal(room.obstacles[0].hp, 82, 'a delayed duplicate id must be ignored');
+    assert.equal(player.meleeAttackId, 1, 'a duplicate packet must not restart the animation');
+    assert.equal(player.meleeHand, firstHand);
 
     player.firePressId = 8;
     player.weapon.lastShotAt = 0;
     processSurvivRoom(room, silentIo, now + 1001);
     assert.equal(room.obstacles[0].hp, 64, 'a genuinely new press id must attack once');
+    assert.equal(player.meleeAttackId, 2);
+    assert.notEqual(player.meleeHand, firstHand, 'distinct clicks should alternate hands');
 });
 
 test('bullets damage and eventually destroy durable Surviv obstacles', () => {

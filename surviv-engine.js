@@ -857,8 +857,8 @@ function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], va
                 opts.houseId,
                 x,
                 y + gap.center,
-                wall * 0.92,
-                gap.size * 0.88,
+                wall * 1.08,
+                gap.size + 2,
                 opts.doorVariant || variant,
                 'east',
                 'interiorDoor',
@@ -886,8 +886,8 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
                 opts.houseId,
                 x + gap.center,
                 y,
-                gap.size * 0.88,
-                wall * 0.92,
+                gap.size + 2,
+                wall * 1.08,
                 opts.doorVariant || variant,
                 'south',
                 'interiorDoor',
@@ -902,8 +902,8 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const doorSide = ['north', 'south', 'east', 'west'].includes(opts.doorSide) ? opts.doorSide : 'south';
     const horizontalDoor = doorSide === 'north' || doorSide === 'south';
     const doorSpan = clamp((horizontalDoor ? w : h) * 0.32, 74, variant === 'mansion' || variant === 'warehouse' ? 132 : 104);
-    const doorW = horizontalDoor ? doorSpan : wall * 0.92;
-    const doorH = horizontalDoor ? wall * 0.92 : doorSpan;
+    const doorW = horizontalDoor ? doorSpan + 2 : wall * 1.08;
+    const doorH = horizontalDoor ? wall * 1.08 : doorSpan + 2;
     const doorX = doorSide === 'west'
         ? x - w / 2 + wall / 2
         : doorSide === 'east' ? x + w / 2 - wall / 2 : x;
@@ -1199,10 +1199,10 @@ function addIronworks(obstacles, loot, spawnPoints, x, y) {
     addVerticalWallWithOpening(obstacles, westX, y, h, wall, 'metal', y + 280, 210, ironworksMeta);
     addVerticalWallWithOpening(obstacles, eastX, y, h, wall, 'metal', y, 230, ironworksMeta);
 
-    addDoor(obstacles, houseId, x - 430, northY, 170, wall * 0.92, 'metal', 'north', 'serviceEntrance');
-    addDoor(obstacles, houseId, x + 430, southY, 170, wall * 0.92, 'metal', 'south', 'serviceEntrance');
-    addDoor(obstacles, houseId, westX, y + 280, wall * 0.92, 210, 'metal', 'west', 'loadingEntrance');
-    addDoor(obstacles, houseId, eastX, y, wall * 0.92, 230, 'metal', 'east', 'mainEntrance');
+    addDoor(obstacles, houseId, x - 430, northY, 172, wall * 1.08, 'metal', 'north', 'serviceEntrance');
+    addDoor(obstacles, houseId, x + 430, southY, 172, wall * 1.08, 'metal', 'south', 'serviceEntrance');
+    addDoor(obstacles, houseId, westX, y + 280, wall * 1.08, 212, 'metal', 'west', 'loadingEntrance');
+    addDoor(obstacles, houseId, eastX, y, wall * 1.08, 232, 'metal', 'east', 'mainEntrance');
 
     // Two side loops connect through the central factory floor at three points.
     // Players can rotate around fights instead of being forced through one hall.
@@ -2515,7 +2515,7 @@ function addHospital(obstacles, loot, spawnPoints, x, y) {
     // South wall with entrance gap
     addWall(obstacles, x - 300, y + 400 - 8, 400, 16, 'plaster');
     addWall(obstacles, x + 300, y + 400 - 8, 400, 16, 'plaster');
-    addDoor(obstacles, houseId, x, y + 400 - 8, 200, 15, 'plaster', 'south');
+    addDoor(obstacles, houseId, x, y + 400 - 8, 202, 17.3, 'plaster', 'south');
     // Side walls
     addWall(obstacles, x - 500 + 8, y, 16, 800, 'plaster');
     addWall(obstacles, x + 500 - 8, y, 16, 800, 'plaster');
@@ -4695,6 +4695,7 @@ function moveEntity(entity, room, dx, dy, speed) {
             // Bots should understand doorways instead of getting pinned against
             // a closed door forever. Human players deliberately use F.
             if (o.kind === 'door' && entity.isBot) {
+                o.openDirection = getDoorOpenDirection(entity, o);
                 o.isOpen = true;
                 o.doorChangedAt = Date.now();
                 markSurvivObstaclesChanged(room);
@@ -4727,9 +4728,8 @@ function tryShoot(entity, room, now) {
         w.lastShotAt = now;
         entity.meleeStartedAt = now;
         entity.meleeUntil = now + MELEE_ANIMATION_MS;
-        // One consistent striking hand prevents unarmed attacks from reading
-        // as an alternating two-hit combo. Damage is still applied exactly once.
-        entity.meleeHand = 'bottom';
+        entity.meleeAttackId = (Number(entity.meleeAttackId) || 0) + 1;
+        entity.meleeHand = entity.meleeHand === 'top' ? 'bottom' : 'top';
 
         const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
         const targets = [
@@ -5681,6 +5681,14 @@ function distanceToObstacleRect(entity, obstacle) {
     return Math.hypot(dx, dy);
 }
 
+function getDoorOpenDirection(entity, door) {
+    const local = toRectLocal(entity.x, entity.y, door);
+    // The renderer normalizes vertical doors by rotating them 90 degrees.
+    // Measure the player on that same local axis, then swing away from them.
+    const playerSide = door.w >= door.h ? local.y : -local.x;
+    return playerSide >= 0 ? -1 : 1;
+}
+
 export function toggleSurvivDoor(entity, room, now) {
     const requestedId = entity.toggleDoorId;
     entity.toggleDoorId = null;
@@ -5703,6 +5711,7 @@ export function toggleSurvivDoor(entity, room, now) {
         ))) return false;
     }
 
+    if (!door.isOpen) door.openDirection = getDoorOpenDirection(entity, door);
     door.isOpen = !door.isOpen;
     door.doorChangedAt = now;
     entity._lastDoorToggleAt = now;
@@ -6173,6 +6182,7 @@ function serializePlayer(p, isYou) {
         meleeUntil: p.meleeUntil || 0,
         meleeRemainingMs: p.meleeUntil > Date.now() ? Math.max(0, p.meleeUntil - Date.now()) : 0,
         meleeHand: p.meleeHand || 'top',
+        meleeAttackId: Number(p.meleeAttackId) || 0,
         reloadEndAt: p.weapon?.reloadEndAt || 0,
         reloadRemainingMs: p.weapon?.reloading ? Math.max(0, (p.weapon.reloadEndAt || 0) - Date.now()) : 0,
         reloadMs: wDef.reloadMs,
@@ -6227,6 +6237,7 @@ function serializeSurvivObstacle(o) {
         ...(o.entranceRole ? { entranceRole: o.entranceRole } : {}),
         ...(o.orientation ? { orientation: o.orientation } : {}),
         ...(o.kind === 'door' ? { isOpen: !!o.isOpen } : {}),
+        ...(o.kind === 'door' && Number.isFinite(o.openDirection) ? { openDirection: o.openDirection } : {}),
         ...(Array.isArray(o.points) ? { points: o.points } : {}),
         ...(Number.isFinite(o.width) ? { width: o.width } : {}),
         ...(Array.isArray(o.widths) ? { widths: o.widths } : {}),
