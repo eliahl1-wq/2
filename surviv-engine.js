@@ -857,8 +857,8 @@ function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], va
                 opts.houseId,
                 x,
                 y + gap.center,
-                wall * 2.15,
-                gap.size * 0.68,
+                wall * 0.92,
+                gap.size * 0.88,
                 opts.doorVariant || variant,
                 'east',
                 'interiorDoor',
@@ -886,8 +886,8 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
                 opts.houseId,
                 x + gap.center,
                 y,
-                gap.size * 0.68,
-                wall * 2.15,
+                gap.size * 0.88,
+                wall * 0.92,
                 opts.doorVariant || variant,
                 'south',
                 'interiorDoor',
@@ -902,8 +902,8 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const doorSide = ['north', 'south', 'east', 'west'].includes(opts.doorSide) ? opts.doorSide : 'south';
     const horizontalDoor = doorSide === 'north' || doorSide === 'south';
     const doorSpan = clamp((horizontalDoor ? w : h) * 0.32, 74, variant === 'mansion' || variant === 'warehouse' ? 132 : 104);
-    const doorW = horizontalDoor ? doorSpan : wall * 2.25;
-    const doorH = horizontalDoor ? wall * 2.25 : doorSpan;
+    const doorW = horizontalDoor ? doorSpan : wall * 0.92;
+    const doorH = horizontalDoor ? wall * 0.92 : doorSpan;
     const doorX = doorSide === 'west'
         ? x - w / 2 + wall / 2
         : doorSide === 'east' ? x + w / 2 - wall / 2 : x;
@@ -971,54 +971,69 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
             });
         }
     } else if (layout === 'split' || compactSplit) {
-        // Two-room homes offer a short flank around their center wall without
-        // turning a small building into a cramped corridor maze.
-        if (w >= h) {
-            addRoomZone(obstacles, houseId, x - w * 0.25, y, w * 0.43, h - wall * 3, 'living-room');
-            addRoomZone(obstacles, houseId, x + w * 0.25, y, w * 0.43, h - wall * 3, 'bedroom');
-            addVerticalInteriorWallSegments(obstacles, x, y, h - wall * 2, wall, [
-                { center: doorSide === 'north' ? -h * 0.16 : h * 0.16, size: 78 },
-            ], variant, { houseId });
+        // A real front-room/back-room plan follows the entrance. This keeps the
+        // outside door out of a divider wall and gives the inner door a clear job.
+        if (horizontalDoor) {
+            const frontDirection = doorSide === 'south' ? 1 : -1;
+            const dividerY = y - frontDirection * h * 0.04;
+            addRoomZone(obstacles, houseId, x, y + frontDirection * h * 0.24, w - wall * 3, h * 0.40, 'living-room');
+            addRoomZone(obstacles, houseId, x, y - frontDirection * h * 0.26, w - wall * 3, h * 0.42, 'bedroom');
+            addHorizontalInteriorWallSegments(obstacles, x, dividerY, w - wall * 2, wall, [
+                { center: -w * 0.18, size: clamp(w * 0.25, 66, 84) },
+            ], variant, { houseId, doorVariant: variant });
+            addObstacle(obstacles, 'furniture', x + w * 0.23, y + frontDirection * h * 0.23, 58, 28, {
+                collidable: false, variant: 'sofa', role: 'living-room', houseId,
+            });
+            addObstacle(obstacles, 'furniture', x + w * 0.22, y - frontDirection * h * 0.25, 42, 54, {
+                collidable: false, variant: 'bed', role: 'bedroom', houseId,
+            });
         } else {
-            addRoomZone(obstacles, houseId, x, y - h * 0.25, w - wall * 3, h * 0.43, 'living-room');
-            addRoomZone(obstacles, houseId, x, y + h * 0.25, w - wall * 3, h * 0.43, 'bedroom');
-            addHorizontalInteriorWallSegments(obstacles, x, y, w - wall * 2, wall, [
-                { center: doorSide === 'west' ? -w * 0.16 : w * 0.16, size: 78 },
-            ], variant, { houseId });
+            const frontDirection = doorSide === 'east' ? 1 : -1;
+            const dividerX = x - frontDirection * w * 0.04;
+            addRoomZone(obstacles, houseId, x + frontDirection * w * 0.24, y, w * 0.40, h - wall * 3, 'living-room');
+            addRoomZone(obstacles, houseId, x - frontDirection * w * 0.26, y, w * 0.42, h - wall * 3, 'bedroom');
+            addVerticalInteriorWallSegments(obstacles, dividerX, y, h - wall * 2, wall, [
+                { center: -h * 0.18, size: clamp(h * 0.25, 66, 84) },
+            ], variant, { houseId, doorVariant: variant });
+            addObstacle(obstacles, 'furniture', x + frontDirection * w * 0.23, y + h * 0.22, 30, 58, {
+                collidable: false, variant: 'sofa', role: 'living-room', houseId,
+            });
+            addObstacle(obstacles, 'furniture', x - frontDirection * w * 0.25, y + h * 0.20, 54, 42, {
+                collidable: false, variant: 'bed', role: 'bedroom', houseId,
+            });
         }
-        addObstacle(obstacles, 'furniture', x - w * 0.24, y - h * 0.16, 48, 28, {
-            collidable: false, variant: 'table', houseId,
-        });
-        addObstacle(obstacles, 'furniture', x + w * 0.24, y + h * 0.16, 42, 30, {
-            collidable: false, variant: 'bed', houseId,
-        });
     } else if (large) {
-        const hallW = clamp(w * 0.22, 98, 170);
-        const wingW = (w - hallW - wall * 4) / 2;
-        addRoomZone(obstacles, houseId, x, y, hallW, h - wall * 3.5, 'hallway');
-        addRoomZone(obstacles, houseId, x - hallW / 2 - wingW / 2 - wall, y - h * 0.27, wingW, h * 0.28, 'north-room');
-        addRoomZone(obstacles, houseId, x - hallW / 2 - wingW / 2 - wall, y + h * 0.02, wingW, h * 0.28, 'mid-room');
-        addRoomZone(obstacles, houseId, x - hallW / 2 - wingW / 2 - wall, y + h * 0.31, wingW, h * 0.24, 'south-room');
-        addRoomZone(obstacles, houseId, x + hallW / 2 + wingW / 2 + wall, y - h * 0.27, wingW, h * 0.28, 'north-room');
-        addRoomZone(obstacles, houseId, x + hallW / 2 + wingW / 2 + wall, y + h * 0.02, wingW, h * 0.28, 'mid-room');
-        addRoomZone(obstacles, houseId, x + hallW / 2 + wingW / 2 + wall, y + h * 0.31, wingW, h * 0.24, 'south-room');
-        addVerticalInteriorWallSegments(obstacles, x - hallW / 2, y, h - wall * 4, wall, [
-            { center: -h * 0.27, size: 82 },
-            { center: h * 0.02, size: 82 },
-            { center: h * 0.31, size: 82 },
-        ], variant, { houseId });
-        addVerticalInteriorWallSegments(obstacles, x + hallW / 2, y, h - wall * 4, wall, [
-            { center: -h * 0.27, size: 82 },
-            { center: h * 0.02, size: 82 },
-            { center: h * 0.31, size: 82 },
-        ], variant, { houseId });
-        addHorizontalInteriorWallSegments(obstacles, x - hallW / 2 - wingW / 2 - wall, y - h * 0.125, wingW, wall, [], variant);
-        addHorizontalInteriorWallSegments(obstacles, x - hallW / 2 - wingW / 2 - wall, y + h * 0.175, wingW, wall, [], variant);
-        addHorizontalInteriorWallSegments(obstacles, x + hallW / 2 + wingW / 2 + wall, y - h * 0.125, wingW, wall, [], variant);
-        addHorizontalInteriorWallSegments(obstacles, x + hallW / 2 + wingW / 2 + wall, y + h * 0.175, wingW, wall, [], variant);
+        if (horizontalDoor) {
+            const hallW = clamp(w * 0.22, 98, 170);
+            const wingW = (w - hallW - wall * 4) / 2;
+            addRoomZone(obstacles, houseId, x, y, hallW, h - wall * 3.5, 'hallway');
+            for (const side of [-1, 1]) {
+                const roomX = x + side * (hallW / 2 + wingW / 2 + wall);
+                addRoomZone(obstacles, houseId, roomX, y - h * 0.22, wingW, h * 0.40, side < 0 ? 'bedroom' : 'kitchen');
+                addRoomZone(obstacles, houseId, roomX, y + h * 0.23, wingW, h * 0.40, side < 0 ? 'study' : 'living-room');
+                addVerticalInteriorWallSegments(obstacles, x + side * hallW / 2, y, h - wall * 4, wall, [
+                    { center: -h * 0.22, size: 76 },
+                    { center: h * 0.23, size: 76 },
+                ], variant, { houseId, doorVariant: variant });
+                addHorizontalInteriorWallSegments(obstacles, roomX, y + h * 0.005, wingW, wall, [], variant);
+            }
+        } else {
+            const hallH = clamp(h * 0.22, 98, 170);
+            const wingH = (h - hallH - wall * 4) / 2;
+            addRoomZone(obstacles, houseId, x, y, w - wall * 3.5, hallH, 'hallway');
+            for (const side of [-1, 1]) {
+                const roomY = y + side * (hallH / 2 + wingH / 2 + wall);
+                addRoomZone(obstacles, houseId, x - w * 0.22, roomY, w * 0.40, wingH, side < 0 ? 'bedroom' : 'study');
+                addRoomZone(obstacles, houseId, x + w * 0.23, roomY, w * 0.40, wingH, side < 0 ? 'kitchen' : 'living-room');
+                addHorizontalInteriorWallSegments(obstacles, x, y + side * hallH / 2, w - wall * 4, wall, [
+                    { center: -w * 0.22, size: 76 },
+                    { center: w * 0.23, size: 76 },
+                ], variant, { houseId, doorVariant: variant });
+                addVerticalInteriorWallSegments(obstacles, x + w * 0.005, roomY, wingH, wall, [], variant);
+            }
+        }
         addObstacle(obstacles, 'furniture', x - w * 0.32, y - h * 0.28, 54, 32, { collidable: false, variant: 'table', houseId });
         addObstacle(obstacles, 'furniture', x + w * 0.33, y + h * 0.27, 48, 34, { collidable: false, variant: 'bed', houseId });
-        addObstacle(obstacles, 'furniture', x - w * 0.31, y + h * 0.06, 42, 30, { collidable: false, variant: 'bed', houseId });
         const industrialInterior = ['warehouse', 'metal', 'ironworks'].includes(variant);
         addObstacle(obstacles, 'furniture', x + w * 0.31, y - h * 0.28, 58, 28, {
             collidable: false,
@@ -1026,16 +1041,18 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
             role: industrialInterior ? 'storage' : 'kitchen-counter',
             houseId,
         });
-        addObstacle(obstacles, 'furniture', x + w * 0.30, y + h * 0.02, 48, 28, {
-            collidable: false,
-            variant: industrialInterior ? 'workbench' : 'table',
-            role: industrialInterior ? 'maintenance' : 'side-table',
-            houseId,
+        addObstacle(obstacles, 'furniture', x - w * 0.05, y - h * 0.31, 44, 24, {
+            collidable: false, variant: industrialInterior ? 'locker' : 'cabinet', role: 'hall-storage', houseId,
         });
     } else {
         // Small houses: no rooms, no interior walls — single open space
-        addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, { collidable: false, variant: 'table', houseId });
-        addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, { collidable: false, variant: 'bed', houseId });
+        const industrialInterior = ['warehouse', 'metal', 'ironworks'].includes(variant);
+        addObstacle(obstacles, 'furniture', x - w * 0.27, y - h * 0.18, 42, 24, {
+            collidable: false, variant: industrialInterior ? 'workbench' : 'sofa', houseId,
+        });
+        addObstacle(obstacles, 'furniture', x + w * 0.27, y + h * 0.12, 36, 28, {
+            collidable: false, variant: industrialInterior ? 'locker' : 'bed', houseId,
+        });
     }
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
@@ -1182,10 +1199,10 @@ function addIronworks(obstacles, loot, spawnPoints, x, y) {
     addVerticalWallWithOpening(obstacles, westX, y, h, wall, 'metal', y + 280, 210, ironworksMeta);
     addVerticalWallWithOpening(obstacles, eastX, y, h, wall, 'metal', y, 230, ironworksMeta);
 
-    addDoor(obstacles, houseId, x - 430, northY, 170, wall * 2.25, 'metal', 'north', 'serviceEntrance');
-    addDoor(obstacles, houseId, x + 430, southY, 170, wall * 2.25, 'metal', 'south', 'serviceEntrance');
-    addDoor(obstacles, houseId, westX, y + 280, wall * 2.25, 210, 'metal', 'west', 'loadingEntrance');
-    addDoor(obstacles, houseId, eastX, y, wall * 2.25, 230, 'metal', 'east', 'mainEntrance');
+    addDoor(obstacles, houseId, x - 430, northY, 170, wall * 0.92, 'metal', 'north', 'serviceEntrance');
+    addDoor(obstacles, houseId, x + 430, southY, 170, wall * 0.92, 'metal', 'south', 'serviceEntrance');
+    addDoor(obstacles, houseId, westX, y + 280, wall * 0.92, 210, 'metal', 'west', 'loadingEntrance');
+    addDoor(obstacles, houseId, eastX, y, wall * 0.92, 230, 'metal', 'east', 'mainEntrance');
 
     // Two side loops connect through the central factory floor at three points.
     // Players can rotate around fights instead of being forced through one hall.
@@ -2498,7 +2515,7 @@ function addHospital(obstacles, loot, spawnPoints, x, y) {
     // South wall with entrance gap
     addWall(obstacles, x - 300, y + 400 - 8, 400, 16, 'plaster');
     addWall(obstacles, x + 300, y + 400 - 8, 400, 16, 'plaster');
-    addDoor(obstacles, houseId, x, y + 400 - 8, 200, 32, 'plaster', 'south');
+    addDoor(obstacles, houseId, x, y + 400 - 8, 200, 15, 'plaster', 'south');
     // Side walls
     addWall(obstacles, x - 500 + 8, y, 16, 800, 'plaster');
     addWall(obstacles, x + 500 - 8, y, 16, 800, 'plaster');
@@ -2508,16 +2525,16 @@ function addHospital(obstacles, loot, spawnPoints, x, y) {
         { center: -200, size: 90 },
         { center: 0, size: 90 },
         { center: 200, size: 90 },
-    ], 'plaster');
+    ], 'plaster', { houseId, doorVariant: 'plaster' });
     addVerticalInteriorWallSegments(obstacles, x + 200, y, 800, 16, [
         { center: -200, size: 90 },
         { center: 0, size: 90 },
         { center: 200, size: 90 },
-    ], 'plaster');
+    ], 'plaster', { houseId, doorVariant: 'plaster' });
 
     // Horizontal dividers with gaps
-    addHorizontalInteriorWallSegments(obstacles, x - 350, y, 300, 16, [{ center: 0, size: 80 }], 'plaster');
-    addHorizontalInteriorWallSegments(obstacles, x + 350, y, 300, 16, [{ center: 0, size: 80 }], 'plaster');
+    addHorizontalInteriorWallSegments(obstacles, x - 350, y, 300, 16, [{ center: 0, size: 80 }], 'plaster', { houseId, doorVariant: 'plaster' });
+    addHorizontalInteriorWallSegments(obstacles, x + 350, y, 300, 16, [{ center: 0, size: 80 }], 'plaster', { houseId, doorVariant: 'plaster' });
 
     // Room zones
     addRoomZone(obstacles, houseId, x - 350, y - 200, 300, 400, 'north-room');
@@ -6087,11 +6104,19 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
 
     if (entity.shooting) {
         if (!activeWeaponDef.automatic && !entity.isBot) {
-            // Human semi-auto weapons and melee fire once per distinct press.
-            // A short weapon cooldown still caps very fast clicking, while a
-            // held trigger can never repeat a pistol, shotgun or sniper shot.
-            if (!entity._meleeInputLatched) tryShoot(entity, room, now);
-            entity._meleeInputLatched = true;
+            // Modern clients attach one stable id to each physical press. That
+            // makes duplicate/delayed shooting=true packets harmless instead
+            // of letting one click restart a melee or semi-auto attack.
+            if (Number.isSafeInteger(entity.firePressId)) {
+                if (entity._processedFirePressId !== entity.firePressId) {
+                    tryShoot(entity, room, now);
+                    entity._processedFirePressId = entity.firePressId;
+                }
+            } else {
+                // Compatibility for older clients and direct engine tests.
+                if (!entity._meleeInputLatched) tryShoot(entity, room, now);
+                entity._meleeInputLatched = true;
+            }
         } else {
             tryShoot(entity, room, now);
             entity._meleeInputLatched = false;

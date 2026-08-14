@@ -8842,6 +8842,7 @@ io.on('connection', (socket) => {
             aimAngle,
             aimDistance,
             shooting,
+            firePressId,
             reload,
             useMedkit,
             pickupWeapon,
@@ -8876,6 +8877,10 @@ io.on('connection', (socket) => {
         }
 
         player.shooting = shooting === true;
+        const parsedFirePressId = Number(firePressId);
+        if (Number.isSafeInteger(parsedFirePressId) && parsedFirePressId >= 0) {
+            player.firePressId = parsedFirePressId;
+        }
         if (useMedkit === true) player.useMedkit = true;
         if (pickupWeapon === true) player.pickupWeaponPending = true;
         const requestedDoorId = safeId(toggleDoorId);

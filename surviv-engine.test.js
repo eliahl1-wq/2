@@ -1989,6 +1989,41 @@ test('one held human melee press produces only one attack', () => {
     assert.equal(room.obstacles[0].hp, 64, 'a new press should trigger the next punch');
 });
 
+test('duplicate packets with the same fire press id cannot create a second melee attack', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'packet-target', kind: 'bush', x: 48, y: 0, w: 30, h: 30,
+        collidable: true, destructible: true, hp: 100, maxHp: 100,
+    }];
+    const player = createSurvivPlayer('packet-player', 'packet-mongo', 'Packet Boxer', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.firePressId = 7;
+    player.shooting = true;
+    room.players.push(player);
+
+    const now = Date.now() + 600000;
+    processSurvivRoom(room, silentIo, now);
+    assert.equal(room.obstacles[0].hp, 82);
+
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, now + 1);
+    player.shooting = true;
+    player.weapon.lastShotAt = 0;
+    processSurvivRoom(room, silentIo, now + 1000);
+    assert.equal(room.obstacles[0].hp, 82, 'a delayed duplicate id must be ignored');
+
+    player.firePressId = 8;
+    player.weapon.lastShotAt = 0;
+    processSurvivRoom(room, silentIo, now + 1001);
+    assert.equal(room.obstacles[0].hp, 64, 'a genuinely new press id must attack once');
+});
+
 test('bullets damage and eventually destroy durable Surviv obstacles', () => {
     const room = makeRoom();
     room.loot = [];
