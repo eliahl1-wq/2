@@ -3058,22 +3058,27 @@ function addBridge(obstacles, x, y, width, length, rotation = 0) {
         collidable: false,
         variant: 'bridge',
         rotation,
+        role: 'roadBridge',
     });
-    // Railings
+    // Collision rails use the exact same transform as the deck. The client
+    // draws them as part of the bridge sprite, so they stay visually welded to
+    // the bridge while remaining server-authoritative barriers.
     const cos = Math.cos(rotation);
     const sin = Math.sin(rotation);
     const railOffset = width / 2 - 8;
     addObstacle(obstacles, 'wall', x - sin * railOffset, y + cos * railOffset, length, 12, {
-        collidable: false,
+        collidable: true,
+        destructible: false,
         rotation,
-        variant: 'stone',
+        variant: 'bridgeRail',
         hue: 210,
         role: 'bridgeRail',
     });
     addObstacle(obstacles, 'wall', x + sin * railOffset, y - cos * railOffset, length, 12, {
-        collidable: false,
+        collidable: true,
+        destructible: false,
         rotation,
-        variant: 'stone',
+        variant: 'bridgeRail',
         hue: 210,
         role: 'bridgeRail',
     });
@@ -3096,7 +3101,8 @@ function addBridgesAlongRiver(obstacles, riverData, roadPositions) {
                 x: rp.x,
                 y: crossingY,
                 distance: Math.abs(crossingY - rp.y),
-                angle: Math.atan2(b.y - a.y, dx),
+                riverWidth: (riverData.widths?.[i] ?? riverData.width) * (1 - t)
+                    + (riverData.widths?.[i + 1] ?? riverData.width) * t,
             };
             if (!crossing || candidate.distance < crossing.distance) crossing = candidate;
         }
@@ -3105,9 +3111,9 @@ function addBridgesAlongRiver(obstacles, riverData, roadPositions) {
                 obstacles,
                 crossing.x,
                 crossing.y,
-                140,
-                riverData.width + 130,
-                crossing.angle + Math.PI / 2,
+                (rp.width || 120) + 20,
+                crossing.riverWidth + 150,
+                rp.rotation ?? Math.PI / 2,
             );
         }
     }
@@ -3656,8 +3662,8 @@ export function generateSurvivMap(worldHalf) {
 
     // Bridges placed exactly where the two N-S highways cross the river (around y ≈ -1500)
     addBridgesAlongRiver(obstacles, riverEW, [
-        { x: -2500, y: -1500 },
-        { x: 2500, y: -1500 }
+        { x: -2500, y: -1500, width: roadW, rotation: Math.PI / 2 },
+        { x: 2500, y: -1500, width: roadW, rotation: Math.PI / 2 },
     ]);
     addRiverbankDetails(obstacles, riverEW);
     addPondDetails(obstacles);
@@ -4314,11 +4320,25 @@ function obstacleCellKey(cx, cy) {
     return cx + ':' + cy;
 }
 
+function getObstacleAabbHalfExtents(obstacle) {
+    const halfW = Math.abs(Number(obstacle.w) || 0) / 2;
+    const halfH = Math.abs(Number(obstacle.h) || 0) / 2;
+    const rotation = Number(obstacle.rotation) || 0;
+    if (Math.abs(rotation) < 1e-9) return { halfW, halfH };
+    const cos = Math.abs(Math.cos(rotation));
+    const sin = Math.abs(Math.sin(rotation));
+    return {
+        halfW: cos * halfW + sin * halfH,
+        halfH: sin * halfW + cos * halfH,
+    };
+}
+
 function insertObstacleInGrid(grid, obstacle) {
-    const minX = Math.floor((obstacle.x - obstacle.w / 2) / SURVIV_OBSTACLE_CELL);
-    const maxX = Math.floor((obstacle.x + obstacle.w / 2) / SURVIV_OBSTACLE_CELL);
-    const minY = Math.floor((obstacle.y - obstacle.h / 2) / SURVIV_OBSTACLE_CELL);
-    const maxY = Math.floor((obstacle.y + obstacle.h / 2) / SURVIV_OBSTACLE_CELL);
+    const { halfW, halfH } = getObstacleAabbHalfExtents(obstacle);
+    const minX = Math.floor((obstacle.x - halfW) / SURVIV_OBSTACLE_CELL);
+    const maxX = Math.floor((obstacle.x + halfW) / SURVIV_OBSTACLE_CELL);
+    const minY = Math.floor((obstacle.y - halfH) / SURVIV_OBSTACLE_CELL);
+    const maxY = Math.floor((obstacle.y + halfH) / SURVIV_OBSTACLE_CELL);
     for (let cx = minX; cx <= maxX; cx++) {
         for (let cy = minY; cy <= maxY; cy++) {
             const key = obstacleCellKey(cx, cy);
@@ -4374,8 +4394,9 @@ function queryObstacles(room, x, y, range, collidableOnly = false) {
             for (const o of bucket) {
                 if (seen.has(o.id)) continue;
                 seen.add(o.id);
-                if (Math.abs(o.x - x) <= range + o.w / 2
-                    && Math.abs(o.y - y) <= range + o.h / 2) {
+                const { halfW, halfH } = getObstacleAabbHalfExtents(o);
+                if (Math.abs(o.x - x) <= range + halfW
+                    && Math.abs(o.y - y) <= range + halfH) {
                     out.push(o);
                 }
             }

@@ -932,6 +932,12 @@ test('river spline metadata survives generation and bridges hit both highways ex
     const map = generateSurvivMap(SURVIV.worldHalf);
     const riverPath = map.obstacles.find(obstacle => obstacle.kind === 'river_path');
     const bridges = map.obstacles.filter(obstacle => obstacle.kind === 'bridge');
+    const bridgeRails = map.obstacles.filter(obstacle => obstacle.role === 'bridgeRail');
+    const verticalHighways = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'networkRoad'
+        && obstacle.h > obstacle.w
+    ));
 
     assert.ok(riverPath);
     assert.equal(riverPath.points.length, 21);
@@ -941,6 +947,45 @@ test('river spline metadata survives generation and bridges hit both highways ex
     assert.ok(riverPath.points.every(point => pointInRect(point.x, point.y, riverPath)));
     assert.equal(bridges.length, 2);
     assert.deepEqual(bridges.map(bridge => Math.round(bridge.x)).sort((a, b) => a - b), [-2500, 2500]);
+    assert.ok(bridges.every(bridge => Math.abs(bridge.rotation - Math.PI / 2) < 1e-9));
+    assert.ok(bridges.every(bridge => bridge.h === 140 && bridge.w > riverPath.width));
+    assert.ok(bridges.every(bridge => verticalHighways.some(road => (
+        Math.abs(road.x - bridge.x) < 1
+        && pointInRect(bridge.x, bridge.y, road, 2)
+    ))), 'each bridge should share the exact axis of its highway');
+
+    assert.equal(bridgeRails.length, 4);
+    assert.ok(bridgeRails.every(rail => rail.collidable === true));
+    assert.ok(bridgeRails.every(rail => rail.destructible !== true));
+    assert.ok(bridgeRails.every(rail => rail.variant === 'bridgeRail'));
+    for (const bridge of bridges) {
+        const rails = bridgeRails.filter(rail => Math.hypot(rail.x - bridge.x, rail.y - bridge.y) < bridge.h);
+        assert.equal(rails.length, 2);
+        assert.ok(rails.every(rail => Math.abs(rail.rotation - bridge.rotation) < 1e-9));
+        assert.ok(rails.every(rail => Math.abs(rail.w - bridge.w) < 1e-9));
+    }
+});
+
+test('bridge rails block movement along their full rotated length', () => {
+    const room = makeRoom();
+    const bridge = room.obstacles.find(obstacle => obstacle.kind === 'bridge');
+    const leftRail = room.obstacles
+        .filter(obstacle => obstacle.role === 'bridgeRail' && obstacle.x < bridge.x)
+        .sort((a, b) => Math.abs(a.y - bridge.y) - Math.abs(b.y - bridge.y))[0];
+    const player = createSurvivPlayer('bridge-collision', 'mongo-bridge', 'Bridge Tester', '#fff', room);
+    const radius = SURVIV.playerRadius;
+
+    room.players = [player];
+    room.bots = [];
+    player.x = leftRail.x + leftRail.h / 2 + radius + 3;
+    player.y = bridge.y + bridge.w * 0.35;
+    player.inputDx = -1;
+    player.inputDy = 0;
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.ok(player.x >= leftRail.x + leftRail.h / 2 + radius - 0.01, (
+        'the player should be resolved against the bridge rail instead of crossing it'
+    ));
 });
 
 test('ground weapons require F and replace the held slot', () => {
