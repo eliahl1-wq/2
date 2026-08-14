@@ -1503,7 +1503,11 @@ test('firearms retain enough range to damage destructible trees', () => {
     assert.ok(SURVIV.bulletLifetimeMs >= 1600, 'ordinary bullets should have a practical combat range');
     processSurvivRoom(room, silentIo, Date.now() + 600000);
 
-    assert.equal(room.obstacles[0].hp, 73, 'a pistol round should damage a destructible tree');
+    assert.equal(
+        room.obstacles[0].hp,
+        84 - WEAPONS.pistol.damage,
+        'a pistol round should damage a destructible tree',
+    );
 });
 test('bullets break loot crates and release their contents', () => {
     const room = makeRoom();
@@ -1581,13 +1585,13 @@ test('hit and damage feedback is private, accurate, and emitted once', () => {
     const shooterTick = ticksBySocket.get(shooter.id)[0];
     const targetTick = ticksBySocket.get(target.id)[0];
     assert.equal(shooterTick.hitConfirm.targetId, target.id);
-    assert.equal(shooterTick.hitConfirm.damage, 11);
+    assert.equal(shooterTick.hitConfirm.damage, WEAPONS.pistol.damage);
     assert.equal(shooterTick.hitConfirm.kill, false);
     assert.equal(Object.hasOwn(shooterTick, 'damageTaken'), false);
     assert.equal(targetTick.damageTaken.sourceId, shooter.id);
     assert.equal(targetTick.damageTaken.kind, 'player');
     assert.equal(targetTick.damageTaken.sourceX, shooter.x);
-    assert.equal(targetTick.damageTaken.damage, 11);
+    assert.equal(targetTick.damageTaken.damage, WEAPONS.pistol.damage);
     assert.equal(Object.hasOwn(targetTick, 'hitConfirm'), false);
 
     broadcastSurvivState(room, io, lbData, {});
@@ -1698,6 +1702,68 @@ test('analog movement strength matches mobile client prediction', () => {
     player.inputDx = 1;
     processSurvivRoom(room, silentIo, Date.now() + 600001);
     assert.ok(Math.abs((player.x - halfSpeedX) - SURVIV.playerSpeed) < 0.001);
+});
+
+test('full-auto fire slows movement while semi-auto fire does not', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('firing-movement', 'firing-movement-mongo', 'Gunner', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 1;
+    player.inputDy = 0;
+    player.shooting = true;
+    player.weapon = { type: 'smg', ammo: 30, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.ok(Math.abs(player.x - SURVIV.playerSpeed * WEAPONS.smg.firingMoveMultiplier) < 0.001);
+
+    const autoX = player.x;
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, Date.now() + 600001);
+    assert.ok(Math.abs((player.x - autoX) - SURVIV.playerSpeed) < 0.001);
+
+    const normalX = player.x;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.shooting = true;
+    processSurvivRoom(room, silentIo, Date.now() + 600200);
+    assert.ok(Math.abs((player.x - normalX) - SURVIV.playerSpeed) < 0.001);
+});
+
+test('human semi-auto guns fire once per click but accept rapid new clicks', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('semi-auto-player', 'semi-auto-mongo', 'Clicker', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.shooting = true;
+    room.players.push(player);
+    const now = Date.now() + 600000;
+
+    processSurvivRoom(room, silentIo, now);
+    assert.equal(player.weapon.ammo, 14);
+
+    processSurvivRoom(room, silentIo, now + WEAPONS.pistol.fireRateMs + 20);
+    assert.equal(player.weapon.ammo, 14, 'holding the trigger must not repeat a semi-auto shot');
+
+    // processSurvivRoom intentionally uses the live server clock. Advance the
+    // weapon cooldown explicitly so this synchronous test can model the next
+    // valid rapid click without sleeping.
+    player.weapon.lastShotAt -= WEAPONS.pistol.fireRateMs + 1;
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, now + WEAPONS.pistol.fireRateMs + 21);
+    player.shooting = true;
+    processSurvivRoom(room, silentIo, now + WEAPONS.pistol.fireRateMs + 22);
+    assert.equal(player.weapon.ammo, 13, 'a released and pressed trigger should fire again quickly');
 });
 
 test('loot crates block movement until they are destroyed', () => {
@@ -1816,6 +1882,9 @@ test('bullets damage and eventually destroy durable Surviv obstacles', () => {
     processSurvivRoom(room, silentIo, Date.now() + 600000);
     assert.equal(room.obstacles[0].hp, 12, 'the first shot should chip the rock');
 
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    player.shooting = true;
     player.weapon.lastShotAt = 0;
     processSurvivRoom(room, silentIo, Date.now() + 600000);
     assert.equal(room.obstacles.some(obstacle => obstacle.id === 'breakable-rock'), false);

@@ -62,6 +62,7 @@ export const WEAPONS = {
         spread: 0,
         bulletSpeed: 0,
         pellets: 0,
+        automatic: false,
     },
     knife: {
         id: 'knife',
@@ -77,13 +78,14 @@ export const WEAPONS = {
         spread: 0,
         bulletSpeed: 0,
         pellets: 0,
+        automatic: false,
     },
     pistol: {
         id: 'pistol',
-        label: 'Pistol',
+        label: 'M9',
         rarity: 'common',
-        damage: 11,
-        fireRateMs: 380,
+        damage: 12,
+        fireRateMs: 120,
         clipSize: 15,
         reloadMs: 1400,
         spread: 0.06,
@@ -91,10 +93,11 @@ export const WEAPONS = {
         range: 2500,
         pellets: 1,
         ammoType: '9mm',
+        automatic: false,
     },
     smg: {
         id: 'smg',
-        label: 'SMG',
+        label: 'MP5',
         rarity: 'common',
         damage: 7,
         fireRateMs: 90,
@@ -105,10 +108,12 @@ export const WEAPONS = {
         range: 2800,
         pellets: 1,
         ammoType: '9mm',
+        automatic: true,
+        firingMoveMultiplier: 0.78,
     },
     shotgun: {
         id: 'shotgun',
-        label: 'Shotgun',
+        label: 'M870',
         rarity: 'rare',
         damage: 5,
         fireRateMs: 750,
@@ -119,24 +124,27 @@ export const WEAPONS = {
         range: 2200,
         pellets: 5,
         ammoType: '12g',
+        automatic: false,
     },
     assault: {
         id: 'assault',
-        label: 'Assault',
+        label: 'M416',
         rarity: 'rare',
-        damage: 14,
-        fireRateMs: 160,
-        clipSize: 22,
+        damage: 11,
+        fireRateMs: 75,
+        clipSize: 30,
         reloadMs: 2000,
         spread: 0.09,
         bulletSpeed: 42,
         range: 3100,
         pellets: 1,
         ammoType: '556',
+        automatic: true,
+        firingMoveMultiplier: 0.74,
     },
     revolver: {
         id: 'revolver',
-        label: 'Revolver',
+        label: 'OT-38',
         rarity: 'common',
         damage: 18,
         fireRateMs: 520,
@@ -147,10 +155,11 @@ export const WEAPONS = {
         range: 3200,
         pellets: 1,
         ammoType: '762',
+        automatic: false,
     },
     dmr: {
         id: 'dmr',
-        label: 'DMR',
+        label: 'M39 EMR',
         rarity: 'rare',
         damage: 24,
         fireRateMs: 360,
@@ -161,10 +170,11 @@ export const WEAPONS = {
         range: 3500,
         pellets: 1,
         ammoType: '762',
+        automatic: false,
     },
     sniper: {
         id: 'sniper',
-        label: 'Sniper',
+        label: 'Mosin-Nagant',
         rarity: 'military',
         damage: 48,
         fireRateMs: 950,
@@ -175,20 +185,23 @@ export const WEAPONS = {
         range: 4200,
         pellets: 1,
         ammoType: '762',
+        automatic: false,
     },
     lmg: {
         id: 'lmg',
-        label: 'LMG',
+        label: 'M249',
         rarity: 'military',
         damage: 10,
         fireRateMs: 105,
-        clipSize: 45,
+        clipSize: 100,
         reloadMs: 2600,
         spread: 0.13,
         bulletSpeed: 40,
         range: 3200,
         pellets: 1,
         ammoType: '556',
+        automatic: true,
+        firingMoveMultiplier: 0.66,
     },
 };
 
@@ -5908,16 +5921,24 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         updateBotAI(entity, room, now, effectiveRadius);
     }
 
-    moveEntity(entity, room, entity.inputDx, entity.inputDy, SURVIV.playerSpeed);
+    const activeWeaponDef = WEAPONS[entity.weapon?.type] || WEAPONS.fists;
+    const firingAutomaticWeapon = !!(
+        entity.shooting
+        && activeWeaponDef.automatic
+        && Number(entity.weapon?.ammo) > 0
+        && !entity.weapon?.reloading
+    );
+    const movementSpeed = SURVIV.playerSpeed * (
+        firingAutomaticWeapon ? activeWeaponDef.firingMoveMultiplier || 0.75 : 1
+    );
+    moveEntity(entity, room, entity.inputDx, entity.inputDy, movementSpeed);
     entity.angle = entity.aimAngle ?? entity.angle;
 
-    const activeWeaponDef = WEAPONS[entity.weapon?.type] || WEAPONS.fists;
     if (entity.shooting) {
-        if (activeWeaponDef.melee && !entity.isBot) {
-            // Human melee is semi-automatic: one press produces exactly one
-            // attack. Pointer packets can remain true for several simulation
-            // ticks, which previously caused an unintended second punch as
-            // soon as the melee cooldown elapsed.
+        if (!activeWeaponDef.automatic && !entity.isBot) {
+            // Human semi-auto weapons and melee fire once per distinct press.
+            // A short weapon cooldown still caps very fast clicking, while a
+            // held trigger can never repeat a pistol, shotgun or sniper shot.
             if (!entity._meleeInputLatched) tryShoot(entity, room, now);
             entity._meleeInputLatched = true;
         } else {
