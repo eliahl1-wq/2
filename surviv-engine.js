@@ -804,7 +804,13 @@ function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
 }
 
 function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south', entranceRole = 'mainEntrance') {
-    return addObstacle(obstacles, 'door', x, y, w, h, {
+    const exterior = entranceRole !== 'interiorDoor';
+    // Keep an exterior slab slightly proud of the wall. This leaves a readable
+    // white lip beyond the roof overhang without detaching it from the opening.
+    const outwardOffset = exterior ? Math.max(6, Math.min(12, Math.min(w, h) * 0.65)) : 0;
+    const doorX = x + (side === 'west' ? -outwardOffset : side === 'east' ? outwardOffset : 0);
+    const doorY = y + (side === 'north' ? -outwardOffset : side === 'south' ? outwardOffset : 0);
+    return addObstacle(obstacles, 'door', doorX, doorY, w, h, {
         collidable: true,
         destructible: false,
         isOpen: false,
@@ -4594,6 +4600,15 @@ function obstacleCellKey(cx, cy) {
 function getObstacleAabbHalfExtents(obstacle) {
     const halfW = Math.abs(Number(obstacle.w) || 0) / 2;
     const halfH = Math.abs(Number(obstacle.h) || 0) / 2;
+    if (obstacle.kind === 'door') {
+        // The spatial index is static between map revisions, while a door can
+        // swing to either side of either hinge. Index its complete swing
+        // envelope so bullets and players can still find the moved leaf.
+        const length = Math.max(halfW * 2, halfH * 2);
+        const thickness = Math.min(halfW * 2, halfH * 2);
+        const swingExtent = length + thickness / 2;
+        return { halfW: swingExtent, halfH: swingExtent };
+    }
     const rotation = Number(obstacle.rotation) || 0;
     if (Math.abs(rotation) < 1e-9) return { halfW, halfH };
     const cos = Math.abs(Math.cos(rotation));
@@ -4895,18 +4910,18 @@ function moveEntity(entity, room, dx, dy, speed) {
     newY = clamp(newY, -wh, wh);
 
     for (const o of getNearbyObstacles(room, newX, newY, 220)) {
-        if (o.kind === 'door' && o.isOpen) continue;
-        if (circleRectCollision(newX, newY, r, o)) {
+        const collisionShape = o.kind === 'door' ? getSurvivDoorCollisionRect(o) : o;
+        if (circleRectCollision(newX, newY, r, collisionShape)) {
             // Bots should understand doorways instead of getting pinned against
             // a closed door forever. Human players deliberately use F.
-            if (o.kind === 'door' && entity.isBot) {
+            if (o.kind === 'door' && entity.isBot && !o.isOpen) {
                 o.openDirection = getDoorOpenDirection(entity, o);
                 o.isOpen = true;
                 o.doorChangedAt = Date.now();
                 markSurvivObstaclesChanged(room);
                 continue;
             }
-            const resolved = resolveCircleRect(newX, newY, r, o);
+            const resolved = resolveCircleRect(newX, newY, r, collisionShape);
             newX = resolved.x;
             newY = resolved.y;
         }
@@ -5808,8 +5823,8 @@ function updateBullets(room, now, effectiveRadius) {
         let nearestObstacle = null;
         let obstacleHitT = Infinity;
         for (const obstacle of getNearbyObstacles(room, midX, midY, queryRange)) {
-            if (obstacle.kind === 'door' && obstacle.isOpen) continue;
-            const hitT = segmentRectHitT(previousX, previousY, bullet.x, bullet.y, obstacle);
+            const collisionShape = obstacle.kind === 'door' ? getSurvivDoorCollisionRect(obstacle) : obstacle;
+            const hitT = segmentRectHitT(previousX, previousY, bullet.x, bullet.y, collisionShape);
             if (hitT != null && hitT < obstacleHitT) {
                 nearestObstacle = obstacle;
                 obstacleHitT = hitT;
@@ -5884,6 +5899,28 @@ function distanceToObstacleRect(entity, obstacle) {
     const dx = Math.max(0, Math.abs(local.x) - obstacle.w / 2);
     const dy = Math.max(0, Math.abs(local.y) - obstacle.h / 2);
     return Math.hypot(dx, dy);
+}
+
+export function getSurvivDoorCollisionRect(door) {
+    if (!door?.isOpen) return door;
+    const horizontal = door.w >= door.h;
+    const length = horizontal ? door.w : door.h;
+    const thickness = horizontal ? door.h : door.w;
+    const baseRotation = (Number(door.rotation) || 0) + (horizontal ? 0 : Math.PI / 2);
+    const swing = (Number(door.openDirection) === -1 ? -1 : 1) * Math.PI / 2;
+    const baseCos = Math.cos(baseRotation);
+    const baseSin = Math.sin(baseRotation);
+    const hingeX = door.x - baseCos * length / 2;
+    const hingeY = door.y - baseSin * length / 2;
+    const openRotation = baseRotation + swing;
+    return {
+        ...door,
+        x: hingeX + Math.cos(openRotation) * length / 2,
+        y: hingeY + Math.sin(openRotation) * length / 2,
+        w: length,
+        h: thickness,
+        rotation: openRotation,
+    };
 }
 
 function getDoorOpenDirection(entity, door) {

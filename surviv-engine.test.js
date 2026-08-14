@@ -11,6 +11,7 @@ import {
     eliminateSurvivPlayer,
     equipSurvivWeaponSlot,
     generateSurvivMap,
+    getSurvivDoorCollisionRect,
     getSurvivZone,
     processSurvivRoom,
     resetSurvivRoomRuntime,
@@ -1037,6 +1038,11 @@ test('surviv doors open with interaction and cannot close through a player', () 
     assert.equal(toggleSurvivDoor(player, room, 1000), true);
     assert.equal(door.isOpen, true);
     assert.equal(door.openDirection, horizontal ? -1 : 1, 'the door should swing away from the interacting player');
+    const openDoorShape = getSurvivDoorCollisionRect(door);
+    assert.ok(Math.hypot(openDoorShape.x - door.x, openDoorShape.y - door.y) > 20,
+        'the open door must keep a moved physical collision shape');
+    assert.ok(Math.abs(Math.sin(openDoorShape.rotation - (door.rotation || 0))) > 0.99,
+        'the physical door leaf must rotate a quarter turn when opened');
 
     player.x = door.x;
     player.y = door.y;
