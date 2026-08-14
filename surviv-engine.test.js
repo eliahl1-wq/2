@@ -90,6 +90,44 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     assert.ok(maxExtent <= SURVIV.worldHalf);
 });
 
+test('every Surviv house has themed furniture outside every complete door swing', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const furniture = map.obstacles.filter(obstacle => obstacle.kind === 'furniture');
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door');
+    const furnishedHouseIds = new Set(furniture.map(obstacle => obstacle.houseId));
+    const variants = new Set(furniture.map(obstacle => obstacle.variant));
+
+    assert.ok(houses.every(house => furnishedHouseIds.has(house.id)));
+    assert.ok(furniture.every(obstacle => obstacle.houseId && obstacle.roomId));
+    assert.ok(furniture.every(obstacle => !['table', 'cabinet', 'machine'].includes(obstacle.variant)));
+    for (const expected of [
+        'sofa', 'bed', 'kitchenCounter', 'diningTable', 'desk', 'salesCounter',
+        'workbench', 'controlConsole', 'hospitalBed', 'storageShelf',
+    ]) {
+        assert.ok(variants.has(expected), `missing redesigned furniture type ${expected}`);
+    }
+
+    for (const prop of furniture) {
+        const house = houses.find(candidate => candidate.id === prop.houseId);
+        assert.ok(house && pointInRect(prop.x, prop.y, house, -12));
+        for (const door of doors.filter(candidate => candidate.houseId === prop.houseId)) {
+            const horizontal = door.w >= door.h;
+            const panelLength = Math.max(door.w, door.h) + 8;
+            const clearance = {
+                x: door.x,
+                y: door.y,
+                w: horizontal ? panelLength + 12 : panelLength * 2 + 12,
+                h: horizontal ? panelLength * 2 + 12 : panelLength + 12,
+            };
+            assert.equal(rectsOverlap(
+                prop.x, prop.y, prop.w + 8, prop.h + 8,
+                clearance.x, clearance.y, clearance.w, clearance.h,
+            ), false, `${prop.variant} must stay outside the complete ${door.role} door swing`);
+        }
+    }
+});
+
 test('surviv open areas keep scattered cover and small houses', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const coverKinds = new Set(['tree', 'bush', 'rock']);
@@ -783,13 +821,16 @@ test('Ironworks is a multi-entry indoor combat landmark with loop routes', () =>
     assert.ok(metalWalls.length >= 12);
     assert.ok(metalWalls.every(wall => wall.landmarkType === 'ironworks'));
 
-    const solidMachines = map.obstacles.filter(obstacle => (
+    const ironworksFurniture = map.obstacles.filter(obstacle => (
         obstacle.kind === 'furniture'
         && obstacle.houseId === floor.id
-        && obstacle.variant === 'machine'
-        && obstacle.collidable
     ));
-    assert.equal(solidMachines.length, 2);
+    assert.ok(ironworksFurniture.length >= 6);
+    assert.ok(ironworksFurniture.every(obstacle => !obstacle.collidable && obstacle.roomId));
+    assert.deepEqual(
+        new Set(ironworksFurniture.map(obstacle => obstacle.variant)),
+        new Set(['workbench', 'controlConsole', 'locker', 'palletStack']),
+    );
 
     const chests = map.loot.filter(item => item.houseId === floor.id && item.type === 'chest');
     assert.equal(chests.length, 5);
