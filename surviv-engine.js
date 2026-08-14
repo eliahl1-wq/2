@@ -4710,7 +4710,9 @@ function tryShoot(entity, room, now) {
         w.lastShotAt = now;
         entity.meleeStartedAt = now;
         entity.meleeUntil = now + MELEE_ANIMATION_MS;
-        entity.meleeHand = entity.meleeHand === 'top' ? 'bottom' : 'top';
+        // One consistent striking hand prevents unarmed attacks from reading
+        // as an alternating two-hit combo. Damage is still applied exactly once.
+        entity.meleeHand = 'bottom';
 
         const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
         const targets = [
