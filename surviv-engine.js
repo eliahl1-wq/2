@@ -5936,9 +5936,14 @@ export function toggleSurvivDoor(entity, room, now) {
     entity.toggleDoorId = null;
     if (!requestedId || now - (entity._lastDoorToggleAt || 0) < 220) return false;
 
-    const door = queryObstacles(room, entity.x, entity.y, 150, false)
+    const door = queryObstacles(room, entity.x, entity.y, 280, false)
         .find(obstacle => obstacle.id === requestedId && obstacle.kind === 'door');
-    if (!door || distanceToObstacleRect(entity, door) > 58) return false;
+    if (!door) return false;
+    const interactionShape = door.isOpen ? getSurvivDoorCollisionRect(door) : door;
+    const interactionDistance = door.isOpen
+        ? Math.min(distanceToObstacleRect(entity, door), distanceToObstacleRect(entity, interactionShape))
+        : distanceToObstacleRect(entity, door);
+    if (interactionDistance > 58) return false;
 
     if (door.isOpen) {
         const occupants = [
