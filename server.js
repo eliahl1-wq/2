@@ -13,6 +13,7 @@ import passport from 'passport';
 import { randomBytes } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { PUBLIC_FREE_PLAY_ROOM_OWNER, getPublicFreePlayEntryFee } from './public-free-mode.js';
 import {
     SLITHER,
     COMPETITIVE_SLITHER,
@@ -782,6 +783,14 @@ function getPersonalFreePlayRoom(userId, mode, entryFeeUsd) {
         rooms.push(room);
     }
     return room;
+}
+
+function getPublicFreePlayRoom(mode) {
+    return getPersonalFreePlayRoom(
+        PUBLIC_FREE_PLAY_ROOM_OWNER,
+        mode,
+        getPublicFreePlayEntryFee(mode),
+    );
 }
 
 function getSurvivRoom(entryFeeUsd) {
@@ -2969,6 +2978,7 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
                     disconnected: player.disconnected ?? false,
                     isResetting: arenaResetting,
                     battleRoyale: !!player.isBattleRoyale,
+                    freeMode: !!player.personalFreePlay,
                 });
             }
         }
@@ -2986,6 +2996,7 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
                     isResetting: arenaResetting,
                     battleRoyale: false,
                     competitiveSlither: true,
+                    freeMode: !!player.personalFreePlay,
                 });
             }
         }
@@ -3003,6 +3014,7 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
                     isResetting: arenaResetting,
                     battleRoyale: false,
                     surviv: true,
+                    freeMode: !!player.personalFreePlay,
                 });
             }
         }
@@ -7282,7 +7294,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket, adminFreeSurvivEntry }) => {
+    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket, adminFreeSurvivEntry, publicFreeMode }) => {
         if (rewardPoolAdminResetting) {
             socket.emit('error', 'Reward pool maintenance is in progress. Try again shortly.');
             return;
@@ -7342,12 +7354,14 @@ io.on('connection', (socket) => {
             user = await ensureUserDepositWallet(user);
             const personalFreePlayContext = await getPersonalFreePlayContext(user);
             const personalFreePlay = personalFreePlayContext.enabled;
-            const personalFreePlayOwnerId = personalFreePlayContext.ownerId;
-            const freePlay = DEV_FREE_PLAY || personalFreePlay;
+            const publicFreePlay = publicFreeMode === true;
+            const sessionFreePlay = personalFreePlay || publicFreePlay;
+            const freePlay = DEV_FREE_PLAY || sessionFreePlay;
             const isAdminAccount = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
             const useAdminFreeSurvivEntry = mode === 'surviv'
                 && adminFreeSurvivEntry === true
-                && isAdminAccount;
+                && isAdminAccount
+                && !sessionFreePlay;
 
 
             if (getBRMatchForMongo(user._id.toString())) {
@@ -7366,9 +7380,11 @@ io.on('connection', (socket) => {
 
             // ── Competitive Slither ($1 / $2 / $5 separate pools) ──
             if (mode === 'competitive-slither') {
-                const entryFeeUsd = normalizeCompetitiveEntryFee(rawEntryFee);
-                const room = personalFreePlay
-                    ? getPersonalFreePlayRoom(personalFreePlayOwnerId, 'competitive-slither', entryFeeUsd)
+                const entryFeeUsd = sessionFreePlay
+                    ? getPublicFreePlayEntryFee('competitive-slither')
+                    : normalizeCompetitiveEntryFee(rawEntryFee);
+                const room = sessionFreePlay
+                    ? getPublicFreePlayRoom('competitive-slither')
                     : getCompetitiveSlitherRoom(entryFeeUsd);
                 removeCompetitiveSpectatorsForUser(room, userKey);
                 const existing = findPlayerInArena(userKey);
@@ -7475,7 +7491,7 @@ io.on('connection', (socket) => {
                         mode: 'competitive-slither',
                         ...(freePlay ? { simulated: true } : {}),
                     },
-                    excludedFromReports: personalFreePlay,
+                    excludedFromReports: sessionFreePlay,
                     status: 'confirmed',
                 });
 
@@ -7510,7 +7526,7 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                newPlayer.personalFreePlay = personalFreePlay;
+                newPlayer.personalFreePlay = sessionFreePlay;
 
                 room.players.push(newPlayer);
                 pendingPaidJoin = null;
@@ -7532,11 +7548,13 @@ io.on('connection', (socket) => {
 
             // ── Surviv ($5 pool) ──
             if (mode === 'surviv') {
-                const entryFeeUsd = normalizeSurvivEntryFee(rawEntryFee);
+                const entryFeeUsd = sessionFreePlay
+                    ? getPublicFreePlayEntryFee('surviv')
+                    : normalizeSurvivEntryFee(rawEntryFee);
                 const room = useAdminFreeSurvivEntry
                     ? getSurvivRoom(entryFeeUsd)
-                    : personalFreePlay
-                    ? getPersonalFreePlayRoom(personalFreePlayOwnerId, 'surviv', entryFeeUsd)
+                    : sessionFreePlay
+                    ? getPublicFreePlayRoom('surviv')
                     : getSurvivRoom(entryFeeUsd);
                 removeSurvivSpectator(room, socket.id);
                 const existing = findPlayerInArena(userKey);
@@ -7646,7 +7664,7 @@ io.on('connection', (socket) => {
                         ...(useAdminFreeSurvivEntry ? { adminFreeEntry: true, fundedEntryUsd: 0, simulated: true } : {}),
                         ...(freePlay ? { simulated: true } : {}),
                     },
-                    excludedFromReports: personalFreePlay || useAdminFreeSurvivEntry,
+                    excludedFromReports: sessionFreePlay || useAdminFreeSurvivEntry,
                     status: 'confirmed',
                 });
 
@@ -7690,7 +7708,7 @@ io.on('connection', (socket) => {
                     adminFreeEntry: useAdminFreeSurvivEntry,
                 });
                 spawnLootFromPool(room, joinLootFunding);
-                newPlayer.personalFreePlay = personalFreePlay || useAdminFreeSurvivEntry;
+                newPlayer.personalFreePlay = sessionFreePlay || useAdminFreeSurvivEntry;
                 newPlayer.adminFreeSurvivEntry = useAdminFreeSurvivEntry;
                 newPlayer.fundedEntryUsd = useAdminFreeSurvivEntry ? 0 : entryFeeUsd;
                 room.players.push(newPlayer);
@@ -7710,12 +7728,14 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            const entryFeeUsd = normalizeEntryFee(rawEntryFee);
+            const entryFeeUsd = sessionFreePlay
+                ? getPublicFreePlayEntryFee(mode)
+                : normalizeEntryFee(rawEntryFee);
             const gameMode = mode === 'slither' ? 'slither' : 'agar';
             const economy = getEconomy(entryFeeUsd);
 
             const existing = findPlayerInArena(userKey);
-            const isFreeTicketPlay = !personalFreePlay && (!!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom));
+            const isFreeTicketPlay = !sessionFreePlay && (!!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom));
 
             if (isFreeTicketPlay && !existing) {
                 // First time joining with a free ticket
@@ -7749,8 +7769,8 @@ io.on('connection', (socket) => {
             const switchingNormalMode = existing?.room && existingMode && existingMode !== gameMode;
             const gameSessionId = existing?.player?.gameSessionId || randomBytes(12).toString('hex');
 
-            const room = existing?.room ?? (personalFreePlay
-                ? getPersonalFreePlayRoom(personalFreePlayOwnerId, gameMode, entryFeeUsd)
+            const room = existing?.room ?? (sessionFreePlay
+                ? getPublicFreePlayRoom(gameMode)
                 : (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd)));
             const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
             let switchedDollarBalance = null;
@@ -7883,7 +7903,7 @@ io.on('connection', (socket) => {
                             isFreeTicketPlay: true,
                             gameSessionId,
                         },
-                        excludedFromReports: personalFreePlay,
+                        excludedFromReports: sessionFreePlay,
                         status: 'confirmed'
                     });
 
@@ -7900,7 +7920,7 @@ io.on('connection', (socket) => {
                             gameSessionId,
                             ...(freePlay ? { simulated: true } : {}),
                         },
-                        excludedFromReports: personalFreePlay,
+                        excludedFromReports: sessionFreePlay,
                         status: 'confirmed'
                     });
                 }
@@ -7986,7 +8006,7 @@ io.on('connection', (socket) => {
                             roomId: room.id,
                             mode: gameMode,
                         },
-                        excludedFromReports: personalFreePlay,
+                        excludedFromReports: sessionFreePlay,
                     status: 'confirmed',
                     }).catch(err => console.error('Reward pool TX log error:', err.message));
                 }
@@ -8004,7 +8024,7 @@ io.on('connection', (socket) => {
                             roomId: room.id,
                             mode: gameMode,
                         },
-                        excludedFromReports: personalFreePlay,
+                        excludedFromReports: sessionFreePlay,
                     status: 'confirmed',
                     }).catch(err => console.error('Owner vault TX log error:', err.message));
                 }
@@ -8181,7 +8201,7 @@ io.on('connection', (socket) => {
                 return;
             }
 
-            newPlayer.personalFreePlay = personalFreePlay;
+            newPlayer.personalFreePlay = sessionFreePlay;
             room.players.push(newPlayer);
             pendingJoinEconomy = null;
             pendingPaidJoin = null;
