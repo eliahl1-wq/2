@@ -43,6 +43,41 @@ function rectsOverlap(x1, y1, w1, h1, x2, y2, w2, h2) {
     return Math.abs(x1 - x2) < (w1 + w2) / 2 && Math.abs(y1 - y2) < (h1 + h2) / 2;
 }
 
+function rotatedRectCorners(rect) {
+    const angle = Number(rect.rotation) || 0;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const halfW = rect.w / 2;
+    const halfH = rect.h / 2;
+    return [[-halfW, -halfH], [halfW, -halfH], [halfW, halfH], [-halfW, halfH]]
+        .map(([x, y]) => ({
+            x: rect.x + x * cos - y * sin,
+            y: rect.y + x * sin + y * cos,
+        }));
+}
+
+function rotatedRectsOverlap(first, second) {
+    const firstCorners = rotatedRectCorners(first);
+    const secondCorners = rotatedRectCorners(second);
+    const axes = [];
+    for (const corners of [firstCorners, secondCorners]) {
+        for (let index = 0; index < 2; index++) {
+            const start = corners[index];
+            const end = corners[(index + 1) % corners.length];
+            const dx = end.x - start.x;
+            const dy = end.y - start.y;
+            const length = Math.max(0.0001, Math.hypot(dx, dy));
+            axes.push({ x: -dy / length, y: dx / length });
+        }
+    }
+    return axes.every(axis => {
+        const firstProjection = firstCorners.map(point => point.x * axis.x + point.y * axis.y);
+        const secondProjection = secondCorners.map(point => point.x * axis.x + point.y * axis.y);
+        return Math.max(...firstProjection) >= Math.min(...secondProjection)
+            && Math.max(...secondProjection) >= Math.min(...firstProjection);
+    });
+}
+
 function pointInRect(x, y, rect, padding = 0) {
     return x >= rect.x - rect.w / 2 - padding
         && x <= rect.x + rect.w / 2 + padding
@@ -989,8 +1024,11 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
 test('river spline metadata survives generation and bridges hit both highways exactly', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const riverPath = map.obstacles.find(obstacle => obstacle.kind === 'river_path');
+    const riverSegments = map.obstacles.filter(obstacle => obstacle.kind === 'river');
     const bridges = map.obstacles.filter(obstacle => obstacle.kind === 'bridge');
     const bridgeRails = map.obstacles.filter(obstacle => obstacle.role === 'bridgeRail');
+    const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road');
     const verticalHighways = map.obstacles.filter(obstacle => (
         obstacle.kind === 'road'
         && obstacle.role === 'networkRoad'
@@ -1011,6 +1049,12 @@ test('river spline metadata survives generation and bridges hit both highways ex
         Math.abs(road.x - bridge.x) < 1
         && pointInRect(bridge.x, bridge.y, road, 2)
     ))), 'each bridge should share the exact axis of its highway');
+    assert.ok(houses.every(house => riverSegments.every(segment => !rotatedRectsOverlap(house, segment))),
+        'houses must stay completely outside the river');
+    const riverRoads = roads.filter(road => riverSegments.some(segment => rotatedRectsOverlap(road, segment)));
+    assert.equal(riverRoads.length, bridges.length, 'only bridged highways may cross the river');
+    assert.ok(riverRoads.every(road => bridges.some(bridge => rotatedRectsOverlap(road, bridge))),
+        'every road entering the river must be covered by a bridge');
 
     assert.equal(bridgeRails.length, 4);
     assert.ok(bridgeRails.every(rail => rail.collidable === true));

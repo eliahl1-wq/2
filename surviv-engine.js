@@ -3267,19 +3267,25 @@ function generateRiverPath(worldHalf, startX, startY, endX, endY, segments = 12)
     const normalX = -dy / length;
     const normalY = dx / length;
     const phase = Math.random() * Math.PI * 2;
-    const wander = worldHalf * 0.055;
+    // Keep the river organic without letting a random seed swing it hundreds
+    // of units into curated districts. The old 550-unit wander could put the
+    // east farm, Eastgate houses, and their roads directly in the water.
+    const wander = Math.min(220, worldHalf * 0.022);
     for (let i = 1; i < segments; i++) {
         const t = i / segments;
         const baseX = startX + (endX - startX) * t;
         const baseY = startY + (endY - startY) * t;
         const envelope = Math.sin(Math.PI * t);
+        // The broad northward arc keeps the middle channel above Riverside,
+        // before the endpoint bends south beneath the east farm and Eastgate.
+        const routeArcY = envelope * Math.min(600, worldHalf * 0.06);
         const lateral = (
             Math.sin(t * Math.PI * 2.4 + phase) * 0.72
             + Math.sin(t * Math.PI * 5.2 + phase * 0.63) * 0.22
         ) * wander * envelope;
         points.push({
             x: baseX + normalX * lateral,
-            y: baseY + normalY * lateral,
+            y: baseY + routeArcY + normalY * lateral,
         });
     }
     points.push({ x: endX, y: endY });
@@ -3933,7 +3939,7 @@ export function generateSurvivMap(worldHalf) {
     // ─────────────────────────────────────────────────────────────────────────
     const riverEW = addRiver(obstacles, wh,
         -wh * 0.9, -wh * 0.18,
-         wh * 0.9, -wh * 0.12,
+         wh * 0.9, -wh * 0.24,
         210 + Math.random() * 60);
 
     // Bridges placed exactly where the two N-S highways cross the river (around y ≈ -1500)
@@ -3954,7 +3960,21 @@ export function generateSurvivMap(worldHalf) {
     const roadReservations = obstacles
         .filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad')
         .map(road => ({ x: road.x, y: road.y, w: road.w, h: road.h }));
-    const placedPositions = [...POI_LIST, ...roadReservations];
+    // Later filler houses and hamlets must reserve the real curved river, not
+    // an old hard-coded horizontal estimate. Axis-aligned segment bounds are
+    // deliberately padded to leave a readable shoreline around buildings.
+    const riverReservations = riverEW.segments.map(segment => {
+        const cos = Math.abs(Math.cos(segment.angle));
+        const sin = Math.abs(Math.sin(segment.angle));
+        const padding = 110;
+        return {
+            x: segment.x,
+            y: segment.y,
+            w: cos * segment.w + sin * segment.h + padding * 2,
+            h: sin * segment.w + cos * segment.h + padding * 2,
+        };
+    });
+    const placedPositions = [...POI_LIST, ...roadReservations, ...riverReservations];
     // Curated hamlets create recognizable rotations between major POIs. They
     // replace the old density fallback that sprinkled isolated houses anywhere.
     const hamletPlans = [
