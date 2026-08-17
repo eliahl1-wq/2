@@ -6254,7 +6254,7 @@ app.post('/api/presence/ping', (req, res) => {
 });
 
 // 6. Exponera live stats för lobby och pre-game
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', async (req, res) => {
     try {
         touchSitePresence(req);
 
@@ -6356,6 +6356,20 @@ app.get('/api/stats', (req, res) => {
         playersByGamemode.surviv = survivHumanCount + survivBotCount;
         totalBotsOnline += survivBotCount;
 
+        // Keep raw activity intact for analytics, but expose one shared visual
+        // count for every public surface that displays "Playing".
+        const displaySettings = await SiteDisplaySettings.findOne({ key: 'pregame' })
+            .select('pregamePlayingOffsets')
+            .lean();
+        const playingOffsets = normalizePregamePlayingOffsets(displaySettings?.pregamePlayingOffsets);
+        const displayPlayersByGamemode = Object.fromEntries(
+            PREGAME_PLAYING_KEYS.map(key => [
+                key,
+                Math.max(0, Number(playersByGamemode[key]) || 0)
+                    + Math.max(0, Number(playingOffsets[key]) || 0),
+            ]),
+        );
+
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
             + playersByGamemode.brAgar + playersByGamemode.brSlither
             + playersByGamemode.competitiveSlither + playersByGamemode.surviv;
@@ -6388,6 +6402,7 @@ app.get('/api/stats', (req, res) => {
             playersByEntryFee,
             playersByModeAndFee,
             playersByGamemode,
+            displayPlayersByGamemode,
             brPlayersByFee,
             globalPlayerEarningsSol,
             globalPlayerEarningsUsd,
