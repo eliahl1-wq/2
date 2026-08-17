@@ -575,6 +575,18 @@ async function ensureFreeTicketChallengeState(user) {
 const GAME_CASHOUT_REASON_RE = /Arena Cashout|Admin Forced Cashout|Auto Room Reset|BR Victory/i;
 const ADMIN_GAME_JOIN_EVENTS = ['join', 'br_join', 'free_ticket_join'];
 const ADMIN_FREE_TICKET_CASHOUT_EVENT = 'free_ticket_cashout';
+const GAME_DEATH_REASONS = ['Arena Death', 'Surviv Death', 'BR Eliminated', 'Competitive Slither Death'];
+
+// Free play remains excluded from reports, rewards, challenges and leaderboards.
+// This narrow matcher only lets its match events appear in activity feeds.
+const FREE_PLAY_ACTIVITY_MATCH = {
+    'meta.simulated': true,
+    $or: [
+        { type: 'game', 'meta.event': 'join' },
+        { type: 'game', 'meta.reason': { $in: GAME_DEATH_REASONS } },
+        { type: 'withdraw', 'meta.reason': { $regex: GAME_CASHOUT_REASON_RE } },
+    ],
+};
 
 function buildGameCashoutTxFilter() {
     return {
@@ -3861,7 +3873,7 @@ function classifyTxActivity(tx) {
     if (['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'].includes(m.event)) return 'sweep';
     if (tx.type === 'game') {
         if (ADMIN_GAME_JOIN_EVENTS.includes(m.event)) return 'entry';
-        if (m.reason === 'Arena Death' || m.reason === 'BR Eliminated' || m.reason === 'Competitive Slither Death') return 'death';
+        if (GAME_DEATH_REASONS.includes(m.reason)) return 'death';
         if (m.event === 'br_refund') return 'refund';
         return 'game';
     }
@@ -3880,13 +3892,16 @@ function txActivityLabel(tx) {
         case 'deposit': return 'Deposit';
         case 'withdraw': return 'Withdrawal';
         case 'entry':
+            if (m.simulated) return `Free play entry · ${m.mode || 'agar'} · $${m.entryFeeUsd ?? '?'}`;
             if (m.event === 'br_join') return `BR entry · $${m.entryFeeUsd ?? '?'}`;
             if (m.event === 'free_ticket_join') return `Free ticket entry · ${m.mode || 'agar'} · $${m.entryFeeUsd ?? '?'} ticket`;
             return `Arena entry · ${m.mode || 'agar'} · $${m.entryFeeUsd ?? '?'}`;
         case 'cashout':
+            if (m.simulated) return `Free play cashout · ${m.mode || 'arena'} · $${txAmountUsd(tx)}`;
             if (m.isFreeTicketPlay) return `Free ticket reward · ${m.mode || 'arena'} · $${m.rewardCreditedUsd ?? txAmountUsd(tx)}`;
             return m.reason || 'Cashout';
         case 'death':
+            if (m.simulated) return `Free play death · ${m.mode || 'arena'} · $${txAmountUsd(tx)}`;
             if (m.isFreeTicketPlay) return `Free ticket death · ${m.mode || 'arena'} · no reward`;
             return m.reason || 'Eliminated';
         case 'refund': return 'BR refund';
@@ -3910,7 +3925,7 @@ function buildTxCategoryFilter(category) {
         case 'cashout':
             return buildGameCashoutTxFilter();
         case 'death':
-            return { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } };
+            return { type: 'game', 'meta.reason': { $in: GAME_DEATH_REASONS } };
         case 'sweep':
             return { $or: [{ 'meta.event': 'pool_sweep' }, { 'meta.event': 'br_owner_sweep' }, { 'meta.event': 'reward_owner_surplus_sweep' }, { 'meta.event': 'reward_pool_factory_reset' }, { 'meta.event': 'affiliate_pool_factory_reset' }] };
         case 'game':
@@ -3941,7 +3956,7 @@ function mapTxToAdminRow(tx, userMap) {
 
 async function buildAdminTxQuery({ userId, showExcluded, type, category, search }) {
     const clauses = [];
-    if (!showExcluded) clauses.push(TX_REPORTED);
+    if (!showExcluded) clauses.push({ $or: [TX_REPORTED, FREE_PLAY_ACTIVITY_MATCH] });
 
     if (userId) {
         clauses.push({ userId });
@@ -3960,6 +3975,7 @@ async function buildAdminTxQuery({ userId, showExcluded, type, category, search 
                     { userId: { $exists: false } },
                     { userId: null },
                     { userId: { $nin: excludedUserIds } },
+                    FREE_PLAY_ACTIVITY_MATCH,
                 ],
             });
         }
@@ -4406,7 +4422,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 $or: [
                     { type: 'withdraw', 'meta.event': ADMIN_FREE_TICKET_CASHOUT_EVENT },
                     { type: 'withdraw', 'meta.reason': { $regex: GAME_CASHOUT_REASON_RE } },
-                    { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } },
+                    { type: 'game', 'meta.reason': { $in: GAME_DEATH_REASONS } },
                 ],
             }).sort({ createdAt: 1 }).lean(),
         ]);
@@ -4445,7 +4461,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 withdrawalCount += 1;
             }
             if (tx.type === 'game' && ADMIN_GAME_JOIN_EVENTS.includes(tx.meta?.event)) gameJoinCount += 1;
-            if (tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(tx.meta?.reason)) deathCount += 1;
+            if (tx.type === 'game' && GAME_DEATH_REASONS.includes(tx.meta?.reason)) deathCount += 1;
             if (tx.type === 'withdraw' && /BR Victory/i.test(tx.meta?.reason || '')) brWinCount += 1;
         }
 
@@ -4581,7 +4597,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                     row.entryUsd += Number(tx.meta?.entryFeeUsd ?? txAmountUsd(tx)) || 0;
                 }
             }
-            if (tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(reason)) {
+            if (tx.type === 'game' && GAME_DEATH_REASONS.includes(reason)) {
                 const fallbackMode = reason === 'Competitive Slither Death' ? 'competitive-slither' : reason === 'BR Eliminated' ? 'battle-royale' : 'agar';
                 ensureMode(tx.meta?.mode || tx.meta?.variant || fallbackMode).deaths += 1;
             }
@@ -5012,7 +5028,13 @@ app.get('/api/admin/dashboard/live-feed', authenticateAdmin, async (req, res) =>
         const noiseFilter = {
             'meta.event': { $nin: ['reset_start', 'reset_complete', 'failure'] },
         };
-        const baseMatch = await reportedTxMatch(noiseFilter);
+        const reportedMatch = await reportedTxMatch(noiseFilter);
+        const baseMatch = {
+            $or: [
+                reportedMatch,
+                { $and: [noiseFilter, FREE_PLAY_ACTIVITY_MATCH] },
+            ],
+        };
         const timeClause = hasSince ? { createdAt: { $gt: since } } : {};
         const filter = Object.keys(timeClause).length
             ? { $and: [baseMatch, timeClause] }
@@ -5126,6 +5148,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
                 { type: 'game', 'meta.event': 'free_ticket_join' },
                 { type: 'withdraw', 'meta.event': ADMIN_FREE_TICKET_CASHOUT_EVENT },
                 { type: 'game', 'meta.reason': 'Arena Death' },
+                { type: 'game', 'meta.reason': 'Surviv Death' },
                 { type: 'game', 'meta.reason': 'BR Eliminated' },
                 { type: 'game', 'meta.reason': 'Competitive Slither Death' },
                 { type: 'game', 'meta.event': 'br_refund' },
@@ -5134,14 +5157,15 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
         };
         const skipUserExclusion = !!req.query.userId;
         const reported = await reportedTxMatch({}, { skipUserExclusion });
-        const andClauses = [eventFilter, reported];
+        const visibleActivity = { $or: [reported, FREE_PLAY_ACTIVITY_MATCH] };
+        const andClauses = [eventFilter, visibleActivity];
         if (req.query.userId) andClauses.push({ userId: req.query.userId });
 
         const eventType = req.query.eventType || '';
         if (eventType === 'entry') {
             andClauses.push({ type: 'game', 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } });
         } else if (eventType === 'death') {
-            andClauses.push({ type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } });
+            andClauses.push({ type: 'game', 'meta.reason': { $in: GAME_DEATH_REASONS } });
         } else if (eventType === 'cashout') {
             andClauses.push(buildGameCashoutTxFilter());
         } else if (eventType === 'refund') {
@@ -5159,7 +5183,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
             let eventType = tx.meta?.event || tx.meta?.reason || tx.type;
             if (tx.meta?.event === 'free_ticket_join') eventType = 'free_ticket_entry';
             else if (tx.meta?.event === 'join' || tx.meta?.event === 'br_join') eventType = 'join';
-            else if (tx.meta?.reason === 'Arena Death' || tx.meta?.reason === 'BR Eliminated' || tx.meta?.reason === 'Competitive Slither Death') eventType = 'death';
+            else if (GAME_DEATH_REASONS.includes(tx.meta?.reason)) eventType = 'death';
             else if (tx.meta?.event === ADMIN_FREE_TICKET_CASHOUT_EVENT) eventType = 'free_ticket_reward';
             else if (/BR Victory/i.test(tx.meta?.reason || '')) eventType = 'br_win';
             else if (/Arena Cashout/i.test(tx.meta?.reason || '')) eventType = 'cashout';
@@ -5177,6 +5201,7 @@ app.get('/api/admin/dashboard/game-history', authenticateAdmin, async (req, res)
                 game: mode,
                 amountUsd: Number(txAmountUsd(tx).toFixed(2)),
                 entryFeeUsd: entryFee,
+                freePlay: tx.meta?.simulated === true,
                 meta: tx.meta,
                 createdAt: tx.createdAt,
             };
@@ -6465,12 +6490,19 @@ app.get('/api/leaderboard', async (req, res) => {
 app.get('/api/leaderboard-live', async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
-        const baseMatch = await reportedTxMatch({
+        const liveEventMatch = {
             $or: [
                 buildGameCashoutTxFilter(),
-                { type: 'game', 'meta.reason': { $in: ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'] } },
+                { type: 'game', 'meta.reason': { $in: GAME_DEATH_REASONS } },
             ],
-        });
+        };
+        const reportedLiveEvents = await reportedTxMatch(liveEventMatch);
+        const baseMatch = {
+            $or: [
+                reportedLiveEvents,
+                { $and: [liveEventMatch, FREE_PLAY_ACTIVITY_MATCH] },
+            ],
+        };
 
         const txs = await Transaction.find(baseMatch).sort({ createdAt: -1 }).limit(limit).lean();
         const userIds = [...new Set(txs.map(t => t.userId?.toString()).filter(Boolean))];
@@ -6480,10 +6512,11 @@ app.get('/api/leaderboard-live', async (req, res) => {
         const events = txs.map((tx) => {
             const username = tx.userId ? (userMap[tx.userId.toString()] || 'Unknown') : 'Unknown';
             const amountUsd = Number(txAmountUsd(tx).toFixed(2));
-            const isDeath = tx.type === 'game' && ['Arena Death', 'BR Eliminated', 'Competitive Slither Death'].includes(tx.meta?.reason);
+            const isDeath = tx.type === 'game' && GAME_DEATH_REASONS.includes(tx.meta?.reason);
+            const freePlay = tx.meta?.simulated === true;
             const text = isDeath
-                ? `${username} died with $${amountUsd.toFixed(2)}`
-                : `${username} cashed out $${amountUsd.toFixed(2)}`;
+                ? `${username} died with $${amountUsd.toFixed(2)}${freePlay ? ' in Free play' : ''}`
+                : `${username} cashed out $${amountUsd.toFixed(2)}${freePlay ? ' in Free play' : ''}`;
 
             return {
                 id: tx._id?.toString(),
@@ -6491,6 +6524,7 @@ app.get('/api/leaderboard-live', async (req, res) => {
                 username,
                 amountUsd,
                 type: isDeath ? 'death' : 'cashout',
+                freePlay,
                 text,
                 createdAt: tx.createdAt,
             };
