@@ -338,7 +338,7 @@ function clampInput(dx, dy) {
 
 export function addSlitherFood(room, n, foodBlobValue, maxBudgetValue = Infinity) {
     const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
-    const massPerPellet = eco.massPerPellet;
+    const massPerPellet = room.isTournament ? 0.02 : eco.massPerPellet;
     let currentValue = getSlitherFoodValue(room);
     for (let i = 0; i < n; i++) {
         if (currentValue + foodBlobValue > maxBudgetValue + 1e-9) break;

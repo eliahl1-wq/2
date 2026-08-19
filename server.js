@@ -6723,6 +6723,7 @@ function foodDensityForRoom(room) {
 }
 
 function foodBlobValueForRoom(room) {
+    if (room.isTournament) return 0.02 * ((room.entryFeeUsd ?? DEFAULT_ENTRY_FEE) / DEFAULT_ENTRY_FEE);
     return getEconomy(room.entryFeeUsd).foodBlobValue;
 }
 
@@ -6904,6 +6905,43 @@ function ensureAgarMovementInput(player) {
         player.mouseX = 220;
         player.mouseY = 0;
     }
+}
+
+function splitAgarCells(player, angle, now = Date.now()) {
+    if (!player?.cells?.length || player.cells.length >= c.maxCells) return 0;
+
+    const totalMass = playerTotalMass(player);
+    const massStart = playerMassStart(player);
+    const availableSlots = c.maxCells - player.cells.length;
+    const newCells = [];
+
+    // Use a snapshot so newly-created pieces cannot split again in the same action.
+    for (const cell of [...player.cells]) {
+        if (newCells.length >= availableSlots) break;
+        if (cell.balance < massStart * 2) continue;
+
+        cell.balance /= 2;
+        cell.lastSplit = now;
+        newCells.push({
+            id: Math.random().toString(36).substr(2, 9),
+            x: cell.x,
+            y: cell.y,
+            balance: cell.balance,
+            radius: cell.radius,
+            vx: Math.cos(angle) * 25,
+            vy: Math.sin(angle) * 25,
+            lastSplit: now,
+        });
+    }
+
+    if (newCells.length === 0) return 0;
+
+    player.cells.push(...newCells);
+    const finalCellCount = player.cells.length;
+    player.cells.forEach(cell => {
+        cell.radius = calculateCellRadius(cell.balance, totalMass, finalCellCount, massStart);
+    });
+    return newCells.length;
 }
 
 function resolveAgarOwnCells(player, now, massStart) {
@@ -7289,7 +7327,7 @@ io.on('connection', (socket) => {
                 tournamentSkinColor,
                 room,
                 economy.massStartBalance,
-                economy.playerStartBalance,
+                TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD * 0.10,
             );
             player.isTournament = true;
             player.tournamentId = tournament._id.toString();
@@ -8530,37 +8568,8 @@ io.on('connection', (socket) => {
     socket.on('2', () => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
-        if (!p || p.cells.length >= c.maxCells) return;
-
-        const totalMass = playerTotalMass(p);
-        const massStart = playerMassStart(p);
-        const availableSlots = c.maxCells - p.cells.length;
-        const newCells = [];
-        for (const cell of p.cells) {
-            if (newCells.length >= availableSlots) break;
-            if (cell.balance >= massStart * 2) {
-                cell.balance /= 2;
-                cell.lastSplit = Date.now(); // Starta timern även för ursprungscellen
-                const angle = Math.atan2(p.mouseY, p.mouseX);
-                newCells.push({
-                    id: Math.random().toString(36).substr(2, 9),
-                    x: cell.x, y: cell.y,
-                    balance: cell.balance,
-                    radius: cell.radius,
-                    vx: Math.cos(angle) * 25,
-                    vy: Math.sin(angle) * 25,
-                    lastSplit: Date.now()
-                });
-            }
-        }
-
-        // A multi-split can add several cells at once. Radius depends on the final
-        // cell count, so recalculate every piece only after the split is complete.
-        p.cells.push(...newCells);
-        const finalCellCount = p.cells.length;
-        p.cells.forEach(cell => {
-            cell.radius = calculateCellRadius(cell.balance, totalMass, finalCellCount, massStart);
-        });
+        if (!p) return;
+        splitAgarCells(p, Math.atan2(p.mouseY, p.mouseX));
 
     });
 
@@ -9432,6 +9441,7 @@ function processRoom(room) {
 
                 let threat = null;
                 let targetPrey = null;
+                let targetPreyMass = 0;
                 let minDistThreat = 900; // Se faror på lite längre håll
                 let minDistPrey = 600;
 
@@ -9451,6 +9461,7 @@ function processRoom(room) {
                         else if (totalBotMass > otherTotalMass * 1.10 && d < minDistPrey) {
                             minDistPrey = d;
                             targetPrey = c2;
+                            targetPreyMass = otherTotalMass;
                         }
                     });
                 });
@@ -9493,6 +9504,24 @@ function processRoom(room) {
                     const preyAngle = Math.atan2(targetPrey.y - head.y, targetPrey.x - head.x) + (Math.random() - 0.5) * 0.2;
                     player.targetX = head.x + Math.cos(preyAngle) * 500;
                     player.targetY = head.y + Math.sin(preyAngle) * 500;
+
+                    // Split-kill only when the launched half will still comfortably eat
+                    // the prey. A cooldown prevents bot multi-split spam between decisions.
+                    const now = Date.now();
+                    const largestCell = botCells.reduce((largest, cell) => (
+                        cell.balance > largest.balance ? cell : largest
+                    ), botCells[0]);
+                    const splitReach = head.radius + targetPrey.radius + 165;
+                    const splitIsSafe = largestCell.balance / 2 > targetPrey.balance * 1.15
+                        && totalBotMass > targetPreyMass * 2.2;
+                    if (!player.isCashingOut
+                        && splitIsSafe
+                        && minDistPrey > head.radius + targetPrey.radius * 0.35
+                        && minDistPrey < splitReach
+                        && now - (player.lastBotSplitAt || 0) >= 2800) {
+                        const splitCount = splitAgarCells(player, preyAngle, now);
+                        if (splitCount > 0) player.lastBotSplitAt = now;
+                    }
 
                 } else {
                     // MAT: Hitta närmaste matbit

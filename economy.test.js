@@ -18,6 +18,8 @@ test('Competitive Slither exposes separate $1, $2, and $5 economies', () => {
         const eco = getCompetitiveEconomy(entryFeeUsd);
         assert.equal(eco.entryFeeUsd, entryFeeUsd);
         assert.equal(eco.dollarStart, entryFeeUsd);
+        assert.equal(eco.playerStartBalance, 1.0);
+        assert.equal(eco.massPerPellet, 0.02);
         assert.equal(eco.cashoutPlayerPct + eco.cashoutFeePct, 1);
     }
 });
@@ -40,18 +42,32 @@ for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
             const eco = getEconomy(entryFeeUsd);
             const { food, ai } = getJoinPoolSplit(entryFeeUsd, population);
             const total = eco.playerStartBalance + food + ai;
-            assert.equal(total, entryFeeUsd);
+            assert.ok(Math.abs(total - entryFeeUsd) < 1e-9, `Total ${total} should equal entry ${entryFeeUsd}`);
             assert.ok(food >= 0);
             assert.ok(ai >= 0);
         });
     }
 }
 
+test('Normal Agar and Slither use 20% starting dollars without changing starting mass', () => {
+    for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
+        const eco = getEconomy(entryFeeUsd);
+        assert.equal(eco.playerStartBalance, entryFeeUsd * 0.20);
+        assert.equal(eco.massStartBalance, 1.0);
+    }
+});
+
+test('Normal food pellets have double value and growth so the target count is halved', () => {
+    const eco = getEconomy(10);
+    assert.equal(eco.foodBlobValue, 0.04);
+    assert.equal(eco.massPerPellet, 0.04);
+});
+
 // --- Reward Pool Split tests ---
 for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
     test(`$${entryFeeUsd} reward pool split conserves value`, () => {
         const { food, ai, rewardPoolContribution, ownerVaultContribution } = getRewardPoolSplit(entryFeeUsd);
-        const playerStart = entryFeeUsd * 0.10;
+        const playerStart = entryFeeUsd * 0.20;
         const total = playerStart + food + ai + rewardPoolContribution + ownerVaultContribution;
         assert.ok(Math.abs(total - entryFeeUsd) < 1e-9, `Total ${total} should equal entry ${entryFeeUsd}`);
         assert.ok(food >= 0);
@@ -65,7 +81,7 @@ test('$5 reward pool split routes extra to reward pool', () => {
     const split = getRewardPoolSplit(5);
     assert.equal(split.rewardPoolContribution, 1.0);
     assert.equal(split.ownerVaultContribution, 0);
-    assert.equal(split.food, 2.5);  // includes golden blob ($0.50)
+    assert.equal(split.food, 2.0);  // includes golden blob ($0.50)
     assert.equal(split.ai, 1.0);
 });
 
@@ -73,7 +89,7 @@ test('$10 reward pool split routes extra to reward pool', () => {
     const split = getRewardPoolSplit(10);
     assert.equal(split.rewardPoolContribution, 2.0);
     assert.equal(split.ownerVaultContribution, 0);
-    assert.equal(split.food, 5.0);  // includes golden blob ($1.00)
+    assert.equal(split.food, 4.0);  // includes golden blob ($1.00)
     assert.equal(split.ai, 2.0);
 });
 
@@ -81,6 +97,6 @@ test('$20 reward pool split routes extra to owner vault', () => {
     const split = getRewardPoolSplit(20);
     assert.equal(split.rewardPoolContribution, 0);
     assert.equal(split.ownerVaultContribution, 4.0);
-    assert.equal(split.food, 10.0);  // includes golden blob ($2.00)
+    assert.equal(split.food, 8.0);  // includes golden blob ($2.00)
     assert.equal(split.ai, 4.0);
 });

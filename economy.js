@@ -15,7 +15,8 @@ export const NORMAL_CASHOUT_FEE_PCT = PLATFORM_CASHOUT_FEE_BPS / 10_000;
 
 /** Baseline economy at $10 entry — all values scale linearly with entry fee. */
 const BASE = {
-    playerStart: 1.0,
+    // Normal Agar/Slither starts with 20% of the entry in cash value.
+    playerStart: 2.0,
     /** Extra food-pool dollars per join (formerly owner cut). */
     joinFoodBonus: 1.0,
     foodLow: 12.0,   // 1–2 humans
@@ -27,10 +28,10 @@ const BASE = {
     botStart: 1.0,
     botMax: 500.0,
     foodDensityPerHuman: 500.0,
-    /** Snake mass gained per normal pellet at $10 entry ($5→0.01, $10→0.02, $20→0.04). Decoupled from dollar value. */
-    massPerPellet: 0.02,
-    /** Pellet dollar value at $10 entry ($5→$0.02, $10→$0.04, $20→$0.08). Half the blob count, same total food pool $. */
-    foodBlobValue: 0.02,
+    /** Twice the growth per pellet, paired with half as many normal pellets. */
+    massPerPellet: 0.04,
+    /** Twice the dollar value per pellet ($5→$0.02, $10→$0.04, $20→$0.08). */
+    foodBlobValue: 0.04,
 };
 
 export function normalizeEntryFee(fee) {
@@ -51,7 +52,8 @@ export function getEconomy(entryFeeUsd) {
         /** In-game dollars (HUD, cashout, wealth tax). Scales with entry tier. */
         playerStartBalance: BASE.playerStart * s,
         /** Snake mass / visual size — fixed baseline, not tied to entry tier. */
-        massStartBalance: BASE.playerStart,
+        // Keep the same visual starting size as before the 10% → 20% change.
+        massStartBalance: 1.0,
         massPerPellet: BASE.massPerPellet,
         goldenBlobMass: getGoldenBlobValue(DEFAULT_ENTRY_FEE),
         joinFoodBonus: BASE.joinFoodBonus * s,
@@ -94,23 +96,23 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
 /**
  * Modified entry split for users who have NOT completed Sponsored Rewards.
  * Allocations (of entry fee):
- *   10 % → player start balance (unchanged, deducted before this split)
- *   50 % → food pool (includes 10 % golden blob deducted in join handler)
+ *   20 % → player start balance (deducted before this split)
+ *   40 % → food pool (includes 10 % golden blob deducted in join handler)
  *   20 % → bots (AI budget)
  *   20 % → reward pool ($5/$10) or owner vault ($20)
  *
  * Dollar amounts:
- *   $5:  food $2.50 (golden $0.50 + pool $2.00), bots $1.00, reward $1.00
- *   $10: food $5.00 (golden $1.00 + pool $4.00), bots $2.00, reward $2.00
- *   $20: food $10.00 (golden $2.00 + pool $8.00), bots $4.00, owner vault $4.00
+ *   $5:  start $1.00, food $2.00, bots $1.00, reward $1.00
+ *   $10: start $2.00, food $4.00, bots $2.00, reward $2.00
+ *   $20: start $4.00, food $8.00, bots $4.00, owner vault $4.00
  *
  * Returns { food, ai, rewardPoolContribution, ownerVaultContribution }.
  * food includes golden blob — join handler subtracts it before adding to foodPoolBalance.
  */
 export function getRewardPoolSplit(entryFeeUsd) {
     const entry = normalizeEntryFee(entryFeeUsd);
-    const playerStart = entry * 0.10; // already deducted as playerStartBalance
-    const food = entry * 0.50;        // includes golden blob (10%)
+    const playerStart = entry * 0.20; // already deducted as playerStartBalance
+    const food = entry * 0.40;        // includes golden blob (10%)
     const ai   = entry * 0.20;
     const contribution = entry - playerStart - food - ai; // 20 %
 
@@ -178,8 +180,8 @@ export function getCompetitiveEconomy(entryFeeUsd) {
         entryFeeUsd: entry,
         dollarStart: entry,
         // Snake mass uses the same baseline as $10 normal slither — size is not tied to entry tier or dollars.
-        playerStartBalance: BASE.playerStart,
-        massPerPellet: BASE.massPerPellet,
+        playerStartBalance: 1.0,
+        massPerPellet: 0.02,
         cashoutFeePct,
         cashoutPlayerPct: 1 - cashoutFeePct,
     };
