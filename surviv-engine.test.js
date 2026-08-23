@@ -5,6 +5,7 @@ import {
     SURVIV,
     SURVIV_AMMO,
     WEAPONS,
+    applySurvivFireInput,
     beginSurvivReload,
     broadcastSurvivState,
     createSurvivPlayer,
@@ -2122,6 +2123,41 @@ test('duplicate packets with the same fire press id cannot create a second melee
     assert.equal(room.obstacles[0].hp, 64, 'a genuinely new press id must attack once');
     assert.equal(player.meleeAttackId, 2);
     assert.notEqual(player.meleeHand, firstHand, 'distinct clicks should alternate hands');
+});
+
+test('a delayed final down packet cannot append a melee swing after release', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'sequence-target', kind: 'bush', x: 48, y: 0, w: 30, h: 30,
+        collidable: true, destructible: true, hp: 500, maxHp: 500,
+    }];
+    const player = createSurvivPlayer('sequence-player', 'sequence-mongo', 'Sequence Boxer', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    room.players.push(player);
+
+    const startedAt = Date.now() + 600000;
+    for (let pressId = 1; pressId <= 5; pressId++) {
+        player.weapon.lastShotAt = 0;
+        applySurvivFireInput(player, true, pressId);
+        applySurvivFireInput(player, false, pressId);
+        processSurvivRoom(room, silentIo, startedAt + pressId * 500);
+    }
+    assert.equal(player.meleeAttackId, 5);
+    assert.equal(room.obstacles[0].hp, 500 - WEAPONS.fists.damage * 5);
+
+    // Simulate a stale volatile down packet arriving after the reliable up for
+    // the fifth click. It must not re-arm shooting or queue a sixth punch.
+    assert.equal(applySurvivFireInput(player, true, 5), false);
+    processSurvivRoom(room, silentIo, startedAt + 4000);
+    assert.equal(player.shooting, false);
+    assert.equal(player.meleeAttackId, 5);
+    assert.equal(room.obstacles[0].hp, 500 - WEAPONS.fists.damage * 5);
 });
 
 test('bullets damage and eventually destroy durable Surviv obstacles', () => {

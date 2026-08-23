@@ -4567,6 +4567,12 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         aimAngle: 0,
         aimDistance: 300,
         shooting: false,
+        _receivedFirePressId: 0,
+        _releasedFirePressId: 0,
+        _pendingFirePressId: null,
+        // Enabled as soon as a real network input packet is received. Engine
+        // tests and legacy callers can still use the older held-state path.
+        _usesQueuedFireInput: false,
         kills: 0,
         startTime: Date.now(),
         disconnected: false,
@@ -4591,6 +4597,41 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         openedContainer: null,
         takeChestItem: null,
     };
+}
+
+export function applySurvivFireInput(entity, shooting, firePressId) {
+    if (!entity) return false;
+    const pressed = shooting === true;
+    const parsedId = Number(firePressId);
+    if (!Number.isSafeInteger(parsedId) || parsedId < 0) {
+        // Compatibility for older clients that do not send press ids.
+        entity.shooting = pressed;
+        entity._usesQueuedFireInput = false;
+        return false;
+    }
+
+    entity._usesQueuedFireInput = true;
+    const receivedId = Number.isSafeInteger(entity._receivedFirePressId)
+        ? entity._receivedFirePressId
+        : -1;
+
+    // Ignore packets from an older press completely. Also ignore a delayed
+    // down packet for an id whose up packet already arrived; this was the
+    // source of the extra final melee swing after a click sequence.
+    if (parsedId < receivedId
+        || (pressed && parsedId === entity._releasedFirePressId)) return false;
+
+    if (parsedId > receivedId) {
+        entity._receivedFirePressId = parsedId;
+        entity.firePressId = parsedId;
+        if (pressed) entity._pendingFirePressId = parsedId;
+    }
+
+    if (!pressed) {
+        entity._releasedFirePressId = Math.max(Number(entity._releasedFirePressId) || 0, parsedId);
+    }
+    entity.shooting = pressed;
+    return pressed && parsedId > receivedId;
 }
 
 function pickSurvivSpawn(room) {
@@ -6384,7 +6425,16 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     entity.surface = getEntitySurfaceKind(room, entity);
     entity.angle = entity.aimAngle ?? entity.angle;
 
-    if (entity.shooting) {
+    if (!activeWeaponDef.automatic && !entity.isBot && entity._usesQueuedFireInput) {
+        const pendingFirePressId = entity._pendingFirePressId;
+        entity._pendingFirePressId = null;
+        if (Number.isSafeInteger(pendingFirePressId)
+            && entity._processedFirePressId !== pendingFirePressId) {
+            tryShoot(entity, room, now);
+            entity._processedFirePressId = pendingFirePressId;
+        }
+        entity._meleeInputLatched = false;
+    } else if (entity.shooting) {
         if (!activeWeaponDef.automatic && !entity.isBot) {
             // Modern clients attach one stable id to each physical press. That
             // makes duplicate/delayed shooting=true packets harmless instead

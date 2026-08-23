@@ -60,6 +60,7 @@ import {
 } from './economy.js';
 import {
     SURVIV,
+    applySurvivFireInput,
     beginSurvivReload,
     createSurvivPlayer,
     eliminateSurvivPlayer,
@@ -8954,11 +8955,7 @@ io.on('connection', (socket) => {
             return;
         }
 
-        player.shooting = shooting === true;
-        const parsedFirePressId = Number(firePressId);
-        if (Number.isSafeInteger(parsedFirePressId) && parsedFirePressId >= 0) {
-            player.firePressId = parsedFirePressId;
-        }
+        applySurvivFireInput(player, shooting, firePressId);
         if (useMedkit === true) player.useMedkit = true;
         if (pickupWeapon === true) player.pickupWeaponPending = true;
         const requestedDoorId = safeId(toggleDoorId);
