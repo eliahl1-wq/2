@@ -136,6 +136,7 @@ test('every Surviv house has themed furniture outside every complete door swing'
 
     assert.ok(houses.every(house => furnishedHouseIds.has(house.id)));
     assert.ok(furniture.every(obstacle => obstacle.houseId && obstacle.roomId));
+    assert.ok(furniture.every(obstacle => obstacle.collidable !== false), 'raised furniture must have a physical hitbox');
     assert.ok(furniture.every(obstacle => !['table', 'cabinet', 'machine'].includes(obstacle.variant)));
     for (const expected of [
         'sofa', 'bed', 'kitchenCounter', 'diningTable', 'desk', 'salesCounter',
@@ -862,7 +863,7 @@ test('Ironworks is a multi-entry indoor combat landmark with loop routes', () =>
         && obstacle.houseId === floor.id
     ));
     assert.ok(ironworksFurniture.length >= 6);
-    assert.ok(ironworksFurniture.every(obstacle => !obstacle.collidable && obstacle.roomId));
+    assert.ok(ironworksFurniture.every(obstacle => obstacle.collidable !== false && obstacle.roomId));
     assert.deepEqual(
         new Set(ironworksFurniture.map(obstacle => obstacle.variant)),
         new Set(['workbench', 'controlConsole', 'locker', 'palletStack']),

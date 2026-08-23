@@ -968,7 +968,13 @@ function furnishHouseInterior(obstacles, house, options = {}) {
         ))) return null;
 
         const furniture = addObstacle(obstacles, 'furniture', x, y, width, height, {
-            collidable: spec.collidable === true,
+            // Furniture represents raised physical props. Keep it solid by
+            // default; only explicit floor-level decorations may opt out.
+            collidable: spec.collidable !== false,
+            // Fixed interior fixtures should not disappear after one stray hit.
+            // Individual lightweight props can opt in when they get a proper
+            // break presentation of their own.
+            destructible: spec.destructible === true,
             variant: spec.variant,
             role: spec.role || room.variant,
             houseId,
