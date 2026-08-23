@@ -2,6 +2,7 @@ import { PLATFORM_CASHOUT_FEE_BPS } from './affiliate-config.js';
 
 export const USD_MICROS_PER_USD = 1_000_000;
 export const BPS_SCALE = 10_000;
+export const DEFAULT_SOLANA_CASHOUT_FEE_BUFFER_LAMPORTS = 20_000;
 
 export function usdToMicros(value) {
     const numeric = Number(value);
@@ -39,6 +40,46 @@ export function calculateCashoutMoney(grossCashoutUsd, platformFeeBps = PLATFORM
         platformFeeUsd: microsToUsd(platformFeeUsdMicros),
         playerPayoutUsd: microsToUsd(playerPayoutUsdMicros),
         platformFeeBps,
+    };
+}
+
+/**
+ * Cap an on-chain SOL payout to what the sender can safely afford after a
+ * small transaction-fee reserve. The on-chain amount is authoritative; its
+ * USD value is rounded to the nearest micro for deterministic reporting.
+ */
+export function calculateAffordableSolanaPayout(
+    requestedPayoutUsd,
+    senderLamports,
+    solPriceUsd,
+    feeBufferLamports = DEFAULT_SOLANA_CASHOUT_FEE_BUFFER_LAMPORTS,
+) {
+    const requestedUsdMicros = usdToMicros(requestedPayoutUsd);
+    const price = Number(solPriceUsd);
+    if (!Number.isFinite(price) || price <= 0) throw new RangeError('SOL price must be positive');
+
+    const balanceLamports = Math.max(0, Math.floor(Number(senderLamports) || 0));
+    const bufferLamports = Math.max(0, Math.floor(Number(feeBufferLamports) || 0));
+    const requestedLamports = Math.max(0, Math.round(
+        (requestedUsdMicros / USD_MICROS_PER_USD) / price * 1_000_000_000,
+    ));
+    const affordableLamports = Math.max(0, balanceLamports - bufferLamports);
+    const payoutLamports = Math.min(requestedLamports, affordableLamports);
+    const payoutUsdMicros = Math.min(
+        requestedUsdMicros,
+        Math.max(0, Math.round((payoutLamports / 1_000_000_000) * price * USD_MICROS_PER_USD)),
+    );
+
+    return {
+        requestedLamports,
+        payoutLamports,
+        requestedPayoutUsd: microsToUsd(requestedUsdMicros),
+        payoutUsdMicros,
+        payoutUsd: microsToUsd(payoutUsdMicros),
+        shortfallUsdMicros: requestedUsdMicros - payoutUsdMicros,
+        shortfallUsd: microsToUsd(requestedUsdMicros - payoutUsdMicros),
+        feeBufferLamports: bufferLamports,
+        liquidityAdjusted: payoutLamports < requestedLamports,
     };
 }
 

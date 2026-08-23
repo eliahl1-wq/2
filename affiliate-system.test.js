@@ -16,9 +16,26 @@ import {
 import {
     calculateAffiliateCommission,
     calculateCashoutMoney,
+    calculateAffordableSolanaPayout,
     multiplyMicrosByBps,
     usdToMicros,
 } from './affiliate-money.js';
+
+test('cashout liquidity cap pays the full request when sender funds are sufficient', () => {
+    const result = calculateAffordableSolanaPayout(1.90, 20_000_000, 100, 20_000);
+    assert.equal(result.payoutLamports, 19_000_000);
+    assert.equal(result.payoutUsd, 1.90);
+    assert.equal(result.shortfallUsd, 0);
+    assert.equal(result.liquidityAdjusted, false);
+});
+
+test('cashout liquidity cap reduces only the unaffordable remainder', () => {
+    const result = calculateAffordableSolanaPayout(1.90, 18_020_000, 100, 20_000);
+    assert.equal(result.payoutLamports, 18_000_000);
+    assert.equal(result.payoutUsd, 1.80);
+    assert.equal(result.shortfallUsd, 0.10);
+    assert.equal(result.liquidityAdjusted, true);
+});
 import {
     AFFILIATE_HOLD_DAYS,
     AFFILIATE_MIN_PAYOUT_USD_MICROS,

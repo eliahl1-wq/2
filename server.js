@@ -114,7 +114,7 @@ import {
     calculateTournamentPrizes,
     serializeTournament,
 } from './tournament-system.js';
-import { calculateCashoutMoney, microsToUsd } from './affiliate-money.js';
+import { calculateAffordableSolanaPayout, calculateCashoutMoney, microsToUsd } from './affiliate-money.js';
 import {
     AffiliatePayout,
     activateAffiliateProfile,
@@ -996,6 +996,18 @@ function commitArenaCashoutReservation(room, player) {
     delete player._arenaCashoutReservationUsd;
 }
 
+function applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity) {
+    logMeta.requestedPlayerPayout = requestedPlayerPayout;
+    logMeta.requestedPayoutLamports = liquidity.requestedLamports;
+    logMeta.playerPayout = liquidity.payoutUsd;
+    logMeta.playerPayoutUsdMicros = liquidity.payoutUsdMicros;
+    logMeta.payoutLamports = liquidity.payoutLamports;
+    logMeta.liquidityAdjusted = liquidity.liquidityAdjusted;
+    logMeta.liquidityShortfallUsd = liquidity.shortfallUsd;
+    logMeta.liquidityShortfallUsdMicros = liquidity.shortfallUsdMicros;
+    logMeta.cashoutFeeBufferLamports = liquidity.feeBufferLamports;
+}
+
 function keepCompetitiveCashoutSpectator(room, player) {
     const head = player.segments?.[0];
     if (!room.competitiveSpectators) room.competitiveSpectators = [];
@@ -1035,7 +1047,8 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     const { cashoutFeePct } = getCompetitiveEconomy(entryFeeUsd);
     const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
     const cashoutMoney = calculateCashoutMoney(dollarBalance, cashoutFeeBps);
-    const playerPayout = cashoutMoney.playerPayoutUsd;
+    const requestedPlayerPayout = cashoutMoney.playerPayoutUsd;
+    let playerPayout = requestedPlayerPayout;
     const platformFee = cashoutMoney.platformFeeUsd;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
@@ -1081,8 +1094,8 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
-    const solPayout = playerPayout / SOL_PRICE_USD;
-    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+    let solPayout = playerPayout / SOL_PRICE_USD;
+    let payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
     const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
 
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
@@ -1092,38 +1105,42 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, SOL_PRICE_USD);
+    payoutLamports = liquidity.payoutLamports;
+    playerPayout = liquidity.payoutUsd;
+    solPayout = payoutLamports / solanaWeb3.LAMPORTS_PER_SOL;
+    applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
+    if (liquidity.liquidityAdjusted) {
+        console.warn(`[Cashout Liquidity] Competitive payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
+    }
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
     const canTransferOwnerFee = false;
     const transferredFeeLamports = 0;
-    if (totalLamports < payoutLamports + transferredFeeLamports + feeBuffer) {
-        throw new Error('House wallet lacks liquidity');
-    }
-
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const userLamports = await connection.getBalance(userPubKey);
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
-        console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
+    if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
+        const fallbackPayout = payoutLamports <= 0 ? requestedPlayerPayout : playerPayout;
+        console.log(`[Cashout Fallback] Payout unavailable or too small for ${user.username}. Retaining $${fallbackPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepCompetitiveCashoutSpectator(room, player);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
-        user.rentFallbackBalanceUsd += playerPayout;
+        user.rentFallbackBalanceUsd += fallbackPayout;
         await user.save();
-        await addRewardFundingUsd(playerPayout);
+        await addRewardFundingUsd(fallbackPayout);
 
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
-            amount: playerPayout,
-            meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            amount: fallbackPayout,
+            meta: { ...logMeta, playerPayout: fallbackPayout, isRentExemptFallback: true, isLiquidityFallback: payoutLamports <= 0, signature: 'sponsored_rent_fallback' },
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'sponsored_rent_fallback' });
-        return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
+        emitCashoutSuccess(player, playerId, mongoId, { amount: fallbackPayout, signature: 'sponsored_rent_fallback' });
+        return { playerPayout: fallbackPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1177,7 +1194,8 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     const { cashoutFeePct } = getSurvivEconomy(entryFeeUsd);
     const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
     const cashoutMoney = calculateCashoutMoney(dollarBalance, cashoutFeeBps);
-    const playerPayout = cashoutMoney.playerPayoutUsd;
+    const requestedPlayerPayout = cashoutMoney.playerPayoutUsd;
+    let playerPayout = requestedPlayerPayout;
     const platformFee = cashoutMoney.platformFeeUsd;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
@@ -1230,8 +1248,8 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
-    const solPayout = playerPayout / SOL_PRICE_USD;
-    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+    let solPayout = playerPayout / SOL_PRICE_USD;
+    let payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
     const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
 
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
@@ -1241,37 +1259,41 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const feeBuffer = Math.round(0.005 * solanaWeb3.LAMPORTS_PER_SOL);
+    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, SOL_PRICE_USD);
+    payoutLamports = liquidity.payoutLamports;
+    playerPayout = liquidity.payoutUsd;
+    solPayout = payoutLamports / solanaWeb3.LAMPORTS_PER_SOL;
+    applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
+    if (liquidity.liquidityAdjusted) {
+        console.warn(`[Cashout Liquidity] Surviv payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
+    }
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
     const canTransferOwnerFee = false;
     const transferredFeeLamports = 0;
-    if (totalLamports < payoutLamports + transferredFeeLamports + feeBuffer) {
-        throw new Error('House wallet lacks liquidity');
-    }
-
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const userLamports = await connection.getBalance(userPubKey);
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
-        console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
+    if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
+        const fallbackPayout = payoutLamports <= 0 ? requestedPlayerPayout : playerPayout;
+        console.log(`[Cashout Fallback] Payout unavailable or too small for ${user.username}. Retaining $${fallbackPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
-        user.rentFallbackBalanceUsd += playerPayout;
+        user.rentFallbackBalanceUsd += fallbackPayout;
         await user.save();
-        await addRewardFundingUsd(playerPayout);
+        await addRewardFundingUsd(fallbackPayout);
 
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
-            amount: playerPayout,
-            meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            amount: fallbackPayout,
+            meta: { ...logMeta, playerPayout: fallbackPayout, isRentExemptFallback: true, isLiquidityFallback: payoutLamports <= 0, signature: 'sponsored_rent_fallback' },
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'sponsored_rent_fallback' });
-        return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
+        emitCashoutSuccess(player, playerId, mongoId, { amount: fallbackPayout, signature: 'sponsored_rent_fallback' });
+        return { playerPayout: fallbackPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1325,7 +1347,8 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     const { cashoutFeePct } = getEconomy(entryFeeUsd);
     const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
     const cashoutMoney = calculateCashoutMoney(dollarBalance, cashoutFeeBps);
-    const playerPayout = cashoutMoney.playerPayoutUsd;
+    const requestedPlayerPayout = cashoutMoney.playerPayoutUsd;
+    let playerPayout = requestedPlayerPayout;
     const platformFee = cashoutMoney.platformFeeUsd;
     const mongoId = player.mongoId?.toString();
     const playerId = player.id;
@@ -1408,8 +1431,8 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
-    const solPayout = playerPayout / SOL_PRICE_USD;
-    const payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
+    let solPayout = playerPayout / SOL_PRICE_USD;
+    let payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
     const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
 
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
@@ -1419,37 +1442,48 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const feeBuffer = Math.round(0.00002 * solanaWeb3.LAMPORTS_PER_SOL);
+    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, SOL_PRICE_USD);
+    payoutLamports = liquidity.payoutLamports;
+    playerPayout = liquidity.payoutUsd;
+    solPayout = payoutLamports / solanaWeb3.LAMPORTS_PER_SOL;
+    applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
+    if (liquidity.liquidityAdjusted) {
+        console.warn(`[Cashout Liquidity] Arena payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
+    }
     // Cashout fees remain in house and are sent in the batched reset sweep.
     const canTransferOwnerFee = false;
-    if (totalLamports < payoutLamports + feeBuffer) {
-        throw new Error('House wallet lacks liquidity');
-    }
 
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const userLamports = await connection.getBalance(userPubKey);
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports > 0 && (userLamports + payoutLamports < rentExemptMinimum)) {
-        console.log(`[Rent Exemption] Payout too small for ${user.username}. Retaining $${playerPayout.toFixed(2)} for later claim.`);
+    if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
+        const fallbackPayout = payoutLamports <= 0 ? requestedPlayerPayout : playerPayout;
+        console.log(`[Cashout Fallback] Payout unavailable or too small for ${user.username}. Retaining $${fallbackPayout.toFixed(2)} for later claim.`);
         room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         keepArenaCashoutSpectator(room, player);
         if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
-        user.rentFallbackBalanceUsd += playerPayout;
+        user.rentFallbackBalanceUsd += fallbackPayout;
         await user.save();
-        await addRewardFundingUsd(playerPayout);
+        await addRewardFundingUsd(fallbackPayout);
 
         await Transaction.create({
             userId: user._id,
             type: 'withdraw',
-            amount: playerPayout,
-            meta: { ...logMeta, isRentExemptFallback: true, signature: 'sponsored_rent_fallback' },
+            amount: fallbackPayout,
+            meta: {
+                ...logMeta,
+                playerPayout: fallbackPayout,
+                isRentExemptFallback: true,
+                isLiquidityFallback: payoutLamports <= 0,
+                signature: 'sponsored_rent_fallback',
+            },
             excludedFromReports: !!player.personalFreePlay,
             status: 'confirmed',
         });
-        emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature: 'sponsored_rent_fallback' });
+        emitCashoutSuccess(player, playerId, mongoId, { amount: fallbackPayout, signature: 'sponsored_rent_fallback' });
         commitArenaCashoutReservation(room, player);
-        return { playerPayout, platformFee, signature: 'sponsored_rent_fallback' };
+        return { playerPayout: fallbackPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
