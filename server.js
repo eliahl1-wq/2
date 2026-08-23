@@ -4517,8 +4517,18 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
         if (!user) return res.status(404).json({ message: 'User not found' });
 
         const uid = user._id;
+        const realGameMatch = {
+            userId: uid,
+            status: 'confirmed',
+            excludedFromReports: { $ne: true },
+            'meta.simulated': { $ne: true },
+            'meta.isFreeTicketPlay': { $ne: true },
+        };
+        const detailNumberFrom = (field, fallback = 0) => ({
+            $convert: { input: { $ifNull: [field, fallback] }, to: 'double', onError: 0, onNull: 0 },
+        });
 
-        const [allTxs, joinTxs, terminalTxs] = await Promise.all([
+        const [allTxs, joinTxs, terminalTxs, gameSpendAgg, gameReturnAgg] = await Promise.all([
             Transaction.find({ userId: uid }).sort({ createdAt: -1 }).limit(500).lean(),
             Transaction.find({ userId: uid, type: 'game', 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } }).sort({ createdAt: -1 }).lean(),
             Transaction.find({
@@ -4529,7 +4539,24 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                     { type: 'game', 'meta.reason': { $in: GAME_DEATH_REASONS } },
                 ],
             }).sort({ createdAt: 1 }).lean(),
+            Transaction.aggregate([
+                { $match: { ...realGameMatch, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } } },
+                { $group: { _id: null, total: { $sum: detailNumberFrom('$meta.entryFeeUsd') } } },
+            ]),
+            Transaction.aggregate([
+                { $match: { ...realGameMatch, ...buildGameCashoutTxFilter() } },
+                {
+                    $group: {
+                        _id: null,
+                        won: { $sum: detailNumberFrom('$meta.playerPayout', '$amount') },
+                        ownerFees: { $sum: detailNumberFrom('$meta.platformFee') },
+                    },
+                },
+            ]),
         ]);
+        const gameSpentUsd = Number((gameSpendAgg[0]?.total ?? 0).toFixed(2));
+        const gameWonUsd = Number((gameReturnAgg[0]?.won ?? 0).toFixed(2));
+        const ownerEarningsUsd = Number((gameReturnAgg[0]?.ownerFees ?? 0).toFixed(2));
 
         let totalDepositedSol = 0;
         let totalWithdrawnUsd = 0;
@@ -4643,6 +4670,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 eventType: isFreeTicketPlay ? 'free_ticket_join' : join.meta?.event === 'br_join' ? 'br_join' : 'join',
                 game,
                 isFreeTicketPlay,
+                freePlay: join.meta?.simulated === true,
                 wagerUsd: Number(wagerUsd.toFixed(2)),
                 ticketValueUsd: Number(ticketValueUsd.toFixed(2)),
                 payoutUsd: Number(payoutUsd.toFixed(2)),
@@ -4660,10 +4688,10 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             };
         }).reverse();
 
-        gameJoinCount = joinTxs.filter(tx => !tx.excludedFromReports).length;
-        deathCount = terminalEvents.filter(event => event.isDeath && !event.tx.excludedFromReports).length;
-        const wins = gameHistory.filter(g => g.outcome === 'Win' && !g.excludedFromReports).length;
-        const losses = gameHistory.filter(g => g.outcome === 'Loss' && !g.excludedFromReports).length;
+        gameJoinCount = joinTxs.filter(tx => !tx.excludedFromReports && tx.meta?.simulated !== true).length;
+        deathCount = terminalEvents.filter(event => event.isDeath && !event.tx.excludedFromReports && event.tx.meta?.simulated !== true).length;
+        const wins = gameHistory.filter(g => g.outcome === 'Win' && !g.excludedFromReports && !g.freePlay).length;
+        const losses = gameHistory.filter(g => g.outcome === 'Loss' && !g.excludedFromReports && !g.freePlay).length;
         const freeTicketGames = gameHistory.filter(game => game.isFreeTicketPlay && !game.excludedFromReports);
         const freeTicketCashouts = freeTicketGames.filter(game => game.terminalType === 'cashout');
         const freeTicketDeaths = freeTicketGames.filter(game => game.terminalType === 'death');
@@ -4788,6 +4816,9 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 depositCount,
                 withdrawalCount,
                 gamesPlayed: gameJoinCount,
+                gameSpentUsd,
+                gameWonUsd,
+                ownerEarningsUsd,
                 wins,
                 losses,
                 deaths: deathCount,
