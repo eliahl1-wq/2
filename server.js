@@ -326,6 +326,7 @@ const UserSchema = new mongoose.Schema({
     depositAddress: { type: String },
     depositSecret: { type: String },
     playtime: { type: Number, default: 0 },
+    lastActiveAt: { type: Date, default: null, index: true },
     excludedFromReports: { type: Boolean, default: false },
     isOwnerAccount: { type: Boolean, default: false, index: true },
     personalFreePlay: { type: Boolean, default: false },
@@ -3852,6 +3853,13 @@ function objectIdCreatedAt(id) {
 function sortAdminUsers(users, sortKey) {
     const list = [...users];
     switch (sortKey) {
+        case 'activity_desc': {
+            const rank = { playing: 2, active: 1, offline: 0 };
+            return list.sort((a, b) => (rank[b.activityStatus] || 0) - (rank[a.activityStatus] || 0)
+                || new Date(b.lastActiveAt || 0) - new Date(a.lastActiveAt || 0));
+        }
+        case 'last_active_desc':
+            return list.sort((a, b) => new Date(b.lastActiveAt || 0) - new Date(a.lastActiveAt || 0));
         case 'balance_asc':
             return list.sort((a, b) => a.balanceSol - b.balanceSol);
         case 'newest':
@@ -3860,6 +3868,8 @@ function sortAdminUsers(users, sortKey) {
             return list.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
         case 'deposits_desc':
             return list.sort((a, b) => b.totalDepositedUsd - a.totalDepositedUsd);
+        case 'game_spend_desc':
+            return list.sort((a, b) => b.gameSpentUsd - a.gameSpentUsd);
         case 'username_asc':
             return list.sort((a, b) => a.username.localeCompare(b.username));
         case 'balance_desc':
@@ -4313,17 +4323,102 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
-        const depositTotals = await Transaction.aggregate([
-            { $match: depositMatch },
-            { $group: { _id: '$userId', totalDepositedSol: { $sum: '$amount' }, depositCount: { $sum: 1 } } },
+        const realGameBaseMatch = {
+            status: 'confirmed',
+            excludedFromReports: { $ne: true },
+            'meta.simulated': { $ne: true },
+            'meta.isFreeTicketPlay': { $ne: true },
+            userId: { $ne: null },
+        };
+        const numberFrom = (field, fallback = 0) => ({
+            $convert: { input: { $ifNull: [field, fallback] }, to: 'double', onError: 0, onNull: 0 },
+        });
+        const [depositTotals, latestActivity, gameSpendTotals, gameReturnTotals] = await Promise.all([
+            Transaction.aggregate([
+                { $match: depositMatch },
+                { $group: { _id: '$userId', totalDepositedSol: { $sum: '$amount' }, depositCount: { $sum: 1 } } },
+            ]),
+            Transaction.aggregate([
+                { $match: { userId: { $ne: null } } },
+                { $group: { _id: '$userId', lastActiveAt: { $max: '$createdAt' } } },
+            ]),
+            Transaction.aggregate([
+                { $match: { ...realGameBaseMatch, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } } },
+                { $group: { _id: '$userId', gameSpentUsd: { $sum: numberFrom('$meta.entryFeeUsd') } } },
+            ]),
+            Transaction.aggregate([
+                { $match: { ...realGameBaseMatch, ...buildGameCashoutTxFilter() } },
+                {
+                    $group: {
+                        _id: '$userId',
+                        gameWonUsd: { $sum: numberFrom('$meta.playerPayout', '$amount') },
+                        ownerEarningsUsd: { $sum: numberFrom('$meta.platformFee') },
+                    },
+                },
+            ]),
         ]);
         const depositMap = Object.fromEntries(depositTotals.map(d => [d._id.toString(), d]));
+        const activityMap = Object.fromEntries(latestActivity.map(row => [row._id.toString(), row.lastActiveAt]));
+        const gameSpendMap = Object.fromEntries(gameSpendTotals.map(row => [row._id.toString(), row]));
+        const gameReturnMap = Object.fromEntries(gameReturnTotals.map(row => [row._id.toString(), row]));
+
+        const playingMap = new Map();
+        const addPlaying = (player, mode, entryFeeUsd) => {
+            const id = player?.mongoId?.toString();
+            if (!id || player.disconnected) return;
+            playingMap.set(id, { mode, entryFeeUsd });
+        };
+        for (const room of rooms) {
+            for (const player of room.players) addPlaying(player, player.mode || 'agar', room.entryFeeUsd);
+        }
+        for (const room of competitiveSlitherRooms) {
+            for (const player of room.players) addPlaying(player, 'competitive-slither', room.entryFeeUsd);
+        }
+        for (const room of survivRooms) {
+            for (const player of room.players) {
+                if (!player._eliminated && player.hp > 0) addPlaying(player, 'surviv', room.entryFeeUsd);
+            }
+        }
+        const brMatches = typeof getActiveBRMatchesRaw === 'function' ? getActiveBRMatchesRaw() : [];
+        for (const room of brMatches) {
+            for (const player of room.players) {
+                addPlaying(player, room.variant === 'slither' ? 'br-slither' : 'br-agar', room.entryFeeUsd);
+            }
+        }
+
+        const onlineMap = new Map();
+        const presenceCutoff = Date.now() - PRESENCE_TTL_MS;
+        for (const [, presence] of sitePresence) {
+            const userId = presence?.userId?.toString();
+            const lastSeen = Number(presence?.lastSeen || 0);
+            if (!userId || lastSeen < presenceCutoff) continue;
+            const current = onlineMap.get(userId);
+            if (!current || lastSeen > current.lastSeen) {
+                onlineMap.set(userId, {
+                    lastSeen,
+                    page: presence.page || 'unknown',
+                    gamemode: presence.gamemode || 'none',
+                });
+            }
+        }
 
         const result = users.map(u => {
-            const dep = depositMap[u._id.toString()];
+            const userId = u._id.toString();
+            const dep = depositMap[userId];
+            const gameSpend = gameSpendMap[userId];
+            const gameReturn = gameReturnMap[userId];
             const balanceSol = u.balance ?? 0;
+            const playing = playingMap.get(userId) || null;
+            const online = onlineMap.get(userId) || null;
+            const createdAt = objectIdCreatedAt(u._id);
+            const lastActiveAt = new Date(Math.max(
+                new Date(activityMap[userId] || 0).getTime() || 0,
+                new Date(u.lastActiveAt || 0).getTime() || 0,
+                Number(online?.lastSeen || 0),
+                new Date(createdAt || 0).getTime() || 0,
+            ));
             return {
                 id: u._id,
                 username: u.username,
@@ -4337,8 +4432,16 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 totalDepositedSol: Number((dep?.totalDepositedSol ?? 0).toFixed(6)),
                 totalDepositedUsd: Number(((dep?.totalDepositedSol ?? 0) * SOL_PRICE_USD).toFixed(2)),
                 depositCount: dep?.depositCount ?? 0,
+                gameSpentUsd: Number((gameSpend?.gameSpentUsd ?? 0).toFixed(2)),
+                gameWonUsd: Number((gameReturn?.gameWonUsd ?? 0).toFixed(2)),
+                ownerEarningsUsd: Number((gameReturn?.ownerEarningsUsd ?? 0).toFixed(2)),
                 playtime: u.playtime ?? 0,
-                createdAt: objectIdCreatedAt(u._id),
+                createdAt,
+                activityStatus: playing ? 'playing' : online ? 'active' : 'offline',
+                lastActiveAt,
+                currentPage: online?.page || null,
+                currentGamemode: playing?.mode || (online?.gamemode !== 'none' ? online?.gamemode : null),
+                currentEntryFeeUsd: playing?.entryFeeUsd ?? null,
                 excludedFromReports: !!u.excludedFromReports,
                 isOwnerAccount: !!u.isOwnerAccount,
                 hasFreeTicket: !!u.hasFreeTicket,
@@ -4623,7 +4726,11 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 freeTicketRewardUsd: Number(row.freeTicketRewardUsd.toFixed(2)),
             }))
             .sort((a, b) => b.games - a.games || b.cashouts - a.cashouts);
-        const latestActivityAt = allTxs[0]?.createdAt || objectIdCreatedAt(user._id);
+        const latestActivityAt = new Date(Math.max(
+            new Date(allTxs[0]?.createdAt || 0).getTime() || 0,
+            new Date(user.lastActiveAt || 0).getTime() || 0,
+            new Date(objectIdCreatedAt(user._id) || 0).getTime() || 0,
+        ));
 
         res.json({
             user: {
@@ -6188,6 +6295,8 @@ app.post('/api/login', async (req, res) => {
 // Site-wide presence (pregame + any page polling /api/stats with X-Presence-Id)
 const sitePresence = new Map();
 const PRESENCE_TTL_MS = 90_000;
+const persistedUserPresenceAt = new Map();
+const USER_ACTIVITY_PERSIST_INTERVAL_MS = 60_000;
 
 function touchSitePresence(req, customKey = null) {
     let ip = 'unknown';
@@ -6246,6 +6355,16 @@ function touchSitePresence(req, customKey = null) {
         gamemode,
         userId: authenticatedUserId || (explicitlyGuest ? null : existing.userId || null),
     });
+
+    if (authenticatedUserId) {
+        const now = Date.now();
+        const userId = String(authenticatedUserId);
+        if (now - (persistedUserPresenceAt.get(userId) || 0) >= USER_ACTIVITY_PERSIST_INTERVAL_MS) {
+            persistedUserPresenceAt.set(userId, now);
+            User.updateOne({ _id: userId }, { $set: { lastActiveAt: new Date(now) } })
+                .catch(error => console.error('Could not persist user activity:', error.message));
+        }
+    }
 }
 
 function getSiteUsersOnline() {
