@@ -3133,52 +3133,17 @@ async function prepareAccountWithdrawalTransaction({ userKeypair, destination, g
             latestBlockhash,
             feeLamports,
             sendLamports,
-            feeSponsored: false,
+            feePaidByUser: true,
         };
     }
 
-    // A wallet containing less than its own transaction fee cannot close
-    // itself. For MAX only, let the house pay that tiny fee so every remaining
-    // lamport can leave the account and the account can truly reach zero.
-    if (!withdrawAll || grossLamports <= 0 || !HOUSE_WALLET_SECRET) {
-        const err = new Error('Amount too small to cover network fees');
-        err.status = 400;
-        throw err;
-    }
-    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
-    );
-    if (houseKeypair.publicKey.equals(userKeypair.publicKey)) {
-        const err = new Error('Amount too small to cover network fees');
-        err.status = 400;
-        throw err;
-    }
-    const sponsoredTransaction = new solanaWeb3.Transaction({
-        feePayer: houseKeypair.publicKey,
-        blockhash: latestBlockhash.blockhash,
-        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-    }).add(
-        solanaWeb3.SystemProgram.transfer({
-            fromPubkey: userKeypair.publicKey,
-            toPubkey: destination,
-            lamports: grossLamports,
-        })
-    );
-    const sponsoredFeeResult = await connection.getFeeForMessage(sponsoredTransaction.compileMessage(), 'confirmed');
-    const sponsoredFeeLamports = sponsoredFeeResult.value;
-    if (!Number.isSafeInteger(sponsoredFeeLamports) || sponsoredFeeLamports <= 0) {
-        throw new Error('Could not calculate the sponsored Solana network fee');
-    }
-    const houseLamports = await connection.getBalance(houseKeypair.publicKey, 'confirmed');
-    if (houseLamports < sponsoredFeeLamports) throw new Error('House wallet cannot sponsor the final withdrawal fee');
-    return {
-        transaction: sponsoredTransaction,
-        signers: [houseKeypair, userKeypair],
-        latestBlockhash,
-        feeLamports: sponsoredFeeLamports,
-        sendLamports: grossLamports,
-        feeSponsored: true,
-    };
+    // Withdrawal fees are always paid by the user's account wallet and are
+    // always deducted from the requested gross amount. The house never sponsors.
+    const err = new Error(withdrawAll
+        ? 'The full balance is too small to cover the Solana network fee. Deposit a little SOL first.'
+        : 'Amount too small to cover network fees');
+    err.status = 400;
+    throw err;
 }
 
 async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress, adminActorId = null, withdrawAll = false }) {
@@ -3218,7 +3183,8 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         }
         reservedSol = isMaxWithdrawal
             ? Math.max(0, Number(currentUser.balance) || 0)
-            : amountUsdNumber / SOL_PRICE_USD;
+            : Math.round((amountUsdNumber / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL)
+                / solanaWeb3.LAMPORTS_PER_SOL;
         if (!Number.isFinite(reservedSol) || reservedSol <= 0) {
             const err = new Error('Insufficient balance');
             err.status = 400;
@@ -3297,7 +3263,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
                 networkFeeSol: prepared.feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
                 amountUsd: effectiveAmountUsd,
                 withdrawAll: isMaxWithdrawal,
-                feeSponsored: prepared.feeSponsored,
+                feePaidByUser: prepared.feePaidByUser,
                 ...(adminActorId ? { event: 'admin_owner_account_withdrawal', adminActorId: String(adminActorId) } : {}),
             },
             status: 'pending',
