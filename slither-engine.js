@@ -44,7 +44,7 @@ export const SLITHER = {
     baseSegments: 12,
     segmentsPerCentLegacy: 0.1,
     foodBlobValue: 0.04, // legacy doc; use getEconomy(entryFee).foodBlobValue per room
-    botStartBalance: 1.0,
+    botStartBalance: 2.0,
     botMaxBalance: 500.0,
     // Fast human-like reactions. Decisions are intentionally not made every
     // 25 ms server tick, which made several bots move in perfect lockstep.

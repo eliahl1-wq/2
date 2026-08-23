@@ -617,7 +617,7 @@ const c = {
     speedMult: 1.45,
     houseFee: 0.0,
     targetPopulation: 30,
-    botStartBalance: 1.0,
+    botStartBalance: 2.0,
     botMaxBalance: 500.0,
     sizeMult: 18,
     growthBoost: 2,

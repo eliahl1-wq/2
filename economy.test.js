@@ -53,6 +53,7 @@ test('Normal Agar and Slither use 20% starting dollars without changing starting
     for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
         const eco = getEconomy(entryFeeUsd);
         assert.equal(eco.playerStartBalance, entryFeeUsd * 0.20);
+        assert.equal(eco.botStartBalance, eco.playerStartBalance);
         assert.equal(eco.massStartBalance, 1.0);
     }
 });
