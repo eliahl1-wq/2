@@ -3095,9 +3095,96 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
 });
 
 // --- NYTT: UTTAG (WITHDRAW) ---
-async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress, adminActorId = null }) {
+async function prepareAccountWithdrawalTransaction({ userKeypair, destination, grossLamports, withdrawAll }) {
+    const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+    const probe = new solanaWeb3.Transaction({
+        feePayer: userKeypair.publicKey,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+    }).add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: userKeypair.publicKey,
+            toPubkey: destination,
+            lamports: Math.max(1, grossLamports),
+        })
+    );
+    const feeResult = await connection.getFeeForMessage(probe.compileMessage(), 'confirmed');
+    const feeLamports = feeResult.value;
+    if (!Number.isSafeInteger(feeLamports) || feeLamports <= 0) {
+        throw new Error('Could not calculate the Solana network fee');
+    }
+
+    const sendLamports = grossLamports - feeLamports;
+    if (sendLamports > 0) {
+        const transaction = new solanaWeb3.Transaction({
+            feePayer: userKeypair.publicKey,
+            blockhash: latestBlockhash.blockhash,
+            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        }).add(
+            solanaWeb3.SystemProgram.transfer({
+                fromPubkey: userKeypair.publicKey,
+                toPubkey: destination,
+                lamports: sendLamports,
+            })
+        );
+        return {
+            transaction,
+            signers: [userKeypair],
+            latestBlockhash,
+            feeLamports,
+            sendLamports,
+            feeSponsored: false,
+        };
+    }
+
+    // A wallet containing less than its own transaction fee cannot close
+    // itself. For MAX only, let the house pay that tiny fee so every remaining
+    // lamport can leave the account and the account can truly reach zero.
+    if (!withdrawAll || grossLamports <= 0 || !HOUSE_WALLET_SECRET) {
+        const err = new Error('Amount too small to cover network fees');
+        err.status = 400;
+        throw err;
+    }
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+    );
+    if (houseKeypair.publicKey.equals(userKeypair.publicKey)) {
+        const err = new Error('Amount too small to cover network fees');
+        err.status = 400;
+        throw err;
+    }
+    const sponsoredTransaction = new solanaWeb3.Transaction({
+        feePayer: houseKeypair.publicKey,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+    }).add(
+        solanaWeb3.SystemProgram.transfer({
+            fromPubkey: userKeypair.publicKey,
+            toPubkey: destination,
+            lamports: grossLamports,
+        })
+    );
+    const sponsoredFeeResult = await connection.getFeeForMessage(sponsoredTransaction.compileMessage(), 'confirmed');
+    const sponsoredFeeLamports = sponsoredFeeResult.value;
+    if (!Number.isSafeInteger(sponsoredFeeLamports) || sponsoredFeeLamports <= 0) {
+        throw new Error('Could not calculate the sponsored Solana network fee');
+    }
+    const houseLamports = await connection.getBalance(houseKeypair.publicKey, 'confirmed');
+    if (houseLamports < sponsoredFeeLamports) throw new Error('House wallet cannot sponsor the final withdrawal fee');
+    return {
+        transaction: sponsoredTransaction,
+        signers: [houseKeypair, userKeypair],
+        latestBlockhash,
+        feeLamports: sponsoredFeeLamports,
+        sendLamports: grossLamports,
+        feeSponsored: true,
+    };
+}
+
+async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress, adminActorId = null, withdrawAll = false }) {
+    const isMaxWithdrawal = withdrawAll === true;
     const amountUsdNumber = Number(amountUSD);
-    if (!Number.isFinite(amountUsdNumber) || amountUsdNumber <= 0 || amountUsdNumber > 1_000_000) {
+    if (!isMaxWithdrawal && (!Number.isFinite(amountUsdNumber) || amountUsdNumber <= 0 || amountUsdNumber > 1_000_000)) {
         const err = new Error('Withdrawal amount must be between $0 and $1,000,000');
         err.status = 400;
         throw err;
@@ -3112,16 +3199,6 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         throw err;
     }
 
-    const solToWithdraw = amountUsdNumber / SOL_PRICE_USD;
-    const lamports = Math.round(solToWithdraw * solanaWeb3.LAMPORTS_PER_SOL);
-    const fee = 5000;
-    const sendAmount = lamports - fee;
-    if (sendAmount <= 0) {
-        const err = new Error('Amount too small to cover network fees');
-        err.status = 400;
-        throw err;
-    }
-
     if (!acquireCashoutLock(userId)) {
         const err = new Error('A withdrawal or cashout is already processing for this account');
         err.status = 409;
@@ -3129,12 +3206,27 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
     }
 
     let reserved = null;
+    let reservedSol = 0;
     let record = null;
     let signature = null;
     try {
+        const currentUser = await User.findById(userId).select('balance');
+        if (!currentUser) {
+            const err = new Error('Account not found');
+            err.status = 404;
+            throw err;
+        }
+        reservedSol = isMaxWithdrawal
+            ? Math.max(0, Number(currentUser.balance) || 0)
+            : amountUsdNumber / SOL_PRICE_USD;
+        if (!Number.isFinite(reservedSol) || reservedSol <= 0) {
+            const err = new Error('Insufficient balance');
+            err.status = 400;
+            throw err;
+        }
         reserved = await User.findOneAndUpdate(
-            { _id: userId, balance: { $gte: solToWithdraw } },
-            { $inc: { balance: -solToWithdraw } },
+            { _id: userId, balance: { $gte: reservedSol } },
+            isMaxWithdrawal ? { $set: { balance: 0 } } : { $inc: { balance: -reservedSol } },
             { new: true },
         );
         if (!reserved) {
@@ -3151,28 +3243,83 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         const userKeypair = solanaWeb3.Keypair.fromSecretKey(
             decryptWalletSecret(reserved.depositSecret)
         );
+        if (destination.equals(userKeypair.publicKey)) {
+            const err = new Error('Withdrawal destination must be different from the account wallet');
+            err.status = 400;
+            throw err;
+        }
+
+        const grossLamports = isMaxWithdrawal
+            ? await connection.getBalance(userKeypair.publicKey, 'confirmed')
+            : Math.round(reservedSol * solanaWeb3.LAMPORTS_PER_SOL);
+        if (!Number.isSafeInteger(grossLamports) || grossLamports < 0) {
+            throw new Error('Invalid account wallet balance');
+        }
+        const grossSolAmount = grossLamports / solanaWeb3.LAMPORTS_PER_SOL;
+        const effectiveAmountUsd = grossSolAmount * SOL_PRICE_USD;
+
+        if (grossLamports === 0 && isMaxWithdrawal) {
+            record = await Transaction.create({
+                userId: reserved._id,
+                type: 'withdraw',
+                amount: 0,
+                currency: 'SOL',
+                meta: {
+                    destination: destination.toBase58(),
+                    solAmount: 0,
+                    sentSolAmount: 0,
+                    networkFeeSol: 0,
+                    amountUsd: 0,
+                    withdrawAll: true,
+                    event: 'account_balance_reconciled_zero',
+                    ...(adminActorId ? { adminActorId: String(adminActorId) } : {}),
+                },
+                status: 'confirmed',
+            });
+            return { success: true, newBalance: 0, signature: 'already_empty', amountUsd: reservedSol * SOL_PRICE_USD, solAmount: 0, sentSolAmount: 0, networkFeeSol: 0, withdrawAll: true };
+        }
+
+        const prepared = await prepareAccountWithdrawalTransaction({
+            userKeypair,
+            destination,
+            grossLamports,
+            withdrawAll: isMaxWithdrawal,
+        });
         record = await Transaction.create({
             userId: reserved._id,
             type: 'withdraw',
-            amount: solToWithdraw,
+            amount: grossSolAmount,
             currency: 'SOL',
             meta: {
                 destination: destination.toBase58(),
-                solAmount: solToWithdraw,
-                amountUsd: amountUsdNumber,
+                solAmount: grossSolAmount,
+                sentSolAmount: prepared.sendLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                networkFeeSol: prepared.feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                amountUsd: effectiveAmountUsd,
+                withdrawAll: isMaxWithdrawal,
+                feeSponsored: prepared.feeSponsored,
                 ...(adminActorId ? { event: 'admin_owner_account_withdrawal', adminActorId: String(adminActorId) } : {}),
             },
             status: 'pending',
         });
-
-        const transaction = new solanaWeb3.Transaction().add(
-            solanaWeb3.SystemProgram.transfer({
-                fromPubkey: userKeypair.publicKey,
-                toPubkey: destination,
-                lamports: sendAmount,
-            })
-        );
-        signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [userKeypair]);
+        // Sign the exact message used for getFeeForMessage. Connection.sendTransaction
+        // replaces the blockhash internally, which can make a full-balance sweep
+        // use a fee from a different message and leave dust (or fail).
+        prepared.transaction.sign(...prepared.signers);
+        signature = await connection.sendRawTransaction(prepared.transaction.serialize(), { maxRetries: 3 });
+        await Transaction.findByIdAndUpdate(record._id, {
+            $set: { 'meta.signature': signature },
+        }).catch(recordErr => console.error('Withdrawal broadcast audit update failed:', recordErr.message));
+        const confirmation = await connection.confirmTransaction({
+            signature,
+            blockhash: prepared.latestBlockhash.blockhash,
+            lastValidBlockHeight: prepared.latestBlockhash.lastValidBlockHeight,
+        }, 'confirmed');
+        if (confirmation.value.err) {
+            const chainError = new Error(`Withdrawal failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+            chainError.onChainFailed = true;
+            throw chainError;
+        }
         try {
             await Transaction.findByIdAndUpdate(record._id, {
                 $set: { status: 'confirmed', 'meta.signature': signature },
@@ -3180,10 +3327,19 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         } catch (recordErr) {
             console.error('Withdrawal confirmed but audit update failed:', recordErr.message);
         }
-        return { success: true, newBalance: reserved.balance, signature, amountUsd: amountUsdNumber, solAmount: solToWithdraw };
+        return {
+            success: true,
+            newBalance: reserved.balance,
+            signature,
+            amountUsd: isMaxWithdrawal ? reservedSol * SOL_PRICE_USD : amountUsdNumber,
+            solAmount: grossSolAmount,
+            sentSolAmount: prepared.sendLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            networkFeeSol: prepared.feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            withdrawAll: isMaxWithdrawal,
+        };
     } catch (err) {
-        if (!signature && reserved) {
-            await User.findByIdAndUpdate(userId, { $inc: { balance: solToWithdraw } }).catch(() => { });
+        if ((!signature || err.onChainFailed) && reserved) {
+            await User.findByIdAndUpdate(userId, { $inc: { balance: reservedSol } }).catch(() => { });
             if (record) {
                 await Transaction.findByIdAndUpdate(record._id, {
                     $set: { status: 'failed', 'meta.error': String(err.message || 'Withdrawal failed').slice(0, 300) },
@@ -3202,6 +3358,7 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
             userId: req.user.id,
             amountUSD: req.body?.amountUSD,
             destinationAddress: req.body?.destinationAddress,
+            withdrawAll: req.body?.withdrawAll === true,
         });
         res.json(result);
     } catch (err) {
@@ -4459,8 +4616,8 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 email: u.email || null,
                 wallet: u.walletAddress || '—',
                 depositAddress: u.depositAddress || '—',
-                balanceSol: Number(balanceSol.toFixed(6)),
-                balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
+                balanceSol: Number(balanceSol.toFixed(9)),
+                balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(8)),
                 visualBalanceOverrideUsd: Number.isFinite(u.visualBalanceOverrideUsd) ? Number(u.visualBalanceOverrideUsd.toFixed(2)) : null,
                 displayBalanceUsd: Number((Number.isFinite(u.visualBalanceOverrideUsd) ? u.visualBalanceOverrideUsd : balanceSol * SOL_PRICE_USD).toFixed(2)),
                 totalDepositedSol: Number((dep?.totalDepositedSol ?? 0).toFixed(6)),
@@ -4801,8 +4958,8 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 email: user.email || null,
                 wallet: user.walletAddress || '—',
                 depositAddress: user.depositAddress || '—',
-                balanceSol: Number(balanceSol.toFixed(6)),
-                balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)),
+                balanceSol: Number(balanceSol.toFixed(9)),
+                balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(8)),
                 visualBalanceOverrideUsd: Number.isFinite(user.visualBalanceOverrideUsd) ? Number(user.visualBalanceOverrideUsd.toFixed(2)) : null,
                 displayBalanceUsd: Number((Number.isFinite(user.visualBalanceOverrideUsd) ? user.visualBalanceOverrideUsd : balanceSol * SOL_PRICE_USD).toFixed(2)),
                 playtime: user.playtime ?? 0,
@@ -5494,6 +5651,7 @@ app.post('/api/admin/users/:userId/withdraw', authenticateAdmin, sensitiveRateLi
             amountUSD: req.body?.amountUSD,
             destinationAddress,
             adminActorId: req.adminUser._id,
+            withdrawAll: req.body?.withdrawAll === true,
         });
         res.json({ ...result, message: `Withdrawal from ${user.username} was confirmed on-chain.` });
     } catch (err) {
