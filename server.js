@@ -148,6 +148,11 @@ import { createAgarCommerceService } from './agar-commerce-service.js';
 import { createCachedBalanceReader } from './solana-rpc-cache.js';
 import { isQualifyingFreeTicketCompletion } from './free-ticket-challenge.js';
 import {
+    calculatePermanentRewardAllocation,
+    permanentProgressReserveUsd,
+    serializePermanentRewards,
+} from './permanent-rewards.js';
+import {
     FREE_TICKET_MAX_BOTS_PER_MODE,
     getFreeTicketBotTarget,
     registerFreeTicketBotJoin,
@@ -341,6 +346,11 @@ const UserSchema = new mongoose.Schema({
     sponsoredRewardsUnlocked: { type: Boolean, default: false },
     sponsoredRewardsBalance: { type: Number, default: 0 }, // USD-denominated promotional reward
     fundedRewardsUsd: { type: Number, default: 0 }, // Amount of the reward that has been funded by the player's game entries
+    permanentRewardProgressVolumeUsdMicros: { type: Number, default: 0 },
+    permanentRewardsBalanceUsdMicros: { type: Number, default: 0 },
+    permanentRewardLifetimeVolumeUsdMicros: { type: Number, default: 0 },
+    permanentRewardLifetimeEarnedUsdMicros: { type: Number, default: 0 },
+    permanentRewardCyclesCompleted: { type: Number, default: 0 },
     rentFallbackBalanceUsd: { type: Number, default: 0 }, // Real cashouts retained because the destination was below rent minimum
     rewardsDisabled: { type: Boolean, default: false },
     rewardsDisabledReason: { type: String, default: '' },
@@ -2448,6 +2458,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         const affiliateStatus = await getAffiliateStatus(user);
         userObj.affiliateActive = affiliateStatus.active;
         userObj.affiliateRewardsAvailable = affiliateStatus.hasRewards;
+        userObj.permanentRewards = serializePermanentRewards(userObj);
 
         res.json(userObj);
     } catch (err) {
@@ -3372,11 +3383,15 @@ async function getRewardWalletLiabilityUsd() {
     const liabilities = await User.aggregate([{ $group: {
         _id: null,
         sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+        permanentUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
+        permanentProgressVolumeUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressVolumeUsdMicros', 0] } },
         rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
         reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
     } }]);
     return Math.max(0,
         (liabilities[0]?.sponsoredUsd || 0)
+        + ((liabilities[0]?.permanentUsdMicros || 0) / 1_000_000)
+        + permanentProgressReserveUsd(liabilities[0]?.permanentProgressVolumeUsdMicros)
         + (liabilities[0]?.rentFallbackUsd || 0)
         + (liabilities[0]?.reservedUsd || 0));
 }
@@ -3395,6 +3410,9 @@ async function logConfirmedRewardClaim(claim) {
         meta: {
             event: 'sponsored_rewards_claim',
             amountUsd: claim.amountUsd,
+            starterAmountUsd: claim.sponsoredAmountUsd || 0,
+            permanentAmountUsd: claim.permanentAmountUsd || 0,
+            retainedWinningsAmountUsd: claim.rentFallbackAmountUsd || 0,
             signature: claim.signature || 'simulated_claim',
             claimId: claim._id.toString(),
             ...(DEV_FREE_PLAY ? { simulated: true } : {}),
@@ -3473,11 +3491,16 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
 
         // Close the narrow race where a shared-wallet alert is raised while a
         // promo claim is being reserved. Real retained winnings are restored.
-        if (claim.sponsoredAmountUsd > 0) {
+        if (claim.sponsoredAmountUsd > 0 || claim.permanentAmountUsd > 0) {
             const currentSecurity = await User.findById(req.user.id).select('rewardsDisabled').lean();
             if (currentSecurity?.rewardsDisabled) {
                 await failAndReleaseRewardClaim(claim._id, 'Promotional rewards disabled during linked-wallet review');
-                await User.updateOne({ _id: req.user.id }, { $set: { sponsoredRewardsBalance: 0, fundedRewardsUsd: 0 } });
+                await User.updateOne({ _id: req.user.id }, { $set: {
+                    sponsoredRewardsBalance: 0,
+                    fundedRewardsUsd: 0,
+                    permanentRewardProgressVolumeUsdMicros: 0,
+                    permanentRewardsBalanceUsdMicros: 0,
+                } });
                 return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
             }
         }
@@ -4228,8 +4251,14 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                         totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } },
                         accountCount: { $sum: 1 },
                         totalSponsoredRewards: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                        totalPermanentRewardsUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
+                        totalPermanentProgressVolumeUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressVolumeUsdMicros', 0] } },
                         totalRetainedWinnings: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
-                        activeSponsoredPlayers: { $sum: { $cond: [{ $gt: ['$sponsoredRewardsBalance', 0] }, 1, 0] } },
+                        activeSponsoredPlayers: { $sum: { $cond: [{ $or: [
+                            { $gt: ['$sponsoredRewardsBalance', 0] },
+                            { $gt: ['$permanentRewardsBalanceUsdMicros', 0] },
+                            { $gt: ['$permanentRewardProgressVolumeUsdMicros', 0] },
+                        ] }, 1, 0] } },
                         completedBeginnerChallenges: { $sum: { $cond: [{ $eq: ['$sponsoredRewardsCompleted', true] }, 1, 0] } },
                         unusedFreeTickets: { $sum: { $cond: [{ $and: [{ $eq: ['$hasFreeTicket', true] }, { $ne: ['$freeTicketUsed', true] }] }, 1, 0] } },
                         usedFreeTickets: { $sum: { $cond: [{ $eq: ['$freeTicketUsed', true] }, 1, 0] } }
@@ -4281,6 +4310,8 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerAccountBalanceSol: Number(ownerAccountBalanceSol.toFixed(6)),
             ownerAccountBalanceUsd: Number((ownerAccountBalanceSol * SOL_PRICE_USD).toFixed(2)),
             totalSponsoredRewards: userBalanceAgg[0]?.totalSponsoredRewards ?? 0,
+            totalPermanentRewards: (userBalanceAgg[0]?.totalPermanentRewardsUsdMicros ?? 0) / 1_000_000,
+            totalPermanentProgressReserve: permanentProgressReserveUsd(userBalanceAgg[0]?.totalPermanentProgressVolumeUsdMicros),
             totalRetainedWinnings: userBalanceAgg[0]?.totalRetainedWinnings ?? 0,
             activeSponsoredPlayers: userBalanceAgg[0]?.activeSponsoredPlayers ?? 0,
             completedBeginnerChallenges: userBalanceAgg[0]?.completedBeginnerChallenges ?? 0,
@@ -4476,7 +4507,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const realGameBaseMatch = {
             status: 'confirmed',
@@ -4606,10 +4637,11 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 sponsoredRewardsCompleted: !!u.sponsoredRewardsCompleted,
                 sponsoredRewardsUnlocked: !!u.sponsoredRewardsUnlocked,
                 sponsoredRewardsBalance: Number((u.sponsoredRewardsBalance ?? 0).toFixed(2)),
+                permanentRewards: serializePermanentRewards(u),
                 fundedRewardsUsd: Number((u.fundedRewardsUsd ?? 0).toFixed(2)),
                 retainedRewardsUsd: Number((u.rentFallbackBalanceUsd ?? 0).toFixed(2)),
                 tournamentRewardsBalance: Number((u.tournamentRewardsBalance ?? 0).toFixed(2)),
-                totalRewardsBalance: Number(((u.sponsoredRewardsBalance ?? 0) + (u.rentFallbackBalanceUsd ?? 0) + (u.tournamentRewardsBalance ?? 0)).toFixed(2)),
+                totalRewardsBalance: Number(((u.sponsoredRewardsBalance ?? 0) + ((u.permanentRewardsBalanceUsdMicros ?? 0) / 1_000_000) + (u.rentFallbackBalanceUsd ?? 0) + (u.tournamentRewardsBalance ?? 0)).toFixed(2)),
                 rewardsDisabled: !!u.rewardsDisabled,
                 rewardClaimInProgress: !!u.rewardClaimInProgress,
                 tournamentRewardClaimInProgress: !!u.tournamentRewardClaimInProgress,
@@ -4949,6 +4981,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 completedFiveDollarGames: user.completedFiveDollarNormalGames ?? 0,
                 completedTenDollarGames: user.completedTenDollarNormalGames ?? 0,
                 sponsoredBalanceUsd: Number((user.sponsoredRewardsBalance ?? 0).toFixed(2)),
+                permanentRewards: serializePermanentRewards(user),
                 fundedUsd: Number((user.fundedRewardsUsd ?? 0).toFixed(2)),
                 retainedWinningsUsd: Number((user.rentFallbackBalanceUsd ?? 0).toFixed(2)),
                 sponsoredClaimedUsd: Number(sponsoredRewardsClaimedUsd.toFixed(2)),
@@ -4960,7 +4993,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 tournamentClaimedUsd: Number(tournamentRewardsClaimedUsd.toFixed(2)),
                 tournamentClaimInProgress: !!user.tournamentRewardClaimInProgress,
                 tournamentClaimReservedUsd: Number((user.tournamentRewardClaimReservedUsd ?? 0).toFixed(2)),
-                totalAvailableUsd: Number(((user.sponsoredRewardsBalance ?? 0) + (user.rentFallbackBalanceUsd ?? 0) + (user.tournamentRewardsBalance ?? 0)).toFixed(2)),
+                totalAvailableUsd: Number(((user.sponsoredRewardsBalance ?? 0) + ((user.permanentRewardsBalanceUsdMicros ?? 0) / 1_000_000) + (user.rentFallbackBalanceUsd ?? 0) + (user.tournamentRewardsBalance ?? 0)).toFixed(2)),
             },
             stats: {
                 totalDepositedSol: Number(totalDepositedSol.toFixed(6)),
@@ -5023,7 +5056,7 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
             user.sponsoredRewardsUnlocked = false;
             user.sponsoredRewardsCompleted = false;
             await user.save();
-            return res.json({ success: true, message: 'Challenge progress reset successfully.', user });
+            return res.json({ success: true, message: 'Starter reward progress reset successfully.', user });
         } else if (action === 'manual_unlock') {
             // Unlock only. Payout must go through the same atomic reward-claim ledger as every user claim.
             if (user.rewardsDisabled) {
@@ -5643,6 +5676,7 @@ app.delete('/api/admin/users/:userId', authenticateAdmin, sensitiveRateLimit({ l
         const liabilities = [
             user.balance,
             user.sponsoredRewardsBalance,
+            (Number(user.permanentRewardsBalanceUsdMicros) || 0) / 1_000_000,
             user.rentFallbackBalanceUsd,
             user.tournamentRewardsBalance,
             user.tournamentRewardsLamports,
@@ -6086,6 +6120,8 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             User.aggregate([{ $group: {
                 _id: null,
                 sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                permanentUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
+                permanentProgressVolumeUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressVolumeUsdMicros', 0] } },
                 rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
                 reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
             } }]),
@@ -6094,6 +6130,8 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
         ]);
         const liabilityUsd = Math.max(0,
             (liabilities[0]?.sponsoredUsd || 0)
+            + ((liabilities[0]?.permanentUsdMicros || 0) / 1_000_000)
+            + permanentProgressReserveUsd(liabilities[0]?.permanentProgressVolumeUsdMicros)
             + (liabilities[0]?.rentFallbackUsd || 0)
             + (liabilities[0]?.reservedUsd || 0));
         if (['reserved', 'broadcast'].includes(currentRewardState?.ownerSurplusSweep?.status)) {
@@ -6175,6 +6213,11 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             sponsoredRewardsCompleted: false,
             sponsoredRewardsBalance: 0,
             fundedRewardsUsd: 0,
+            permanentRewardProgressVolumeUsdMicros: 0,
+            permanentRewardsBalanceUsdMicros: 0,
+            permanentRewardLifetimeVolumeUsdMicros: 0,
+            permanentRewardLifetimeEarnedUsdMicros: 0,
+            permanentRewardCyclesCompleted: 0,
             rentFallbackBalanceUsd: 0,
             rewardClaimInProgress: false,
             rewardClaimReservedUsd: 0,
@@ -6193,6 +6236,11 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             sponsoredRewardsCompleted: false,
             sponsoredRewardsBalance: 0,
             fundedRewardsUsd: 0,
+            permanentRewardProgressVolumeUsdMicros: 0,
+            permanentRewardsBalanceUsdMicros: 0,
+            permanentRewardLifetimeVolumeUsdMicros: 0,
+            permanentRewardLifetimeEarnedUsdMicros: 0,
+            permanentRewardCyclesCompleted: 0,
             rentFallbackBalanceUsd: 0,
             rewardClaimInProgress: false,
             rewardClaimReservedUsd: 0,
@@ -6211,6 +6259,11 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
                 'snapshots.$[].sponsoredRewardsCompleted': false,
                 'snapshots.$[].sponsoredRewardsBalance': 0,
                 'snapshots.$[].fundedRewardsUsd': 0,
+                'snapshots.$[].permanentRewardProgressVolumeUsdMicros': 0,
+                'snapshots.$[].permanentRewardsBalanceUsdMicros': 0,
+                'snapshots.$[].permanentRewardLifetimeVolumeUsdMicros': 0,
+                'snapshots.$[].permanentRewardLifetimeEarnedUsdMicros': 0,
+                'snapshots.$[].permanentRewardCyclesCompleted': 0,
             } },
         );
         await resetRewardPoolAccounting();
@@ -7354,6 +7407,12 @@ async function rollbackJoinEconomy(pending, reason) {
 
     if (pending.rewardFundingUsd > 0) {
         await reducePendingRewardUsd(pending.rewardFundingUsd);
+        if (pending.rewardUserState) {
+            await User.updateOne(
+                { _id: pending.userId },
+                { $set: pending.rewardUserState },
+            ).catch(err => console.error('Join rollback reward-state restore failed:', err.message));
+        }
         await Transaction.create({
             userId: pending.userId,
             type: 'game',
@@ -8308,19 +8367,33 @@ io.on('connection', (socket) => {
             }
 
             // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population)
-            // If user hasn't completed Sponsored Rewards, use reduced split with reward pool contribution
+            // Every paid normal entry reserves 20% for rewards. An unfinished
+            // starter reward is funded first; the remainder advances the
+            // permanent $20 volume -> $4 reward cycle.
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
             let foodAlloc, aiAlloc, rewardContribution = 0, ownerContribution = 0;
+            let permanentRewardAllocation = null;
 
-            if (!freePlay && !user.sponsoredRewardsCompleted && !user.rewardsDisabled && !isFreeTicketPlay) {
+            if (!freePlay && !isFreeTicketPlay) {
                 const rpSplit = getRewardPoolSplit(entryFeeUsd);
                 foodAlloc = rpSplit.food;
                 aiAlloc = rpSplit.ai;
-                
-                const remainingToFund = Math.max(0, (user.sponsoredRewardsBalance || 0) - (user.fundedRewardsUsd || 0));
-                rewardContribution = Math.min(rpSplit.rewardPoolContribution, remainingToFund);
-                ownerContribution = rpSplit.ownerVaultContribution + (rpSplit.rewardPoolContribution - rewardContribution);
+
+                if (user.rewardsDisabled) {
+                    ownerContribution = rpSplit.rewardPoolContribution + rpSplit.ownerVaultContribution;
+                } else {
+                    const remainingToFund = user.sponsoredRewardsCompleted
+                        ? 0
+                        : Math.max(0, (user.sponsoredRewardsBalance || 0) - (user.fundedRewardsUsd || 0));
+                    permanentRewardAllocation = calculatePermanentRewardAllocation({
+                        entryFeeUsd,
+                        starterFundingRemainingUsd: remainingToFund,
+                        progressVolumeUsdMicros: user.permanentRewardProgressVolumeUsdMicros || 0,
+                    });
+                    rewardContribution = permanentRewardAllocation.contributionUsd;
+                    ownerContribution = rpSplit.ownerVaultContribution;
+                }
             } else {
                 const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
                 foodAlloc = stdSplit.food;
@@ -8349,6 +8422,14 @@ io.on('connection', (socket) => {
                 slitherBots: [...room.slitherBots],
                 freeTicketBotTargets: { ...(room.freeTicketBotTargets || { agar: 0, slither: 0 }) },
                 rewardFundingUsd: 0,
+                rewardUserState: permanentRewardAllocation ? {
+                    fundedRewardsUsd: Number(user.fundedRewardsUsd) || 0,
+                    permanentRewardProgressVolumeUsdMicros: Number(user.permanentRewardProgressVolumeUsdMicros) || 0,
+                    permanentRewardsBalanceUsdMicros: Number(user.permanentRewardsBalanceUsdMicros) || 0,
+                    permanentRewardLifetimeVolumeUsdMicros: Number(user.permanentRewardLifetimeVolumeUsdMicros) || 0,
+                    permanentRewardLifetimeEarnedUsdMicros: Number(user.permanentRewardLifetimeEarnedUsdMicros) || 0,
+                    permanentRewardCyclesCompleted: Number(user.permanentRewardCyclesCompleted) || 0,
+                } : null,
             };
 
             // Bot budget: if room already has >1 bot, only 10% of AI allocation funds bots
@@ -8370,11 +8451,23 @@ io.on('connection', (socket) => {
 
                 // Reward pool / owner vault contributions
                 if (rewardContribution > 0) {
-                    await Promise.all([
-                        addRewardFundingUsd(rewardContribution),
-                        User.updateOne({ _id: user._id }, { $inc: { fundedRewardsUsd: rewardContribution } })
-                    ]);
+                    const rewardUserUpdate = permanentRewardAllocation ? {
+                        $inc: {
+                            fundedRewardsUsd: permanentRewardAllocation.starterFundingUsd,
+                            permanentRewardsBalanceUsdMicros: permanentRewardAllocation.unlockedRewardUsdMicros,
+                            permanentRewardLifetimeVolumeUsdMicros: permanentRewardAllocation.permanentVolumeUsdMicros,
+                            permanentRewardLifetimeEarnedUsdMicros: permanentRewardAllocation.unlockedRewardUsdMicros,
+                            permanentRewardCyclesCompleted: permanentRewardAllocation.cyclesCompleted,
+                        },
+                        $set: {
+                            permanentRewardProgressVolumeUsdMicros: permanentRewardAllocation.nextProgressVolumeUsdMicros,
+                        },
+                    } : null;
+                    await addRewardFundingUsd(rewardContribution);
                     pendingJoinEconomy.rewardFundingUsd = rewardContribution;
+                    if (rewardUserUpdate) {
+                        await User.updateOne({ _id: user._id }, rewardUserUpdate);
+                    }
                     console.log(`🏆 REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${getCachedPendingRewardUsd().toFixed(2)}`);
                     Transaction.create({
                         userId: user._id,
@@ -8384,6 +8477,11 @@ io.on('connection', (socket) => {
                             event: 'reward_pool_contribution',
                             entryFeeUsd,
                             contributionUsd: rewardContribution,
+                            starterFundingUsd: permanentRewardAllocation?.starterFundingUsd || 0,
+                            permanentFundingUsd: permanentRewardAllocation?.permanentFundingUsd || 0,
+                            permanentVolumeUsd: permanentRewardAllocation?.permanentVolumeUsd || 0,
+                            permanentRewardUnlockedUsd: permanentRewardAllocation?.unlockedRewardUsd || 0,
+                            permanentRewardCyclesCompleted: permanentRewardAllocation?.cyclesCompleted || 0,
                             roomId: room.id,
                             mode: gameMode,
                         },

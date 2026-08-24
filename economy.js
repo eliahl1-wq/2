@@ -101,12 +101,12 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
  *   20 % → player start balance (deducted before this split)
  *   40 % → food pool (includes 10 % golden blob deducted in join handler)
  *   20 % → bots (AI budget)
- *   20 % → reward pool ($5/$10) or owner vault ($20)
+ *   20 % → rewards (starter funding first, then the permanent reward cycle)
  *
  * Dollar amounts:
  *   $5:  start $1.00, food $2.00, bots $1.00, reward $1.00
  *   $10: start $2.00, food $4.00, bots $2.00, reward $2.00
- *   $20: start $4.00, food $8.00, bots $4.00, owner vault $4.00
+ *   $20: start $4.00, food $8.00, bots $4.00, rewards $4.00
  *
  * Returns { food, ai, rewardPoolContribution, ownerVaultContribution }.
  * food includes golden blob — join handler subtracts it before adding to foodPoolBalance.
@@ -118,12 +118,7 @@ export function getRewardPoolSplit(entryFeeUsd) {
     const ai   = entry * 0.20;
     const contribution = entry - playerStart - food - ai; // 20 %
 
-    if (entry <= 10) {
-        // $5 and $10: contribution goes to reward pool
-        return { food, ai, rewardPoolContribution: contribution, ownerVaultContribution: 0 };
-    }
-    // $20+: contribution goes to owner vault (not reward pool)
-    return { food, ai, rewardPoolContribution: 0, ownerVaultContribution: contribution };
+    return { food, ai, rewardPoolContribution: contribution, ownerVaultContribution: 0 };
 }
 
 

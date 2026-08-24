@@ -26,6 +26,7 @@ const RewardClaimSchema = new mongoose.Schema({
     claimKey: { type: String, unique: true, required: true },
     amountUsd: { type: Number, required: true },
     sponsoredAmountUsd: { type: Number, default: 0 },
+    permanentAmountUsd: { type: Number, default: 0 },
     rentFallbackAmountUsd: { type: Number, default: 0 },
     solAmount: { type: Number, default: null },
     status: { type: String, enum: ['reserved', 'broadcast', 'confirmed', 'failed'], default: 'reserved', index: true },
@@ -58,6 +59,12 @@ const RewardSecurityAlertSchema = new mongoose.Schema({
         sponsoredRewardsUnlocked: Boolean,
         sponsoredRewardsCompleted: Boolean,
         sponsoredRewardsBalance: Number,
+        fundedRewardsUsd: Number,
+        permanentRewardProgressVolumeUsdMicros: Number,
+        permanentRewardsBalanceUsdMicros: Number,
+        permanentRewardLifetimeVolumeUsdMicros: Number,
+        permanentRewardLifetimeEarnedUsdMicros: Number,
+        permanentRewardCyclesCompleted: Number,
     }],
     status: { type: String, enum: ['pending', 'approved', 'denied'], default: 'pending', index: true },
     resolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -173,6 +180,10 @@ export async function reserveRewardClaim(userId) {
                 sponsoredRewardsBalance: { $gt: 0 },
                 rewardsDisabled: { $ne: true },
             },
+            {
+                permanentRewardsBalanceUsdMicros: { $gt: 0 },
+                rewardsDisabled: { $ne: true },
+            },
         ],
     });
     if (!user) return null;
@@ -180,8 +191,12 @@ export async function reserveRewardClaim(userId) {
     const sponsoredAmountUsd = user.sponsoredRewardsUnlocked && user.sponsoredRewardsCompleted && !user.rewardsDisabled
         ? (Number(user.sponsoredRewardsBalance) || 0)
         : 0;
+    const permanentAmountUsdMicros = !user.rewardsDisabled
+        ? Math.max(0, Math.floor(Number(user.permanentRewardsBalanceUsdMicros) || 0))
+        : 0;
+    const permanentAmountUsd = permanentAmountUsdMicros / 1_000_000;
     const rentFallbackAmountUsd = Number(user.rentFallbackBalanceUsd) || 0;
-    const amountUsd = sponsoredAmountUsd + rentFallbackAmountUsd;
+    const amountUsd = sponsoredAmountUsd + permanentAmountUsd + rentFallbackAmountUsd;
 
     // Perform the update atomically, matching the expected balances to prevent race conditions
     const updatedUser = await User.findOneAndUpdate(
@@ -189,6 +204,11 @@ export async function reserveRewardClaim(userId) {
             _id: userId,
             rewardClaimInProgress: { $ne: true },
             sponsoredRewardsBalance: user.sponsoredRewardsBalance,
+            // Existing accounts may predate the permanent-reward fields. Treat
+            // a missing value as the schema's zero default during the first claim.
+            permanentRewardsBalanceUsdMicros: permanentAmountUsdMicros > 0
+                ? user.permanentRewardsBalanceUsdMicros
+                : { $in: [0, null] },
             rentFallbackBalanceUsd: user.rentFallbackBalanceUsd,
         },
         {
@@ -197,6 +217,7 @@ export async function reserveRewardClaim(userId) {
                 rewardClaimInProgress: true,
                 rewardClaimReservedUsd: amountUsd,
                 sponsoredRewardsBalance: user.sponsoredRewardsBalance - sponsoredAmountUsd,
+                permanentRewardsBalanceUsdMicros: (Number(user.permanentRewardsBalanceUsdMicros) || 0) - permanentAmountUsdMicros,
                 rentFallbackBalanceUsd: 0,
             }
         },
@@ -211,6 +232,7 @@ export async function reserveRewardClaim(userId) {
             claimKey,
             amountUsd,
             sponsoredAmountUsd,
+            permanentAmountUsd,
             rentFallbackAmountUsd,
             status: 'reserved',
         });
@@ -219,7 +241,11 @@ export async function reserveRewardClaim(userId) {
         await User.updateOne(
             { _id: userId, activeRewardClaimId: claimId },
             {
-                $inc: { sponsoredRewardsBalance: sponsoredAmountUsd, rentFallbackBalanceUsd: rentFallbackAmountUsd },
+                $inc: {
+                    sponsoredRewardsBalance: sponsoredAmountUsd,
+                    permanentRewardsBalanceUsdMicros: permanentAmountUsdMicros,
+                    rentFallbackBalanceUsd: rentFallbackAmountUsd,
+                },
                 $set: { rewardClaimInProgress: false, rewardClaimReservedUsd: 0 },
                 $unset: { activeRewardClaimId: 1 },
             },
@@ -277,7 +303,11 @@ export async function failAndReleaseRewardClaim(claimId, error) {
     await User.updateOne(
         { _id: claim.userId, activeRewardClaimId: claim._id },
         {
-            $inc: { sponsoredRewardsBalance: claim.sponsoredAmountUsd || 0, rentFallbackBalanceUsd: claim.rentFallbackAmountUsd || 0 },
+            $inc: {
+                sponsoredRewardsBalance: claim.sponsoredAmountUsd || 0,
+                permanentRewardsBalanceUsdMicros: Math.round((claim.permanentAmountUsd || 0) * 1_000_000),
+                rentFallbackBalanceUsd: claim.rentFallbackAmountUsd || 0,
+            },
             $set: { rewardClaimInProgress: false, rewardClaimReservedUsd: 0 },
             $unset: { activeRewardClaimId: 1 },
         },
@@ -315,6 +345,11 @@ async function snapshotUser(user) {
         sponsoredRewardsCompleted: !!user.sponsoredRewardsCompleted,
         sponsoredRewardsBalance: user.sponsoredRewardsBalance || 0,
         fundedRewardsUsd: user.fundedRewardsUsd || 0,
+        permanentRewardProgressVolumeUsdMicros: user.permanentRewardProgressVolumeUsdMicros || 0,
+        permanentRewardsBalanceUsdMicros: user.permanentRewardsBalanceUsdMicros || 0,
+        permanentRewardLifetimeVolumeUsdMicros: user.permanentRewardLifetimeVolumeUsdMicros || 0,
+        permanentRewardLifetimeEarnedUsdMicros: user.permanentRewardLifetimeEarnedUsdMicros || 0,
+        permanentRewardCyclesCompleted: user.permanentRewardCyclesCompleted || 0,
     };
 }
 
@@ -386,6 +421,8 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
                     sponsoredRewardsCompleted: false,
                     sponsoredRewardsBalance: 0,
                     fundedRewardsUsd: 0,
+                    permanentRewardProgressVolumeUsdMicros: 0,
+                    permanentRewardsBalanceUsdMicros: 0,
                 },
             },
         );
@@ -411,6 +448,11 @@ async function restoreSharedWalletSnapshot(User, alert, snapshot) {
             sponsoredRewardsUnlocked: snapshot.sponsoredRewardsUnlocked,
             sponsoredRewardsCompleted: snapshot.sponsoredRewardsCompleted,
             sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, current.sponsoredRewardsBalance || 0),
+            permanentRewardProgressVolumeUsdMicros: snapshot.permanentRewardProgressVolumeUsdMicros || 0,
+            permanentRewardsBalanceUsdMicros: Math.max(snapshot.permanentRewardsBalanceUsdMicros || 0, current.permanentRewardsBalanceUsdMicros || 0),
+            permanentRewardLifetimeVolumeUsdMicros: Math.max(snapshot.permanentRewardLifetimeVolumeUsdMicros || 0, current.permanentRewardLifetimeVolumeUsdMicros || 0),
+            permanentRewardLifetimeEarnedUsdMicros: Math.max(snapshot.permanentRewardLifetimeEarnedUsdMicros || 0, current.permanentRewardLifetimeEarnedUsdMicros || 0),
+            permanentRewardCyclesCompleted: Math.max(snapshot.permanentRewardCyclesCompleted || 0, current.permanentRewardCyclesCompleted || 0),
         } },
     );
 }
@@ -488,6 +530,11 @@ export async function resolveRewardSecurityAlert(alertId, action, adminUserId, n
                     sponsoredRewardsCompleted: snapshot.sponsoredRewardsCompleted,
                     sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, (await User.findById(snapshot.userId).lean())?.sponsoredRewardsBalance || 0),
                     fundedRewardsUsd: snapshot.fundedRewardsUsd || 0,
+                    permanentRewardProgressVolumeUsdMicros: snapshot.permanentRewardProgressVolumeUsdMicros || 0,
+                    permanentRewardsBalanceUsdMicros: snapshot.permanentRewardsBalanceUsdMicros || 0,
+                    permanentRewardLifetimeVolumeUsdMicros: snapshot.permanentRewardLifetimeVolumeUsdMicros || 0,
+                    permanentRewardLifetimeEarnedUsdMicros: snapshot.permanentRewardLifetimeEarnedUsdMicros || 0,
+                    permanentRewardCyclesCompleted: snapshot.permanentRewardCyclesCompleted || 0,
                 } },
             );
         }

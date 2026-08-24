@@ -331,12 +331,17 @@ test('surviv countryside keeps dense distributed cover and frequent solo rural h
         + Math.floor((obstacle.y + SURVIV.worldHalf) / 1600)
     )));
     const gameplayTreeCells = new Map();
-    for (const tree of map.obstacles.filter(obstacle => obstacle.kind === 'tree')) {
+    const allTrees = map.obstacles.filter(obstacle => obstacle.kind === 'tree');
+    const survivTrees = allTrees.filter(tree => tree.canopyStyle === 'surviv');
+    const legacyTrees = allTrees.filter(tree => tree.canopyStyle === 'legacy');
+    const survivTreeCells = new Set();
+    for (const tree of allTrees) {
         if (Math.abs(tree.x) >= 9500 || Math.abs(tree.y) >= 9500) continue;
         const key = Math.floor((tree.x + 9500) / 1000)
             + ','
             + Math.floor((tree.y + 9500) / 650);
         gameplayTreeCells.set(key, (gameplayTreeCells.get(key) || 0) + 1);
+        if (tree.canopyStyle === 'surviv') survivTreeCells.add(key);
     }
     const gameplayCellCount = 19 * 30;
     const averageTreesPerGameplayCell = [...gameplayTreeCells.values()]
@@ -364,6 +369,12 @@ test('surviv countryside keeps dense distributed cover and frequent solo rural h
         'most gameplay-sized countryside cells should contain several visible trees');
     assert.ok(averageTreesPerGameplayCell >= 7.4,
         `expected multiple visible trees per desktop-scale cell, got ${averageTreesPerGameplayCell.toFixed(2)}`);
+    assert.ok(survivTrees.length / allTrees.length >= 0.72 && survivTrees.length / allTrees.length <= 0.78,
+        `roughly three quarters of trees should use the new canopy, got ${survivTrees.length}/${allTrees.length}`);
+    assert.ok(legacyTrees.length / allTrees.length >= 0.22 && legacyTrees.length / allTrees.length <= 0.28,
+        `roughly one quarter of trees should retain legacy biome art, got ${legacyTrees.length}/${allTrees.length}`);
+    assert.ok(survivTreeCells.size >= 520,
+        `new tree canopies should appear across nearly the whole playable map, got ${survivTreeCells.size} cells`);
     assert.ok(ruralHomes.length >= 20 && ruralHomes.length <= 27,
         `expected frequent authored solo homes between POIs, got ${ruralHomes.length}`);
     assert.ok(rotationCover.length >= 145 && rotationCover.length <= 190,
@@ -1279,6 +1290,64 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
             player.x, player.y, SURVIV.playerRadius + 10, obstacle,
         )), 'runtime spawn should stay outside structures and water');
     }
+});
+
+test('interior partitions meet nearby exterior walls without visual or collision gaps', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const floors = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const exteriorWalls = map.obstacles.filter(obstacle => obstacle.kind === 'wall');
+    const interiorWalls = map.obstacles.filter(obstacle => obstacle.kind === 'interiorWall');
+    const maxVisibleGap = 42;
+    let joinedEndpoints = 0;
+
+    for (const floor of floors) {
+        const floorLeft = floor.x - floor.w / 2;
+        const floorRight = floor.x + floor.w / 2;
+        const floorTop = floor.y - floor.h / 2;
+        const floorBottom = floor.y + floor.h / 2;
+        const partitions = interiorWalls.filter(wall => wall.houseId === floor.id);
+        const boundaryWalls = exteriorWalls.filter(wall => {
+            if (wall.houseId && wall.houseId !== floor.id) return false;
+            if (wall.h > wall.w) {
+                return Math.min(Math.abs(wall.x - floorLeft), Math.abs(wall.x - floorRight))
+                        <= Math.max(18, wall.w * 1.25)
+                    && wall.y + wall.h / 2 >= floorTop - 2
+                    && wall.y - wall.h / 2 <= floorBottom + 2;
+            }
+            return Math.min(Math.abs(wall.y - floorTop), Math.abs(wall.y - floorBottom))
+                    <= Math.max(18, wall.h * 1.25)
+                && wall.x + wall.w / 2 >= floorLeft - 2
+                && wall.x - wall.w / 2 <= floorRight + 2;
+        });
+
+        for (const partition of partitions) {
+            const horizontal = partition.w >= partition.h;
+            const nearTargets = boundaryWalls.filter(wall => horizontal
+                ? wall.h > wall.w
+                    && partition.y + partition.h / 2 >= wall.y - wall.h / 2 - 0.5
+                    && partition.y - partition.h / 2 <= wall.y + wall.h / 2 + 0.5
+                : wall.w >= wall.h
+                    && partition.x + partition.w / 2 >= wall.x - wall.w / 2 - 0.5
+                    && partition.x - partition.w / 2 <= wall.x + wall.w / 2 + 0.5);
+            const endpointGaps = horizontal
+                ? nearTargets.flatMap(wall => [
+                    partition.x - partition.w / 2 - (wall.x + wall.w / 2),
+                    (wall.x - wall.w / 2) - (partition.x + partition.w / 2),
+                ])
+                : nearTargets.flatMap(wall => [
+                    partition.y - partition.h / 2 - (wall.y + wall.h / 2),
+                    (wall.y - wall.h / 2) - (partition.y + partition.h / 2),
+                ]);
+            for (const gap of endpointGaps) {
+                if (gap < -maxVisibleGap || gap > maxVisibleGap) continue;
+                assert.ok(gap <= 0.5,
+                    `detached interior-wall endpoint leaves a ${gap.toFixed(2)} unit gap in ${floor.label || floor.role || floor.id} (${partition.id})`);
+                joinedEndpoints++;
+            }
+        }
+    }
+
+    assert.ok(joinedEndpoints >= 30, 'expected the assertion to cover many exterior-wall junctions');
 });
 
 test('river spline metadata survives generation and bridges hit both highways exactly', () => {
@@ -2732,6 +2801,9 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.equal(serializedRiver.points.length, 21);
     assert.equal(serializedRiver.widths.length, serializedRiver.points.length);
     assert.ok(serializedRiver.width >= 210);
+    const serializedTree = ticks[0].obstacles.find(obstacle => obstacle.kind === 'tree');
+    assert.ok(serializedTree);
+    assert.ok(serializedTree.canopyStyle === 'surviv' || serializedTree.canopyStyle === 'legacy');
     assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
     assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
     assert.equal(Object.hasOwn(ticks[1], 'fullMap'), false);

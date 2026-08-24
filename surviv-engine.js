@@ -949,6 +949,96 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
     }
 }
 
+function sealInteriorWallExteriorJunctions(obstacles) {
+    const floors = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const exteriorWalls = obstacles.filter(obstacle => (
+        obstacle.kind === 'wall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
+    ));
+    const interiorWalls = obstacles.filter(obstacle => (
+        obstacle.kind === 'interiorWall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
+    ));
+    const maxVisibleGap = 42;
+
+    for (const floor of floors) {
+        const floorLeft = floor.x - floor.w / 2;
+        const floorRight = floor.x + floor.w / 2;
+        const floorTop = floor.y - floor.h / 2;
+        const floorBottom = floor.y + floor.h / 2;
+        const belongsToFloor = obstacle => obstacle.houseId
+            ? obstacle.houseId === floor.id
+            : pointInRect(obstacle.x, obstacle.y, floor, 2);
+        const partitions = interiorWalls.filter(belongsToFloor);
+        if (!partitions.length) continue;
+
+        // Older and hand-authored buildings do not all tag exterior segments
+        // with houseId. Boundary position therefore remains the authoritative
+        // association, while a conflicting explicit houseId is rejected.
+        const boundaryWalls = exteriorWalls.filter(wall => {
+            if (wall.houseId && wall.houseId !== floor.id) return false;
+            const vertical = wall.h > wall.w;
+            if (vertical) {
+                return Math.min(
+                    Math.abs(wall.x - floorLeft),
+                    Math.abs(wall.x - floorRight),
+                ) <= Math.max(18, wall.w * 1.25)
+                    && wall.y + wall.h / 2 >= floorTop - 2
+                    && wall.y - wall.h / 2 <= floorBottom + 2;
+            }
+            return Math.min(
+                Math.abs(wall.y - floorTop),
+                Math.abs(wall.y - floorBottom),
+            ) <= Math.max(18, wall.h * 1.25)
+                && wall.x + wall.w / 2 >= floorLeft - 2
+                && wall.x - wall.w / 2 <= floorRight + 2;
+        });
+
+        for (const partition of partitions) {
+            const horizontal = partition.w >= partition.h;
+            if (horizontal) {
+                let minX = partition.x - partition.w / 2;
+                let maxX = partition.x + partition.w / 2;
+                const candidates = boundaryWalls.filter(wall => (
+                    wall.h > wall.w
+                    && partition.y + partition.h / 2 >= wall.y - wall.h / 2 - 0.5
+                    && partition.y - partition.h / 2 <= wall.y + wall.h / 2 + 0.5
+                ));
+                const leftTarget = candidates
+                    .map(wall => ({ wall, gap: minX - (wall.x + wall.w / 2) }))
+                    .filter(entry => entry.wall.x < partition.x && entry.gap >= -1 && entry.gap <= maxVisibleGap)
+                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                const rightTarget = candidates
+                    .map(wall => ({ wall, gap: (wall.x - wall.w / 2) - maxX }))
+                    .filter(entry => entry.wall.x > partition.x && entry.gap >= -1 && entry.gap <= maxVisibleGap)
+                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                if (leftTarget) minX = Math.min(minX, leftTarget.x);
+                if (rightTarget) maxX = Math.max(maxX, rightTarget.x);
+                partition.x = (minX + maxX) / 2;
+                partition.w = maxX - minX;
+            } else {
+                let minY = partition.y - partition.h / 2;
+                let maxY = partition.y + partition.h / 2;
+                const candidates = boundaryWalls.filter(wall => (
+                    wall.w >= wall.h
+                    && partition.x + partition.w / 2 >= wall.x - wall.w / 2 - 0.5
+                    && partition.x - partition.w / 2 <= wall.x + wall.w / 2 + 0.5
+                ));
+                const topTarget = candidates
+                    .map(wall => ({ wall, gap: minY - (wall.y + wall.h / 2) }))
+                    .filter(entry => entry.wall.y < partition.y && entry.gap >= -1 && entry.gap <= maxVisibleGap)
+                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                const bottomTarget = candidates
+                    .map(wall => ({ wall, gap: (wall.y - wall.h / 2) - maxY }))
+                    .filter(entry => entry.wall.y > partition.y && entry.gap >= -1 && entry.gap <= maxVisibleGap)
+                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                if (topTarget) minY = Math.min(minY, topTarget.y);
+                if (bottomTarget) maxY = Math.max(maxY, bottomTarget.y);
+                partition.y = (minY + maxY) / 2;
+                partition.h = maxY - minY;
+            }
+        }
+    }
+}
+
 function getInteriorDoorSwingRect(door) {
     const horizontal = door.w >= door.h;
     const panelLength = Math.max(door.w, door.h) + 8;
@@ -4139,7 +4229,9 @@ function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = [], plac
 }
 
 function addLandmarkTrees(obstacles, worldHalf, targetCount = 30, exclusionAreas = []) {
-    let added = 0;
+    let added = obstacles.filter(obstacle => (
+        obstacle.kind === 'tree' && obstacle.role === 'landmarkTree'
+    )).length;
     const margin = 920;
     const step = 1480;
     for (let gx = -worldHalf + margin; gx <= worldHalf - margin && added < targetCount; gx += step) {
@@ -4176,6 +4268,20 @@ function addLandmarkTrees(obstacles, worldHalf, targetCount = 30, exclusionAreas
         }
     }
     return added;
+}
+
+function assignTreeCanopyStyles(obstacles) {
+    const trees = obstacles.filter(obstacle => obstacle.kind === 'tree');
+    for (const tree of trees) {
+        // Coordinate hashing distributes the retained legacy quarter across
+        // every biome instead of concentrating it in one generator pass.
+        let hash = 2166136261;
+        hash ^= Math.round((Number(tree.x) || 0) * 10);
+        hash = Math.imul(hash, 16777619);
+        hash ^= Math.round((Number(tree.y) || 0) * 10);
+        hash = Math.imul(hash, 16777619);
+        tree.canopyStyle = (hash >>> 0) % 4 === 0 ? 'legacy' : 'surviv';
+    }
 }
 
 function addWorldFurnitureDetails(obstacles) {
@@ -5297,7 +5403,13 @@ export function generateSurvivMap(worldHalf) {
     addCanopyInfill(obstacles, wh, 4650, INTENTIONAL_OPEN_AREAS, countrysidePlacementIndex);
     addNaturalDetailScatter(obstacles, wh, [...POI_LIST, ...INTENTIONAL_OPEN_AREAS], countrysidePlacementIndex);
     addScatteredGroundLoot(obstacles, loot);
+    sealInteriorWallExteriorJunctions(obstacles);
     clearInvalidBuildingProps(obstacles);
+    // Later residences may legitimately clear an earlier landmark tree. Top up
+    // after that cleanup so every generated map still exposes the large tree
+    // design instead of depending on a favorable placement seed.
+    addLandmarkTrees(obstacles, wh, 30, INTENTIONAL_OPEN_AREAS);
+    assignTreeCanopyStyles(obstacles);
     sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
 
     return { obstacles, loot, spawnPoints, landmarks };
@@ -7855,6 +7967,7 @@ function serializeSurvivObstacle(o) {
         ...(o.hue != null ? { hue: o.hue } : {}),
         ...(o.rotation ? { rotation: o.rotation } : {}),
         ...(o.variant ? { variant: o.variant } : {}),
+        ...(o.canopyStyle ? { canopyStyle: o.canopyStyle } : {}),
         ...(o.biome ? { biome: o.biome } : {}),
         ...(o.label ? { label: o.label } : {}),
         ...(o.houseId ? { houseId: o.houseId } : {}),

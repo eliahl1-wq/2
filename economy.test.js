@@ -94,10 +94,10 @@ test('$10 reward pool split routes extra to reward pool', () => {
     assert.equal(split.ai, 2.0);
 });
 
-test('$20 reward pool split routes extra to owner vault', () => {
+test('$20 reward pool split routes the full 20% reward share to rewards', () => {
     const split = getRewardPoolSplit(20);
-    assert.equal(split.rewardPoolContribution, 0);
-    assert.equal(split.ownerVaultContribution, 4.0);
+    assert.equal(split.rewardPoolContribution, 4.0);
+    assert.equal(split.ownerVaultContribution, 0);
     assert.equal(split.food, 8.0);  // includes golden blob ($2.00)
     assert.equal(split.ai, 4.0);
 });
