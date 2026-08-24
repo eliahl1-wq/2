@@ -2561,6 +2561,9 @@ test('surviv static terrain payload is retained between periodic sends', () => {
 
     assert.ok(Array.isArray(ticks[0].obstacles));
     assert.ok(ticks[0].minimap);
+    assert.ok(Array.isArray(ticks[0].fullMap?.obstacles));
+    assert.ok(ticks[0].fullMap.obstacles.length > ticks[0].minimap.obstacles.length);
+    assert.ok(Array.isArray(ticks[0].fullMap.landmarks));
     assert.equal(ticks[0].obstaclePatch.x, player.x);
     assert.equal(ticks[0].obstaclePatch.y, player.y);
     assert.ok(ticks[0].obstaclePatch.retainRange > ticks[0].obstaclePatch.range);
@@ -2578,6 +2581,7 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.ok(serializedRiver.width >= 210);
     assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
     assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
+    assert.equal(Object.hasOwn(ticks[1], 'fullMap'), false);
     assert.ok(Array.isArray(ticks[1].players));
     assert.equal(ticks[1].you.id, player.id);
     assert.equal(ticks[1].players.some(other => other.id === player.id), false);
@@ -2604,6 +2608,47 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     assert.equal(serializedIronworks.landmarkType, 'ironworks');
     assert.equal(serializedIronworks.orientation, 'east');
     assert.equal(serializedMainDoor.role, 'east');
+});
+
+test('surviv expanded map exposes coarse activity areas without exact enemy positions', () => {
+    const room = makeRoom();
+    const viewer = createSurvivPlayer('map-viewer', 'mongo-map-viewer', 'Viewer', '#fff', room);
+    const enemy = createSurvivPlayer('map-enemy', 'mongo-map-enemy', 'Enemy', '#f00', room);
+    viewer.x = 0;
+    viewer.y = 0;
+    enemy.x = 9837;
+    enemy.y = 9463;
+    room.players.push(viewer, enemy);
+
+    const ticksByViewer = new Map();
+    const io = {
+        to(socketId) {
+            return {
+                emit(event, payload) {
+                    if (event === 'survivTick') ticksByViewer.set(socketId, payload);
+                },
+            };
+        },
+    };
+    broadcastSurvivState(room, io, {
+        leaderboard: [],
+        aliveCount: 2,
+        zone: { x: 0, y: 0, radius: SURVIV.worldHalf },
+    }, {});
+
+    const tick = ticksByViewer.get(viewer.id);
+    assert.ok(tick.fullMap);
+    assert.ok(tick.activityZones.length >= 1);
+    const activity = tick.activityZones.find(candidate => (
+        Math.hypot(candidate.x - enemy.x, candidate.y - enemy.y) <= candidate.radius
+    ));
+    assert.ok(activity);
+    assert.ok(activity.radius >= 1200);
+    assert.ok(Math.abs(activity.x) <= SURVIV.worldHalf - 1200);
+    assert.ok(Math.abs(activity.y) <= SURVIV.worldHalf - 1200);
+    assert.notEqual(activity.x, enemy.x);
+    assert.notEqual(activity.y, enemy.y);
+    assert.equal(tick.fullMap.obstacles.some(obstacle => obstacle.kind === 'door'), false);
 });
 
 test('surviv alive count and leaderboard use the same active entities', () => {

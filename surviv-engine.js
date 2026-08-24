@@ -4915,6 +4915,8 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room.obstacles = nextMap.obstacles || [];
     room.spawnPoints = nextMap.spawnPoints || [];
     room.landmarks = nextMap.landmarks || [];
+    room._survivFullMapSent = new Set();
+    room._survivActivitySnapshot = null;
     room._survivObstacleIndex = null;
     room._survivLootIndex = null;
     room._survivObstacleRevision = 0;
@@ -7067,6 +7069,28 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     }
 
     const allPlayers = getActiveSurvivEntities(room);
+    // The expanded map is intentionally imprecise about opponents. It reports
+    // coarse, slowly refreshed activity cells instead of exact player
+    // coordinates, so the map is useful for routing without becoming a
+    // real-time wallhack.
+    if (!room._survivActivitySnapshot || now - room._survivActivitySnapshot.capturedAt >= 2500) {
+        const cellSize = 2400;
+        const cells = new Map();
+        for (const player of allPlayers) {
+            const cellX = Math.floor((player.x + SURVIV.worldHalf) / cellSize);
+            const cellY = Math.floor((player.y + SURVIV.worldHalf) / cellSize);
+            const key = `${cellX}:${cellY}`;
+            const cell = cells.get(key) || {
+                x: clamp(-SURVIV.worldHalf + (cellX + 0.5) * cellSize, -SURVIV.worldHalf + cellSize / 2, SURVIV.worldHalf - cellSize / 2),
+                y: clamp(-SURVIV.worldHalf + (cellY + 0.5) * cellSize, -SURVIV.worldHalf + cellSize / 2, SURVIV.worldHalf - cellSize / 2),
+                radius: 1320,
+                entityIds: [],
+            };
+            cell.entityIds.push(player.id);
+            cells.set(key, cell);
+        }
+        room._survivActivitySnapshot = { capturedAt: now, cells: Array.from(cells.values()) };
+    }
     const pendingKillFeed = Array.isArray(room._pendingKillFeed) ? room._pendingKillFeed : [];
     const aliveCount = Number.isFinite(lbData.aliveCount) ? lbData.aliveCount : allPlayers.length;
     room.deathMarkers = (room.deathMarkers || []).filter(marker => now - marker.createdAt < 30000).slice(-40);
@@ -7148,9 +7172,51 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 food: minimapLoot,
                 obstacles: minimapObstacles,
             };
+            room._survivFullMapSent ||= new Set();
+            if (!room._survivFullMapSent.has(socketId)) {
+                const fullMapKinds = new Set([
+                    'road', 'roadJunction', 'trail_path', 'river_path', 'houseFloor',
+                    'water', 'bridge', 'container',
+                ]);
+                staticPayload.fullMap = {
+                    worldHalf: SURVIV.worldHalf,
+                    obstacles: (room.obstacles || [])
+                        .filter(obstacle => fullMapKinds.has(obstacle.kind))
+                        .map(obstacle => ({
+                            x: Math.round(obstacle.x),
+                            y: Math.round(obstacle.y),
+                            w: Math.round(obstacle.w || 0),
+                            h: Math.round(obstacle.h || 0),
+                            kind: obstacle.kind,
+                            ...(obstacle.rotation ? { rotation: Number(obstacle.rotation.toFixed(3)) } : {}),
+                            ...(Array.isArray(obstacle.points) ? {
+                                points: obstacle.points.map(point => ({
+                                    x: Math.round(point.x),
+                                    y: Math.round(point.y),
+                                })),
+                            } : {}),
+                            ...(Number.isFinite(obstacle.width) ? { width: Math.round(obstacle.width) } : {}),
+                        })),
+                    landmarks: (room.landmarks || []).map(landmark => ({
+                        id: landmark.id,
+                        name: landmark.name || landmark.label || '',
+                        x: landmark.x,
+                        y: landmark.y,
+                    })),
+                };
+                room._survivFullMapSent.add(socketId);
+            }
         }
 
         const viewerEntity = youId ? allPlayers.find(player => player.id === youId) : null;
+        const activityZones = (room._survivActivitySnapshot?.cells || [])
+            .filter(cell => cell.entityIds.some(entityId => entityId !== youId))
+            .map(cell => ({
+                x: cell.x,
+                y: cell.y,
+                radius: cell.radius,
+                strength: Math.min(1, 0.48 + cell.entityIds.filter(entityId => entityId !== youId).length * 0.12),
+            }));
         io.to(socketId).emit('survivTick', {
             you: youId ? serializePlayer(
                 viewerEntity || { id: youId, x: viewX, y: viewY, dollarBalance, hp: 0 },
@@ -7165,6 +7231,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             aliveCount,
             dollarBalance,
             spectating,
+            activityZones,
             ...(pendingKillFeed.length ? { killFeed: pendingKillFeed.map(entry => ({ ...entry })) } : {}),
             ...(viewerEntity?._hitConfirm ? { hitConfirm: { ...viewerEntity._hitConfirm } } : {}),
             ...(viewerEntity?._damageTaken ? { damageTaken: { ...viewerEntity._damageTaken } } : {}),
