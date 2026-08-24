@@ -651,6 +651,8 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         roomId: options.roomId || null,
         role: options.role || null,
         landmarkType: options.landmarkType || null,
+        blueprint: options.blueprint || null,
+        designId: options.designId || null,
         entranceRole: options.entranceRole || null,
         orientation: options.orientation || null,
         ...(kind === 'door' ? { isOpen: !!options.isOpen } : {}),
@@ -899,7 +901,7 @@ function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], va
         cursor = Math.max(cursor, gapMax);
     }
     if (max - cursor > wall * 1.5) addInteriorWall(obstacles, x, (cursor + max) / 2, wall, max - cursor, variant, opts);
-    if (opts.houseId) {
+    if (opts.houseId && opts.addDoors !== false) {
         for (const gap of sorted) {
             addDoor(
                 obstacles,
@@ -930,7 +932,7 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
         cursor = Math.max(cursor, gapMax);
     }
     if (max - cursor > wall * 1.5) addInteriorWall(obstacles, (cursor + max) / 2, y, max - cursor, wall, variant, opts);
-    if (opts.houseId) {
+    if (opts.houseId && opts.addDoors !== false) {
         for (const gap of sorted) {
             addDoor(
                 obstacles,
@@ -964,7 +966,7 @@ const BREAKABLE_INTERIOR_VARIANTS = new Set([
     'coffeeTable', 'nightstand', 'dresser', 'armchair', 'floorLamp', 'housePlant',
     'diningTable', 'desk', 'bookshelf', 'displayShelf', 'palletStack', 'toolCabinet',
     'labBench', 'specimenTank', 'serverRack', 'generator', 'weaponRack', 'mapTable',
-    'bunkBed', 'toilet', 'prisonBench',
+    'bunkBed', 'toilet', 'prisonBench', 'vanity', 'wardrobe', 'sideboard', 'entryBench',
 ]);
 
 function resolveHouseInteriorTheme(variant, options = {}) {
@@ -1166,17 +1168,17 @@ function furnishHouseInterior(obstacles, house, options = {}) {
             continue;
         }
 
-        if (roomType === 'living-room') {
+        if (['living-room', 'family-room', 'playroom', 'sunroom'].includes(roomType)) {
             horizontalPlan(room, [
                 { variant: 'sofa', x: 0.23, y: -0.25, w: 96, h: 38 },
                 { variant: 'coffeeTable', x: 0.16, y: 0.16, w: 58, h: 30 },
                 { variant: 'armchair', x: -0.31, y: 0.19, w: 40, h: 40 },
-                { variant: 'floorLamp', x: -0.32, y: -0.29, w: 28, h: 28, maxHp: 18 },
+                { variant: roomType === 'sunroom' ? 'housePlant' : 'floorLamp', x: -0.32, y: -0.29, w: 28, h: 28, maxHp: 18 },
             ], [
                 { variant: 'sofa', x: -0.25, y: 0.23, w: 38, h: 96 },
                 { variant: 'coffeeTable', x: 0.16, y: 0.16, w: 30, h: 58 },
                 { variant: 'armchair', x: 0.19, y: -0.31, w: 40, h: 40 },
-                { variant: 'floorLamp', x: -0.29, y: -0.32, w: 28, h: 28, maxHp: 18 },
+                { variant: roomType === 'sunroom' ? 'housePlant' : 'floorLamp', x: -0.29, y: -0.32, w: 28, h: 28, maxHp: 18 },
             ]);
         } else if (roomType === 'bedroom') {
             horizontalPlan(room, [
@@ -1190,23 +1192,53 @@ function furnishHouseInterior(obstacles, house, options = {}) {
                 { variant: 'nightstand', x: -0.29, y: 0.02, w: 28, h: 28 },
                 { variant: 'housePlant', x: 0.27, y: -0.30, w: 30, h: 30, maxHp: 18 },
             ]);
-        } else if (roomType === 'kitchen') {
+        } else if (roomType === 'kitchen' || roomType === 'pantry' || roomType === 'laundry') {
             horizontalPlan(room, [
                 { variant: 'kitchenCounter', x: 0.17, y: -0.31, w: 118, h: 34 },
-                { variant: 'diningTable', x: 0.25, y: 0.25, w: 72, h: 50 },
+                { variant: roomType === 'kitchen' ? 'diningTable' : 'sideboard', x: 0.25, y: 0.25, w: 72, h: 50 },
             ], [
                 { variant: 'kitchenCounter', x: -0.31, y: 0.17, w: 34, h: 118 },
-                { variant: 'diningTable', x: 0.25, y: 0.25, w: 50, h: 72 },
+                { variant: roomType === 'kitchen' ? 'diningTable' : 'sideboard', x: 0.25, y: 0.25, w: 50, h: 72 },
             ]);
-        } else if (roomType === 'study') {
+        } else if (roomType === 'dining-room' || roomType === 'breakfast-room') {
+            horizontalPlan(room, [
+                { variant: 'diningTable', x: -0.05, y: 0.02, w: 104, h: 68 },
+                { variant: 'sideboard', x: 0.31, y: -0.28, w: 76, h: 28 },
+                { variant: 'housePlant', x: -0.34, y: 0.28, w: 28, h: 28, maxHp: 18 },
+            ], [
+                { variant: 'diningTable', x: 0.02, y: -0.05, w: 68, h: 104 },
+                { variant: 'sideboard', x: -0.28, y: 0.31, w: 28, h: 76 },
+                { variant: 'housePlant', x: 0.28, y: -0.34, w: 28, h: 28, maxHp: 18 },
+            ]);
+        } else if (roomType === 'bathroom') {
+            horizontalPlan(room, [
+                { variant: 'bathtub', x: -0.18, y: -0.25, w: 82, h: 38, destructible: false },
+                { variant: 'vanity', x: 0.29, y: 0.22, w: 48, h: 30, maxHp: 34 },
+                { variant: 'toilet', x: -0.30, y: 0.27, w: 30, h: 30, maxHp: 32 },
+            ], [
+                { variant: 'bathtub', x: -0.25, y: -0.18, w: 38, h: 82, destructible: false },
+                { variant: 'vanity', x: 0.22, y: 0.29, w: 30, h: 48, maxHp: 34 },
+                { variant: 'toilet', x: 0.27, y: -0.30, w: 30, h: 30, maxHp: 32 },
+            ]);
+        } else if (roomType === 'study' || roomType === 'library') {
             horizontalPlan(room, [
                 { variant: 'desk', x: -0.25, y: -0.25, w: 72, h: 38 },
                 { variant: 'bookshelf', x: 0.30, y: 0.10, w: 30, h: 96 },
                 { variant: 'armchair', x: -0.12, y: 0.25, w: 40, h: 40 },
+                ...(roomType === 'library' ? [{ variant: 'bookshelf', x: 0.02, y: -0.31, w: 76, h: 28 }] : []),
             ], [
                 { variant: 'desk', x: -0.25, y: -0.25, w: 38, h: 72 },
                 { variant: 'bookshelf', x: 0.10, y: 0.30, w: 96, h: 30 },
                 { variant: 'armchair', x: 0.25, y: -0.12, w: 40, h: 40 },
+                ...(roomType === 'library' ? [{ variant: 'bookshelf', x: -0.31, y: 0.02, w: 28, h: 76 }] : []),
+            ]);
+        } else if (roomType === 'mudroom' || roomType === 'entry') {
+            horizontalPlan(room, [
+                { variant: 'entryBench', x: -0.18, y: -0.29, w: 80, h: 28, maxHp: 32 },
+                { variant: 'wardrobe', x: 0.31, y: 0.12, w: 30, h: 76, maxHp: 44 },
+            ], [
+                { variant: 'entryBench', x: -0.29, y: -0.18, w: 28, h: 80, maxHp: 32 },
+                { variant: 'wardrobe', x: 0.12, y: 0.31, w: 76, h: 30, maxHp: 44 },
             ]);
         } else if (roomType === 'shop-front') {
             horizontalPlan(room, [
@@ -1272,6 +1304,98 @@ function furnishHouseInterior(obstacles, house, options = {}) {
                 place(room, { variant: 'coffeeTable', x: back * 0.28, y: -0.20, w: 26, h: 48 });
                 place(room, { variant: 'bed', x: back * 0.20, y: 0.30, w: 68, h: 44 });
                 place(room, { variant: farm ? 'toolCabinet' : 'housePlant', x: -back * 0.22, y: -0.34, w: 28, h: 28, maxHp: 18 });
+            }
+        }
+    }
+
+    if (options.detailedResidence) {
+        for (const room of rooms.filter(candidate => candidate.variant === 'bedroom')) {
+            if (occupied.some(prop => prop.roomId === room.id && prop.variant === 'bed')) continue;
+            const horizontal = room.w >= room.h;
+            const bedSize = horizontal ? [40, 58] : [58, 40];
+            for (const [px, py] of [[-0.18, -0.18], [0.18, -0.18], [-0.18, 0.18], [0.18, 0.18], [0, -0.22], [0, 0.22]]) {
+                if (place(room, {
+                    variant: 'bed',
+                    x: px,
+                    y: py,
+                    w: bedSize[0],
+                    h: bedSize[1],
+                    margin: 3,
+                })) break;
+            }
+        }
+        const compactVariantForRoom = roomType => {
+            if (roomType === 'bathroom') return ['bathtub', 'vanity'];
+            if (roomType === 'entry' || roomType === 'mudroom') return ['entryBench', 'wardrobe'];
+            if (roomType === 'dining-room' || roomType === 'breakfast-room') return ['diningTable', 'sideboard'];
+            if (roomType === 'kitchen' || roomType === 'pantry' || roomType === 'laundry') return ['kitchenCounter', 'sideboard'];
+            if (roomType === 'bedroom') return ['bed', 'nightstand', 'wardrobe'];
+            if (roomType === 'library' || roomType === 'study') return ['bookshelf', 'floorLamp'];
+            if (roomType === 'living-room' || roomType === 'family-room' || roomType === 'playroom') return ['sofa', 'floorLamp', 'armchair'];
+            if (roomType === 'sunroom') return ['housePlant', 'armchair', 'floorLamp'];
+            return ['sideboard', 'housePlant'];
+        };
+        for (const room of rooms) {
+            if (room.variant === 'hallway') continue;
+            const compactUtility = ['bathroom', 'entry', 'mudroom', 'pantry', 'laundry'].includes(room.variant);
+            const target = !compactUtility && room.w * room.h >= 22000 ? 3 : 2;
+            let roomProps = occupied.filter(prop => prop.roomId === room.id).length;
+            const variants = compactVariantForRoom(room.variant);
+            const positions = [
+                [-0.34, -0.30], [0.34, -0.30], [-0.34, 0.30], [0.34, 0.30],
+                [-0.36, 0], [0.36, 0], [0, -0.34], [0, 0.34],
+            ];
+            for (let attempt = 0; attempt < positions.length && roomProps < target; attempt++) {
+                const variant = variants[attempt % variants.length];
+                if (occupied.some(prop => prop.roomId === room.id && prop.variant === variant)) continue;
+                const horizontal = room.w >= room.h;
+                let width = 28;
+                let height = 28;
+                if (variant === 'bed') [width, height] = horizontal ? [44, 62] : [62, 44];
+                else if (variant === 'sofa') [width, height] = horizontal ? [62, 30] : [30, 62];
+                else if (variant === 'diningTable') [width, height] = horizontal ? [54, 36] : [36, 54];
+                else if (variant === 'kitchenCounter') [width, height] = horizontal ? [60, 28] : [28, 60];
+                else if (variant === 'armchair') [width, height] = [34, 34];
+                else if (variant === 'bathtub' || variant === 'wardrobe' || variant === 'bookshelf') {
+                    [width, height] = horizontal ? [56, 26] : [26, 56];
+                }
+                const [rawX, rawY] = positions[attempt];
+                const compactOffset = Math.max(width, height) > 42 ? 0.23 : 0.34;
+                const px = clamp(rawX, -compactOffset, compactOffset);
+                const py = clamp(rawY, -compactOffset, compactOffset);
+                if (place(room, {
+                    variant,
+                    x: px,
+                    y: py,
+                    w: width,
+                    h: height,
+                    margin: 4,
+                    maxHp: variant === 'housePlant' ? 18 : 34,
+                    destructible: variant === 'bathtub' ? false : undefined,
+                })) roomProps++;
+            }
+        }
+
+        if (placedCount < 6) {
+            const smallPositions = [
+                [-0.28, -0.25], [0.28, -0.25], [-0.28, 0.25], [0.28, 0.25],
+                [-0.30, 0], [0.30, 0], [0, -0.28], [0, 0.28],
+            ];
+            for (const room of rooms) {
+                if (room.variant === 'hallway') continue;
+                for (const [px, py] of smallPositions) {
+                    if (placedCount >= 6) break;
+                    place(room, {
+                        variant: placedCount % 2 === 0 ? 'floorLamp' : 'nightstand',
+                        x: px,
+                        y: py,
+                        w: 22,
+                        h: 22,
+                        margin: 3,
+                        maxHp: 18,
+                    });
+                }
+                if (placedCount >= 6) break;
             }
         }
     }
@@ -1500,6 +1624,461 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     return floor;
 }
 
+// These are original AgarStake residential plans. Coordinates are normalized
+// around each floor so one authored plan can be mirrored without turning into
+// the same generic four-room corridor. Each plan has a deliberate circulation
+// idea, real room functions, and at least two ways out.
+const LARGE_RESIDENCE_BLUEPRINTS = Object.freeze([
+    {
+        id: 'center-hall', w: 540, h: 410,
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'north', offset: 0, role: 'gardenEntrance' }],
+        rooms: [
+            [0, 0, 0.17, 0.84, 'hallway'],
+            [-0.29, -0.23, 0.38, 0.38, 'bedroom'], [0.29, -0.23, 0.38, 0.38, 'dining-room'],
+            [-0.29, 0.23, 0.38, 0.38, 'living-room'], [0.29, 0.23, 0.38, 0.38, 'kitchen'],
+        ],
+        walls: [
+            ['v', -0.10, 0, 0.86, [[-0.23, 58], [0.23, 58]]],
+            ['v', 0.10, 0, 0.86, [[-0.23, 58], [0.23, 58]]],
+            ['h', -0.30, 0, 0.38, []], ['h', 0.30, 0, 0.38, []],
+        ],
+        lootRoom: 3,
+    },
+    {
+        id: 'side-gallery', w: 500, h: 450,
+        exits: [{ side: 'west', offset: 0.24, role: 'mainEntrance' }, { side: 'east', offset: -0.24, role: 'sideEntrance' }],
+        rooms: [
+            [-0.30, 0, 0.16, 0.84, 'hallway'],
+            [0.08, 0.25, 0.50, 0.34, 'family-room'], [0.03, -0.25, 0.28, 0.34, 'bedroom'],
+            [0.31, -0.25, 0.22, 0.34, 'bathroom'], [0.31, 0.25, 0.22, 0.34, 'kitchen'],
+        ],
+        walls: [
+            ['v', -0.20, 0, 0.86, [[-0.25, 56], [0.25, 56]]],
+            ['h', 0.12, 0, 0.62, []],
+            ['v', 0.18, -0.25, 0.36, [[-0.25, 50]]],
+            ['v', 0.18, 0.25, 0.36, [[0.25, 50]]],
+        ],
+        lootRoom: 2,
+    },
+    {
+        id: 'cross-house', w: 560, h: 420,
+        exits: [{ side: 'south', offset: -0.16, role: 'mainEntrance' }, { side: 'east', offset: 0.18, role: 'sideEntrance' }],
+        rooms: [
+            [-0.25, -0.23, 0.36, 0.34, 'bedroom'], [0.25, -0.23, 0.36, 0.34, 'library'],
+            [-0.25, 0.23, 0.36, 0.34, 'living-room'], [0.25, 0.23, 0.36, 0.34, 'kitchen'],
+            [0, 0, 0.18, 0.18, 'hallway'],
+        ],
+        walls: [
+            ['v', 0, 0, 0.86, [[-0.24, 56], [0, 62], [0.24, 56]]],
+            ['h', 0, 0, 0.88, [[-0.25, 56], [0, 62], [0.25, 56]]],
+        ],
+        lootRoom: 1,
+    },
+    {
+        id: 'kitchen-heart', w: 520, h: 460,
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'north', offset: 0.30, role: 'rearEntrance' }],
+        rooms: [
+            [0, 0, 0.31, 0.28, 'kitchen'],
+            [-0.31, -0.27, 0.25, 0.30, 'bedroom'], [0.31, -0.27, 0.25, 0.30, 'bathroom'],
+            [-0.31, 0.24, 0.25, 0.36, 'living-room'], [0.31, 0.24, 0.25, 0.36, 'dining-room'],
+            [0, 0.34, 0.18, 0.20, 'entry'],
+        ],
+        walls: [
+            ['v', -0.18, 0, 0.72, [[-0.27, 54], [0, 56], [0.24, 54]]],
+            ['v', 0.18, 0, 0.72, [[-0.27, 54], [0, 56], [0.24, 54]]],
+            ['h', 0, -0.18, 0.34, [[0, 54]]], ['h', 0, 0.18, 0.34, [[0, 54]]],
+        ],
+        lootRoom: 3,
+    },
+    {
+        id: 'longhouse', w: 600, h: 360,
+        exits: [{ side: 'west', offset: 0, role: 'mainEntrance' }, { side: 'east', offset: 0, role: 'rearEntrance' }],
+        rooms: [
+            [0, 0, 0.86, 0.17, 'hallway'],
+            [-0.30, -0.27, 0.24, 0.30, 'bedroom'], [0, -0.27, 0.24, 0.30, 'study'], [0.30, -0.27, 0.24, 0.30, 'bathroom'],
+            [-0.30, 0.27, 0.24, 0.30, 'living-room'], [0, 0.27, 0.24, 0.30, 'dining-room'], [0.30, 0.27, 0.24, 0.30, 'kitchen'],
+        ],
+        walls: [
+            ['h', 0, -0.10, 0.88, [[-0.30, 52], [0, 52], [0.30, 52]]],
+            ['h', 0, 0.10, 0.88, [[-0.30, 52], [0, 52], [0.30, 52]]],
+            ['v', -0.17, -0.28, 0.32, []], ['v', 0.17, -0.28, 0.32, []],
+            ['v', -0.17, 0.28, 0.32, []], ['v', 0.17, 0.28, 0.32, []],
+        ],
+        lootRoom: 1,
+    },
+    {
+        id: 'sunroom-loop', w: 480, h: 470,
+        exits: [{ side: 'south', offset: -0.22, role: 'mainEntrance' }, { side: 'east', offset: -0.22, role: 'gardenEntrance' }],
+        rooms: [
+            [0, -0.33, 0.44, 0.20, 'sunroom'],
+            [-0.27, -0.05, 0.28, 0.30, 'bedroom'], [0.22, -0.05, 0.36, 0.30, 'family-room'],
+            [-0.27, 0.29, 0.28, 0.25, 'study'], [0.02, 0.29, 0.22, 0.25, 'entry'], [0.30, 0.29, 0.20, 0.25, 'kitchen'],
+        ],
+        walls: [
+            ['h', 0, -0.20, 0.86, [[0, 58]]],
+            ['v', -0.11, 0.08, 0.54, [[-0.05, 54], [0.29, 54]]],
+            ['h', 0.10, 0.14, 0.60, [[0.02, 54]]],
+            ['v', 0.18, 0.29, 0.25, [[0.29, 48]]],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'library-spine', w: 570, h: 400,
+        exits: [{ side: 'south', offset: -0.13, role: 'mainEntrance' }, { side: 'north', offset: -0.13, role: 'rearEntrance' }],
+        rooms: [
+            [-0.13, 0, 0.16, 0.84, 'hallway'], [-0.34, 0, 0.24, 0.78, 'library'],
+            [0.19, -0.28, 0.40, 0.25, 'bedroom'], [0.19, 0, 0.40, 0.25, 'dining-room'], [0.19, 0.28, 0.40, 0.25, 'living-room'],
+        ],
+        walls: [
+            ['v', -0.23, 0, 0.86, [[0, 58]]],
+            ['v', -0.03, 0, 0.86, [[-0.28, 54], [0, 54], [0.28, 54]]],
+            ['h', 0.19, -0.14, 0.42, []], ['h', 0.19, 0.14, 0.42, []],
+        ],
+        lootRoom: 1,
+    },
+    {
+        id: 'split-wing', w: 530, h: 440,
+        exits: [{ side: 'south', offset: 0.24, role: 'mainEntrance' }, { side: 'west', offset: -0.22, role: 'sideEntrance' }],
+        rooms: [
+            [-0.25, -0.25, 0.36, 0.34, 'bedroom'], [0.24, -0.25, 0.38, 0.34, 'kitchen'],
+            [-0.28, 0.23, 0.30, 0.38, 'bathroom'], [0.18, 0.23, 0.48, 0.38, 'family-room'],
+            [0.02, -0.01, 0.18, 0.16, 'entry'],
+        ],
+        walls: [
+            ['h', 0, 0, 0.86, [[-0.28, 54], [0.02, 60], [0.26, 54]]],
+            ['v', -0.08, -0.25, 0.36, [[-0.25, 52]]],
+            ['v', -0.10, 0.23, 0.38, [[0.23, 54]]],
+        ],
+        lootRoom: 3,
+    },
+    {
+        id: 'conservatory-ring', w: 560, h: 460,
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'west', offset: -0.30, role: 'gardenEntrance' }],
+        rooms: [
+            [0, 0, 0.27, 0.27, 'sunroom'],
+            [-0.30, -0.27, 0.27, 0.28, 'bedroom'], [0.30, -0.27, 0.27, 0.28, 'library'],
+            [-0.30, 0.26, 0.27, 0.30, 'living-room'], [0.30, 0.26, 0.27, 0.30, 'dining-room'],
+            [0, -0.32, 0.20, 0.20, 'bathroom'], [0, 0.34, 0.18, 0.16, 'entry'],
+        ],
+        walls: [
+            ['v', -0.17, 0, 0.72, [[-0.27, 52], [0, 54], [0.26, 52]]],
+            ['v', 0.17, 0, 0.72, [[-0.27, 52], [0, 54], [0.26, 52]]],
+            ['h', 0, -0.17, 0.34, [[0, 52]]], ['h', 0, 0.17, 0.34, [[0, 52]]],
+        ],
+        lootRoom: 2,
+    },
+    {
+        id: 'family-farmhouse', w: 590, h: 430,
+        exits: [{ side: 'south', offset: -0.28, role: 'mainEntrance' }, { side: 'east', offset: -0.20, role: 'mudroomEntrance' }],
+        rooms: [
+            [-0.31, -0.24, 0.25, 0.35, 'bedroom'], [0, -0.24, 0.25, 0.35, 'bedroom'], [0.31, -0.24, 0.25, 0.35, 'bathroom'],
+            [-0.31, 0.24, 0.25, 0.35, 'living-room'], [0, 0.24, 0.25, 0.35, 'dining-room'], [0.31, 0.16, 0.25, 0.22, 'kitchen'],
+            [0.31, 0.36, 0.25, 0.15, 'mudroom'],
+        ],
+        walls: [
+            ['h', 0, 0, 0.88, [[-0.31, 52], [0, 52], [0.31, 52]]],
+            ['v', -0.17, -0.24, 0.37, []], ['v', 0.17, -0.24, 0.37, []],
+            ['v', -0.17, 0.24, 0.37, [[0.24, 50]]], ['v', 0.17, 0.24, 0.37, [[0.18, 50]]],
+            ['h', 0.31, 0.29, 0.27, [[0.31, 48]]],
+        ],
+        lootRoom: 0,
+    },
+]);
+
+const LARGE_RESIDENCE_STYLES = Object.freeze([
+    { variant: 'residence-sage', hue: 104 }, { variant: 'residence-blue', hue: 207 },
+    { variant: 'residence-cream', hue: 42 }, { variant: 'residence-brick', hue: 10 },
+    { variant: 'residence-slate', hue: 224 }, { variant: 'residence-rose', hue: 348 },
+    { variant: 'residence-sand', hue: 31 }, { variant: 'residence-pine', hue: 132 },
+    { variant: 'residence-teal', hue: 181 }, { variant: 'residence-clay', hue: 18 },
+]);
+
+function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
+    const blueprint = LARGE_RESIDENCE_BLUEPRINTS[options.blueprintIndex % LARGE_RESIDENCE_BLUEPRINTS.length];
+    const style = LARGE_RESIDENCE_STYLES[options.styleIndex % LARGE_RESIDENCE_STYLES.length];
+    const mirror = !!options.mirror;
+    const wall = 15;
+    const transformX = value => mirror ? -value : value;
+    const transformSide = side => mirror && side === 'east' ? 'west' : mirror && side === 'west' ? 'east' : side;
+    const transformExit = exit => ({
+        ...exit,
+        side: transformSide(exit.side),
+        offset: mirror && (exit.side === 'north' || exit.side === 'south') ? -exit.offset : exit.offset,
+    });
+    const exits = blueprint.exits.map(transformExit);
+    const designId = `${blueprint.id}-${options.instanceIndex + 1}-${mirror ? 'mirror' : 'original'}-${style.variant}`;
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, blueprint.w, blueprint.h, {
+        collidable: false,
+        hue: style.hue + (options.instanceIndex % 3) * 3,
+        variant: style.variant,
+        role: 'largeResidence',
+        landmarkType: 'residential',
+        orientation: exits[0].side,
+        blueprint: blueprint.id,
+        designId,
+        label: `Residence ${options.instanceIndex + 1}`,
+    });
+    const houseId = floor.id;
+    const northY = y - blueprint.h / 2 + wall / 2;
+    const southY = y + blueprint.h / 2 - wall / 2;
+    const westX = x - blueprint.w / 2 + wall / 2;
+    const eastX = x + blueprint.w / 2 - wall / 2;
+    const exitsBySide = new Map(exits.map(exit => [exit.side, exit]));
+    const exteriorWallOptions = { houseId, role: 'exteriorWall', landmarkType: 'residential' };
+
+    for (const side of ['north', 'south']) {
+        const exit = exitsBySide.get(side);
+        const wallY = side === 'north' ? northY : southY;
+        if (exit) {
+            const doorSpan = compactDoorSpan(64, style.variant);
+            const doorX = x + exit.offset * blueprint.w;
+            addHorizontalWallWithOpening(obstacles, x, wallY, blueprint.w, wall, style.variant, doorX, doorSpan, exteriorWallOptions);
+            addDoor(obstacles, houseId, doorX, wallY, doorSpan + 2, wall * 0.90, style.variant, side, exit.role);
+        } else {
+            addWall(obstacles, x, wallY, blueprint.w, wall, style.variant, exteriorWallOptions);
+        }
+    }
+    for (const side of ['west', 'east']) {
+        const exit = exitsBySide.get(side);
+        const wallX = side === 'west' ? westX : eastX;
+        if (exit) {
+            const doorSpan = compactDoorSpan(64, style.variant);
+            const doorY = y + exit.offset * blueprint.h;
+            addVerticalWallWithOpening(obstacles, wallX, y, blueprint.h, wall, style.variant, doorY, doorSpan, exteriorWallOptions);
+            addDoor(obstacles, houseId, wallX, doorY, wall * 0.90, doorSpan + 2, style.variant, side, exit.role);
+        } else {
+            addWall(obstacles, wallX, y, wall, blueprint.h, style.variant, exteriorWallOptions);
+        }
+    }
+
+    const rooms = blueprint.rooms.map(([roomX, roomY, roomW, roomH, roomType]) => addRoomZone(
+        obstacles,
+        houseId,
+        x + transformX(roomX) * blueprint.w,
+        y + roomY * blueprint.h,
+        roomW * blueprint.w,
+        roomH * blueprint.h,
+        roomType,
+    ));
+    for (const [axis, centerX, centerY, length, gapSpecs] of blueprint.walls) {
+        const openPlanArch = blueprint.id === 'kitchen-heart' || blueprint.id === 'conservatory-ring';
+        if (axis === 'v') {
+            const transformedX = transformX(centerX);
+            const wallY = y + centerY * blueprint.h;
+            const gaps = gapSpecs.map(([gapY, size]) => ({ center: (gapY - centerY) * blueprint.h, size }));
+            addVerticalInteriorWallSegments(
+                obstacles,
+                x + transformedX * blueprint.w,
+                wallY,
+                length * blueprint.h,
+                wall,
+                gaps,
+                style.variant,
+                { houseId, doorVariant: style.variant, role: 'residentialPartition', addDoors: !openPlanArch },
+            );
+        } else {
+            const transformedCenterX = transformX(centerX);
+            const wallX = x + transformedCenterX * blueprint.w;
+            const gaps = gapSpecs.map(([gapX, size]) => ({
+                center: (transformX(gapX) - transformedCenterX) * blueprint.w,
+                size,
+            }));
+            addHorizontalInteriorWallSegments(
+                obstacles,
+                wallX,
+                y + centerY * blueprint.h,
+                length * blueprint.w,
+                wall,
+                gaps,
+                style.variant,
+                { houseId, doorVariant: style.variant, role: 'residentialPartition', addDoors: !openPlanArch },
+            );
+        }
+    }
+
+    furnishHouseInterior(obstacles, floor, { theme: 'home', detailedResidence: true });
+
+    const lootRoom = rooms[blueprint.lootRoom] || rooms[0];
+    loot.push(makeChest(
+        lootRoom.x + Math.min(lootRoom.w * 0.23, 44),
+        lootRoom.y + Math.min(lootRoom.h * 0.20, 36),
+        options.instanceIndex % 6 === 0 ? 'rare' : 'common',
+        null,
+        'map',
+        { houseId, landmarkType: 'residential', room: lootRoom.variant },
+    ));
+
+    const entrance = exits[0];
+    const outwardX = entrance.side === 'east' ? 1 : entrance.side === 'west' ? -1 : 0;
+    const outwardY = entrance.side === 'south' ? 1 : entrance.side === 'north' ? -1 : 0;
+    const doorX = entrance.side === 'north' || entrance.side === 'south'
+        ? x + entrance.offset * blueprint.w
+        : x + outwardX * (blueprint.w / 2 - wall / 2);
+    const doorY = entrance.side === 'east' || entrance.side === 'west'
+        ? y + entrance.offset * blueprint.h
+        : y + outwardY * (blueprint.h / 2 - wall / 2);
+    const drivewayLength = 150;
+    addObstacle(obstacles, 'road',
+        doorX + outwardX * (blueprint.w / 2 + drivewayLength / 2 + 14 - blueprint.w / 2),
+        doorY + outwardY * (blueprint.h / 2 + drivewayLength / 2 + 14 - blueprint.h / 2),
+        outwardX ? drivewayLength : 58,
+        outwardY ? drivewayLength : 58,
+        {
+            collidable: false,
+            variant: options.instanceIndex % 3 === 0 ? 'gravel' : 'dirt',
+            role: 'residentialDrive',
+            landmarkType: 'residential',
+            houseId,
+        },
+    );
+    const sideX = -outwardY;
+    const sideY = outwardX;
+    addObstacle(obstacles, 'mailbox',
+        doorX + outwardX * 118 + sideX * 78,
+        doorY + outwardY * 118 + sideY * 78,
+        28, 34,
+        {
+            collidable: false,
+            rotation: outwardX ? Math.PI / 2 : 0,
+            variant: options.instanceIndex % 2 ? 'painted' : 'rural',
+            hue: style.hue,
+            role: 'residenceMailbox',
+            houseId,
+        },
+    );
+    for (const side of [-1, 1]) {
+        addObstacle(obstacles, 'bush',
+            doorX + outwardX * 54 + sideX * side * 150,
+            doorY + outwardY * 54 + sideY * side * 150,
+            46 + (options.instanceIndex % 2) * 4,
+            38 + ((options.instanceIndex + 1) % 2) * 4,
+            {
+                collidable: false,
+                variant: options.instanceIndex % 4 === 0 ? 'flowering' : 'homestead',
+                hue: 96 + (options.instanceIndex % 5) * 4,
+                role: 'residenceGarden',
+                landmarkType: 'residential',
+                houseId,
+            },
+        );
+    }
+    spawnPoints.push({ x: doorX + outwardX * 90, y: doorY + outwardY * 90 });
+    return floor;
+}
+
+function addManorHouse(obstacles, loot, spawnPoints, x, y) {
+    const w = 760;
+    const h = 560;
+    const wall = 18;
+    const variant = 'mansion';
+    const landmarkType = 'estate';
+    const role = 'mainBuilding';
+    const northY = y - h / 2 + wall / 2;
+    const southY = y + h / 2 - wall / 2;
+    const westX = x - w / 2 + wall / 2;
+    const eastX = x + w / 2 - wall / 2;
+    const mainDoorX = x - 34;
+    const rearDoorX = x + 224;
+    const serviceDoorY = y + 128;
+    const exteriorDoorSpan = compactDoorSpan(94, variant);
+    const serviceDoorSpan = compactDoorSpan(78, variant);
+
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, {
+        collidable: false,
+        hue: 32,
+        variant,
+        label: 'MANOR',
+        role,
+        landmarkType,
+        orientation: 'south',
+    });
+    const houseId = floor.id;
+    const meta = { houseId, landmarkType, role };
+
+    // Three readable exits stop the manor becoming a single-door trap. Their
+    // offsets deliberately avoid a rigid north/south sightline through the hall.
+    addHorizontalWallWithOpening(obstacles, x, northY, w, wall, variant, rearDoorX, serviceDoorSpan, meta);
+    addHorizontalWallWithOpening(obstacles, x, southY, w, wall, variant, mainDoorX, exteriorDoorSpan, meta);
+    addWall(obstacles, westX, y, wall, h, variant, meta);
+    addVerticalWallWithOpening(obstacles, eastX, y, h, wall, variant, serviceDoorY, serviceDoorSpan, meta);
+    addDoor(obstacles, houseId, mainDoorX, southY, exteriorDoorSpan + 2, wall * 0.9, variant, 'south', 'mainEntrance');
+    addDoor(obstacles, houseId, rearDoorX, northY, serviceDoorSpan + 2, wall * 0.9, variant, 'north', 'gardenEntrance');
+    addDoor(obstacles, houseId, eastX, serviceDoorY, wall * 0.9, serviceDoorSpan + 2, variant, 'east', 'serviceEntrance');
+
+    // The floor plan is an asymmetric loop around a compact winter garden.
+    // Unlike the old four-box generator there is no uninterrupted central
+    // corridor, and every wing has at least two useful combat rotations.
+    addRoomZone(obstacles, houseId, x, y + 178, 258, 164, 'hallway');
+    addRoomZone(obstacles, houseId, x, y - 186, 258, 150, 'study');
+    const courtyard = addRoomZone(obstacles, houseId, x, y - 10, 146, 142, 'courtyard');
+    addRoomZone(obstacles, houseId, x - 255, y + 134, 202, 218, 'living-room');
+    addRoomZone(obstacles, houseId, x - 255, y - 140, 202, 206, 'bedroom');
+    const kitchen = addRoomZone(obstacles, houseId, x + 258, y + 118, 204, 232, 'kitchen');
+    const eastStudy = addRoomZone(obstacles, houseId, x + 258, y - 158, 204, 184, 'study');
+
+    addVerticalInteriorWallSegments(obstacles, x - 146, y, h - wall * 4, wall, [
+        { center: -145, size: 82 },
+        { center: 0, size: 76 },
+        { center: 142, size: 92 },
+    ], variant, { ...meta, doorVariant: variant });
+    addVerticalInteriorWallSegments(obstacles, x + 148, y, h - wall * 4, wall, [
+        { center: -154, size: 76 },
+        { center: -2, size: 74 },
+        { center: 124, size: 90 },
+    ], variant, { ...meta, doorVariant: variant });
+    addHorizontalInteriorWallSegments(obstacles, x - 257, y + 12, 210, wall, [
+        { center: -18, size: 78 },
+    ], variant, { ...meta, doorVariant: variant });
+    addHorizontalInteriorWallSegments(obstacles, x + 258, y - 38, 210, wall, [
+        { center: 20, size: 76 },
+    ], variant, { ...meta, doorVariant: variant });
+
+    // Short plaster-and-glass garden edges read as architecture without
+    // recreating four more full-height room walls. The open side arches keep
+    // movement fluid and the central planter breaks long firing lanes.
+    addInteriorWall(obstacles, x, y - 88, 164, wall, variant, meta);
+    addInteriorWall(obstacles, x, y + 68, 164, wall, variant, meta);
+    addInteriorWall(obstacles, x - 82, y - 64, wall, 48, variant, meta);
+    addInteriorWall(obstacles, x - 82, y + 44, wall, 48, variant, meta);
+    addInteriorWall(obstacles, x + 82, y - 64, wall, 48, variant, meta);
+    addInteriorWall(obstacles, x + 82, y + 44, wall, 48, variant, meta);
+
+    furnishHouseInterior(obstacles, floor, { theme: 'home' });
+    const addManorFixture = (room, variantName, fixtureX, fixtureY, fixtureW, fixtureH, fixtureRole) => (
+        addObstacle(obstacles, 'furniture', fixtureX, fixtureY, fixtureW, fixtureH, {
+            collidable: true,
+            destructible: BREAKABLE_INTERIOR_VARIANTS.has(variantName),
+            maxHp: 40,
+            variant: variantName,
+            role: fixtureRole,
+            houseId,
+            roomId: room.id,
+            landmarkType,
+        })
+    );
+    addManorFixture(kitchen, 'diningTable', x + 270, y + 50, 72, 50, 'formalDining');
+    addManorFixture(kitchen, 'kitchenCounter', x + 270, y + 216, 104, 30, 'serviceCounter');
+    addManorFixture(eastStudy, 'desk', x + 300, y - 170, 70, 36, 'writingDesk');
+    addManorFixture(eastStudy, 'bookshelf', x + 344, y - 158, 28, 82, 'libraryWall');
+    addObstacle(obstacles, 'furniture', x, y - 10, 52, 52, {
+        collidable: true,
+        destructible: true,
+        maxHp: 32,
+        variant: 'housePlant',
+        role: 'winterGardenPlanter',
+        houseId,
+        roomId: courtyard.id,
+        landmarkType,
+    });
+
+    const manorLoot = room => ({ houseId, landmarkType, room });
+    loot.push(makeChest(x - 260, y - 190, 'rare', null, 'map', manorLoot('bedroom')));
+    loot.push(makeChest(x + 278, y - 182, 'military', null, 'map', manorLoot('study')));
+    spawnPoints.push({ x: mainDoorX, y: y + h / 2 + 72, role: 'manor-front' });
+    spawnPoints.push({ x: x + w / 2 + 72, y: serviceDoorY, role: 'manor-service' });
+    return floor;
+}
+
 function addMansion(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1500, 1050, {
         collidable: false,
@@ -1507,16 +2086,13 @@ function addMansion(obstacles, loot, spawnPoints, x, y) {
         role: 'courtyard',
         landmarkType: 'estate',
     });
-    addObstacle(obstacles, 'road', x, y + 425, 180, 330, {
+    addObstacle(obstacles, 'road', x, y + 455, 180, 330, {
         collidable: false,
         variant: 'dirt',
         role: 'driveway',
         landmarkType: 'estate',
     });
-    addHouse(obstacles, loot, spawnPoints, x, y, 720, 520, {
-        hue: 32, variant: 'mansion', tier: 'rare', wall: 18,
-        doorSide: 'south', landmarkType: 'estate', label: 'MANOR', role: 'mainBuilding',
-    });
+    addManorHouse(obstacles, loot, spawnPoints, x, y);
     addHouse(obstacles, loot, spawnPoints, x - 560, y + 240, 320, 260, {
         hue: 28, variant: 'guesthouse', tier: 'rare',
         doorSide: 'east', landmarkType: 'estate', label: 'GUEST', role: 'guesthouse',
@@ -3701,22 +4277,27 @@ function addWorldFurnitureDetails(obstacles) {
     }
 
     const landmarkTrees = obstacles.filter(obstacle => obstacle.kind === 'tree' && obstacle.role === 'landmarkTree');
-    for (let index = 0; index < landmarkTrees.length && picnicTables.length < 8; index += 5) {
-        const tree = landmarkTrees[index];
-        const angle = (index * 2.399) % (Math.PI * 2);
-        const distance = Math.max(tree.w, tree.h) / 2 + 112;
-        const x = tree.x + Math.cos(angle) * distance;
-        const y = tree.y + Math.sin(angle) * distance;
-        if (isMapPositionBlocked(obstacles, x, y, 34)) continue;
-        picnicTables.push(addObstacle(obstacles, 'picnicTable', x, y, 70, 48, {
-            collidable: false, rotation: angle, variant: 'wood', role: 'scenicDetail',
-        }));
-        const benchX = x - Math.sin(angle) * 96;
-        const benchY = y + Math.cos(angle) * 96;
-        if (!isMapPositionBlocked(obstacles, benchX, benchY, 28)) {
-            benches.push(addObstacle(obstacles, 'bench', benchX, benchY, 62, 26, {
-                collidable: false, rotation: angle, variant: 'park', role: 'scenicDetail',
+    // Keep the original wide spacing pass, then use staggered offsets to fill
+    // blocked candidates. A single six-tree pass could randomly leave only
+    // four tables after later building-overlap cleanup.
+    for (let offset = 0; offset < 5 && picnicTables.length < 8; offset++) {
+        for (let index = offset; index < landmarkTrees.length && picnicTables.length < 8; index += 5) {
+            const tree = landmarkTrees[index];
+            const angle = (index * 2.399) % (Math.PI * 2);
+            const distance = Math.max(tree.w, tree.h) / 2 + 112;
+            const x = tree.x + Math.cos(angle) * distance;
+            const y = tree.y + Math.sin(angle) * distance;
+            if (isMapPositionBlocked(obstacles, x, y, 34)) continue;
+            picnicTables.push(addObstacle(obstacles, 'picnicTable', x, y, 70, 48, {
+                collidable: false, rotation: angle, variant: 'wood', role: 'scenicDetail',
             }));
+            const benchX = x - Math.sin(angle) * 96;
+            const benchY = y + Math.cos(angle) * 96;
+            if (!isMapPositionBlocked(obstacles, benchX, benchY, 28)) {
+                benches.push(addObstacle(obstacles, 'bench', benchX, benchY, 62, 26, {
+                    collidable: false, rotation: angle, variant: 'park', role: 'scenicDetail',
+                }));
+            }
         }
     }
 
@@ -4179,6 +4760,29 @@ const CURATED_RURAL_SITES = Object.freeze([
     { x: 7350, y: 5350, variant: 'cabin', doorSide: 'north', hue: 20 },
 ]);
 
+// A generous authored candidate pool lets the generator keep exactly twenty
+// larger homes while still respecting whichever hamlets, rural homes, trails,
+// river bends, and POI buffers survived this map seed.
+const LARGE_RESIDENCE_SITE_CANDIDATES = Object.freeze([
+    [-8450, -8500], [8450, -8450], [-8350, 8250], [8350, 8350],
+    [-6100, -8200], [6300, -8350], [-6000, 7900], [6250, 7900],
+    [-3750, -9100], [3600, -9150], [-3900, 8950], [3750, 9000],
+    [-1550, -9000], [1250, -8850], [-1650, 8950], [1450, 9000],
+    [-9000, -5200], [9000, -5250], [-8800, 4750], [8850, 4550],
+    [-6900, -5000], [6800, -4800], [-6700, 5000], [6650, 5050],
+    [-4700, -5350], [4700, -5550], [-4550, 5600], [4650, 5700],
+    [-1650, -5350], [1450, -5300], [-1650, 5900], [1600, 5650],
+    [-8900, -3150], [8850, -3200], [-8750, 2850], [8800, 3000],
+    [-6900, -2850], [6750, -3050], [-6750, 3050], [6750, 3200],
+    [-4600, -2850], [4550, -3000], [-4500, 3150], [4550, 3200],
+    [-1500, -3000], [1450, -3100], [-1550, 3000], [1600, 3100],
+    [-9200, 7000], [9150, 6900], [-9000, -7000], [9100, -6900],
+    [-5400, 6900], [5550, 6900], [-5400, -6900], [5300, -7000],
+    [-3200, 7100], [3250, 7000], [-3200, -7100], [3350, -7200],
+    [-7800, 1450], [7900, 1200], [-7700, -450], [7800, -250],
+    [-3600, 1050], [3650, 850], [-3700, -500], [3850, -450],
+]);
+
 function rotationCoverVariant(kind, biome, index) {
     if (kind === 'tree') {
         if (biome === 'pine') return index % 4 === 0 ? 'giantPine' : 'pine';
@@ -4287,6 +4891,28 @@ function addCuratedRuralSite(obstacles, loot, spawnPoints, plan) {
             role: 'homesteadCover',
         });
     }
+}
+
+function addLargeResidentialLayer(obstacles, loot, spawnPoints, placedPositions, target = 20) {
+    let added = 0;
+    for (const [x, y] of LARGE_RESIDENCE_SITE_CANDIDATES) {
+        if (added >= target) break;
+        const blueprintIndex = added % LARGE_RESIDENCE_BLUEPRINTS.length;
+        const blueprint = LARGE_RESIDENCE_BLUEPRINTS[blueprintIndex];
+        const area = { x, y, w: blueprint.w, h: blueprint.h };
+        if (isAreaOverlapping(x, y, area.w, area.h, 110, placedPositions)) continue;
+
+        addLargeResidence(obstacles, loot, spawnPoints, x, y, {
+            blueprintIndex,
+            styleIndex: (added * 3 + Math.floor(added / LARGE_RESIDENCE_BLUEPRINTS.length))
+                % LARGE_RESIDENCE_STYLES.length,
+            instanceIndex: added,
+            mirror: added >= LARGE_RESIDENCE_BLUEPRINTS.length,
+        });
+        placedPositions.push(area);
+        added++;
+    }
+    return added;
 }
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
@@ -4647,6 +5273,7 @@ export function generateSurvivMap(worldHalf) {
         addCuratedRuralSite(obstacles, loot, spawnPoints, plan);
         placedPositions.push(area);
     }
+    addLargeResidentialLayer(obstacles, loot, spawnPoints, placedPositions, 20);
 
     // Fixed biome pockets give the outer regions different silhouettes while
     // keeping their centres and route relationships stable between matches.
@@ -5042,6 +5669,42 @@ function pickupGroundWeapon(entity, room) {
     return true;
 }
 
+function swapGroundVest(entity, room, requestedId) {
+    if (entity.isBot || entity.isCashingOut || !requestedId) return false;
+    const now = Date.now();
+    const candidate = querySurvivLoot(room, entity.x, entity.y, SURVIV.lootPickupRadius + 24)
+        .find(({ item }) => item.id === requestedId && item.type === 'vest');
+    if (!candidate) return false;
+    const item = candidate.item;
+    if (item.pickupAfter && now < item.pickupAfter) return false;
+    if (dist(entity.x, entity.y, item.x, item.y) > SURVIV.lootPickupRadius + 24) return false;
+
+    const incomingLevel = normalizeVestLevel(item.vestLevel);
+    const previousLevel = normalizeVestLevel(entity.vestLevel);
+    if (incomingLevel <= 0 || incomingLevel === previousLevel) return false;
+
+    entity.vestLevel = incomingLevel;
+    if (previousLevel > 0) {
+        item.vestLevel = previousLevel;
+        item.tier = previousLevel >= 3 ? 'military' : previousLevel === 2 ? 'rare' : 'common';
+        item.source = 'player-swap';
+        item.pickupAfter = now + 900;
+        markSurvivLootChanged(room);
+    } else {
+        removeSurvivLootAt(room, candidate.index);
+    }
+    const incomingVest = vestDefinition(incomingLevel);
+    entity.lastLoot = {
+        id: `ground-vest:${entity.id}:${now}`,
+        type: 'ground',
+        tier: incomingLevel >= 3 ? 'military' : incomingLevel === 2 ? 'rare' : 'common',
+        source: 'ground',
+        items: { vestLevel: incomingLevel, vestLabel: incomingVest.label },
+        pickedAt: now,
+    };
+    return true;
+}
+
 export function equipSurvivWeaponSlot(entity, slot) {
     const inv = ensureInventory(entity);
     const index = Number(slot);
@@ -5170,6 +5833,7 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         useMedkit: false,
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
+        pickupVestId: null,
         toggleDoorId: null,
         openChestId: null,
         chestHoldId: null,
@@ -6789,6 +7453,7 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         useMedkit: false,
         medkitUseEndAt: 0,
         pickupWeaponPending: false,
+        pickupVestId: null,
         openChestId: null,
         chestHoldId: null,
         chestHoldStartedAt: 0,
@@ -6976,6 +7641,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.shooting = false;
         entity.useMedkit = false;
         entity.pickupWeaponPending = false;
+        entity.pickupVestId = null;
         entity.toggleDoorId = null;
         entity.equipSlotPending = null;
         entity.throwGrenadePending = false;
@@ -6993,6 +7659,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.shooting = false;
         entity.useMedkit = false;
         entity.pickupWeaponPending = false;
+        entity.pickupVestId = null;
         entity.toggleDoorId = null;
         entity.openChestId = null;
         entity.takeChestItem = null;
@@ -7002,6 +7669,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.useMedkit = false;
         entity.medkitUseEndAt = 0;
         entity.pickupWeaponPending = false;
+        entity.pickupVestId = null;
         entity.equipSlotPending = null;
     }
 
@@ -7016,6 +7684,10 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     if (!entity.isCashingOut && entity.pickupWeaponPending) {
         pickupGroundWeapon(entity, room);
         entity.pickupWeaponPending = false;
+    }
+    if (!entity.isCashingOut && entity.pickupVestId) {
+        swapGroundVest(entity, room, entity.pickupVestId);
+        entity.pickupVestId = null;
     }
     if (!entity.isCashingOut && entity.toggleDoorId) {
         toggleSurvivDoor(entity, room, now);
@@ -7189,6 +7861,8 @@ function serializeSurvivObstacle(o) {
         ...(o.roomId ? { roomId: o.roomId } : {}),
         ...(o.role ? { role: o.role } : {}),
         ...(o.landmarkType ? { landmarkType: o.landmarkType } : {}),
+        ...(o.blueprint ? { blueprint: o.blueprint } : {}),
+        ...(o.designId ? { designId: o.designId } : {}),
         ...(o.entranceRole ? { entranceRole: o.entranceRole } : {}),
         ...(o.orientation ? { orientation: o.orientation } : {}),
         ...(o.kind === 'door' ? { isOpen: !!o.isOpen } : {}),

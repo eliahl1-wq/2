@@ -8927,6 +8927,7 @@ io.on('connection', (socket) => {
                 player.shooting = false;
                 player.useMedkit = false;
                 player.pickupWeaponPending = false;
+                player.pickupVestId = null;
                 player.equipSlotPending = null;
                 player.throwGrenadePending = false;
                 player.swapWeaponSlots = null;
@@ -9100,6 +9101,7 @@ io.on('connection', (socket) => {
             player.shooting = false;
             player.useMedkit = false;
             player.pickupWeaponPending = false;
+            player.pickupVestId = null;
             player.openChestId = null;
             player.takeChestItem = null;
             player.removeTimeout = setTimeout(() => {
@@ -9218,6 +9220,7 @@ io.on('connection', (socket) => {
             reload,
             useMedkit,
             pickupWeapon,
+            pickupVestId,
             toggleDoorId,
             equipSlot,
             throwGrenade,
@@ -9251,6 +9254,8 @@ io.on('connection', (socket) => {
         applySurvivFireInput(player, shooting, firePressId);
         if (useMedkit === true) player.useMedkit = true;
         if (pickupWeapon === true) player.pickupWeaponPending = true;
+        const requestedVestId = safeId(pickupVestId);
+        if (requestedVestId) player.pickupVestId = requestedVestId;
         const requestedDoorId = safeId(toggleDoorId);
         if (requestedDoorId) player.toggleDoorId = requestedDoorId;
         if (throwGrenade === true) player.throwGrenadePending = true;

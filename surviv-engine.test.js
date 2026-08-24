@@ -124,7 +124,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
 
     assert.equal(SURVIV.worldHalf, 10000);
     assert.equal(map.landmarks.length, 34);
-    assert.ok(houses.length >= 158 && houses.length <= 168,
+    assert.ok(houses.length >= 178 && houses.length <= 188,
         `expected a deliberate building budget, got ${houses.length}`);
     assert.ok(chests.length < houses.length);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
@@ -180,6 +180,86 @@ test('prison cell blocks use a purpose-built four-cell plan facing the yard', ()
             obstacle.x, obstacle.y, block, obstacle.kind === 'door' ? 3 : 0,
         )), 'cell-block geometry must stay attached to its floor');
     }
+});
+
+test('estate manor uses a purpose-built courtyard loop instead of the generic four-room corridor', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const manor = map.obstacles.find(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && obstacle.variant === 'mansion'
+        && obstacle.landmarkType === 'estate'
+        && obstacle.role === 'mainBuilding'
+    ));
+
+    assert.ok(manor);
+    assert.deepEqual([manor.w, manor.h], [760, 560]);
+    const contents = map.obstacles.filter(obstacle => obstacle.houseId === manor.id);
+    const rooms = contents.filter(obstacle => obstacle.kind === 'roomZone');
+    const roomTypes = rooms.map(room => room.variant);
+    const doors = contents.filter(obstacle => obstacle.kind === 'door');
+    const interiorWalls = contents.filter(obstacle => obstacle.kind === 'interiorWall');
+    const manorChests = map.loot.filter(item => item.type === 'chest' && item.houseId === manor.id);
+
+    assert.equal(rooms.length, 7);
+    assert.deepEqual(new Set(roomTypes), new Set([
+        'hallway', 'study', 'courtyard', 'living-room', 'bedroom', 'kitchen',
+    ]));
+    assert.equal(roomTypes.filter(type => type === 'courtyard').length, 1);
+    assert.equal(doors.filter(door => door.entranceRole !== 'interiorDoor').length, 3);
+    assert.deepEqual(new Set(doors
+        .filter(door => door.entranceRole !== 'interiorDoor')
+        .map(door => door.entranceRole)), new Set(['mainEntrance', 'gardenEntrance', 'serviceEntrance']));
+    assert.ok(interiorWalls.every(wall => Math.max(wall.w, wall.h) <= 210),
+        'manor should not recreate a long uninterrupted central corridor wall');
+    assert.equal(manorChests.length, 2);
+    assert.ok(contents.some(obstacle => obstacle.kind === 'furniture' && obstacle.role === 'winterGardenPlanter'));
+});
+
+test('larger residential layer adds twenty distinct detailed homes across ten real blueprints', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const homes = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && obstacle.role === 'largeResidence'
+        && obstacle.landmarkType === 'residential'
+    ));
+    const homeIds = new Set(homes.map(home => home.id));
+    const rooms = map.obstacles.filter(obstacle => obstacle.kind === 'roomZone' && homeIds.has(obstacle.houseId));
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door' && homeIds.has(obstacle.houseId));
+    const furniture = map.obstacles.filter(obstacle => obstacle.kind === 'furniture' && homeIds.has(obstacle.houseId));
+    const drives = map.obstacles.filter(obstacle => obstacle.role === 'residentialDrive' && homeIds.has(obstacle.houseId));
+    const mailboxes = map.obstacles.filter(obstacle => obstacle.role === 'residenceMailbox' && homeIds.has(obstacle.houseId));
+    const gardens = map.obstacles.filter(obstacle => obstacle.role === 'residenceGarden' && homeIds.has(obstacle.houseId));
+    const chests = map.loot.filter(item => item.type === 'chest' && homeIds.has(item.houseId));
+
+    assert.equal(homes.length, 20);
+    assert.equal(new Set(homes.map(home => home.blueprint)).size, 10);
+    assert.equal(new Set(homes.map(home => home.designId)).size, 20);
+    assert.equal(new Set(homes.map(home => home.variant)).size, 10);
+    assert.ok(homes.every(home => home.w >= 480 && home.h >= 360));
+    assert.equal(drives.length, 20);
+    assert.equal(mailboxes.length, 20);
+    assert.equal(gardens.length, 40);
+    assert.equal(chests.length, 20);
+    assert.ok(furniture.length >= 160, `expected detailed furnishing, got ${furniture.length} pieces`);
+    assert.ok(['bathtub', 'vanity', 'wardrobe', 'sideboard', 'entryBench']
+        .every(variant => furniture.some(item => item.variant === variant)));
+
+    const layoutSignatures = new Set();
+    for (const home of homes) {
+        const homeRooms = rooms.filter(room => room.houseId === home.id);
+        const homeDoors = doors.filter(door => door.houseId === home.id);
+        const homeFurniture = furniture.filter(item => item.houseId === home.id);
+        const exteriorDoors = homeDoors.filter(door => door.entranceRole !== 'interiorDoor');
+        assert.ok(homeRooms.length >= 5);
+        assert.equal(exteriorDoors.length, 2);
+        assert.ok(homeFurniture.length >= 5, `${home.blueprint} should feel intentionally furnished`);
+        assert.ok(homeDoors.every(door => pointInRect(door.x, door.y, home, 3)));
+        layoutSignatures.add(home.blueprint + ':' + homeRooms
+            .map(room => `${room.variant}@${Math.round((room.x - home.x) / 10)},${Math.round((room.y - home.y) / 10)}`)
+            .sort()
+            .join('|'));
+    }
+    assert.ok(layoutSignatures.size >= 10);
 });
 
 test('every Surviv house has themed furniture outside every complete door swing', () => {
@@ -286,7 +366,8 @@ test('surviv countryside keeps dense distributed cover and frequent solo rural h
         `expected multiple visible trees per desktop-scale cell, got ${averageTreesPerGameplayCell.toFixed(2)}`);
     assert.ok(ruralHomes.length >= 20 && ruralHomes.length <= 27,
         `expected frequent authored solo homes between POIs, got ${ruralHomes.length}`);
-    assert.ok(rotationCover.length >= 155 && rotationCover.length <= 190);
+    assert.ok(rotationCover.length >= 145 && rotationCover.length <= 190,
+        'larger homes may replace a small amount of rotation cover, but the authored cover network should remain dense');
     assert.ok(rotationCells.size >= 62, 'rotation cover should span distinct travel corridors');
     assert.equal(map.obstacles.some(obstacle => obstacle.role === 'gapHouse' || obstacle.role === 'gapCover'), false);
 });
@@ -598,7 +679,7 @@ test('surviv roads, landmark trees, and world furniture add varied readable deta
     assert.ok(map.obstacles
         .filter(obstacle => decorKinds.has(obstacle.kind))
         .every(obstacle => obstacle.collidable === false));
-    assert.ok(map.obstacles.length < 10500, 'static map detail should stay inside the performance budget');
+    assert.ok(map.obstacles.length < 11200, 'static map detail should stay inside the expanded residential performance budget');
 });
 
 test('new roadside landmarks have distinct buildings and connect to the highway network', () => {
@@ -724,7 +805,7 @@ test('urban expansion adds five dense and distinct road-connected districts', ()
         ['civic-quarter', { buildings: 6, approachRole: 'civicStreet' }],
     ]);
 
-    assert.ok(houses.length >= 158 && houses.length <= 168);
+    assert.ok(houses.length >= 178 && houses.length <= 188);
     assert.ok(roads.length >= 75);
     assert.ok(junctions.length >= 25);
     for (const [landmarkType, expected] of expectedDistricts) {
@@ -1638,7 +1719,7 @@ test('ground loot creates a pickup summary for the player', () => {
     assert.equal(player.lastLoot.items.medkits, 1);
 });
 
-test('vest pickups equip only upgrades and leave the replaced vest on the ground', () => {
+test('vest pickups auto-equip upgrades and F can deliberately equip a lower tier', () => {
     const room = makeRoom();
     const player = createSurvivPlayer('human-vest', 'mongo-vest', 'Armored', '#fff', room);
     player.vestLevel = 1;
@@ -1658,6 +1739,18 @@ test('vest pickups equip only upgrades and leave the replaced vest on the ground
     processSurvivRoom(room, silentIo, Date.now() + 600010);
     assert.equal(player.vestLevel, 3);
     assert.ok(room.loot.some(item => item.id === 'worse-vest'), 'a worse vest should remain available for another player');
+
+    player.pickupVestId = 'worse-vest';
+    processSurvivRoom(room, silentIo, Date.now() + 600020);
+    assert.equal(player.vestLevel, 2, 'an explicit F interaction should permit a downgrade');
+    assert.equal(player.lastLoot.items.vestLevel, 2);
+    assert.equal(player.lastLoot.items.vestLabel, 'Level 2 Vest');
+    assert.ok(room.loot.some(item => (
+        item.id === 'worse-vest'
+        && item.type === 'vest'
+        && item.vestLevel === 3
+        && item.source === 'player-swap'
+    )), 'the replaced higher vest should remain on the ground');
 });
 
 test('legacy ground ammo without a caliber is repaired and can be picked up', () => {
