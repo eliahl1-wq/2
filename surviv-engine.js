@@ -949,11 +949,13 @@ const BREAKABLE_INTERIOR_VARIANTS = new Set([
     'coffeeTable', 'nightstand', 'dresser', 'armchair', 'floorLamp', 'housePlant',
     'diningTable', 'desk', 'bookshelf', 'displayShelf', 'palletStack', 'toolCabinet',
     'labBench', 'specimenTank', 'serverRack', 'generator', 'weaponRack', 'mapTable',
+    'bunkBed', 'toilet', 'prisonBench',
 ]);
 
 function resolveHouseInteriorTheme(variant, options = {}) {
     const landmarkType = options.landmarkType || '';
     const role = options.role || '';
+    if (landmarkType === 'prison' && role === 'cellBlock') return 'prison';
     if (landmarkType === 'lab' || role === 'laboratory') return 'lab';
     if (landmarkType === 'hospital' || role === 'clinic') return 'medical';
     if (['military', 'bunker', 'prison'].includes(landmarkType)
@@ -970,6 +972,7 @@ function furnishHouseInterior(obstacles, house, options = {}) {
     const houseId = house.id;
     const theme = options.theme || 'home';
     const lab = theme === 'lab';
+    const prison = theme === 'prison';
     const military = theme === 'military';
     const farm = theme === 'farm';
     const industrial = theme === 'industrial' || lab || military
@@ -1049,7 +1052,35 @@ function furnishHouseInterior(obstacles, house, options = {}) {
 
     for (const room of rooms) {
         const roomType = room.variant || 'room';
-        if (roomType === 'hallway') continue;
+        if (roomType === 'hallway' || roomType === 'cell-corridor') continue;
+
+        if (prison) {
+            if (roomType === 'cell') {
+                const outerSide = room.x < house.x ? -1 : 1;
+                place(room, {
+                    variant: 'bunkBed', x: outerSide * 0.24, y: -0.15,
+                    w: 28, h: 72, maxHp: 48, role: 'cell-bunk',
+                });
+                place(room, {
+                    variant: 'toilet', x: outerSide * 0.27, y: 0.31,
+                    w: 30, h: 30, maxHp: 32, role: 'cell-toilet', margin: 5,
+                });
+                place(room, {
+                    variant: 'locker', x: -outerSide * 0.16, y: -0.31,
+                    w: 26, h: 34, maxHp: 36, role: 'cell-locker', margin: 5,
+                });
+            } else if (roomType === 'intake') {
+                place(room, {
+                    variant: 'prisonBench', x: -0.33, y: 0.08,
+                    w: 92, h: 28, maxHp: 38, role: 'visitor-bench', margin: 5,
+                });
+                place(room, {
+                    variant: 'controlConsole', x: 0.27, y: -0.03,
+                    w: 72, h: 32, role: 'guard-desk', margin: 5,
+                });
+            }
+            continue;
+        }
 
         if (lab) {
             if (['control-room', 'study', 'living-room'].includes(roomType)) {
@@ -1260,6 +1291,8 @@ function furnishHouseInterior(obstacles, house, options = {}) {
         if (house.w >= 560) ensureSignatureProp('labBench', [84, 28], [28, 84]);
         else if (house.w >= 390) ensureSignatureProp('serverRack', [62, 28], [28, 62]);
         else ensureSignatureProp('specimenTank', [44, 44], [44, 44]);
+    } else if (prison) {
+        ensureSignatureProp('bunkBed', [62, 34], [34, 62]);
     } else if (military) {
         if (house.role === 'armory' || house.role === 'barracks') {
             ensureSignatureProp('weaponRack', [76, 28], [28, 76]);
@@ -2826,6 +2859,128 @@ function addGasStation(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'container', x + 350, y + 100, 110, 50, { hue: 200, rotation: -0.1, variant: 'blue' });
 }
 
+function addPrisonCellBlock(obstacles, loot, spawnPoints, x, y, options = {}) {
+    const entranceSide = options.entranceSide === 'north' ? 'north' : 'south';
+    const entryDirection = entranceSide === 'south' ? 1 : -1;
+    const w = 360;
+    const h = 460;
+    const wall = 16;
+    const variant = 'metal';
+    const landmarkType = 'prison';
+    const role = 'cellBlock';
+    const entranceY = y + entryDirection * (h / 2 - wall / 2);
+    const backY = y - entryDirection * (h / 2 - wall / 2);
+    const westX = x - w / 2 + wall / 2;
+    const eastX = x + w / 2 - wall / 2;
+    const mainDoorSpan = compactDoorSpan(112, variant);
+
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, {
+        collidable: false,
+        hue: 205,
+        variant: 'prisonBlock',
+        role,
+        landmarkType,
+        orientation: entranceSide,
+    });
+    const houseId = floor.id;
+    const meta = { houseId, landmarkType, role };
+
+    // Every cell block faces the central yard. The exterior doorway is cut into
+    // the wall instead of being overlaid on top of one continuous wall.
+    if (entranceSide === 'south') {
+        addWall(obstacles, x, backY, w, wall, variant, meta);
+        addHorizontalWallWithOpening(obstacles, x, entranceY, w, wall, variant, x, mainDoorSpan, meta);
+    } else {
+        addHorizontalWallWithOpening(obstacles, x, entranceY, w, wall, variant, x, mainDoorSpan, meta);
+        addWall(obstacles, x, backY, w, wall, variant, meta);
+    }
+    addWall(obstacles, westX, y, wall, h, variant, meta);
+    addWall(obstacles, eastX, y, wall, h, variant, meta);
+    addDoor(
+        obstacles, houseId, x, entranceY,
+        mainDoorSpan + 2, wall * 0.9, variant, entranceSide, 'mainEntrance',
+    );
+
+    // A shallow intake/day room leads into a wide central aisle. Two proper
+    // cells sit on each side; their doors are part of the corridor walls and
+    // the solid dividers between cells do not create decorative dead ends.
+    const intakeDividerY = y + entryDirection * 108;
+    const secureCenterY = y - entryDirection * 54;
+    const secureHeight = 308;
+    const corridorHalfWidth = 53;
+    const cellWingWidth = 108;
+    const cellXOffset = 112;
+    const rearCellY = y - entryDirection * 145;
+    const frontCellY = y + entryDirection * 20;
+    const cellHeight = 142;
+    const cellDividerY = y - entryDirection * 64;
+
+    addRoomZone(obstacles, houseId, x, y + entryDirection * 166, w - wall * 3, 88, 'intake');
+    addRoomZone(obstacles, houseId, x, secureCenterY, corridorHalfWidth * 2 - wall, secureHeight - 12, 'cell-corridor');
+    for (const side of [-1, 1]) {
+        addRoomZone(obstacles, houseId, x + side * cellXOffset, rearCellY, cellWingWidth, cellHeight, 'cell');
+        addRoomZone(obstacles, houseId, x + side * cellXOffset, frontCellY, cellWingWidth, cellHeight, 'cell');
+
+        addVerticalInteriorWallSegments(
+            obstacles,
+            x + side * corridorHalfWidth,
+            secureCenterY,
+            secureHeight,
+            wall,
+            [
+                { center: rearCellY - secureCenterY, size: 66 },
+                { center: frontCellY - secureCenterY, size: 66 },
+            ],
+            variant,
+            { ...meta, doorVariant: variant },
+        );
+        addHorizontalInteriorWallSegments(
+            obstacles,
+            x + side * cellXOffset,
+            cellDividerY,
+            cellWingWidth + 14,
+            wall,
+            [],
+            variant,
+            meta,
+        );
+    }
+    addHorizontalInteriorWallSegments(
+        obstacles,
+        x,
+        intakeDividerY,
+        w - wall * 2,
+        wall,
+        [{ center: 0, size: 82 }],
+        variant,
+        { ...meta, doorVariant: variant },
+    );
+
+    furnishHouseInterior(obstacles, floor, { theme: 'prison' });
+
+    // The loot point sits at the end of the aisle, visibly valuable but clear
+    // of the cell furniture and every door sweep.
+    loot.push(makeChest(
+        x,
+        y - entryDirection * 184,
+        options.tier || 'rare',
+        null,
+        'map',
+        { houseId, landmarkType, room: 'cell-corridor' },
+    ));
+
+    // A concrete threshold makes the entrance legible from outside without a
+    // fake door marker or roof label.
+    addObstacle(obstacles, 'field', x, y + entryDirection * (h / 2 + 28), 104, 56, {
+        collidable: false,
+        variant: 'parkingLot',
+        role: 'cellBlockThreshold',
+        landmarkType,
+    });
+    spawnPoints.push({ x, y: y + entryDirection * (h / 2 + 76), role: 'prison-cell-block' });
+    return floor;
+}
+
 function addPrison(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'field', x, y, 1800, 1800, { collidable: false, variant: 'quarry' });
 
@@ -2849,11 +3004,12 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
         addObstacle(obstacles, 'barrel', x - 200 + Math.random() * 400, y - 200 + Math.random() * 400, 30, 30, { hue: 20, variant: 'water' });
     }
 
-    // Cell blocks — all loot is inside these buildings
-    addHouse(obstacles, loot, spawnPoints, x - 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'military', hue: 200, wall: 16 });
-    addHouse(obstacles, loot, spawnPoints, x + 500, y - 500, 300, 400, { variant: 'warehouse', tier: 'military', hue: 200, wall: 16 });
-    addHouse(obstacles, loot, spawnPoints, x - 500, y + 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
-    addHouse(obstacles, loot, spawnPoints, x + 500, y + 500, 300, 400, { variant: 'warehouse', tier: 'rare', hue: 200, wall: 16 });
+    // Four purpose-built cell blocks face the shared exercise yard. They no
+    // longer inherit the generic house kitchen/bedroom corridor layout.
+    addPrisonCellBlock(obstacles, loot, spawnPoints, x - 500, y - 500, { entranceSide: 'south', tier: 'military' });
+    addPrisonCellBlock(obstacles, loot, spawnPoints, x + 500, y - 500, { entranceSide: 'south', tier: 'military' });
+    addPrisonCellBlock(obstacles, loot, spawnPoints, x - 500, y + 500, { entranceSide: 'north', tier: 'rare' });
+    addPrisonCellBlock(obstacles, loot, spawnPoints, x + 500, y + 500, { entranceSide: 'north', tier: 'rare' });
     // Warden office (center)
     addHouse(obstacles, loot, spawnPoints, x, y, 260, 220, { variant: 'warehouse', tier: 'military', hue: 210, wall: 14 });
 

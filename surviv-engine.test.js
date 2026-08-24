@@ -141,6 +141,47 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     assert.ok(maxExtent <= SURVIV.worldHalf);
 });
 
+test('prison cell blocks use a purpose-built four-cell plan facing the yard', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const blocks = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && obstacle.landmarkType === 'prison'
+        && obstacle.role === 'cellBlock'
+    ));
+
+    assert.equal(blocks.length, 4);
+    assert.equal(blocks.filter(block => block.orientation === 'north').length, 2);
+    assert.equal(blocks.filter(block => block.orientation === 'south').length, 2);
+
+    for (const block of blocks) {
+        const contents = map.obstacles.filter(obstacle => obstacle.houseId === block.id);
+        const rooms = contents.filter(obstacle => obstacle.kind === 'roomZone');
+        const doors = contents.filter(obstacle => obstacle.kind === 'door');
+        const furniture = contents.filter(obstacle => obstacle.kind === 'furniture');
+        const roomTypes = rooms.map(room => room.variant);
+        const furnitureTypes = furniture.map(prop => prop.variant);
+        const blockChests = map.loot.filter(item => item.type === 'chest' && item.houseId === block.id);
+
+        assert.equal(block.variant, 'prisonBlock');
+        assert.deepEqual([block.w, block.h], [360, 460]);
+        assert.equal(roomTypes.filter(type => type === 'cell').length, 4);
+        assert.equal(roomTypes.filter(type => type === 'cell-corridor').length, 1);
+        assert.equal(roomTypes.filter(type => type === 'intake').length, 1);
+        assert.equal(roomTypes.some(type => ['bedroom', 'kitchen', 'living-room', 'study'].includes(type)), false);
+        assert.equal(doors.length, 6, 'cell block should have one entrance, one security door, and four cell doors');
+        assert.equal(doors.filter(door => door.entranceRole === 'mainEntrance').length, 1);
+        assert.equal(doors.filter(door => door.entranceRole === 'interiorDoor').length, 5);
+        assert.equal(furnitureTypes.filter(type => type === 'bunkBed').length, 4);
+        assert.equal(furnitureTypes.filter(type => type === 'toilet').length, 4);
+        assert.ok(furnitureTypes.includes('prisonBench'));
+        assert.ok(furnitureTypes.includes('controlConsole'));
+        assert.equal(blockChests.length, 1);
+        assert.ok(contents.every(obstacle => obstacle.kind === 'roomZone' || pointInRect(
+            obstacle.x, obstacle.y, block, obstacle.kind === 'door' ? 3 : 0,
+        )), 'cell-block geometry must stay attached to its floor');
+    }
+});
+
 test('every Surviv house has themed furniture outside every complete door swing', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
