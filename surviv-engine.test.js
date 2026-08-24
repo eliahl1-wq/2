@@ -124,7 +124,8 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
 
     assert.equal(SURVIV.worldHalf, 10000);
     assert.equal(map.landmarks.length, 34);
-    assert.ok(houses.length >= 160);
+    assert.ok(houses.length >= 135 && houses.length <= 155,
+        `expected a deliberate building budget, got ${houses.length}`);
     assert.ok(chests.length < houses.length);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
         'wood_crate', 'supply_crate', 'ammo_crate', 'medical_crate', 'armory_crate',
@@ -190,7 +191,7 @@ test('every Surviv house has themed furniture outside every complete door swing'
     }
 });
 
-test('surviv open areas keep scattered cover and small houses', () => {
+test('surviv countryside uses curated cover routes and a limited rural building budget', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const coverKinds = new Set(['tree', 'bush', 'rock']);
     const openCover = map.obstacles.filter(obstacle => (
@@ -208,21 +209,31 @@ test('surviv open areas keep scattered cover and small houses', () => {
         + ','
         + Math.floor((obstacle.y + SURVIV.worldHalf) / 1600)
     )));
-    const smallHouseVariants = new Set(['cabin', 'house', 'barn']);
-    const smallOpenHouses = map.obstacles.filter(obstacle => (
+    const ruralHomes = map.obstacles.filter(obstacle => (
         obstacle.kind === 'houseFloor'
-        && smallHouseVariants.has(obstacle.variant)
-        && Math.hypot(obstacle.x, obstacle.y) > 1800
+        && obstacle.role === 'ruralHome'
     ));
+    const rotationCover = map.obstacles.filter(obstacle => obstacle.role === 'rotationCover');
+    const rotationCells = new Set(rotationCover.map(obstacle => (
+        Math.floor((obstacle.x + SURVIV.worldHalf) / 600)
+        + ','
+        + Math.floor((obstacle.y + SURVIV.worldHalf) / 600)
+    )));
 
-    assert.ok(openCover.length >= 700);
-    assert.ok(openTrees.length >= 500);
-    assert.ok(coverCells.size >= 75);
-    assert.ok(treeCells.size >= 88);
-    assert.ok(smallOpenHouses.length >= 40);
+    assert.ok(openCover.length >= 430 && openCover.length <= 620,
+        `expected readable countryside cover budget, got ${openCover.length}`);
+    assert.ok(openTrees.length >= 220 && openTrees.length <= 340,
+        `expected restrained tree budget, got ${openTrees.length}`);
+    assert.ok(coverCells.size >= 90);
+    assert.ok(treeCells.size >= 75);
+    assert.ok(ruralHomes.length >= 5 && ruralHomes.length <= 10,
+        `expected only a handful of curated rural homes, got ${ruralHomes.length}`);
+    assert.ok(rotationCover.length >= 155 && rotationCover.length <= 190);
+    assert.ok(rotationCells.size >= 62, 'rotation cover should span distinct travel corridors');
+    assert.equal(map.obstacles.some(obstacle => obstacle.role === 'gapHouse' || obstacle.role === 'gapCover'), false);
 });
 
-test('completed Surviv land has no large unplanned empty fields', () => {
+test('Surviv map preserves deliberate open combat fields with readable covered edges', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const coverKinds = new Set([
         'houseFloor', 'tree', 'rock', 'bush', 'stump', 'fallenLog',
@@ -231,10 +242,9 @@ test('completed Surviv land has no large unplanned empty fields', () => {
     const surfaceKinds = new Set(['road', 'water', 'river', 'houseFloor']);
     const cover = map.obstacles.filter(obstacle => coverKinds.has(obstacle.kind));
     const reservedSurfaces = map.obstacles.filter(obstacle => surfaceKinds.has(obstacle.kind));
-    const gapCover = map.obstacles.filter(obstacle => obstacle.role === 'gapCover');
-    const gapHouses = map.obstacles.filter(obstacle => (
-        obstacle.kind === 'houseFloor' && obstacle.role === 'gapHouse'
-    ));
+    const openAreas = map.obstacles.filter(obstacle => obstacle.role === 'openCombatArea');
+    const edgeCover = map.obstacles.filter(obstacle => obstacle.role === 'openAreaEdge');
+    const houses = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
     let largestGap = 0;
     let largeGapSamples = 0;
 
@@ -245,18 +255,27 @@ test('completed Surviv land has no large unplanned empty fields', () => {
             if (reservedSurfaces.some(surface => pointToRectDistance(x, y, surface) < 260)) continue;
             const nearestCover = Math.min(...cover.map(obstacle => pointToRectDistance(x, y, obstacle)));
             largestGap = Math.max(largestGap, nearestCover);
-            if (nearestCover > 550) largeGapSamples++;
+            if (nearestCover > 1100) largeGapSamples++;
         }
     }
 
-    assert.ok(gapCover.length >= 520, `expected dense adaptive land cover, got ${gapCover.length}`);
-    const gapKinds = new Set(gapCover.map(obstacle => obstacle.kind));
-    for (const kind of ['tree', 'rock', 'bush', 'stump', 'fallenLog']) {
-        assert.ok(gapKinds.has(kind), `dense land fill is missing ${kind}`);
+    assert.equal(openAreas.length, 6);
+    assert.equal(new Set(openAreas.map(area => area.label)).size, openAreas.length);
+    assert.ok(edgeCover.length >= 40);
+    for (const area of openAreas) {
+        assert.ok(houses.every(house => !rectsOverlap(
+            area.x, area.y, area.w, area.h,
+            house.x, house.y, house.w, house.h,
+        )), `${area.label} should not contain a building`);
+        assert.ok(cover.every(obstacle => !pointInRect(
+            obstacle.x, obstacle.y, area, -40,
+        )), `${area.label} should keep an uncluttered centre`);
+        const nearestCover = Math.min(...cover.map(obstacle => pointToRectDistance(area.x, area.y, obstacle)));
+        assert.ok(nearestCover >= 420 && nearestCover <= 650,
+            `${area.label} should be open but bounded by usable cover`);
     }
-    assert.ok(gapHouses.length >= 12, `expected more gap houses, got ${gapHouses.length}`);
-    assert.ok(largestGap < 700, `largest playable land gap is ${Math.round(largestGap)} units`);
-    assert.ok(largeGapSamples <= 4, `too many sparse land samples: ${largeGapSamples}`);
+    assert.ok(largestGap < 1500, `largest playable land gap is ${Math.round(largestGap)} units`);
+    assert.ok(largeGapSamples <= 8, `too many unexplained sparse land samples: ${largeGapSamples}`);
 });
 
 test('pond sites and the west forest camp keep readable spacing', () => {
@@ -491,7 +510,7 @@ test('surviv roads, landmark trees, and world furniture add varied readable deta
     for (const variant of ['asphalt', 'dirt', 'gravel', 'cobblestone', 'service', 'rail']) {
         assert.ok(roadVariants.has(variant), 'missing road surface ' + variant);
     }
-    assert.ok(landmarkTrees.length >= 30);
+    assert.ok(landmarkTrees.length >= 28);
     assert.ok(landmarkTrees.every(tree => tree.w >= 82 && tree.h >= 82));
     for (const variant of ['ancientOak', 'giantPine', 'willowTree', 'birch']) {
         assert.ok(treeVariants.has(variant), 'missing landmark tree ' + variant);
@@ -632,7 +651,7 @@ test('urban expansion adds five dense and distinct road-connected districts', ()
         ['civic-quarter', { buildings: 6, approachRole: 'civicStreet' }],
     ]);
 
-    assert.ok(houses.length >= 160);
+    assert.ok(houses.length >= 135 && houses.length <= 155);
     assert.ok(roads.length >= 75);
     assert.ok(junctions.length >= 25);
     for (const [landmarkType, expected] of expectedDistricts) {
@@ -747,6 +766,25 @@ test('straight surviv roads do not create extra square asphalt stubs', () => {
     assert.equal(squareAsphaltRoads.length, 0);
 });
 
+test('outer regional roads stop at the highways instead of forming a repetitive full grid', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const networkRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road' && obstacle.role === 'networkRoad'
+    ));
+
+    for (const point of [
+        { x: -6000, y: -6100 }, { x: 6000, y: -6100 },
+        { x: -6000, y: 6200 }, { x: 6000, y: 6200 },
+    ]) {
+        assert.ok(networkRoads.some(road => pointInRect(point.x, point.y, road, 4)),
+            `missing regional collector at ${point.x},${point.y}`);
+    }
+    assert.equal(networkRoads.some(road => pointInRect(0, -6100, road, 4)), false);
+    assert.equal(networkRoads.some(road => pointInRect(0, 6200, road, 4)), false);
+    assert.ok(networkRoads.some(road => pointInRect(2100, 8200, road, 4)),
+        'rail depot freight road should connect to the east highway');
+});
+
 test('surviv roads expose clean crossing and T-junction surfaces', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const roads = map.obstacles.filter(obstacle => obstacle.kind === 'road' && obstacle.role === 'networkRoad');
@@ -780,7 +818,8 @@ test('surviv adds curved trails and varied natural detail without another buildi
     assert.ok(trails.some(trail => trail.variant === 'boardwalk'));
     assert.ok(trails.some(trail => trail.variant === 'forest'));
     assert.ok(trails.some(trail => trail.variant === 'gravel'));
-    assert.ok(naturalDetails.length >= 550);
+    assert.ok(naturalDetails.length >= 280 && naturalDetails.length <= 380,
+        `natural detail should stay varied without uniform clutter, got ${naturalDetails.length}`);
     assert.ok(bushVariants.has('bramble'));
     assert.ok(bushVariants.has('berry'));
     assert.ok(bushVariants.has('flowering'));
@@ -1033,6 +1072,8 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
 
     assert.ok([...doors, ...interiorDoors].every(door => Math.max(door.w, door.h) <= 64.01),
         'door leaves should stay compact even in large and industrial buildings');
+    assert.ok([...doors, ...interiorDoors].every(door => Math.min(door.w, door.h) <= 6.51),
+        'door leaves should remain much thinner than their surrounding walls');
     assert.ok(interiorDoors.length >= 30, 'split and corridor buildings should expose real interior doors');
     assert.ok(interiorDoors.every(door => {
         const house = floors.find(floor => floor.id === door.houseId);
@@ -2049,6 +2090,37 @@ test('human semi-auto guns fire once per click but accept rapid new clicks', () 
     player.shooting = true;
     processSurvivRoom(room, silentIo, now + WEAPONS.pistol.fireRateMs + 22);
     assert.equal(player.weapon.ammo, 13, 'a released and pressed trigger should fire again quickly');
+});
+
+test('automatic guns emit one projectile per cadence step with progressive spread', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const player = createSurvivPlayer('auto-cadence-player', 'auto-cadence-mongo', 'Sprayer', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.weapon = { type: 'm416', ammo: 30, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.shooting = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.weapon.ammo, 29);
+    assert.equal(room.bullets.length, 1, 'one automatic cadence step must create one projectile');
+
+    processSurvivRoom(room, silentIo, Date.now() + 600001);
+    assert.equal(player.weapon.ammo, 29, 'the same cadence window must not create a duplicate round');
+    assert.equal(room.bullets.length, 1);
+
+    player.weapon.lastShotAt -= WEAPONS.m416.fireRateMs + 1;
+    processSurvivRoom(room, silentIo, Date.now() + 600100);
+    assert.equal(player.weapon.ammo, 28);
+    assert.equal(room.bullets.length, 2);
+    assert.equal(new Set(room.bullets.map(bullet => bullet.shotId)).size, 2,
+        'successive automatic rounds need distinct shot identities');
+    assert.ok(room.bullets.every(bullet => bullet.shotId && bullet.weaponType === 'm416'));
 });
 
 test('loot crates block movement until they are destroyed', () => {

@@ -823,13 +823,19 @@ function compactDoorSpan(requestedSpan, variant = 'wood') {
 }
 
 function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south', entranceRole = 'mainEntrance') {
-    const exterior = entranceRole !== 'interiorDoor';
-    // Keep an exterior slab slightly proud of the wall. This leaves a readable
-    // white lip beyond the roof overhang without detaching it from the opening.
-    const outwardOffset = exterior ? Math.max(6, Math.min(12, Math.min(w, h) * 0.65)) : 0;
-    const doorX = x + (side === 'west' ? -outwardOffset : side === 'east' ? outwardOffset : 0);
-    const doorY = y + (side === 'north' ? -outwardOffset : side === 'south' ? outwardOffset : 0);
-    return addObstacle(obstacles, 'door', doorX, doorY, w, h, {
+    // Keep the leaf centered in its wall opening. Exterior doors used to be
+    // shifted outward, which detached their collision and hinge from the wall.
+    const horizontal = side === 'north' || side === 'south';
+    const leafLength = Math.max(w, h);
+    const leafThickness = clamp(Math.min(w, h) * 0.52, 5, 6.5);
+    return addObstacle(
+        obstacles,
+        'door',
+        x,
+        y,
+        horizontal ? leafLength : leafThickness,
+        horizontal ? leafThickness : leafLength,
+        {
         collidable: true,
         destructible: false,
         isOpen: false,
@@ -838,7 +844,8 @@ function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south
         role: side,
         entranceRole,
         orientation: side,
-    });
+        },
+    );
 }
 
 function addHorizontalWallWithOpening(obstacles, x, y, w, wall, variant, openingCenterX = x, openingW = 0, opts = {}) {
@@ -2551,7 +2558,7 @@ function addRailDepot(obstacles, loot, spawnPoints, x, y) {
             collidable: false, variant: 'rail', role: 'railTrack', landmarkType,
         });
     }
-    addObstacle(obstacles, 'road', x - 920, y + 250, 92, 1000, {
+    addObstacle(obstacles, 'road', x + 920, y + 250, 92, 1000, {
         collidable: false, variant: 'asphalt', role: 'depotApproach', landmarkType,
     });
 
@@ -2583,7 +2590,7 @@ function addRailDepot(obstacles, loot, spawnPoints, x, y) {
     loot.push(makeChest(x + 360, y - 410, 'military', null, 'map', {
         houseId: freightHall.id, landmarkType, room: 'hallway',
     }));
-    spawnPoints.push({ x: x - 980, y: y + 350, role: 'depot-road' });
+    spawnPoints.push({ x: x + 980, y: y + 350, role: 'depot-road' });
     spawnPoints.push({ x: x + 960, y, role: 'rail-yard' });
 }
 
@@ -2987,7 +2994,7 @@ function addTrailPath(obstacles, points, opts = {}) {
 const WILDERNESS_TRAIL_PLANS = [
     { points: [
         { x: 700, y: -7200 }, { x: 790, y: -7010 }, { x: 860, y: -6840 },
-        { x: 1080, y: -6460 }, { x: 1200, y: -6100 },
+        { x: 1500, y: -6500 }, { x: 2500, y: -6100 },
     ], opts: { width: 58, variant: 'gravel', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Ranger Cache Track' } },
     { points: [
         { x: 8600, y: 3600 }, { x: 8460, y: 3440 }, { x: 8320, y: 3260 },
@@ -2995,7 +3002,7 @@ const WILDERNESS_TRAIL_PLANS = [
     ], opts: { width: 56, variant: 'gravel', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Aid Station Track' } },
     { points: [
         { x: -1200, y: 8500 }, { x: -1300, y: 8240 }, { x: -1400, y: 7950 },
-        { x: -1680, y: 7100 }, { x: -1900, y: 6200 },
+        { x: -1900, y: 7000 }, { x: -2500, y: 6200 },
     ], opts: { width: 54, variant: 'forest', role: 'supplyAccess', landmarkType: 'supply-cache', label: 'Smuggler Trail' } },
     { points: [
         { x: 4100, y: -2700 }, { x: 3990, y: -2870 }, { x: 3890, y: -3060 },
@@ -3159,7 +3166,7 @@ function addPondDetails(obstacles) {
     }
 }
 
-function addCanopyInfill(obstacles, worldHalf, targetCount = 80) {
+function addCanopyInfill(obstacles, worldHalf, targetCount = 36, exclusionAreas = []) {
     let added = 0;
     const margin = 850;
     const step = 1450;
@@ -3170,6 +3177,10 @@ function addCanopyInfill(obstacles, worldHalf, targetCount = 80) {
                 const x = clamp(gx + (Math.random() - 0.5) * 760, -worldHalf + 620, worldHalf - 620);
                 const y = clamp(gy + (Math.random() - 0.5) * 760, -worldHalf + 620, worldHalf - 620);
                 const size = 38 + Math.random() * 24;
+                if (exclusionAreas.some(area => rectsOverlap(
+                    x, y, size + 80, size + 80,
+                    area.x, area.y, area.w, area.h,
+                ))) continue;
                 if (isMapPositionBlocked(obstacles, x, y, size / 2 + 18)) continue;
                 addObstacle(obstacles, 'tree', x, y, size, size, {
                     hue: y < -4800 ? 112 : 96 + Math.floor(Math.random() * 34),
@@ -3187,15 +3198,15 @@ function addCanopyInfill(obstacles, worldHalf, targetCount = 80) {
 
 function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
     const bushVariants = ['bramble', 'berry', 'flowering', 'juniper'];
-    const step = 650;
+    const step = 1050;
     const margin = 620;
     for (let gx = -worldHalf + margin; gx <= worldHalf - margin; gx += step) {
         for (let gy = -worldHalf + margin; gy <= worldHalf - margin; gy += step) {
-            if (Math.random() < 0.28) continue;
+            if (Math.random() < 0.34) continue;
             const baseX = gx + (Math.random() - 0.5) * step * 0.68;
             const baseY = gy + (Math.random() - 0.5) * step * 0.68;
             if (exclusionAreas.some(area => rectsOverlap(baseX, baseY, 80, 80, area.x, area.y, area.w + 360, area.h + 360))) continue;
-            const clusterCount = Math.random() < 0.36 ? 2 : 1;
+            const clusterCount = Math.random() < 0.18 ? 2 : 1;
             for (let cluster = 0; cluster < clusterCount; cluster++) {
                 const x = baseX + (Math.random() - 0.5) * 105;
                 const y = baseY + (Math.random() - 0.5) * 105;
@@ -3241,7 +3252,7 @@ function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
     }
 }
 
-function addLandmarkTrees(obstacles, worldHalf, targetCount = 38) {
+function addLandmarkTrees(obstacles, worldHalf, targetCount = 30, exclusionAreas = []) {
     let added = 0;
     const margin = 920;
     const step = 1480;
@@ -3252,6 +3263,10 @@ function addLandmarkTrees(obstacles, worldHalf, targetCount = 38) {
                 const x = clamp(gx + (Math.random() - 0.5) * 820, -worldHalf + 520, worldHalf - 520);
                 const y = clamp(gy + (Math.random() - 0.5) * 820, -worldHalf + 520, worldHalf - 520);
                 const size = 82 + Math.random() * 42;
+                if (exclusionAreas.some(area => rectsOverlap(
+                    x, y, size + 90, size + 90,
+                    area.x, area.y, area.w, area.h,
+                ))) continue;
                 if (isMapPositionBlocked(obstacles, x, y, size * 0.46 + 24)) continue;
 
                 let variant = 'ancientOak';
@@ -3746,237 +3761,185 @@ function isAreaOverlapping(x, y, w, h, buffer = 200, poiList = []) {
     return false;
 }
 
-const SPARSE_FILL_KINDS = new Set([
-    'houseFloor', 'tree', 'bush', 'rock', 'stump', 'fallenLog', 'hayBale',
-    'crate', 'barrel', 'sandbag', 'tent', 'water',
+// These are deliberately empty combat spaces, not holes waiting for another
+// density pass. Their edges provide cover while their centres preserve long
+// reads, rotations, and meaningful risk between nearby landmarks.
+const INTENTIONAL_OPEN_AREAS = Object.freeze([
+    { x: -850, y: -5200, w: 1300, h: 820, variant: 'woods', label: 'North Meadow' },
+    { x: 7350, y: 1650, w: 1120, h: 840, variant: 'village', label: 'East Pasture' },
+    { x: 1450, y: 4300, w: 1180, h: 820, variant: 'village', label: 'South Green' },
+    { x: -3650, y: -650, w: 1060, h: 760, variant: 'woods', label: 'West Heath' },
+    { x: 6500, y: 5200, w: 1080, h: 820, variant: 'scrub', label: 'Prison Fields' },
+    { x: -6100, y: 3000, w: 980, h: 760, variant: 'wetlands', label: 'Wetland Flats' },
 ]);
 
-function addSparseAreaFill(obstacles, loot, spawnPoints, worldHalf, placedPositions) {
-    const candidates = [];
-    const step = 1800;
-    const sampleRadius = step * 0.48;
-    const margin = 1100;
+const CURATED_COVER_PATTERNS = Object.freeze({
+    splitGrove: Object.freeze([
+        ['tree', -190, -120, 68, 68], ['tree', -142, 112, 54, 54],
+        ['rock', -68, 176, 56, 40], ['bush', -238, 28, 48, 40],
+        ['tree', 188, -108, 62, 62], ['tree', 146, 126, 52, 52],
+        ['rock', 64, -184, 54, 38], ['bush', 238, 32, 46, 40],
+    ]),
+    rockGate: Object.freeze([
+        ['rock', -152, -72, 76, 48], ['tree', -202, 92, 58, 58],
+        ['bush', -82, 156, 48, 40], ['fallenLog', -232, -168, 96, 24],
+        ['rock', 152, 72, 72, 46], ['tree', 206, -96, 58, 58],
+        ['bush', 82, -158, 46, 38],
+    ]),
+    windbreak: Object.freeze([
+        ['tree', -240, -94, 54, 54], ['tree', -120, -58, 62, 62],
+        ['bush', 0, -28, 50, 42], ['tree', 124, 8, 58, 58],
+        ['tree', 246, 46, 64, 64], ['rock', -44, 146, 62, 42],
+        ['fallenLog', 174, 164, 104, 24],
+    ]),
+    clearing: Object.freeze([
+        ['tree', -222, -88, 64, 64], ['rock', -132, 176, 62, 42],
+        ['tree', 18, 226, 58, 58], ['bush', 178, 168, 50, 42],
+        ['tree', 234, -42, 66, 66], ['rock', 112, -196, 58, 40],
+        ['tree', -82, -224, 54, 54],
+    ]),
+});
 
-    for (let x = -worldHalf + margin; x <= worldHalf - margin; x += step) {
-        for (let y = -worldHalf + margin; y <= worldHalf - margin; y += step) {
-            if (Math.hypot(x, y) < 1650) continue;
-            let houses = 0;
-            let details = 0;
-            for (const obstacle of obstacles) {
-                if (!SPARSE_FILL_KINDS.has(obstacle.kind)) continue;
-                if (Math.abs(obstacle.x - x) > sampleRadius || Math.abs(obstacle.y - y) > sampleRadius) continue;
-                if (obstacle.kind === 'houseFloor') houses++;
-                else details++;
-            }
-            candidates.push({ x, y, houses, details, score: houses * 12 + details });
-        }
-    }
-
-    // Fill the emptiest cells first. A stable coordinate tie-break keeps the
-    // overall distribution broad even though individual props remain varied.
-    candidates.sort((a, b) => a.score - b.score || a.y - b.y || a.x - b.x);
-    let housesAdded = 0;
-    let detailClustersAdded = 0;
-    const houseLimit = 20;
-    const detailClusterLimit = 22;
-
-    for (const candidate of candidates) {
-        if (housesAdded >= houseLimit && detailClustersAdded >= detailClusterLimit) break;
-        const preferHouse = housesAdded < houseLimit
-            && candidate.houses === 0
-            && (candidate.details < 14 || detailClustersAdded >= detailClusterLimit);
-
-        for (let attempt = 0; attempt < 7; attempt++) {
-            const x = clamp(candidate.x + (Math.random() - 0.5) * 620, -worldHalf + 760, worldHalf - 760);
-            const y = clamp(candidate.y + (Math.random() - 0.5) * 620, -worldHalf + 760, worldHalf - 760);
-            const areaW = preferHouse ? 620 : 440;
-            const areaH = preferHouse ? 560 : 440;
-            const buffer = preferHouse ? 145 : 80;
-            if (isAreaOverlapping(x, y, areaW, areaH, buffer, placedPositions)) continue;
-            if (isMapPositionBlocked(obstacles, x, y, preferHouse ? 155 : 48)) continue;
-
-            if (preferHouse) {
-                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-                placedPositions.push({ x, y, w: areaW, h: areaH });
-                housesAdded++;
-            } else if (detailClustersAdded < detailClusterLimit) {
-                const placed = addOpenFieldScatter(obstacles, x, y, {
-                    radius: 135 + Math.random() * 75,
-                    count: 4 + Math.floor(Math.random() * 4),
-                    variant: y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
-                });
-                if (placed <= 0) continue;
-                placedPositions.push({ x, y, w: areaW, h: areaH });
-                detailClustersAdded++;
-            }
-            break;
-        }
-    }
-
-    return { housesAdded, detailClustersAdded };
-}
-
-const GAP_COVER_KINDS = new Set([
-    'houseFloor', 'tree', 'bush', 'rock', 'stump', 'fallenLog', 'hayBale',
-    'crate', 'barrel', 'container', 'sandbag', 'tent', 'picnicTable',
+const CURATED_ROTATION_AREAS = Object.freeze([
+    [-8600, -5700, 'splitGrove', 'pine', 0.18], [-6200, -5550, 'rockGate', 'pine', 0.92],
+    [-3400, -6900, 'windbreak', 'pine', 0.34], [1700, -7600, 'clearing', 'pine', 0.72],
+    [4200, -7350, 'windbreak', 'pine', 1.22], [7900, -8200, 'splitGrove', 'pine', 0.46],
+    [8350, -4550, 'rockGate', 'grass', 1.08], [-8650, -2450, 'clearing', 'wetlands', 0.24],
+    [-6250, -2550, 'rockGate', 'wetlands', 0.84], [-3450, -2850, 'splitGrove', 'grass', 0.42],
+    [-1450, -2250, 'rockGate', 'wetlands', 1.18], [1100, -2850, 'splitGrove', 'wetlands', 0.58],
+    [4450, -2350, 'clearing', 'grass', 0.18], [6650, -1850, 'rockGate', 'grass', 1.04],
+    [8650, -450, 'splitGrove', 'grass', 0.48], [-8550, 3450, 'windbreak', 'wetlands', 1.14],
+    [-4200, 2600, 'splitGrove', 'grass', 0.36], [-2700, 4250, 'clearing', 'grass', 0.82],
+    [2800, 5400, 'rockGate', 'scrub', 1.18], [4700, 6300, 'splitGrove', 'scrub', 0.4],
+    [7600, 4150, 'clearing', 'scrub', 0.74], [8550, 6800, 'windbreak', 'scrub', 1.1],
+    [-8550, 7900, 'splitGrove', 'scrub', 0.34], [-5700, 8650, 'windbreak', 'scrub', 0.94],
+    [-3000, 7650, 'rockGate', 'scrub', 0.5], [1550, 7100, 'clearing', 'scrub', 1.2],
+    [3600, 8750, 'rockGate', 'scrub', 0.74], [7800, 8750, 'splitGrove', 'scrub', 0.22],
 ]);
-const GAP_BLOCKED_SURFACE_KINDS = new Set(['road', 'water', 'river', 'houseFloor']);
 
-function pointToObstacleDistance(x, y, obstacle) {
-    const angle = -(Number(obstacle.rotation) || 0);
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-    const dx = x - obstacle.x;
-    const dy = y - obstacle.y;
-    const localX = dx * cos - dy * sin;
-    const localY = dx * sin + dy * cos;
-    const outsideX = Math.max(0, Math.abs(localX) - (obstacle.w || 0) / 2);
-    const outsideY = Math.max(0, Math.abs(localY) - (obstacle.h || 0) / 2);
-    return Math.hypot(outsideX, outsideY);
+const CURATED_RURAL_SITES = Object.freeze([
+    { x: -8900, y: -7200, variant: 'cabin', doorSide: 'east', hue: 18 },
+    { x: -3500, y: -8650, variant: 'house', doorSide: 'south', hue: 26 },
+    { x: -250, y: -8600, variant: 'cabin', doorSide: 'east', hue: 20 },
+    { x: 8650, y: -7100, variant: 'house', doorSide: 'west', hue: 32 },
+    { x: 8950, y: -2500, variant: 'barn', doorSide: 'west', hue: 18 },
+    { x: 8950, y: 5650, variant: 'house', doorSide: 'west', hue: 24 },
+    { x: 7000, y: 9150, variant: 'cabin', doorSide: 'north', hue: 22 },
+    { x: -300, y: 9200, variant: 'house', doorSide: 'north', hue: 28 },
+    { x: -3300, y: 9100, variant: 'cabin', doorSide: 'east', hue: 20 },
+    { x: -9000, y: 8850, variant: 'barn', doorSide: 'east', hue: 16 },
+    { x: -9000, y: 1050, variant: 'house', doorSide: 'east', hue: 30 },
+    { x: -8750, y: -950, variant: 'cabin', doorSide: 'east', hue: 18 },
+]);
+
+function rotationCoverVariant(kind, biome, index) {
+    if (kind === 'tree') {
+        if (biome === 'pine') return index % 4 === 0 ? 'giantPine' : 'pine';
+        if (biome === 'wetlands') return index % 3 === 0 ? 'willowTree' : 'grove';
+        if (biome === 'scrub') return index % 3 === 0 ? 'birch' : 'scrub';
+        return index % 4 === 0 ? 'ancientOak' : 'grove';
+    }
+    if (kind === 'fallenLog') return biome === 'pine' ? 'birch' : 'mossy';
+    return biome;
 }
 
-function isGapSampleBlocked(blockedSurfaces, x, y) {
-    return blockedSurfaces.some(obstacle => (
-        GAP_BLOCKED_SURFACE_KINDS.has(obstacle.kind)
-        && pointToObstacleDistance(x, y, obstacle) < 95
-    ));
-}
-
-function addGapCoverCluster(obstacles, x, y, variant) {
-    // Every gap cluster deliberately mixes hard and soft cover. This keeps open
-    // crossings interesting instead of creating another group of only trees.
-    const kinds = ['tree', 'rock', 'tree', 'bush', 'tree', 'rock'];
-    kinds.push(Math.random() < 0.52 ? 'fallenLog' : 'stump');
-    if (Math.random() < 0.58) kinds.push('tree');
-    let placed = 0;
-
-    for (let index = 0; index < kinds.length; index++) {
-        const kind = kinds[index];
-        for (let attempt = 0; attempt < 12; attempt++) {
-            const angle = Math.random() * Math.PI * 2;
-            const radius = index === 0 ? Math.random() * 38 : 58 + Math.random() * 165;
-            const ox = x + Math.cos(angle) * radius;
-            const oy = y + Math.sin(angle) * radius;
-            const size = kind === 'fallenLog'
-                ? 72 + Math.random() * 42
-                : kind === 'tree' ? 38 + Math.random() * 48 : 30 + Math.random() * 38;
-            const width = size;
-            const height = kind === 'rock'
-                ? 26 + Math.random() * 26
-                : kind === 'fallenLog' ? 20 + Math.random() * 8 : size;
-            if (isMapPositionBlocked(obstacles, ox, oy, Math.max(width, height) / 2 + 8)) continue;
-
-            const treeVariant = variant === 'pine'
-                ? (Math.random() < 0.22 ? 'giantPine' : 'pine')
-                : Math.random() < 0.16 ? 'birch'
-                    : Math.random() < 0.08 ? 'ancientOak' : variant;
-            addObstacle(obstacles, kind, ox, oy, width, height, {
-                hue: kind === 'rock' ? 212 + Math.floor(Math.random() * 26) : 96 + Math.floor(Math.random() * 36),
-                rotation: Math.random() * Math.PI,
-                collidable: kind === 'bush' ? Math.random() > 0.35 : true,
-                variant: kind === 'fallenLog' ? (Math.random() < 0.55 ? 'mossy' : 'birch')
-                    : kind === 'stump' ? (Math.random() < 0.55 ? 'mossy' : 'cut')
-                        : kind === 'tree' ? treeVariant : variant,
-                role: 'gapCover',
+function addCuratedRotationCover(obstacles) {
+    let areasAdded = 0;
+    let propsAdded = 0;
+    for (const [centerX, centerY, patternName, biome, angle] of CURATED_ROTATION_AREAS) {
+        const pattern = CURATED_COVER_PATTERNS[patternName];
+        const before = obstacles.length;
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
+        for (let index = 0; index < pattern.length; index++) {
+            const [kind, localX, localY, width, height] = pattern[index];
+            const x = centerX + localX * cos - localY * sin;
+            const y = centerY + localX * sin + localY * cos;
+            if (INTENTIONAL_OPEN_AREAS.some(area => rectsOverlap(
+                x, y, width + 48, height + 48,
+                area.x, area.y, area.w, area.h,
+            ))) continue;
+            if (isMapPositionBlocked(obstacles, x, y, Math.max(width, height) / 2 + 10)) continue;
+            addObstacle(obstacles, kind, x, y, width, height, {
+                hue: kind === 'rock' ? 218 : biome === 'pine' ? 116 : biome === 'wetlands' ? 92 : 104,
+                rotation: angle + index * 0.31,
+                collidable: kind !== 'bush',
+                variant: rotationCoverVariant(kind, biome, index),
+                biome,
+                role: 'rotationCover',
             });
-            placed++;
-            break;
         }
+        const added = obstacles.length - before;
+        if (added >= 3) areasAdded++;
+        propsAdded += added;
     }
-
-    return placed;
+    return { areasAdded, propsAdded };
 }
 
-function addAdaptiveGapFill(obstacles, loot, spawnPoints, worldHalf, placedPositions) {
-    const cover = obstacles.filter(obstacle => GAP_COVER_KINDS.has(obstacle.kind));
-    const houses = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
-    const blockedSurfaces = obstacles.filter(obstacle => GAP_BLOCKED_SURFACE_KINDS.has(obstacle.kind));
-    const candidates = [];
-    const step = 440;
-    const margin = 600;
-
-    for (let x = -worldHalf + margin; x <= worldHalf - margin; x += step) {
-        for (let y = -worldHalf + margin; y <= worldHalf - margin; y += step) {
-            if (isGapSampleBlocked(blockedSurfaces, x, y)) continue;
-            let nearestCover = Infinity;
-            for (const obstacle of cover) {
-                nearestCover = Math.min(nearestCover, pointToObstacleDistance(x, y, obstacle));
-                if (nearestCover <= 410) break;
-            }
-            if (nearestCover <= 410) continue;
-
-            let nearestHouse = Infinity;
-            for (const house of houses) {
-                nearestHouse = Math.min(nearestHouse, pointToObstacleDistance(x, y, house));
-            }
-            candidates.push({ x, y, nearestCover, nearestHouse });
+function addOpenCombatAreaEdges(obstacles) {
+    let propsAdded = 0;
+    const edgePattern = [
+        [-0.32, -0.58, 'tree'], [0.32, -0.58, 'rock'],
+        [-0.32, 0.58, 'rock'], [0.32, 0.58, 'tree'],
+        [-0.57, -0.22, 'bush'], [-0.57, 0.22, 'tree'],
+        [0.57, -0.22, 'tree'], [0.57, 0.22, 'bush'],
+    ];
+    for (const [areaIndex, area] of INTENTIONAL_OPEN_AREAS.entries()) {
+        for (const [index, [nx, ny, kind]] of edgePattern.entries()) {
+            const x = area.x + nx * area.w;
+            const y = area.y + ny * area.h;
+            const width = kind === 'rock' ? 62 : kind === 'bush' ? 48 : 58 + (index % 2) * 8;
+            const height = kind === 'rock' ? 42 : kind === 'bush' ? 40 : width;
+            if (isMapPositionBlocked(obstacles, x, y, Math.max(width, height) / 2 + 8)) continue;
+            addObstacle(obstacles, kind, x, y, width, height, {
+                hue: kind === 'rock' ? 216 : area.variant === 'wetlands' ? 92 : 104,
+                rotation: areaIndex * 0.37 + index * 0.61,
+                collidable: kind !== 'bush',
+                variant: kind === 'tree'
+                    ? area.variant === 'wetlands' ? 'willowTree' : area.variant === 'scrub' ? 'scrub' : 'grove'
+                    : area.variant,
+                biome: area.variant,
+                role: 'openAreaEdge',
+            });
+            propsAdded++;
         }
     }
+    return propsAdded;
+}
 
-    candidates.sort((a, b) => b.nearestCover - a.nearestCover || a.y - b.y || a.x - b.x);
-    const anchors = [];
-    let housesAdded = 0;
-    let clustersAdded = 0;
-    const houseLimit = 18;
-    const clusterLimit = 82;
-
-    for (const candidate of candidates) {
-        if (housesAdded >= houseLimit && clustersAdded >= clusterLimit) break;
-        if (anchors.some(anchor => Math.hypot(anchor.x - candidate.x, anchor.y - candidate.y) < 380)) continue;
-
-        const preferHouse = housesAdded < houseLimit
-            && candidate.nearestCover > 560
-            && candidate.nearestHouse > 720;
-        let completed = false;
-        for (let attempt = 0; attempt < 8 && !completed; attempt++) {
-            const x = clamp(candidate.x + (Math.random() - 0.5) * 170, -worldHalf + 700, worldHalf - 700);
-            const y = clamp(candidate.y + (Math.random() - 0.5) * 170, -worldHalf + 700, worldHalf - 700);
-
-            const tryingHouse = preferHouse && attempt < 4;
-            if (tryingHouse) {
-                const areaW = 600;
-                const areaH = 540;
-                // Candidate distance already excludes finished POIs and other
-                // houses. Keep the actual road/river/trail checks here without
-                // reusing broad planning boxes that cover otherwise empty land.
-                if (isAreaOverlapping(x, y, areaW, areaH, 105, [])) continue;
-                if (houses.some(house => rectsOverlap(
-                    x, y, areaW, areaH,
-                    house.x, house.y, house.w + 300, house.h + 300,
-                ))) continue;
-                if (isMapPositionBlocked(obstacles, x, y, 150)) continue;
-                const obstacleCountBeforeHouse = obstacles.length;
-                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-                placedPositions.push({ x, y, w: areaW, h: areaH });
-                const addedHouse = obstacles
-                    .slice(obstacleCountBeforeHouse)
-                    .find(obstacle => obstacle.kind === 'houseFloor');
-                if (addedHouse) {
-                    addedHouse.role = 'gapHouse';
-                    houses.push(addedHouse);
-                    blockedSurfaces.push(addedHouse);
-                }
-                housesAdded++;
-                completed = true;
-            } else if (clustersAdded < clusterLimit) {
-                if (isGapSampleBlocked(blockedSurfaces, x, y)) continue;
-                const placed = addGapCoverCluster(
-                    obstacles,
-                    x,
-                    y,
-                    y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
-                );
-                if (placed < 3) continue;
-                placedPositions.push({ x, y, w: 420, h: 420 });
-                clustersAdded++;
-                completed = true;
-            }
-
-            if (completed) anchors.push({ x, y });
-        }
+function addCuratedRuralSite(obstacles, loot, spawnPoints, plan) {
+    addHouse(obstacles, loot, spawnPoints, plan.x, plan.y, plan.variant === 'barn' ? 260 : 220, plan.variant === 'barn' ? 195 : 180, {
+        variant: plan.variant,
+        hue: plan.hue,
+        tier: 'common',
+        doorSide: plan.doorSide,
+        layout: plan.variant === 'barn' ? 'open' : 'split',
+        landmarkType: 'rural-site',
+        role: 'ruralHome',
+    });
+    const approachAngle = plan.doorSide === 'east' ? 0
+        : plan.doorSide === 'west' ? Math.PI
+            : plan.doorSide === 'south' ? Math.PI / 2 : -Math.PI / 2;
+    const sideX = -Math.sin(approachAngle);
+    const sideY = Math.cos(approachAngle);
+    const cover = [
+        { kind: 'tree', forward: -85, side: -185, w: 64, h: 64 },
+        { kind: 'rock', forward: 65, side: 190, w: 58, h: 40 },
+        { kind: 'bush', forward: -130, side: 150, w: 46, h: 38 },
+    ];
+    for (const [index, prop] of cover.entries()) {
+        const x = plan.x + Math.cos(approachAngle) * prop.forward + sideX * prop.side;
+        const y = plan.y + Math.sin(approachAngle) * prop.forward + sideY * prop.side;
+        if (isMapPositionBlocked(obstacles, x, y, Math.max(prop.w, prop.h) / 2 + 8)) continue;
+        addObstacle(obstacles, prop.kind, x, y, prop.w, prop.h, {
+            hue: prop.kind === 'rock' ? 216 : 105,
+            rotation: approachAngle + index * 0.7,
+            collidable: prop.kind !== 'bush',
+            variant: prop.kind === 'tree' && plan.y < -4800 ? 'pine' : 'homestead',
+            landmarkType: 'rural-site',
+            role: 'homesteadCover',
+        });
     }
-
-    return { housesAdded, clustersAdded };
 }
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
@@ -4198,9 +4161,13 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, -wh * 0.9, 2000, wh * 0.9, 2000, roadW);
     // North East-West Highway
     addRoad(obstacles, -wh * 0.9, -4000, wh * 0.9, -4000, roadW);
-    // Secondary cross-map routes reduce the long empty rotations in the outer rings.
-    addRoad(obstacles, -wh * 0.9, -6100, wh * 0.9, -6100, roadW);
-    addRoad(obstacles, -wh * 0.9, 6200, wh * 0.9, 6200, roadW);
+    // Outer collectors stop at the two north-south highways. Breaking these
+    // routes into four regional roads avoids a repetitive six-line grid and
+    // leaves the north/south centre as riskier cross-country rotations.
+    addRoad(obstacles, -wh * 0.9, -6100, -2500, -6100, roadW);
+    addRoad(obstacles, 2500, -6100, wh * 0.9, -6100, roadW);
+    addRoad(obstacles, -wh * 0.9, 6200, -2500, 6200, roadW);
+    addRoad(obstacles, 2500, 6200, wh * 0.9, 6200, roadW);
 
     // Branch connectors linking compounds to the highways
     addRoad(obstacles, 0, 0, 0, 2000, roadW);             // Old Estate to E-W Highway
@@ -4224,7 +4191,7 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, riversidePos.x, -4000, riversidePos.x, riversidePos.y, roadW); // Riverside cross street
     addRoad(obstacles, 2500, eastgatePos.y, eastgatePos.x - 1120, eastgatePos.y, roadW); // Eastgate avenue
     addRoad(obstacles, -2500, westportPos.y + 80, westportPos.x + 920, westportPos.y + 80, roadW); // Westport road
-    addRoad(obstacles, railDepotPos.x - 920, 6200, railDepotPos.x - 920, railDepotPos.y, roadW); // Rail depot approach
+    addRoad(obstacles, 2500, railDepotPos.y, railDepotPos.x + 930, railDepotPos.y, roadW); // Rail depot freight approach
     addRoad(obstacles, -2500, civicQuarterPos.y + 50, civicQuarterPos.x - 900, civicQuarterPos.y + 50, roadW); // Civic boulevard
 
     // SW Town's south cobblestone lane already reaches the cross-map highway.
@@ -4261,7 +4228,7 @@ export function generateSurvivMap(worldHalf) {
     addPondDetails(obstacles);
 
     addWildernessTrailNetwork(obstacles);
-    addLandmarkTrees(obstacles, wh);
+    addLandmarkTrees(obstacles, wh, 30, INTENTIONAL_OPEN_AREAS);
     addWorldFurnitureDetails(obstacles);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -4284,7 +4251,21 @@ export function generateSurvivMap(worldHalf) {
             h: sin * segment.w + cos * segment.h + padding * 2,
         };
     });
-    const placedPositions = [...POI_LIST, ...roadReservations, ...riverReservations];
+    for (const area of INTENTIONAL_OPEN_AREAS) {
+        addObstacle(obstacles, 'field', area.x, area.y, area.w, area.h, {
+            collidable: false,
+            variant: area.variant,
+            role: 'openCombatArea',
+            label: area.label,
+        });
+    }
+    addOpenCombatAreaEdges(obstacles);
+    const placedPositions = [
+        ...POI_LIST,
+        ...roadReservations,
+        ...riverReservations,
+        ...INTENTIONAL_OPEN_AREAS,
+    ];
     // Curated hamlets create recognizable rotations between major POIs. They
     // replace the old density fallback that sprinkled isolated houses anywhere.
     const hamletPlans = [
@@ -4308,97 +4289,37 @@ export function generateSurvivMap(worldHalf) {
         addRoadsideHamlet(obstacles, loot, spawnPoints, plan.x, plan.y, plan.orientation);
         placedPositions.push({ x: plan.x, y: plan.y, w, h });
     }
-
-
-    // NW Pine Forest biome - compact patches that break up empty crossings.
-    for (let i = 0; i < 5; i++) {
-        const fx = -6500 + i * 2000 + (Math.random() - 0.5) * 400;
-        const fy = -6000 + (Math.random() - 0.5) * 400;
-        if (!isAreaOverlapping(fx, fy, 800, 800, 200, placedPositions)) {
-            addForest(obstacles, loot, spawnPoints, fx, fy, 16, 340);
-            placedPositions.push({ x: fx, y: fy, w: 800, h: 800 });
-        }
+    // A small set of fixed rural homes replaces dozens of grid/random filler
+    // buildings. Each one occupies an outer rotation where a solo structure
+    // creates a decision rather than competing with an established landmark.
+    for (const plan of CURATED_RURAL_SITES) {
+        const area = { x: plan.x, y: plan.y, w: 620, h: 560 };
+        if (isAreaOverlapping(area.x, area.y, area.w, area.h, 130, placedPositions)) continue;
+        if (isMapPositionBlocked(obstacles, plan.x, plan.y, 155)) continue;
+        addCuratedRuralSite(obstacles, loot, spawnPoints, plan);
+        placedPositions.push(area);
     }
 
-    // SW Wetlands/Swamp biome.
-    for (let i = 0; i < 5; i++) {
-        const sx = -7000 + i * 1500 + (Math.random() - 0.5) * 300;
-        const sy = 4500 + (Math.random() - 0.5) * 300;
-        if (!isAreaOverlapping(sx, sy, 600, 600, 200, placedPositions)) {
-            addCoverPatch(obstacles, loot, spawnPoints, sx, sy, { radius: 230, variant: 'wetlands' });
-            placedPositions.push({ x: sx, y: sy, w: 600, h: 600 });
-        }
+    // Fixed biome pockets give the outer regions different silhouettes while
+    // keeping their centres and route relationships stable between matches.
+    const biomePatches = [
+        { x: -6500, y: -5450, radius: 285, variant: 'woods' },
+        { x: -1650, y: -7050, radius: 250, variant: 'woods' },
+        { x: 6900, y: -7800, radius: 260, variant: 'woods' },
+        { x: -7900, y: 4650, radius: 250, variant: 'wetlands' },
+        { x: -4900, y: 4550, radius: 230, variant: 'wetlands' },
+        { x: 5900, y: 6900, radius: 250, variant: 'scrub' },
+    ];
+    for (const patch of biomePatches) {
+        const size = patch.radius * 2.2;
+        if (isAreaOverlapping(patch.x, patch.y, size, size, 150, placedPositions)) continue;
+        addCoverPatch(obstacles, loot, spawnPoints, patch.x, patch.y, patch);
+        placedPositions.push({ x: patch.x, y: patch.y, w: size, h: size });
     }
 
-    // Standalone filler houses, microsites, and cover patches.
-    const fillStep = 2350;
-    const fillMargin = 1550;
-    for (let gx = -wh + fillMargin; gx <= wh - fillMargin; gx += fillStep) {
-        for (let gy = -wh + fillMargin; gy <= wh - fillMargin; gy += fillStep) {
-            const x = clamp(gx + (Math.random() - 0.5) * 1050, -wh + 1200, wh - 1200);
-            const y = clamp(gy + (Math.random() - 0.5) * 1050, -wh + 1200, wh - 1200);
-            
-            if (Math.hypot(x, y) < 2000) continue;
-            
-            if (isAreaOverlapping(x, y, 1000, 820, 320, placedPositions)) continue;
-            
-            placedPositions.push({ x, y, w: 1000, h: 820 });
-            const roll = Math.random();
-            if (roll < 0.62) {
-                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-            } else if (roll < 0.88) {
-                addMicroSite(obstacles, loot, spawnPoints, x, y, 'grass');
-            } else {
-                addCoverPatch(obstacles, loot, spawnPoints, x, y, { radius: 260, variant: 'woods' });
-            }
-        }
-    }
-
-    // Countryside scatter: loose trees and occasional single houses so the long crossings
-    // still feel natural without turning every open field into a dense compound.
-    let countrysideHouses = 0;
-    const countrysideHouseLimit = 28;
-    const scatterStep = 1250;
-    const scatterMargin = 950;
-    for (let gx = -wh + scatterMargin; gx <= wh - scatterMargin; gx += scatterStep) {
-        for (let gy = -wh + scatterMargin; gy <= wh - scatterMargin; gy += scatterStep) {
-            if (Math.random() < 0.08) continue;
-            const x = clamp(gx + (Math.random() - 0.5) * 620, -wh + 760, wh - 760);
-            const y = clamp(gy + (Math.random() - 0.5) * 620, -wh + 760, wh - 760);
-
-            if (Math.hypot(x, y) < 1700) continue;
-            if (isAreaOverlapping(x, y, 330, 330, 115, placedPositions)) continue;
-
-            if (countrysideHouses < countrysideHouseLimit && Math.random() < 0.23) {
-                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
-                placedPositions.push({ x, y, w: 560, h: 520 });
-                countrysideHouses++;
-            } else {
-                const placed = addOpenFieldScatter(obstacles, x, y, {
-                    radius: 190 + Math.random() * 210,
-                    count: 6 + Math.floor(Math.random() * 5),
-                    variant: y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
-                });
-                if (placed > 0) placedPositions.push({ x, y, w: 300, h: 300 });
-            }
-        }
-    }
-
-    // Forests scattered organically in remaining outer areas
-    for (let i = 0; i < 10; i++) {
-        const pos = randomSpawnCoord(wh * 0.88);
-        if (Math.hypot(pos.x, pos.y) < 2400) continue;
-        if (!isAreaOverlapping(pos.x, pos.y, 560, 560, 240, placedPositions)) {
-            addForest(obstacles, loot, spawnPoints, pos.x, pos.y, 16, 320);
-            placedPositions.push({ x: pos.x, y: pos.y, w: 600, h: 600 });
-        }
-    }
-
-    // Add small points of interest only where the completed layout is still sparse.
-    addSparseAreaFill(obstacles, loot, spawnPoints, wh, placedPositions);
-    addCanopyInfill(obstacles, wh);
-    addNaturalDetailScatter(obstacles, wh, POI_LIST);
-    addAdaptiveGapFill(obstacles, loot, spawnPoints, wh, placedPositions);
+    addCuratedRotationCover(obstacles);
+    addCanopyInfill(obstacles, wh, 36, INTENTIONAL_OPEN_AREAS);
+    addNaturalDetailScatter(obstacles, wh, [...POI_LIST, ...INTENTIONAL_OPEN_AREAS]);
     addScatteredGroundLoot(obstacles, loot);
     clearInvalidBuildingProps(obstacles);
     sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
@@ -5417,19 +5338,37 @@ function tryShoot(entity, room, now) {
         return;
     }
 
-    if (now - w.lastShotAt < wDef.fireRateMs) return;
+    const previousShotAt = Number(w.lastShotAt) || 0;
+    if (now - previousShotAt < wDef.fireRateMs) return;
 
+    const continuingBurst = wDef.automatic
+        && previousShotAt > 0
+        && now - previousShotAt <= wDef.fireRateMs * 1.8 + 25;
+    w.spreadShotIndex = continuingBurst ? (Number(w.spreadShotIndex) || 0) + 1 : 0;
     w.lastShotAt = now;
     w.ammo -= 1;
 
     const baseAngle = entity.aimAngle ?? entity.angle ?? 0;
     const pellets = wDef.pellets || 1;
+    entity.shotSequence = (Number(entity.shotSequence) || 0) + 1;
+    const shotId = `${entity.id}:${entity.shotSequence}`;
+    const burstBloom = wDef.automatic ? clamp(w.spreadShotIndex / 9, 0, 1) : 1;
+    const effectiveSpread = wDef.spread * (wDef.automatic ? 0.62 + burstBloom * 0.38 : 1);
 
     for (let i = 0; i < pellets; i++) {
-        const spread = (Math.random() - 0.5) * wDef.spread * 2;
+        // A shotgun intentionally fans several pellets from one shell. Every
+        // other gun creates exactly one projectile per cadence interval. Auto
+        // spread follows a low-clumping recoil pattern and blooms gradually.
+        const spreadPosition = pellets > 1
+            ? (i / (pellets - 1)) * 2 - 1
+            : Math.sin(entity.shotSequence * 2.399963229728653) * 0.78;
+        const jitterScale = pellets > 1 ? 0.10 : 0.22;
+        const spread = spreadPosition * effectiveSpread
+            + (Math.random() - 0.5) * effectiveSpread * jitterScale;
         const angle = baseAngle + spread;
         room.bullets.push({
             id: randId(),
+            shotId,
             ownerId: entity.id,
             ownerIsBot: !!entity.isBot,
             x: entity.x + Math.cos(angle) * (SURVIV.playerRadius + 4),
@@ -7017,7 +6956,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
 
         const visibleBullets = room.bullets
             .filter(b => b.ownerId === youId || isInView(viewX, viewY, b.x, b.y, range + 300))
-            .map(b => ({ id: b.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType, isGrenade: !!b.isGrenade, detonateAt: b.detonateAt || 0 }));
+            .map(b => ({ id: b.id, shotId: b.shotId, x: b.x, y: b.y, vx: b.vx, vy: b.vy, ownerId: b.ownerId, weaponType: b.weaponType, isGrenade: !!b.isGrenade, detonateAt: b.detonateAt || 0 }));
         const visibleDeathMarkers = room.deathMarkers
             .filter(marker => isInView(viewX, viewY, marker.x, marker.y, range))
             .map(marker => ({ ...marker }));
