@@ -363,12 +363,27 @@ test('pond sites and the west forest camp keep readable spacing', () => {
 
 test('static surviv map loot never creates unfunded money', () => {
     let chestCount = 0;
+    const standardWeapons = new Set([
+        'm9', 'ot38', 'mac10', 'mp5', 'm870', 'mp220', 'ak47', 'm416',
+        'famas', 'vss', 'mosin', 'awms', 'dp28', 'm249', 'm4a1s', 'dualm9', 'knife',
+    ]);
+    const standardAmmo = new Set(['9mm', '12g', '556', '762', '308']);
     for (let i = 0; i < 8; i++) {
         const map = generateSurvivMap(SURVIV.worldHalf);
         const chests = map.loot.filter(item => item.type === 'chest' && item.source === 'map');
+        const weaponTypes = map.loot.flatMap(item => [
+            item.type === 'weapon' ? item.weaponType : null,
+            item.contents?.weaponType || null,
+        ]).filter(Boolean);
+        const ammoTypes = map.loot.flatMap(item => [
+            item.type === 'ammo' ? item.ammoType : null,
+            item.contents?.ammoType || null,
+        ]).filter(Boolean);
         chestCount += chests.length;
         assert.ok(chests.every(chest => !(Number(chest.contents?.money) > 0)));
         assert.ok(map.loot.every(item => item.type !== 'money' || !(Number(item.dollarValue) > 0)));
+        assert.ok(weaponTypes.every(weaponType => standardWeapons.has(weaponType)), `unexpected normal-match weapon: ${weaponTypes.find(weaponType => !standardWeapons.has(weaponType))}`);
+        assert.ok(ammoTypes.every(ammoType => standardAmmo.has(ammoType)), `unexpected normal-match ammo: ${ammoTypes.find(ammoType => !standardAmmo.has(ammoType))}`);
     }
 
     assert.ok(chestCount > 80);

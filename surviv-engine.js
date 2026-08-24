@@ -4,7 +4,7 @@
  */
 
 import { getSurvivEconomy } from './economy.js';
-import { SURVIV_FIREARM_IDS, SURVIV_WEAPONS } from './surviv-weapons.js';
+import { SURVIV_STANDARD_FIREARM_IDS, SURVIV_WEAPONS } from './surviv-weapons.js';
 
 const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
@@ -28,7 +28,10 @@ export const SURVIV_AMMO = Object.freeze({
     heart: { id: 'heart', label: 'Heart Ammo', color: '#ef7ee8', max: 90, pickup: 15 },
     bugle: { id: 'bugle', label: 'Bugle Ammo', color: '#f6c453', max: 30, pickup: 5 },
 });
-const SURVIV_AMMO_TYPES = Object.keys(SURVIV_AMMO);
+// Normal matches only spawn calibers consumed by the standard 16-gun roster.
+// Event calibers stay defined solely so an old reconnect can still resolve its
+// inventory without leaking unusable ammunition into new maps.
+const SURVIV_AMMO_TYPES = Object.freeze(['9mm', '12g', '556', '762', '308']);
 
 export const SURVIV = {
     worldHalf: 10000,
@@ -226,11 +229,11 @@ const BOT_NAMES = [
 ];
 
 const WEAPON_RARITY_POOLS = {
-    common: SURVIV_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'common'),
-    rare: ['knife', ...SURVIV_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'rare')],
-    military: SURVIV_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'military'),
+    common: SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'common'),
+    rare: ['knife', ...SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'rare')],
+    military: SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'military'),
 };
-const LOOT_WEAPON_TYPES = [...SURVIV_FIREARM_IDS];
+const LOOT_WEAPON_TYPES = [...SURVIV_STANDARD_FIREARM_IDS];
 const SURVIV_OBSTACLE_CELL = 700;
 const SURVIV_LOOT_CELL = 600;
 // Socket.IO is reliable and ordered, so static world data only needs a sparse
@@ -2820,11 +2823,11 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     }
 
     // Guaranteed military ground loot inside warehouse and barracks
-    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'sv98', source: 'military-loot' }));
+    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'awms', source: 'military-loot' }));
     loot.push(makeGroundLoot('ammo', x - 40, y, { source: 'military-loot' }));
     loot.push(makeGroundLoot('ammo', x + 40, y, { source: 'military-loot' }));
     loot.push(makeGroundLoot('weapon', x - 550, y - 400, { weaponType: 'm4a1s', source: 'military-loot' }));
-    loot.push(makeGroundLoot('weapon', x + 550, y - 400, { weaponType: 'mk20ssr', source: 'military-loot' }));
+    loot.push(makeGroundLoot('weapon', x + 550, y - 400, { weaponType: 'vss', source: 'military-loot' }));
     loot.push(makeGroundLoot('medkit', x, y + 100, { source: 'military-loot' }));
 
     spawnPoints.push({ x: x, y: y + 780 });
@@ -3020,7 +3023,7 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'wall', x + 800, y + 800, 100, 100, 'stone');
 
     // Warden signature loot
-    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'ots38', source: 'prison-loot' }));
+    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'ot38', source: 'prison-loot' }));
     loot.push(makeGroundLoot('ammo', x - 30, y, { source: 'prison-loot' }));
     loot.push(makeGroundLoot('armor', x + 30, y, { armorValue: 60, source: 'prison-loot' }));
 
@@ -3116,7 +3119,7 @@ function addRadioTower(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'crate', x + 120, y + 340, 44, 44, { rotation: -0.1 });
 
     // Guaranteed control room loot
-    loot.push(makeGroundLoot('weapon', x - 200, y - 200, { weaponType: 'cz3a1', source: 'tower-loot' }));
+    loot.push(makeGroundLoot('weapon', x - 200, y - 200, { weaponType: 'mac10', source: 'tower-loot' }));
     loot.push(makeGroundLoot('ammo', x - 200, y - 160, { source: 'tower-loot' }));
 
     spawnPoints.push({ x, y: y + 460 });

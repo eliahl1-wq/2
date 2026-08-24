@@ -106,6 +106,16 @@ const FIREARMS = {
 
 export const SURVIV_FIREARM_IDS = Object.freeze(Object.keys(FIREARMS));
 
+// The standard AgarStake Surviv roster. Event and compatibility definitions
+// remain valid for old sessions, but normal map/chest generation must only use
+// the readable core set presented in the loadout reference.
+export const SURVIV_STANDARD_FIREARM_IDS = Object.freeze([
+    'm9', 'ot38', 'mac10', 'mp5',
+    'm870', 'mp220', 'ak47', 'm416',
+    'famas', 'vss', 'mosin', 'awms',
+    'dp28', 'm249', 'm4a1s', 'dualm9',
+]);
+
 export const SURVIV_WEAPONS = Object.freeze({
     fists: Object.freeze({
         id: 'fists', label: 'Fists', family: 'melee', rarity: 'common', damage: 18,
