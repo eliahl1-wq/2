@@ -378,7 +378,7 @@ export function createAgarCommerceService({
             if (!['agar', 'slither'].includes(gameMode)) return false;
             return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
         }
-        if (['agarstake', 'aurora', 'eclipse'].includes(skinId)) {
+        if (['aurora', 'eclipse'].includes(skinId)) {
             if (gameMode !== 'slither') return false;
             return !!(await SkinEntitlement.exists({ userId, gameMode: 'slither', skinId }));
         }

@@ -4,6 +4,7 @@
  */
 
 import { getSurvivEconomy } from './economy.js';
+import { SURVIV_FIREARM_IDS, SURVIV_WEAPONS } from './surviv-weapons.js';
 
 const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
@@ -18,6 +19,14 @@ export const SURVIV_AMMO = Object.freeze({
     '12g': { id: '12g', label: '12 Gauge', color: '#f05a5a', max: 48, pickup: 8 },
     '556': { id: '556', label: '5.56mm', color: '#63d471', max: 180, pickup: 30 },
     '762': { id: '762', label: '7.62mm', color: '#5aa9f8', max: 90, pickup: 15 },
+    '45acp': { id: '45acp', label: '.45 ACP', color: '#b6f06a', max: 120, pickup: 24 },
+    '50ae': { id: '50ae', label: '.50 AE', color: '#6ee7f2', max: 42, pickup: 7 },
+    '308': { id: '308', label: '.308 Subsonic', color: '#33434d', max: 30, pickup: 5 },
+    '40mm': { id: '40mm', label: '40mm', color: '#d4a452', max: 12, pickup: 2 },
+    flare: { id: 'flare', label: 'Flare', color: '#ff784f', max: 8, pickup: 1 },
+    potato: { id: 'potato', label: 'Potato Ammo', color: '#b98a52', max: 90, pickup: 15 },
+    heart: { id: 'heart', label: 'Heart Ammo', color: '#ef7ee8', max: 90, pickup: 15 },
+    bugle: { id: 'bugle', label: 'Bugle Ammo', color: '#f6c453', max: 30, pickup: 5 },
 });
 const SURVIV_AMMO_TYPES = Object.keys(SURVIV_AMMO);
 
@@ -48,7 +57,7 @@ export const SURVIV = {
     grenadeFalloffExponent: 1.7,
 };
 
-export const WEAPONS = {
+const LEGACY_WEAPONS = {
     fists: {
         id: 'fists',
         label: 'Fists',
@@ -206,17 +215,22 @@ export const WEAPONS = {
     },
 };
 
+// Kept above as a readable historical balance reference; gameplay now uses
+// the complete named catalog.
+void LEGACY_WEAPONS;
+export const WEAPONS = SURVIV_WEAPONS;
+
 const BOT_NAMES = [
     'Scout', 'Raider', 'Ghost', 'Viper', 'Hawk', 'Wolf', 'Rogue', 'Blaze',
     'Nomad', 'Cipher', 'Ranger', 'Striker', 'Hunter', 'Ace', 'Reaper',
 ];
 
 const WEAPON_RARITY_POOLS = {
-    common: ['revolver', 'revolver', 'smg', 'shotgun'],
-    rare: ['knife', 'smg', 'shotgun', 'assault', 'assault', 'dmr'],
-    military: ['assault', 'dmr', 'dmr', 'sniper', 'lmg'],
+    common: SURVIV_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'common'),
+    rare: ['knife', ...SURVIV_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'rare')],
+    military: SURVIV_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'military'),
 };
-const LOOT_WEAPON_TYPES = [...new Set(Object.values(WEAPON_RARITY_POOLS).flat().filter(w => w !== 'pistol'))];
+const LOOT_WEAPON_TYPES = [...SURVIV_FIREARM_IDS];
 const SURVIV_OBSTACLE_CELL = 700;
 const SURVIV_LOOT_CELL = 600;
 // Socket.IO is reliable and ordered, so static world data only needs a sparse
@@ -803,6 +817,11 @@ function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
     });
 }
 
+function compactDoorSpan(requestedSpan, variant = 'wood') {
+    const industrial = ['warehouse', 'mansion', 'metal', 'ironworks'].includes(variant);
+    return clamp((Number(requestedSpan) || 56) * 0.62, 48, industrial ? 72 : 60);
+}
+
 function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south', entranceRole = 'mainEntrance') {
     const exterior = entranceRole !== 'interiorDoor';
     // Keep an exterior slab slightly proud of the wall. This leaves a readable
@@ -848,7 +867,9 @@ function addVerticalInteriorWallSegments(obstacles, x, y, h, wall, gaps = [], va
     const min = y - h / 2;
     const max = y + h / 2;
     let cursor = min;
-    const sorted = [...gaps].sort((a, b) => a.center - b.center);
+    const sorted = gaps
+        .map(gap => ({ ...gap, size: compactDoorSpan(gap.size, opts.doorVariant || variant) }))
+        .sort((a, b) => a.center - b.center);
     for (const gap of sorted) {
         const gapMin = clamp(y + gap.center - gap.size / 2, min, max);
         const gapMax = clamp(y + gap.center + gap.size / 2, min, max);
@@ -877,7 +898,9 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
     const min = x - w / 2;
     const max = x + w / 2;
     let cursor = min;
-    const sorted = [...gaps].sort((a, b) => a.center - b.center);
+    const sorted = gaps
+        .map(gap => ({ ...gap, size: compactDoorSpan(gap.size, opts.doorVariant || variant) }))
+        .sort((a, b) => a.center - b.center);
     for (const gap of sorted) {
         const gapMin = clamp(x + gap.center - gap.size / 2, min, max);
         const gapMax = clamp(x + gap.center + gap.size / 2, min, max);
@@ -915,11 +938,36 @@ function getInteriorDoorSwingRect(door) {
     };
 }
 
+const BREAKABLE_INTERIOR_VARIANTS = new Set([
+    'coffeeTable', 'nightstand', 'dresser', 'armchair', 'floorLamp', 'housePlant',
+    'diningTable', 'desk', 'bookshelf', 'displayShelf', 'palletStack', 'toolCabinet',
+    'labBench', 'specimenTank', 'serverRack', 'generator', 'weaponRack', 'mapTable',
+]);
+
+function resolveHouseInteriorTheme(variant, options = {}) {
+    const landmarkType = options.landmarkType || '';
+    const role = options.role || '';
+    if (landmarkType === 'lab' || role === 'laboratory') return 'lab';
+    if (landmarkType === 'hospital' || role === 'clinic') return 'medical';
+    if (['military', 'bunker', 'prison'].includes(landmarkType)
+        || ['armory', 'barracks', 'guardhouse'].includes(role)) return 'military';
+    if (['farm', 'orchard'].includes(landmarkType)
+        || ['barn', 'farmhouse', 'greenhouse', 'shed', 'ciderBarn', 'packingShed'].includes(role)) return 'farm';
+    if (['warehouse', 'metal', 'ironworks'].includes(variant)
+        || ['garage', 'utility', 'workshop', 'sawmill', 'engineShop', 'freightHall'].includes(role)) return 'industrial';
+    if (options.layout === 'shop' || ['store', 'harborShop', 'repairShop', 'postOffice'].includes(role)) return 'commercial';
+    return 'home';
+}
+
 function furnishHouseInterior(obstacles, house, options = {}) {
     const houseId = house.id;
-    const industrial = options.theme === 'industrial'
+    const theme = options.theme || 'home';
+    const lab = theme === 'lab';
+    const military = theme === 'military';
+    const farm = theme === 'farm';
+    const industrial = theme === 'industrial' || lab || military
         || ['warehouse', 'metal', 'ironworks'].includes(house.variant);
-    const medical = options.theme === 'medical';
+    const medical = theme === 'medical';
     const rooms = obstacles.filter(obstacle => obstacle.kind === 'roomZone' && obstacle.houseId === houseId);
     if (!rooms.length) {
         rooms.push({
@@ -974,7 +1022,8 @@ function furnishHouseInterior(obstacles, house, options = {}) {
             // Fixed interior fixtures should not disappear after one stray hit.
             // Individual lightweight props can opt in when they get a proper
             // break presentation of their own.
-            destructible: spec.destructible === true,
+            destructible: spec.destructible ?? BREAKABLE_INTERIOR_VARIANTS.has(spec.variant),
+            maxHp: spec.maxHp,
             variant: spec.variant,
             role: spec.role || room.variant,
             houseId,
@@ -995,6 +1044,44 @@ function furnishHouseInterior(obstacles, house, options = {}) {
         const roomType = room.variant || 'room';
         if (roomType === 'hallway') continue;
 
+        if (lab) {
+            if (['control-room', 'study', 'living-room'].includes(roomType)) {
+                horizontalPlan(room, [
+                    { variant: 'controlConsole', x: 0.20, y: -0.24, w: 104, h: 34 },
+                    { variant: 'serverRack', x: -0.32, y: 0.12, w: 34, h: 82, maxHp: 42 },
+                    { variant: 'specimenTank', x: 0.22, y: 0.24, w: 54, h: 54, maxHp: 48 },
+                ], [
+                    { variant: 'controlConsole', x: -0.24, y: 0.20, w: 34, h: 104 },
+                    { variant: 'serverRack', x: 0.12, y: -0.32, w: 82, h: 34, maxHp: 42 },
+                    { variant: 'specimenTank', x: 0.24, y: 0.22, w: 54, h: 54, maxHp: 48 },
+                ]);
+            } else {
+                horizontalPlan(room, [
+                    { variant: 'labBench', x: -0.12, y: -0.24, w: 112, h: 34, maxHp: 38 },
+                    { variant: 'specimenTank', x: 0.29, y: 0.21, w: 56, h: 56, maxHp: 48 },
+                    { variant: 'medicalCabinet', x: -0.31, y: 0.20, w: 32, h: 68 },
+                ], [
+                    { variant: 'labBench', x: -0.24, y: -0.12, w: 34, h: 112, maxHp: 38 },
+                    { variant: 'specimenTank', x: 0.21, y: 0.29, w: 56, h: 56, maxHp: 48 },
+                    { variant: 'medicalCabinet', x: 0.20, y: -0.31, w: 68, h: 32 },
+                ]);
+            }
+            continue;
+        }
+
+        if (military) {
+            horizontalPlan(room, [
+                { variant: roomType === 'bedroom' ? 'locker' : 'weaponRack', x: -0.28, y: -0.29, w: 86, h: 30, maxHp: 44 },
+                { variant: roomType === 'control-room' || roomType === 'study' ? 'mapTable' : 'storageShelf', x: 0.20, y: 0.21, w: 86, h: 50, maxHp: 38 },
+                { variant: 'ammoLocker', x: 0.31, y: -0.18, w: 30, h: 64 },
+            ], [
+                { variant: roomType === 'bedroom' ? 'locker' : 'weaponRack', x: -0.29, y: -0.28, w: 30, h: 86, maxHp: 44 },
+                { variant: roomType === 'control-room' || roomType === 'study' ? 'mapTable' : 'storageShelf', x: 0.21, y: 0.20, w: 50, h: 86, maxHp: 38 },
+                { variant: 'ammoLocker', x: -0.18, y: 0.31, w: 64, h: 30 },
+            ]);
+            continue;
+        }
+
         if (medical && ['north-room', 'south-room'].includes(roomType)) {
             const outerSide = room.x < house.x ? -1 : 1;
             place(room, { variant: 'hospitalBed', x: outerSide * 0.28, y: -0.25, w: 54, h: 98, role: 'patient-bed' });
@@ -1007,9 +1094,11 @@ function furnishHouseInterior(obstacles, house, options = {}) {
             horizontalPlan(room, [
                 { variant: 'workbench', x: 0.24, y: -0.26, w: 96, h: 32 },
                 { variant: 'toolCabinet', x: -0.32, y: 0.16, w: 28, h: 58 },
+                { variant: 'generator', x: 0.22, y: 0.25, w: 62, h: 48, maxHp: 54 },
             ], [
                 { variant: 'workbench', x: -0.26, y: 0.24, w: 32, h: 96 },
                 { variant: 'toolCabinet', x: 0.16, y: -0.32, w: 58, h: 28 },
+                { variant: 'generator', x: 0.25, y: 0.22, w: 48, h: 62, maxHp: 54 },
             ]);
             continue;
         }
@@ -1029,20 +1118,24 @@ function furnishHouseInterior(obstacles, house, options = {}) {
                 { variant: 'sofa', x: 0.23, y: -0.25, w: 96, h: 38 },
                 { variant: 'coffeeTable', x: 0.16, y: 0.16, w: 58, h: 30 },
                 { variant: 'armchair', x: -0.31, y: 0.19, w: 40, h: 40 },
+                { variant: 'floorLamp', x: -0.32, y: -0.29, w: 28, h: 28, maxHp: 18 },
             ], [
                 { variant: 'sofa', x: -0.25, y: 0.23, w: 38, h: 96 },
                 { variant: 'coffeeTable', x: 0.16, y: 0.16, w: 30, h: 58 },
                 { variant: 'armchair', x: 0.19, y: -0.31, w: 40, h: 40 },
+                { variant: 'floorLamp', x: -0.29, y: -0.32, w: 28, h: 28, maxHp: 18 },
             ]);
         } else if (roomType === 'bedroom') {
             horizontalPlan(room, [
                 { variant: 'bed', x: 0.29, y: 0.02, w: 54, h: 82 },
                 { variant: 'dresser', x: -0.28, y: -0.29, w: 72, h: 28 },
                 { variant: 'nightstand', x: 0.02, y: -0.29, w: 28, h: 28 },
+                { variant: 'housePlant', x: -0.30, y: 0.27, w: 30, h: 30, maxHp: 18 },
             ], [
                 { variant: 'bed', x: 0.02, y: 0.29, w: 82, h: 54 },
                 { variant: 'dresser', x: -0.29, y: -0.28, w: 28, h: 72 },
                 { variant: 'nightstand', x: -0.29, y: 0.02, w: 28, h: 28 },
+                { variant: 'housePlant', x: 0.27, y: -0.30, w: 30, h: 30, maxHp: 18 },
             ]);
         } else if (roomType === 'kitchen') {
             horizontalPlan(room, [
@@ -1085,10 +1178,12 @@ function furnishHouseInterior(obstacles, house, options = {}) {
                 { variant: 'workbench', x: -0.20, y: -0.31, w: 126, h: 42 },
                 { variant: 'toolCabinet', x: 0.31, y: -0.12, w: 36, h: 92 },
                 { variant: 'storageShelf', x: 0.12, y: 0.31, w: 96, h: 34 },
+                { variant: 'generator', x: -0.28, y: 0.24, w: 64, h: 48, maxHp: 54 },
             ], [
                 { variant: 'workbench', x: -0.31, y: -0.20, w: 42, h: 126 },
                 { variant: 'toolCabinet', x: -0.12, y: 0.31, w: 92, h: 36 },
                 { variant: 'storageShelf', x: 0.31, y: 0.12, w: 34, h: 96 },
+                { variant: 'generator', x: 0.24, y: -0.28, w: 48, h: 64, maxHp: 54 },
             ]);
         } else if (roomType === 'control-room') {
             horizontalPlan(room, [
@@ -1116,14 +1211,56 @@ function furnishHouseInterior(obstacles, house, options = {}) {
                 place(room, { variant: 'kitchenCounter', x: 0.28, y: back, w: 54, h: 28, margin: 6 });
                 place(room, { variant: 'coffeeTable', x: -0.20, y: back * 0.28, w: 48, h: 26 });
                 place(room, { variant: 'bed', x: 0.30, y: back * 0.20, w: 44, h: 68 });
+                place(room, { variant: farm ? 'toolCabinet' : 'housePlant', x: -0.34, y: -back * 0.22, w: 28, h: 28, maxHp: 18 });
             } else {
                 const back = side === 'east' ? -0.35 : 0.35;
                 place(room, { variant: 'sofa', x: back, y: -0.20, w: 32, h: 76, margin: 6 });
                 place(room, { variant: 'kitchenCounter', x: back, y: 0.28, w: 28, h: 54, margin: 6 });
                 place(room, { variant: 'coffeeTable', x: back * 0.28, y: -0.20, w: 26, h: 48 });
                 place(room, { variant: 'bed', x: back * 0.20, y: 0.30, w: 68, h: 44 });
+                place(room, { variant: farm ? 'toolCabinet' : 'housePlant', x: -back * 0.22, y: -0.34, w: 28, h: 28, maxHp: 18 });
             }
         }
+    }
+
+    const placedVariants = () => new Set(occupied.map(prop => prop.variant));
+    const ensureSignatureProp = (variant, horizontalSize, verticalSize) => {
+        if (placedVariants().has(variant)) return;
+        const candidates = rooms.filter(room => room.variant !== 'hallway');
+        for (const room of candidates) {
+            const horizontal = room.w >= room.h;
+            const size = horizontal ? horizontalSize : verticalSize;
+            const positions = horizontal
+                ? [[0, -0.28], [0, 0.28], [-0.27, 0], [0.27, 0]]
+                : [[-0.28, 0], [0.28, 0], [0, -0.27], [0, 0.27]];
+            for (const [x, y] of positions) {
+                if (place(room, {
+                    variant,
+                    x,
+                    y,
+                    w: size[0],
+                    h: size[1],
+                    margin: 5,
+                    maxHp: variant === 'specimenTank' ? 48 : 40,
+                })) return;
+            }
+        }
+    };
+
+    // Signature fixtures make buildings recognizable at a glance even when a
+    // compact procedural room rejected one of the preferred full-size props.
+    if (lab) {
+        if (house.w >= 560) ensureSignatureProp('labBench', [84, 28], [28, 84]);
+        else if (house.w >= 390) ensureSignatureProp('serverRack', [62, 28], [28, 62]);
+        else ensureSignatureProp('specimenTank', [44, 44], [44, 44]);
+    } else if (military) {
+        if (house.role === 'armory' || house.role === 'barracks') {
+            ensureSignatureProp('weaponRack', [76, 28], [28, 76]);
+        } else {
+            ensureSignatureProp('mapTable', [68, 42], [42, 68]);
+        }
+    } else if (industrial && house.w >= 300) {
+        ensureSignatureProp('generator', [56, 38], [38, 56]);
     }
 
     // Very small cabins can have a door sweep covering most of the central
@@ -1167,7 +1304,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const variant = opts.variant || 'house';
     const doorSide = ['north', 'south', 'east', 'west'].includes(opts.doorSide) ? opts.doorSide : 'south';
     const horizontalDoor = doorSide === 'north' || doorSide === 'south';
-    const doorSpan = clamp((horizontalDoor ? w : h) * 0.32, 74, variant === 'mansion' || variant === 'warehouse' ? 132 : 104);
+    const doorSpan = compactDoorSpan((horizontalDoor ? w : h) * 0.32, variant);
     const doorW = horizontalDoor ? doorSpan + 2 : wall * 0.90;
     const doorH = horizontalDoor ? wall * 0.90 : doorSpan + 2;
     const doorX = doorSide === 'west'
@@ -1283,7 +1420,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     }
 
     furnishHouseInterior(obstacles, floor, {
-        theme: ['warehouse', 'metal', 'ironworks'].includes(variant) ? 'industrial' : 'home',
+        theme: resolveHouseInteriorTheme(variant, opts),
     });
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
@@ -1363,12 +1500,12 @@ function addMansion(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'tree', x + 580, y - 350, 46, 46, { hue: 115, rotation: 1.5 });
     
     // Guaranteed high-tier ground loot inside the mansion compound buildings
-    loot.push(makeGroundLoot('weapon', x, y - 50, { weaponType: 'assault', source: 'estate-loot' }));
+    loot.push(makeGroundLoot('weapon', x, y - 50, { weaponType: 'm416', source: 'estate-loot' }));
     loot.push(makeGroundLoot('ammo', x - 40, y - 50, { source: 'estate-loot' }));
     loot.push(makeGroundLoot('ammo', x + 40, y - 50, { source: 'estate-loot' }));
     loot.push(makeGroundLoot('medkit', x, y + 100, { source: 'estate-loot' }));
-    loot.push(makeGroundLoot('weapon', x - 560, y + 240, { weaponType: 'shotgun', source: 'estate-loot' })); // inside guesthouse
-    loot.push(makeGroundLoot('weapon', x + 570, y + 250, { weaponType: 'lmg', source: 'estate-loot' })); // inside garage
+    loot.push(makeGroundLoot('weapon', x - 560, y + 240, { weaponType: 'm870', source: 'estate-loot' })); // inside guesthouse
+    loot.push(makeGroundLoot('weapon', x + 570, y + 250, { weaponType: 'm249', source: 'estate-loot' })); // inside garage
     
     // Fairer spawn points at the outskirts of the estate
     spawnPoints.push({ x, y: y + 660 });
@@ -1425,15 +1562,16 @@ function addIronworks(obstacles, loot, spawnPoints, x, y) {
     const houseId = floor.id;
     const ironworksMeta = { houseId, landmarkType: 'ironworks' };
 
-    addHorizontalWallWithOpening(obstacles, x, northY, w, wall, 'metal', x - 430, 170, ironworksMeta);
-    addHorizontalWallWithOpening(obstacles, x, southY, w, wall, 'metal', x + 430, 170, ironworksMeta);
-    addVerticalWallWithOpening(obstacles, westX, y, h, wall, 'metal', y + 280, 210, ironworksMeta);
-    addVerticalWallWithOpening(obstacles, eastX, y, h, wall, 'metal', y, 230, ironworksMeta);
+    const ironworksDoorSpan = compactDoorSpan(170, 'metal');
+    addHorizontalWallWithOpening(obstacles, x, northY, w, wall, 'metal', x - 430, ironworksDoorSpan, ironworksMeta);
+    addHorizontalWallWithOpening(obstacles, x, southY, w, wall, 'metal', x + 430, ironworksDoorSpan, ironworksMeta);
+    addVerticalWallWithOpening(obstacles, westX, y, h, wall, 'metal', y + 280, ironworksDoorSpan, ironworksMeta);
+    addVerticalWallWithOpening(obstacles, eastX, y, h, wall, 'metal', y, ironworksDoorSpan, ironworksMeta);
 
-    addDoor(obstacles, houseId, x - 430, northY, 172, wall * 0.90, 'metal', 'north', 'serviceEntrance');
-    addDoor(obstacles, houseId, x + 430, southY, 172, wall * 0.90, 'metal', 'south', 'serviceEntrance');
-    addDoor(obstacles, houseId, westX, y + 280, wall * 0.90, 212, 'metal', 'west', 'loadingEntrance');
-    addDoor(obstacles, houseId, eastX, y, wall * 0.90, 232, 'metal', 'east', 'mainEntrance');
+    addDoor(obstacles, houseId, x - 430, northY, ironworksDoorSpan + 2, wall * 0.90, 'metal', 'north', 'serviceEntrance');
+    addDoor(obstacles, houseId, x + 430, southY, ironworksDoorSpan + 2, wall * 0.90, 'metal', 'south', 'serviceEntrance');
+    addDoor(obstacles, houseId, westX, y + 280, wall * 0.90, ironworksDoorSpan + 2, 'metal', 'west', 'loadingEntrance');
+    addDoor(obstacles, houseId, eastX, y, wall * 0.90, ironworksDoorSpan + 2, 'metal', 'east', 'mainEntrance');
 
     // Two side loops connect through the central factory floor at three points.
     // Players can rotate around fights instead of being forced through one hall.
@@ -2642,11 +2780,11 @@ function addMilitaryBase(obstacles, loot, spawnPoints, x, y) {
     }
 
     // Guaranteed military ground loot inside warehouse and barracks
-    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'sniper', source: 'military-loot' }));
+    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'sv98', source: 'military-loot' }));
     loot.push(makeGroundLoot('ammo', x - 40, y, { source: 'military-loot' }));
     loot.push(makeGroundLoot('ammo', x + 40, y, { source: 'military-loot' }));
-    loot.push(makeGroundLoot('weapon', x - 550, y - 400, { weaponType: 'assault', source: 'military-loot' }));
-    loot.push(makeGroundLoot('weapon', x + 550, y - 400, { weaponType: 'dmr', source: 'military-loot' }));
+    loot.push(makeGroundLoot('weapon', x - 550, y - 400, { weaponType: 'm4a1s', source: 'military-loot' }));
+    loot.push(makeGroundLoot('weapon', x + 550, y - 400, { weaponType: 'mk20ssr', source: 'military-loot' }));
     loot.push(makeGroundLoot('medkit', x, y + 100, { source: 'military-loot' }));
 
     spawnPoints.push({ x: x, y: y + 780 });
@@ -2719,7 +2857,7 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'wall', x + 800, y + 800, 100, 100, 'stone');
 
     // Warden signature loot
-    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'revolver', source: 'prison-loot' }));
+    loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'ots38', source: 'prison-loot' }));
     loot.push(makeGroundLoot('ammo', x - 30, y, { source: 'prison-loot' }));
     loot.push(makeGroundLoot('armor', x + 30, y, { armorValue: 60, source: 'prison-loot' }));
 
@@ -2736,9 +2874,12 @@ function addHospital(obstacles, loot, spawnPoints, x, y) {
     // North wall
     addWall(obstacles, x, y - 400 + 8, 1000, 16, 'plaster');
     // South wall with entrance gap
-    addWall(obstacles, x - 300, y + 400 - 8, 400, 16, 'plaster');
-    addWall(obstacles, x + 300, y + 400 - 8, 400, 16, 'plaster');
-    addDoor(obstacles, houseId, x, y + 400 - 8, 202, 14.4, 'plaster', 'south');
+    const hospitalDoorSpan = compactDoorSpan(202, 'plaster');
+    const hospitalWallSpan = (1000 - hospitalDoorSpan) / 2;
+    const hospitalWallOffset = (1000 + hospitalDoorSpan) / 4;
+    addWall(obstacles, x - hospitalWallOffset, y + 400 - 8, hospitalWallSpan, 16, 'plaster');
+    addWall(obstacles, x + hospitalWallOffset, y + 400 - 8, hospitalWallSpan, 16, 'plaster');
+    addDoor(obstacles, houseId, x, y + 400 - 8, hospitalDoorSpan + 2, 14.4, 'plaster', 'south');
     // Side walls
     addWall(obstacles, x - 500 + 8, y, 16, 800, 'plaster');
     addWall(obstacles, x + 500 - 8, y, 16, 800, 'plaster');
@@ -2812,7 +2953,7 @@ function addRadioTower(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'crate', x + 120, y + 340, 44, 44, { rotation: -0.1 });
 
     // Guaranteed control room loot
-    loot.push(makeGroundLoot('weapon', x - 200, y - 200, { weaponType: 'smg', source: 'tower-loot' }));
+    loot.push(makeGroundLoot('weapon', x - 200, y - 200, { weaponType: 'cz3a1', source: 'tower-loot' }));
     loot.push(makeGroundLoot('ammo', x - 200, y - 160, { source: 'tower-loot' }));
 
     spawnPoints.push({ x, y: y + 460 });
@@ -3050,7 +3191,7 @@ function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
     const margin = 620;
     for (let gx = -worldHalf + margin; gx <= worldHalf - margin; gx += step) {
         for (let gy = -worldHalf + margin; gy <= worldHalf - margin; gy += step) {
-            if (Math.random() < 0.18) continue;
+            if (Math.random() < 0.28) continue;
             const baseX = gx + (Math.random() - 0.5) * step * 0.68;
             const baseY = gy + (Math.random() - 0.5) * step * 0.68;
             if (exclusionAreas.some(area => rectsOverlap(baseX, baseY, 80, 80, area.x, area.y, area.w + 360, area.h + 360))) continue;
@@ -3674,6 +3815,157 @@ function addSparseAreaFill(obstacles, loot, spawnPoints, worldHalf, placedPositi
 
     return { housesAdded, detailClustersAdded };
 }
+
+const GAP_COVER_KINDS = new Set([
+    'houseFloor', 'tree', 'bush', 'rock', 'stump', 'fallenLog', 'hayBale',
+    'crate', 'barrel', 'container', 'sandbag', 'tent', 'picnicTable',
+]);
+const GAP_BLOCKED_SURFACE_KINDS = new Set(['road', 'water', 'river', 'houseFloor']);
+
+function pointToObstacleDistance(x, y, obstacle) {
+    const angle = -(Number(obstacle.rotation) || 0);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const dx = x - obstacle.x;
+    const dy = y - obstacle.y;
+    const localX = dx * cos - dy * sin;
+    const localY = dx * sin + dy * cos;
+    const outsideX = Math.max(0, Math.abs(localX) - (obstacle.w || 0) / 2);
+    const outsideY = Math.max(0, Math.abs(localY) - (obstacle.h || 0) / 2);
+    return Math.hypot(outsideX, outsideY);
+}
+
+function isGapSampleBlocked(blockedSurfaces, x, y) {
+    return blockedSurfaces.some(obstacle => (
+        GAP_BLOCKED_SURFACE_KINDS.has(obstacle.kind)
+        && pointToObstacleDistance(x, y, obstacle) < 95
+    ));
+}
+
+function addGapCoverCluster(obstacles, x, y, variant) {
+    // Every gap cluster deliberately mixes hard and soft cover. This keeps open
+    // crossings interesting instead of creating another group of only trees.
+    const kinds = ['tree', 'rock', 'tree', 'bush', 'tree'];
+    if (Math.random() < 0.45) kinds.push('rock');
+    let placed = 0;
+
+    for (let index = 0; index < kinds.length; index++) {
+        const kind = kinds[index];
+        for (let attempt = 0; attempt < 12; attempt++) {
+            const angle = Math.random() * Math.PI * 2;
+            const radius = index === 0 ? Math.random() * 45 : 65 + Math.random() * 135;
+            const ox = x + Math.cos(angle) * radius;
+            const oy = y + Math.sin(angle) * radius;
+            const size = kind === 'fallenLog' ? 70 + Math.random() * 30 : 32 + Math.random() * 34;
+            const width = size;
+            const height = kind === 'rock'
+                ? 26 + Math.random() * 26
+                : kind === 'fallenLog' ? 20 + Math.random() * 8 : size;
+            if (isMapPositionBlocked(obstacles, ox, oy, Math.max(width, height) / 2 + 8)) continue;
+
+            addObstacle(obstacles, kind, ox, oy, width, height, {
+                hue: kind === 'rock' ? 212 + Math.floor(Math.random() * 26) : 96 + Math.floor(Math.random() * 36),
+                rotation: Math.random() * Math.PI,
+                collidable: kind === 'bush' ? Math.random() > 0.35 : true,
+                variant: kind === 'fallenLog' ? (Math.random() < 0.55 ? 'mossy' : 'birch') : variant,
+                role: 'gapCover',
+            });
+            placed++;
+            break;
+        }
+    }
+
+    return placed;
+}
+
+function addAdaptiveGapFill(obstacles, loot, spawnPoints, worldHalf, placedPositions) {
+    const cover = obstacles.filter(obstacle => GAP_COVER_KINDS.has(obstacle.kind));
+    const houses = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const blockedSurfaces = obstacles.filter(obstacle => GAP_BLOCKED_SURFACE_KINDS.has(obstacle.kind));
+    const candidates = [];
+    const step = 600;
+    const margin = 650;
+
+    for (let x = -worldHalf + margin; x <= worldHalf - margin; x += step) {
+        for (let y = -worldHalf + margin; y <= worldHalf - margin; y += step) {
+            if (isGapSampleBlocked(blockedSurfaces, x, y)) continue;
+            let nearestCover = Infinity;
+            for (const obstacle of cover) {
+                nearestCover = Math.min(nearestCover, pointToObstacleDistance(x, y, obstacle));
+                if (nearestCover <= 540) break;
+            }
+            if (nearestCover <= 540) continue;
+
+            let nearestHouse = Infinity;
+            for (const house of houses) {
+                nearestHouse = Math.min(nearestHouse, pointToObstacleDistance(x, y, house));
+            }
+            candidates.push({ x, y, nearestCover, nearestHouse });
+        }
+    }
+
+    candidates.sort((a, b) => b.nearestCover - a.nearestCover || a.y - b.y || a.x - b.x);
+    const anchors = [];
+    const protectedAreas = placedPositions.filter(area => area.w >= 750 || area.h >= 750);
+    let housesAdded = 0;
+    let clustersAdded = 0;
+    const houseLimit = 6;
+    const clusterLimit = 38;
+
+    for (const candidate of candidates) {
+        if (housesAdded >= houseLimit && clustersAdded >= clusterLimit) break;
+        if (anchors.some(anchor => Math.hypot(anchor.x - candidate.x, anchor.y - candidate.y) < 560)) continue;
+
+        const preferHouse = housesAdded < houseLimit
+            && candidate.nearestCover > 650
+            && candidate.nearestHouse > 900;
+        let completed = false;
+        for (let attempt = 0; attempt < 8 && !completed; attempt++) {
+            const x = clamp(candidate.x + (Math.random() - 0.5) * 170, -worldHalf + 700, worldHalf - 700);
+            const y = clamp(candidate.y + (Math.random() - 0.5) * 170, -worldHalf + 700, worldHalf - 700);
+
+            const tryingHouse = preferHouse && attempt < 3;
+            if (tryingHouse) {
+                const areaW = 600;
+                const areaH = 540;
+                if (isAreaOverlapping(x, y, areaW, areaH, 125, protectedAreas)) continue;
+                if (houses.some(house => rectsOverlap(
+                    x, y, areaW, areaH,
+                    house.x, house.y, house.w + 300, house.h + 300,
+                ))) continue;
+                if (isMapPositionBlocked(obstacles, x, y, 150)) continue;
+                const obstacleCountBeforeHouse = obstacles.length;
+                addStandaloneHouse(obstacles, loot, spawnPoints, x, y);
+                placedPositions.push({ x, y, w: areaW, h: areaH });
+                const addedHouse = obstacles
+                    .slice(obstacleCountBeforeHouse)
+                    .find(obstacle => obstacle.kind === 'houseFloor');
+                if (addedHouse) {
+                    houses.push(addedHouse);
+                    blockedSurfaces.push(addedHouse);
+                }
+                housesAdded++;
+                completed = true;
+            } else if (clustersAdded < clusterLimit) {
+                if (isGapSampleBlocked(blockedSurfaces, x, y)) continue;
+                const placed = addGapCoverCluster(
+                    obstacles,
+                    x,
+                    y,
+                    y < -4800 ? 'pine' : y > 4200 ? 'scrub' : 'grass',
+                );
+                if (placed < 3) continue;
+                placedPositions.push({ x, y, w: 420, h: 420 });
+                clustersAdded++;
+                completed = true;
+            }
+
+            if (completed) anchors.push({ x, y });
+        }
+    }
+
+    return { housesAdded, clustersAdded };
+}
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
     const loot = [];
@@ -4094,6 +4386,7 @@ export function generateSurvivMap(worldHalf) {
     addSparseAreaFill(obstacles, loot, spawnPoints, wh, placedPositions);
     addCanopyInfill(obstacles, wh);
     addNaturalDetailScatter(obstacles, wh, POI_LIST);
+    addAdaptiveGapFill(obstacles, loot, spawnPoints, wh, placedPositions);
     addScatteredGroundLoot(obstacles, loot);
     clearInvalidBuildingProps(obstacles);
     sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
@@ -4773,9 +5066,25 @@ function markSurvivObstaclesChanged(room) {
     room._survivObstacleRevision = (room._survivObstacleRevision || 0) + 1;
 }
 
+function recordSolidObjectImpact(attacker, obstacle) {
+    if (!attacker || !obstacle) return;
+    attacker._objectImpactSequence = (Number(attacker._objectImpactSequence) || 0) + 1;
+    attacker._objectImpact = {
+        id: `${attacker.id}:${attacker._objectImpactSequence}`,
+        x: obstacle.x,
+        y: obstacle.y,
+        kind: obstacle.kind || 'object',
+        variant: obstacle.variant || null,
+    };
+}
+
 function damageSurvivObstacle(room, obstacle, damage, attacker = null) {
+    if (!obstacle || !(damage > 0)) return false;
     const durability = getDestructibleObstacleHp(obstacle);
-    if (!durability || !(damage > 0)) return false;
+    if (!durability) {
+        recordSolidObjectImpact(attacker, obstacle);
+        return false;
+    }
     obstacle.hp = Math.max(0, durability.hp - damage);
     markSurvivObstaclesChanged(room);
     if (obstacle.hp > 0) return false;
@@ -5038,11 +5347,16 @@ function tryShoot(entity, room, now) {
         }
         let closestObstacle = null;
         for (const obstacle of queryObstacles(room, entity.x, entity.y, wDef.meleeReach + 120, true)) {
-            if (!getDestructibleObstacleHp(obstacle)) continue;
-            const halfExtent = Math.max(obstacle.w || 0, obstacle.h || 0) / 2;
-            const obstacleDistance = Math.max(0, dist(entity.x, entity.y, obstacle.x, obstacle.y) - halfExtent);
+            const collisionShape = obstacle.kind === 'door' ? getSurvivDoorCollisionRect(obstacle) : obstacle;
+            const local = toRectLocal(entity.x, entity.y, collisionShape);
+            const contactPoint = fromRectLocal(
+                clamp(local.x, -collisionShape.w / 2, collisionShape.w / 2),
+                clamp(local.y, -collisionShape.h / 2, collisionShape.h / 2),
+                collisionShape,
+            );
+            const obstacleDistance = dist(entity.x, entity.y, contactPoint.x, contactPoint.y);
             if (obstacleDistance > wDef.meleeReach) continue;
-            const obstacleAngle = Math.atan2(obstacle.y - entity.y, obstacle.x - entity.x);
+            const obstacleAngle = Math.atan2(contactPoint.y - entity.y, contactPoint.x - entity.x);
             const angleDelta = Math.abs(Math.atan2(Math.sin(obstacleAngle - baseAngle), Math.cos(obstacleAngle - baseAngle)));
             if (angleDelta > wDef.meleeArc) continue;
             if (obstacleDistance < closestDistance) {
@@ -6224,11 +6538,12 @@ function findBestBotLoot(bot, room, range = 2400) {
 }
 
 function getBotCombatProfile(weaponType) {
-    if (weaponType === 'shotgun') return { preferredMin: 120, preferredMax: 250, fireRange: 390 };
-    if (weaponType === 'sniper' || weaponType === 'dmr') return { preferredMin: 420, preferredMax: 650, fireRange: 1050 };
-    if (weaponType === 'assault' || weaponType === 'lmg') return { preferredMin: 250, preferredMax: 440, fireRange: 900 };
-    if (weaponType === 'smg') return { preferredMin: 150, preferredMax: 310, fireRange: 680 };
-    if (weaponType === 'pistol' || weaponType === 'revolver') return { preferredMin: 180, preferredMax: 350, fireRange: 760 };
+    const family = WEAPONS[weaponType]?.family || weaponType;
+    if (family === 'shotgun') return { preferredMin: 120, preferredMax: 250, fireRange: 390 };
+    if (family === 'sniper' || family === 'dmr') return { preferredMin: 420, preferredMax: 650, fireRange: 1050 };
+    if (family === 'assault' || family === 'lmg') return { preferredMin: 250, preferredMax: 440, fireRange: 900 };
+    if (family === 'smg') return { preferredMin: 150, preferredMax: 310, fireRange: 680 };
+    if (family === 'pistol' || family === 'revolver') return { preferredMin: 180, preferredMax: 350, fireRange: 760 };
     return { preferredMin: 20, preferredMax: 54, fireRange: 76 };
 }
 
@@ -6746,6 +7061,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             ...(pendingKillFeed.length ? { killFeed: pendingKillFeed.map(entry => ({ ...entry })) } : {}),
             ...(viewerEntity?._hitConfirm ? { hitConfirm: { ...viewerEntity._hitConfirm } } : {}),
             ...(viewerEntity?._damageTaken ? { damageTaken: { ...viewerEntity._damageTaken } } : {}),
+            ...(viewerEntity?._objectImpact ? { objectImpact: { ...viewerEntity._objectImpact } } : {}),
             ...(spectating ? {
                 spectateTargets: allPlayers.map(p => ({
                     id: p.id,
@@ -6768,6 +7084,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     for (const entity of allPlayers) {
         entity._hitConfirm = null;
         entity._damageTaken = null;
+        entity._objectImpact = null;
     }
     room._pendingKillFeed = [];
     pruneSurvivViewerPayloadCache(room, now);

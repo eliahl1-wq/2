@@ -48,13 +48,6 @@ export const AGAR_SHOP_PRODUCTS = Object.freeze([
         usdPrice: 3,
     }),
     Object.freeze({
-        id: 'slither:agarstake',
-        gameMode: 'slither',
-        skinId: 'agarstake',
-        name: 'AGAR',
-        usdPrice: 1,
-    }),
-    Object.freeze({
         id: 'slither:aurora',
         gameMode: 'slither',
         skinId: 'aurora',

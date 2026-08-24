@@ -3796,10 +3796,6 @@ function isFlagSkinColor(value) {
     return typeof value === 'string' && FLAG_SKIN_COLOR_RE.test(value);
 }
 
-function isAgarStakeSkinColor(value) {
-    return value === 'agarstake';
-}
-
 const SPECIAL_SLITHER_SKIN_IDS = new Set(['aurora', 'eclipse']);
 
 function getSpecialSlitherSkinId(value) {
@@ -7461,7 +7457,7 @@ io.on('connection', (socket) => {
             let user = await User.findById(decoded.id);
             if (!user) throw new Error('User not found');
             user = await ensureUserDepositWallet(user);
-            let tournamentSkinColor = typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || isAgarStakeSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))
+            let tournamentSkinColor = typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))
                 ? skinColor
                 : util.randomSlitherColor();
             const wantsRainbow = skinId === 'rainbow' || tournamentSkinColor === 'random';
@@ -7472,11 +7468,6 @@ io.on('connection', (socket) => {
             if (wantsFlags && !await hasSkinAccess(user, 'slither', 'flags')) {
                 throw new Error('Flag Pack must be purchased in the AGAR shop first.');
             }
-            const wantsAgarStake = skinId === 'agarstake' || isAgarStakeSkinColor(tournamentSkinColor);
-            if (wantsAgarStake && !await hasSkinAccess(user, 'slither', 'agarstake')) {
-                throw new Error('The AGAR skin must be purchased in the AGAR shop first.');
-            }
-            if (wantsAgarStake) tournamentSkinColor = 'agarstake';
             const tournamentSpecialSkinId = getSpecialSlitherSkinId(skinId) || getSpecialSlitherSkinId(tournamentSkinColor);
             if (tournamentSpecialSkinId && !await hasSkinAccess(user, 'slither', tournamentSpecialSkinId)) {
                 throw new Error((tournamentSpecialSkinId === 'aurora' ? 'Aurora Veil' : 'Solar Eclipse') + ' must be purchased in the AGAR shop first.');
@@ -7705,7 +7696,7 @@ io.on('connection', (socket) => {
                 return;
             }
             let validatedSkinColor = null;
-            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || isFlagSkinColor(skinColor) || isAgarStakeSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
+            if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || isFlagSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
             const decoded = await verifyAccountToken(token);
@@ -7731,12 +7722,6 @@ io.on('connection', (socket) => {
                 socket.emit('error', 'Flag Pack must be purchased in the AGAR shop first.');
                 return;
             }
-            const wantsAgarStake = skinId === 'agarstake' || isAgarStakeSkinColor(validatedSkinColor);
-            if (wantsAgarStake && (entitlementMode !== 'slither' || !await hasSkinAccess(user, 'slither', 'agarstake'))) {
-                socket.emit('error', 'The AGAR skin must be purchased in the AGAR shop first.');
-                return;
-            }
-            if (wantsAgarStake) validatedSkinColor = 'agarstake';
             const specialSlitherSkinId = getSpecialSlitherSkinId(skinId) || getSpecialSlitherSkinId(validatedSkinColor);
             if (specialSlitherSkinId && (entitlementMode !== 'slither' || !await hasSkinAccess(user, 'slither', specialSlitherSkinId))) {
                 socket.emit('error', (specialSlitherSkinId === 'aurora' ? 'Aurora Veil' : 'Solar Eclipse') + ' must be purchased in the AGAR shop first.');

@@ -86,6 +86,19 @@ function pointInRect(x, y, rect, padding = 0) {
         && y <= rect.y + rect.h / 2 + padding;
 }
 
+function pointToRectDistance(x, y, rect) {
+    const angle = -(Number(rect.rotation) || 0);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const dx = x - rect.x;
+    const dy = y - rect.y;
+    const localX = dx * cos - dy * sin;
+    const localY = dx * sin + dy * cos;
+    const outsideX = Math.max(0, Math.abs(localX) - rect.w / 2);
+    const outsideY = Math.max(0, Math.abs(localY) - rect.h / 2);
+    return Math.hypot(outsideX, outsideY);
+}
+
 function circleRectCollision(x, y, radius, rect) {
     const angle = -(Number(rect.rotation) || 0);
     const cos = Math.cos(angle);
@@ -142,9 +155,20 @@ test('every Surviv house has themed furniture outside every complete door swing'
     for (const expected of [
         'sofa', 'bed', 'kitchenCounter', 'diningTable', 'desk', 'salesCounter',
         'workbench', 'controlConsole', 'hospitalBed', 'storageShelf',
+        'floorLamp', 'housePlant', 'generator', 'labBench', 'specimenTank',
+        'serverRack', 'weaponRack', 'ammoLocker',
     ]) {
         assert.ok(variants.has(expected), `missing redesigned furniture type ${expected}`);
     }
+    assert.ok(furniture.filter(obstacle => obstacle.destructible).length >= 180,
+        'interiors should contain plenty of breakable cover and lightweight furniture');
+
+    const labFurniture = furniture.filter(obstacle => obstacle.landmarkType === 'lab');
+    assert.ok(['labBench', 'specimenTank', 'serverRack']
+        .every(variant => labFurniture.some(obstacle => obstacle.variant === variant)));
+    const militaryFurniture = furniture.filter(obstacle => obstacle.landmarkType === 'military');
+    assert.ok(['weaponRack', 'ammoLocker']
+        .every(variant => militaryFurniture.some(obstacle => obstacle.variant === variant)));
 
     for (const prop of furniture) {
         const house = houses.find(candidate => candidate.id === prop.houseId);
@@ -196,6 +220,39 @@ test('surviv open areas keep scattered cover and small houses', () => {
     assert.ok(coverCells.size >= 75);
     assert.ok(treeCells.size >= 88);
     assert.ok(smallOpenHouses.length >= 40);
+});
+
+test('completed Surviv land has no large unplanned empty fields', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const coverKinds = new Set([
+        'houseFloor', 'tree', 'rock', 'bush', 'stump', 'fallenLog',
+        'crate', 'barrel', 'container', 'tent', 'sandbag', 'hayBale',
+    ]);
+    const surfaceKinds = new Set(['road', 'water', 'river', 'houseFloor']);
+    const cover = map.obstacles.filter(obstacle => coverKinds.has(obstacle.kind));
+    const reservedSurfaces = map.obstacles.filter(obstacle => surfaceKinds.has(obstacle.kind));
+    const gapCover = map.obstacles.filter(obstacle => obstacle.role === 'gapCover');
+    let largestGap = 0;
+    let largeGapSamples = 0;
+
+    for (let x = -9000; x <= 9000; x += 600) {
+        for (let y = -9000; y <= 9000; y += 600) {
+            // Roads, door approaches, and shorelines need clear shoulders for
+            // movement and are not unplanned empty countryside.
+            if (reservedSurfaces.some(surface => pointToRectDistance(x, y, surface) < 260)) continue;
+            const nearestCover = Math.min(...cover.map(obstacle => pointToRectDistance(x, y, obstacle)));
+            largestGap = Math.max(largestGap, nearestCover);
+            if (nearestCover > 650) largeGapSamples++;
+        }
+    }
+
+    assert.ok(gapCover.length >= 185, `expected adaptive land cover, got ${gapCover.length}`);
+    assert.deepEqual(
+        new Set(gapCover.map(obstacle => obstacle.kind)),
+        new Set(['tree', 'rock', 'bush']),
+    );
+    assert.ok(largestGap < 980, `largest playable land gap is ${Math.round(largestGap)} units`);
+    assert.ok(largeGapSamples <= 5, `too many sparse land samples: ${largeGapSamples}`);
 });
 
 test('pond sites and the west forest camp keep readable spacing', () => {
@@ -445,7 +502,7 @@ test('surviv roads, landmark trees, and world furniture add varied readable deta
     assert.ok(map.obstacles
         .filter(obstacle => decorKinds.has(obstacle.kind))
         .every(obstacle => obstacle.collidable === false));
-    assert.ok(map.obstacles.length < 4700, 'static map detail should stay inside the performance budget');
+    assert.ok(map.obstacles.length < 5100, 'static map detail should stay inside the performance budget');
 });
 
 test('new roadside landmarks have distinct buildings and connect to the highway network', () => {
@@ -865,10 +922,10 @@ test('Ironworks is a multi-entry indoor combat landmark with loop routes', () =>
     ));
     assert.ok(ironworksFurniture.length >= 6);
     assert.ok(ironworksFurniture.every(obstacle => obstacle.collidable !== false && obstacle.roomId));
-    assert.deepEqual(
-        new Set(ironworksFurniture.map(obstacle => obstacle.variant)),
-        new Set(['workbench', 'controlConsole', 'locker', 'palletStack']),
-    );
+    const ironworksFurnitureVariants = new Set(ironworksFurniture.map(obstacle => obstacle.variant));
+    for (const variant of ['workbench', 'controlConsole', 'locker', 'palletStack']) {
+        assert.ok(ironworksFurnitureVariants.has(variant), `missing Ironworks furniture ${variant}`);
+    }
 
     const chests = map.loot.filter(item => item.houseId === floor.id && item.type === 'chest');
     assert.equal(chests.length, 5);
@@ -970,6 +1027,8 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
     const propKinds = new Set(['tree', 'bush', 'rock', 'crate', 'barrel', 'container', 'sandbag', 'tent']);
     const props = map.obstacles.filter(obstacle => propKinds.has(obstacle.kind));
 
+    assert.ok([...doors, ...interiorDoors].every(door => Math.max(door.w, door.h) <= 74.01),
+        'door leaves should stay compact even in large and industrial buildings');
     assert.ok(interiorDoors.length >= 30, 'split and corridor buildings should expose real interior doors');
     assert.ok(interiorDoors.every(door => {
         const house = floors.find(floor => floor.id === door.houseId);
@@ -2051,6 +2110,31 @@ test('melee attacks destroy weak Surviv obstacles', () => {
 
     assert.equal(room.obstacles.some(obstacle => obstacle.id === 'breakable-bush'), false);
     assert.ok(room._survivObstacleRevision > 0);
+});
+
+test('melee hits on solid non-destructible props emit a material impact event', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'solid-metal-locker', kind: 'furniture', variant: 'metal',
+        x: 48, y: 0, w: 30, h: 30, collidable: true, destructible: false,
+    }];
+    const player = createSurvivPlayer('solid-impact-player', 'solid-impact-mongo', 'Striker', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.aimAngle = 0;
+    player.shooting = true;
+    room.players.push(player);
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(room.obstacles.some(obstacle => obstacle.id === 'solid-metal-locker'), true);
+    assert.equal(player._objectImpact?.kind, 'furniture');
+    assert.equal(player._objectImpact?.variant, 'metal');
+    assert.match(player._objectImpact?.id || '', /^solid-impact-player:/);
 });
 
 test('one held human melee press produces only one attack', () => {
