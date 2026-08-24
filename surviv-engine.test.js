@@ -232,6 +232,9 @@ test('completed Surviv land has no large unplanned empty fields', () => {
     const cover = map.obstacles.filter(obstacle => coverKinds.has(obstacle.kind));
     const reservedSurfaces = map.obstacles.filter(obstacle => surfaceKinds.has(obstacle.kind));
     const gapCover = map.obstacles.filter(obstacle => obstacle.role === 'gapCover');
+    const gapHouses = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'houseFloor' && obstacle.role === 'gapHouse'
+    ));
     let largestGap = 0;
     let largeGapSamples = 0;
 
@@ -242,17 +245,18 @@ test('completed Surviv land has no large unplanned empty fields', () => {
             if (reservedSurfaces.some(surface => pointToRectDistance(x, y, surface) < 260)) continue;
             const nearestCover = Math.min(...cover.map(obstacle => pointToRectDistance(x, y, obstacle)));
             largestGap = Math.max(largestGap, nearestCover);
-            if (nearestCover > 650) largeGapSamples++;
+            if (nearestCover > 550) largeGapSamples++;
         }
     }
 
-    assert.ok(gapCover.length >= 185, `expected adaptive land cover, got ${gapCover.length}`);
-    assert.deepEqual(
-        new Set(gapCover.map(obstacle => obstacle.kind)),
-        new Set(['tree', 'rock', 'bush']),
-    );
-    assert.ok(largestGap < 980, `largest playable land gap is ${Math.round(largestGap)} units`);
-    assert.ok(largeGapSamples <= 5, `too many sparse land samples: ${largeGapSamples}`);
+    assert.ok(gapCover.length >= 520, `expected dense adaptive land cover, got ${gapCover.length}`);
+    const gapKinds = new Set(gapCover.map(obstacle => obstacle.kind));
+    for (const kind of ['tree', 'rock', 'bush', 'stump', 'fallenLog']) {
+        assert.ok(gapKinds.has(kind), `dense land fill is missing ${kind}`);
+    }
+    assert.ok(gapHouses.length >= 12, `expected more gap houses, got ${gapHouses.length}`);
+    assert.ok(largestGap < 700, `largest playable land gap is ${Math.round(largestGap)} units`);
+    assert.ok(largeGapSamples <= 4, `too many sparse land samples: ${largeGapSamples}`);
 });
 
 test('pond sites and the west forest camp keep readable spacing', () => {
@@ -502,7 +506,7 @@ test('surviv roads, landmark trees, and world furniture add varied readable deta
     assert.ok(map.obstacles
         .filter(obstacle => decorKinds.has(obstacle.kind))
         .every(obstacle => obstacle.collidable === false));
-    assert.ok(map.obstacles.length < 5100, 'static map detail should stay inside the performance budget');
+    assert.ok(map.obstacles.length < 5700, 'static map detail should stay inside the performance budget');
 });
 
 test('new roadside landmarks have distinct buildings and connect to the highway network', () => {
@@ -1027,7 +1031,7 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
     const propKinds = new Set(['tree', 'bush', 'rock', 'crate', 'barrel', 'container', 'sandbag', 'tent']);
     const props = map.obstacles.filter(obstacle => propKinds.has(obstacle.kind));
 
-    assert.ok([...doors, ...interiorDoors].every(door => Math.max(door.w, door.h) <= 74.01),
+    assert.ok([...doors, ...interiorDoors].every(door => Math.max(door.w, door.h) <= 64.01),
         'door leaves should stay compact even in large and industrial buildings');
     assert.ok(interiorDoors.length >= 30, 'split and corridor buildings should expose real interior doors');
     assert.ok(interiorDoors.every(door => {

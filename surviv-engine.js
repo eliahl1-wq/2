@@ -819,7 +819,7 @@ function addRoomZone(obstacles, houseId, x, y, w, h, variant = 'room') {
 
 function compactDoorSpan(requestedSpan, variant = 'wood') {
     const industrial = ['warehouse', 'mansion', 'metal', 'ironworks'].includes(variant);
-    return clamp((Number(requestedSpan) || 56) * 0.62, 48, industrial ? 72 : 60);
+    return clamp((Number(requestedSpan) || 52) * 0.56, 42, industrial ? 62 : 54);
 }
 
 function addDoor(obstacles, houseId, x, y, w, h, variant = 'wood', side = 'south', entranceRole = 'mainEntrance') {
@@ -3845,29 +3845,38 @@ function isGapSampleBlocked(blockedSurfaces, x, y) {
 function addGapCoverCluster(obstacles, x, y, variant) {
     // Every gap cluster deliberately mixes hard and soft cover. This keeps open
     // crossings interesting instead of creating another group of only trees.
-    const kinds = ['tree', 'rock', 'tree', 'bush', 'tree'];
-    if (Math.random() < 0.45) kinds.push('rock');
+    const kinds = ['tree', 'rock', 'tree', 'bush', 'tree', 'rock'];
+    kinds.push(Math.random() < 0.52 ? 'fallenLog' : 'stump');
+    if (Math.random() < 0.58) kinds.push('tree');
     let placed = 0;
 
     for (let index = 0; index < kinds.length; index++) {
         const kind = kinds[index];
         for (let attempt = 0; attempt < 12; attempt++) {
             const angle = Math.random() * Math.PI * 2;
-            const radius = index === 0 ? Math.random() * 45 : 65 + Math.random() * 135;
+            const radius = index === 0 ? Math.random() * 38 : 58 + Math.random() * 165;
             const ox = x + Math.cos(angle) * radius;
             const oy = y + Math.sin(angle) * radius;
-            const size = kind === 'fallenLog' ? 70 + Math.random() * 30 : 32 + Math.random() * 34;
+            const size = kind === 'fallenLog'
+                ? 72 + Math.random() * 42
+                : kind === 'tree' ? 38 + Math.random() * 48 : 30 + Math.random() * 38;
             const width = size;
             const height = kind === 'rock'
                 ? 26 + Math.random() * 26
                 : kind === 'fallenLog' ? 20 + Math.random() * 8 : size;
             if (isMapPositionBlocked(obstacles, ox, oy, Math.max(width, height) / 2 + 8)) continue;
 
+            const treeVariant = variant === 'pine'
+                ? (Math.random() < 0.22 ? 'giantPine' : 'pine')
+                : Math.random() < 0.16 ? 'birch'
+                    : Math.random() < 0.08 ? 'ancientOak' : variant;
             addObstacle(obstacles, kind, ox, oy, width, height, {
                 hue: kind === 'rock' ? 212 + Math.floor(Math.random() * 26) : 96 + Math.floor(Math.random() * 36),
                 rotation: Math.random() * Math.PI,
                 collidable: kind === 'bush' ? Math.random() > 0.35 : true,
-                variant: kind === 'fallenLog' ? (Math.random() < 0.55 ? 'mossy' : 'birch') : variant,
+                variant: kind === 'fallenLog' ? (Math.random() < 0.55 ? 'mossy' : 'birch')
+                    : kind === 'stump' ? (Math.random() < 0.55 ? 'mossy' : 'cut')
+                        : kind === 'tree' ? treeVariant : variant,
                 role: 'gapCover',
             });
             placed++;
@@ -3883,8 +3892,8 @@ function addAdaptiveGapFill(obstacles, loot, spawnPoints, worldHalf, placedPosit
     const houses = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
     const blockedSurfaces = obstacles.filter(obstacle => GAP_BLOCKED_SURFACE_KINDS.has(obstacle.kind));
     const candidates = [];
-    const step = 600;
-    const margin = 650;
+    const step = 440;
+    const margin = 600;
 
     for (let x = -worldHalf + margin; x <= worldHalf - margin; x += step) {
         for (let y = -worldHalf + margin; y <= worldHalf - margin; y += step) {
@@ -3892,9 +3901,9 @@ function addAdaptiveGapFill(obstacles, loot, spawnPoints, worldHalf, placedPosit
             let nearestCover = Infinity;
             for (const obstacle of cover) {
                 nearestCover = Math.min(nearestCover, pointToObstacleDistance(x, y, obstacle));
-                if (nearestCover <= 540) break;
+                if (nearestCover <= 410) break;
             }
-            if (nearestCover <= 540) continue;
+            if (nearestCover <= 410) continue;
 
             let nearestHouse = Infinity;
             for (const house of houses) {
@@ -3906,29 +3915,31 @@ function addAdaptiveGapFill(obstacles, loot, spawnPoints, worldHalf, placedPosit
 
     candidates.sort((a, b) => b.nearestCover - a.nearestCover || a.y - b.y || a.x - b.x);
     const anchors = [];
-    const protectedAreas = placedPositions.filter(area => area.w >= 750 || area.h >= 750);
     let housesAdded = 0;
     let clustersAdded = 0;
-    const houseLimit = 6;
-    const clusterLimit = 38;
+    const houseLimit = 18;
+    const clusterLimit = 82;
 
     for (const candidate of candidates) {
         if (housesAdded >= houseLimit && clustersAdded >= clusterLimit) break;
-        if (anchors.some(anchor => Math.hypot(anchor.x - candidate.x, anchor.y - candidate.y) < 560)) continue;
+        if (anchors.some(anchor => Math.hypot(anchor.x - candidate.x, anchor.y - candidate.y) < 380)) continue;
 
         const preferHouse = housesAdded < houseLimit
-            && candidate.nearestCover > 650
-            && candidate.nearestHouse > 900;
+            && candidate.nearestCover > 560
+            && candidate.nearestHouse > 720;
         let completed = false;
         for (let attempt = 0; attempt < 8 && !completed; attempt++) {
             const x = clamp(candidate.x + (Math.random() - 0.5) * 170, -worldHalf + 700, worldHalf - 700);
             const y = clamp(candidate.y + (Math.random() - 0.5) * 170, -worldHalf + 700, worldHalf - 700);
 
-            const tryingHouse = preferHouse && attempt < 3;
+            const tryingHouse = preferHouse && attempt < 4;
             if (tryingHouse) {
                 const areaW = 600;
                 const areaH = 540;
-                if (isAreaOverlapping(x, y, areaW, areaH, 125, protectedAreas)) continue;
+                // Candidate distance already excludes finished POIs and other
+                // houses. Keep the actual road/river/trail checks here without
+                // reusing broad planning boxes that cover otherwise empty land.
+                if (isAreaOverlapping(x, y, areaW, areaH, 105, [])) continue;
                 if (houses.some(house => rectsOverlap(
                     x, y, areaW, areaH,
                     house.x, house.y, house.w + 300, house.h + 300,
@@ -3941,6 +3952,7 @@ function addAdaptiveGapFill(obstacles, loot, spawnPoints, worldHalf, placedPosit
                     .slice(obstacleCountBeforeHouse)
                     .find(obstacle => obstacle.kind === 'houseFloor');
                 if (addedHouse) {
+                    addedHouse.role = 'gapHouse';
                     houses.push(addedHouse);
                     blockedSurfaces.push(addedHouse);
                 }
