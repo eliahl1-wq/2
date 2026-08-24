@@ -14,6 +14,16 @@ const SURVIV_MELEE_SLOT = SURVIV_MAX_WEAPONS;
 const SURVIV_MAX_MEDKITS = 6;
 const SURVIV_MAX_GRENADES = 3;
 
+export const SURVIV_VESTS = Object.freeze({
+    0: Object.freeze({ level: 0, label: 'No Vest', damageReduction: 0 }),
+    1: Object.freeze({ level: 1, label: 'Level 1 Vest', damageReduction: 0.25 }),
+    2: Object.freeze({ level: 2, label: 'Level 2 Vest', damageReduction: 0.38 }),
+    3: Object.freeze({ level: 3, label: 'Level 3 Vest', damageReduction: 0.45 }),
+});
+
+const normalizeVestLevel = value => Math.max(0, Math.min(3, Math.round(Number(value) || 0)));
+const vestDefinition = value => SURVIV_VESTS[normalizeVestLevel(value)];
+
 export const SURVIV_AMMO = Object.freeze({
     '9mm': { id: '9mm', label: '9mm', color: '#f5d547', max: 180, pickup: 30 },
     '12g': { id: '12g', label: '12 Gauge', color: '#f05a5a', max: 48, pickup: 8 },
@@ -525,9 +535,11 @@ function randomChestContents(tier = 'common', options = {}) {
     if (Math.random() < medkitChance) {
         contents.medkits = tier === 'military' && Math.random() > 0.55 ? 2 : 1;
     }
-    const armorChance = (tier === 'military' ? 0.9 : tier === 'rare' ? 0.62 : 0.24) * (outdoor ? 0.72 : 1);
-    if (Math.random() < armorChance) {
-        contents.armor = tier === 'military' ? 60 : 35;
+    const vestChance = (tier === 'military' ? 0.9 : tier === 'rare' ? 0.62 : 0.24) * (outdoor ? 0.72 : 1);
+    if (Math.random() < vestChance) {
+        contents.vestLevel = tier === 'military'
+            ? (Math.random() < 0.32 ? 3 : 2)
+            : tier === 'rare' ? 2 : 1;
     }
     return contents;
 }
@@ -564,7 +576,7 @@ function randomContainerContents(containerType, tier, options = {}) {
         return {
             rarity: tier,
             medkits: tier === 'military' || Math.random() < 0.45 ? 2 : 1,
-            armor: tier === 'military' ? 60 : 35,
+            vestLevel: tier === 'military' ? 3 : 1,
         };
     }
     const result = randomChestContents(tier, options);
@@ -3025,7 +3037,7 @@ function addPrison(obstacles, loot, spawnPoints, x, y) {
     // Warden signature loot
     loot.push(makeGroundLoot('weapon', x, y, { weaponType: 'ot38', source: 'prison-loot' }));
     loot.push(makeGroundLoot('ammo', x - 30, y, { source: 'prison-loot' }));
-    loot.push(makeGroundLoot('armor', x + 30, y, { armorValue: 60, source: 'prison-loot' }));
+    loot.push(makeGroundLoot('vest', x + 30, y, { vestLevel: 3, source: 'prison-loot', tier: 'military' }));
 
     spawnPoints.push({ x, y: y + 960 });
     spawnPoints.push({ x, y: y - 960 });
@@ -3325,81 +3337,220 @@ function addPondDetails(obstacles) {
     }
 }
 
-function addCanopyInfill(obstacles, worldHalf, targetCount = 36, exclusionAreas = []) {
-    let added = 0;
-    const margin = 850;
-    const step = 1450;
-    for (let gx = -worldHalf + margin; gx <= worldHalf - margin && added < targetCount; gx += step) {
-        for (let gy = -worldHalf + margin; gy <= worldHalf - margin && added < targetCount; gy += step) {
-            if (Math.hypot(gx, gy) < 1900) continue;
-            for (let attempt = 0; attempt < 5; attempt++) {
-                const x = clamp(gx + (Math.random() - 0.5) * 760, -worldHalf + 620, worldHalf - 620);
-                const y = clamp(gy + (Math.random() - 0.5) * 760, -worldHalf + 620, worldHalf - 620);
-                const size = 38 + Math.random() * 24;
-                if (exclusionAreas.some(area => rectsOverlap(
-                    x, y, size + 80, size + 80,
-                    area.x, area.y, area.w, area.h,
-                ))) continue;
-                if (isMapPositionBlocked(obstacles, x, y, size / 2 + 18)) continue;
-                addObstacle(obstacles, 'tree', x, y, size, size, {
-                    hue: y < -4800 ? 112 : 96 + Math.floor(Math.random() * 34),
-                    rotation: Math.random() * Math.PI,
-                    variant: y < -4800 ? 'pine' : y > 4300 ? 'scrub' : 'grove',
-                    role: 'canopyInfill',
-                });
-                added++;
-                break;
+function createMapPlacementIndex(obstacles, cellSize = 260) {
+    const grid = new Map();
+    const insert = obstacle => {
+        if (!BLOCKED_KINDS.has(obstacle.kind) || !Number.isFinite(obstacle.x) || !Number.isFinite(obstacle.y)) return;
+        const minX = Math.floor((obstacle.x - obstacle.w / 2) / cellSize);
+        const maxX = Math.floor((obstacle.x + obstacle.w / 2) / cellSize);
+        const minY = Math.floor((obstacle.y - obstacle.h / 2) / cellSize);
+        const maxY = Math.floor((obstacle.y + obstacle.h / 2) / cellSize);
+        for (let cellX = minX; cellX <= maxX; cellX++) {
+            for (let cellY = minY; cellY <= maxY; cellY++) {
+                const key = `${cellX},${cellY}`;
+                const bucket = grid.get(key);
+                if (bucket) bucket.push(obstacle);
+                else grid.set(key, [obstacle]);
             }
+        }
+    };
+    for (const obstacle of obstacles) insert(obstacle);
+
+    return {
+        add: insert,
+        blocked(x, y, radius = 30) {
+            if (isNearRoadOrRiver(x, y, radius) || isNearPlannedTrail(x, y, radius)) return true;
+            const pad = radius + 12;
+            const minX = Math.floor((x - pad) / cellSize);
+            const maxX = Math.floor((x + pad) / cellSize);
+            const minY = Math.floor((y - pad) / cellSize);
+            const maxY = Math.floor((y + pad) / cellSize);
+            const seen = new Set();
+            for (let cellX = minX; cellX <= maxX; cellX++) {
+                for (let cellY = minY; cellY <= maxY; cellY++) {
+                    const bucket = grid.get(`${cellX},${cellY}`);
+                    if (!bucket) continue;
+                    for (const obstacle of bucket) {
+                        if (seen.has(obstacle.id)) continue;
+                        seen.add(obstacle.id);
+                        if (x >= obstacle.x - obstacle.w / 2 - pad && x <= obstacle.x + obstacle.w / 2 + pad
+                            && y >= obstacle.y - obstacle.h / 2 - pad && y <= obstacle.y + obstacle.h / 2 + pad) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        },
+    };
+}
+
+function addCanopyInfill(obstacles, worldHalf, targetCount = 4650, exclusionAreas = [], placementIndex = null) {
+    let added = 0;
+    const margin = 240;
+    const step = 200;
+    const candidates = [];
+
+    // Build the whole candidate grid before placing anything. The former loop
+    // stopped as soon as its tiny global budget was reached, so virtually all
+    // of its trees accumulated in the first corner visited by the loop while
+    // most of the island remained bare.
+    for (let gx = -worldHalf + margin; gx <= worldHalf - margin; gx += step) {
+        for (let gy = -worldHalf + margin; gy <= worldHalf - margin; gy += step) {
+            candidates.push({ gx, gy });
+        }
+    }
+    for (let index = candidates.length - 1; index > 0; index--) {
+        const swapIndex = Math.floor(Math.random() * (index + 1));
+        [candidates[index], candidates[swapIndex]] = [candidates[swapIndex], candidates[index]];
+    }
+
+    for (const { gx, gy } of candidates) {
+        if (added >= targetCount) break;
+        // A few skipped cells keep small sightline channels between the denser
+        // pockets. Authored combat meadows remain protected separately below.
+        if (Math.random() < 0.08) continue;
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const x = clamp(gx + (Math.random() - 0.5) * step * 0.72, -worldHalf + 260, worldHalf - 260);
+            const y = clamp(gy + (Math.random() - 0.5) * step * 0.72, -worldHalf + 260, worldHalf - 260);
+            const size = 42 + Math.random() * 30;
+            if (exclusionAreas.some(area => rectsOverlap(
+                x, y, size + 110, size + 110,
+                area.x, area.y, area.w, area.h,
+            ))) continue;
+            if (placementIndex
+                ? placementIndex.blocked(x, y, size / 2 + 20)
+                : isMapPositionBlocked(obstacles, x, y, size / 2 + 20)) continue;
+
+            let variant = 'grove';
+            let hue = 98 + Math.floor(Math.random() * 30);
+            if (y < -4700) {
+                variant = Math.random() < 0.76 ? 'pine' : 'giantPine';
+                hue = 112 + Math.floor(Math.random() * 18);
+            } else if (y > 4400) {
+                variant = Math.random() < 0.72 ? 'scrub' : 'birch';
+                hue = 94 + Math.floor(Math.random() * 26);
+            } else if (Math.abs(y + 1500) < 1050 && Math.random() < 0.34) {
+                variant = 'willowTree';
+                hue = 88 + Math.floor(Math.random() * 18);
+            } else if (Math.random() < 0.14) {
+                variant = 'birch';
+            }
+            const tree = addObstacle(obstacles, 'tree', x, y, size, size, {
+                hue,
+                rotation: Math.random() * Math.PI,
+                variant,
+                role: 'canopyInfill',
+            });
+            placementIndex?.add(tree);
+
+            // Some trees anchor a small asymmetric companion rather than
+            // standing alone in an otherwise empty square. This creates the
+            // tree/bush/stone pockets that make short rotations interesting,
+            // while most trees remain isolated and easy to route around.
+            if (Math.random() < 0.28) {
+                const companionAngle = Math.random() * Math.PI * 2;
+                const companionDistance = 92 + Math.random() * 68;
+                const companionX = x + Math.cos(companionAngle) * companionDistance;
+                const companionY = y + Math.sin(companionAngle) * companionDistance;
+                const companionRoll = Math.random();
+                const companionKind = companionRoll < 0.56 ? 'bush'
+                    : companionRoll < 0.80 ? 'rock'
+                        : companionRoll < 0.91 ? 'fallenLog' : 'stump';
+                const companionW = companionKind === 'fallenLog' ? 68 + Math.random() * 30
+                    : companionKind === 'rock' ? 42 + Math.random() * 24
+                        : companionKind === 'stump' ? 28 + Math.random() * 14 : 38 + Math.random() * 20;
+                const companionH = companionKind === 'fallenLog' ? 20 + Math.random() * 8
+                    : companionKind === 'rock' ? companionW * 0.72
+                        : companionKind === 'stump' ? companionW * 0.88 : companionW * 0.82;
+                const companionRadius = Math.max(companionW, companionH) / 2 + 4;
+                const excluded = exclusionAreas.some(area => rectsOverlap(
+                    companionX, companionY, companionW + 60, companionH + 60,
+                    area.x, area.y, area.w, area.h,
+                ));
+                const blocked = placementIndex
+                    ? placementIndex.blocked(companionX, companionY, companionRadius)
+                    : isMapPositionBlocked(obstacles, companionX, companionY, companionRadius);
+                if (!excluded && !blocked
+                    && Math.abs(companionX) < worldHalf - 180
+                    && Math.abs(companionY) < worldHalf - 180) {
+                    const companion = addObstacle(obstacles, companionKind, companionX, companionY, companionW, companionH, {
+                        hue: companionKind === 'rock' ? 212 + Math.floor(Math.random() * 24) : hue,
+                        rotation: companionAngle + Math.random() * 0.7,
+                        collidable: companionKind !== 'bush',
+                        variant: companionKind === 'bush' ? (y < -4700 ? 'juniper' : 'bramble')
+                            : companionKind === 'fallenLog' ? (y < -4700 ? 'birch' : 'mossy')
+                                : variant,
+                        role: 'canopyCompanion',
+                    });
+                    placementIndex?.add(companion);
+                }
+            }
+            added++;
+            break;
         }
     }
     return added;
 }
 
-function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = []) {
+function addNaturalDetailScatter(obstacles, worldHalf, exclusionAreas = [], placementIndex = null) {
     const bushVariants = ['bramble', 'berry', 'flowering', 'juniper'];
-    const step = 1050;
-    const margin = 620;
+    const step = 620;
+    const margin = 420;
     for (let gx = -worldHalf + margin; gx <= worldHalf - margin; gx += step) {
         for (let gy = -worldHalf + margin; gy <= worldHalf - margin; gy += step) {
-            if (Math.random() < 0.34) continue;
+            if (Math.random() < 0.22) continue;
             const baseX = gx + (Math.random() - 0.5) * step * 0.68;
             const baseY = gy + (Math.random() - 0.5) * step * 0.68;
             if (exclusionAreas.some(area => rectsOverlap(baseX, baseY, 80, 80, area.x, area.y, area.w + 360, area.h + 360))) continue;
-            const clusterCount = Math.random() < 0.18 ? 2 : 1;
+            const clusterCount = Math.random() < 0.34 ? 2 : 1;
             for (let cluster = 0; cluster < clusterCount; cluster++) {
                 const x = baseX + (Math.random() - 0.5) * 105;
                 const y = baseY + (Math.random() - 0.5) * 105;
                 const roll = Math.random();
                 const size = 22 + Math.random() * 28;
-                if (isMapPositionBlocked(obstacles, x, y, size / 2)) continue;
+                if (placementIndex
+                    ? placementIndex.blocked(x, y, size / 2)
+                    : isMapPositionBlocked(obstacles, x, y, size / 2)) continue;
 
-                if (roll < 0.50) {
+                if (roll < 0.42) {
                     const variant = bushVariants[Math.floor(Math.random() * bushVariants.length)];
-                    addObstacle(obstacles, 'bush', x, y, size + 10, size, {
+                    const bush = addObstacle(obstacles, 'bush', x, y, size + 10, size, {
                         collidable: Math.random() < 0.32,
                         hue: variant === 'juniper' ? 126 : 92 + Math.floor(Math.random() * 36),
                         rotation: Math.random() * Math.PI,
                         variant,
                         role: 'naturalDetail',
                     });
-                } else if (roll < 0.69) {
+                    placementIndex?.add(bush);
+                } else if (roll < 0.57) {
+                    const rock = addObstacle(obstacles, 'rock', x, y, size + 18, size * 0.74, {
+                        hue: 210 + Math.floor(Math.random() * 28),
+                        rotation: Math.random() * Math.PI,
+                        variant: gy < -4500 ? 'granite' : gy > 4300 ? 'dry' : 'mossy',
+                        role: 'naturalDetail',
+                    });
+                    placementIndex?.add(rock);
+                } else if (roll < 0.72) {
                     addObstacle(obstacles, 'grassTuft', x, y, size, size * 0.72, {
                         collidable: false, hue: 74 + Math.floor(Math.random() * 34),
                         rotation: Math.random() * Math.PI, variant: gy > 4300 ? 'dry' : 'meadow', role: 'naturalDetail',
                     });
-                } else if (roll < 0.82) {
+                } else if (roll < 0.83) {
                     addObstacle(obstacles, 'wildflowers', x, y, size, size, {
                         collidable: false, hue: Math.floor(Math.random() * 360),
                         rotation: Math.random() * Math.PI, variant: 'meadow', role: 'naturalDetail',
                     });
                 } else if (roll < 0.90) {
-                    addObstacle(obstacles, 'stump', x, y, 26 + Math.random() * 15, 24 + Math.random() * 12, {
+                    const stump = addObstacle(obstacles, 'stump', x, y, 26 + Math.random() * 15, 24 + Math.random() * 12, {
                         rotation: Math.random() * Math.PI, variant: 'mossy', role: 'naturalDetail',
                     });
+                    placementIndex?.add(stump);
                 } else if (roll < 0.97) {
-                    addObstacle(obstacles, 'fallenLog', x, y, 62 + Math.random() * 42, 20 + Math.random() * 8, {
+                    const fallenLog = addObstacle(obstacles, 'fallenLog', x, y, 62 + Math.random() * 42, 20 + Math.random() * 8, {
                         rotation: Math.random() * Math.PI, variant: Math.random() < 0.55 ? 'mossy' : 'birch', role: 'naturalDetail',
                     });
+                    placementIndex?.add(fallenLog);
                 } else {
                     addObstacle(obstacles, 'mushrooms', x, y, 30, 26, {
                         collidable: false, hue: 18 + Math.floor(Math.random() * 28),
@@ -3785,7 +3936,7 @@ function addScatteredGroundLoot(obstacles, loot) {
             } else if (roll < 0.62) {
                 loot.push(makeGroundLoot('medkit', pos.x, pos.y, metadata));
             } else if (roll < 0.82) {
-                loot.push(makeGroundLoot('armor', pos.x, pos.y, { ...metadata, armorValue: 35 }));
+                loot.push(makeGroundLoot('vest', pos.x, pos.y, { ...metadata, vestLevel: 1 }));
             } else {
                 const tier = Math.random() < 0.08 ? 'rare' : 'common';
                 const weaponType = pickWeaponForTier(tier);
@@ -3978,17 +4129,54 @@ const CURATED_ROTATION_AREAS = Object.freeze([
 
 const CURATED_RURAL_SITES = Object.freeze([
     { x: -8900, y: -7200, variant: 'cabin', doorSide: 'east', hue: 18 },
+    { x: -6700, y: -9100, variant: 'house', doorSide: 'south', hue: 30 },
+    { x: -5200, y: -6200, variant: 'cabin', doorSide: 'east', hue: 20 },
     { x: -3500, y: -8650, variant: 'house', doorSide: 'south', hue: 26 },
+    { x: -1850, y: -9050, variant: 'cabin', doorSide: 'south', hue: 22 },
     { x: -250, y: -8600, variant: 'cabin', doorSide: 'east', hue: 20 },
+    { x: 1700, y: -9150, variant: 'house', doorSide: 'south', hue: 28 },
+    { x: 4050, y: -9000, variant: 'cabin', doorSide: 'west', hue: 21 },
+    { x: 6500, y: -9100, variant: 'house', doorSide: 'south', hue: 32 },
     { x: 8650, y: -7100, variant: 'house', doorSide: 'west', hue: 32 },
+    { x: 9100, y: -5050, variant: 'cabin', doorSide: 'west', hue: 20 },
     { x: 8950, y: -2500, variant: 'barn', doorSide: 'west', hue: 18 },
+    { x: 9100, y: -250, variant: 'house', doorSide: 'west', hue: 29 },
+    { x: 9200, y: 2200, variant: 'cabin', doorSide: 'west', hue: 23 },
     { x: 8950, y: 5650, variant: 'house', doorSide: 'west', hue: 24 },
+    { x: 9050, y: 8350, variant: 'barn', doorSide: 'west', hue: 17 },
     { x: 7000, y: 9150, variant: 'cabin', doorSide: 'north', hue: 22 },
+    { x: 4500, y: 9200, variant: 'house', doorSide: 'north', hue: 31 },
+    { x: 1950, y: 9250, variant: 'cabin', doorSide: 'north', hue: 20 },
     { x: -300, y: 9200, variant: 'house', doorSide: 'north', hue: 28 },
     { x: -3300, y: 9100, variant: 'cabin', doorSide: 'east', hue: 20 },
+    { x: -6100, y: 9150, variant: 'house', doorSide: 'north', hue: 30 },
     { x: -9000, y: 8850, variant: 'barn', doorSide: 'east', hue: 16 },
+    { x: -9200, y: 5750, variant: 'cabin', doorSide: 'east', hue: 21 },
+    { x: -9200, y: 3300, variant: 'house', doorSide: 'east', hue: 27 },
     { x: -9000, y: 1050, variant: 'house', doorSide: 'east', hue: 30 },
     { x: -8750, y: -950, variant: 'cabin', doorSide: 'east', hue: 18 },
+    { x: -9100, y: -5900, variant: 'house', doorSide: 'east', hue: 26 },
+
+    // Interior solo sites break up the large rotations between named POIs.
+    { x: -6200, y: -5750, variant: 'cabin', doorSide: 'south', hue: 20 },
+    { x: -3300, y: -6200, variant: 'house', doorSide: 'east', hue: 29 },
+    { x: -900, y: -6100, variant: 'cabin', doorSide: 'west', hue: 22 },
+    { x: 1450, y: -6100, variant: 'house', doorSide: 'south', hue: 27 },
+    { x: 4650, y: -8350, variant: 'cabin', doorSide: 'east', hue: 19 },
+    { x: 7900, y: -8600, variant: 'house', doorSide: 'south', hue: 31 },
+    { x: -6500, y: -2500, variant: 'cabin', doorSide: 'north', hue: 20 },
+    { x: -3450, y: -2850, variant: 'house', doorSide: 'west', hue: 30 },
+    { x: 1650, y: -2850, variant: 'cabin', doorSide: 'east', hue: 21 },
+    { x: 6900, y: -2450, variant: 'house', doorSide: 'north', hue: 28 },
+    { x: -4200, y: 2700, variant: 'cabin', doorSide: 'south', hue: 20 },
+    { x: -2700, y: 3900, variant: 'house', doorSide: 'east', hue: 27 },
+    { x: 1800, y: 3350, variant: 'cabin', doorSide: 'west', hue: 21 },
+    { x: 7200, y: 3000, variant: 'house', doorSide: 'south', hue: 29 },
+    { x: -7100, y: 3700, variant: 'cabin', doorSide: 'north', hue: 20 },
+    { x: -2450, y: 6000, variant: 'house', doorSide: 'east', hue: 28 },
+    { x: 1900, y: 5950, variant: 'cabin', doorSide: 'west', hue: 22 },
+    { x: 4200, y: 6900, variant: 'house', doorSide: 'south', hue: 30 },
+    { x: 7350, y: 5350, variant: 'cabin', doorSide: 'north', hue: 20 },
 ]);
 
 function rotationCoverVariant(kind, biome, index) {
@@ -4448,9 +4636,10 @@ export function generateSurvivMap(worldHalf) {
         addRoadsideHamlet(obstacles, loot, spawnPoints, plan.x, plan.y, plan.orientation);
         placedPositions.push({ x: plan.x, y: plan.y, w, h });
     }
-    // A small set of fixed rural homes replaces dozens of grid/random filler
-    // buildings. Each one occupies an outer rotation where a solo structure
-    // creates a decision rather than competing with an established landmark.
+    // Solo homes and cabins fill the rotations between major destinations.
+    // Their positions are authored candidates rather than a uniform random
+    // house grid, so empty countryside gains loot decisions and landmarks
+    // without every building collapsing into another village.
     for (const plan of CURATED_RURAL_SITES) {
         const area = { x: plan.x, y: plan.y, w: 620, h: 560 };
         if (isAreaOverlapping(area.x, area.y, area.w, area.h, 130, placedPositions)) continue;
@@ -4477,8 +4666,9 @@ export function generateSurvivMap(worldHalf) {
     }
 
     addCuratedRotationCover(obstacles);
-    addCanopyInfill(obstacles, wh, 36, INTENTIONAL_OPEN_AREAS);
-    addNaturalDetailScatter(obstacles, wh, [...POI_LIST, ...INTENTIONAL_OPEN_AREAS]);
+    const countrysidePlacementIndex = createMapPlacementIndex(obstacles);
+    addCanopyInfill(obstacles, wh, 4650, INTENTIONAL_OPEN_AREAS, countrysidePlacementIndex);
+    addNaturalDetailScatter(obstacles, wh, [...POI_LIST, ...INTENTIONAL_OPEN_AREAS], countrysidePlacementIndex);
     addScatteredGroundLoot(obstacles, loot);
     clearInvalidBuildingProps(obstacles);
     sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
@@ -4685,14 +4875,15 @@ function describeContainerItems(contents = {}) {
     if (contents.grenades) {
         items.push({ key: 'grenades', kind: 'grenade', label: 'Grenade', value: Number(contents.grenades) });
     }
-    if (contents.armor) {
-        items.push({ key: 'armor', kind: 'armor', label: 'Armor', value: Number(contents.armor) });
+    if (contents.vestLevel) {
+        const vest = vestDefinition(contents.vestLevel);
+        items.push({ key: 'vest', kind: 'vest', label: vest.label, value: vest.level });
     }
     return items;
 }
 
 function isContainerEmpty(contents = {}) {
-    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoAmount && !contents.grenades && !contents.armor;
+    return !contents.money && !contents.weaponType && !contents.medkits && !contents.ammoAmount && !contents.grenades && !contents.vestLevel;
 }
 
 function applyLootContents(entity, contents = {}, options = {}) {
@@ -4700,7 +4891,8 @@ function applyLootContents(entity, contents = {}, options = {}) {
     const summary = {
         money: 0,
         medkits: 0,
-        armor: 0,
+        vestLevel: 0,
+        vestLabel: null,
         ammoType: null,
         ammoAmount: 0,
         grenades: 0,
@@ -4717,9 +4909,14 @@ function applyLootContents(entity, contents = {}, options = {}) {
         summary.medkits = Math.max(0, Math.min(Number(contents.medkits) || 0, SURVIV_MAX_MEDKITS - inv.medkits));
         inv.medkits += summary.medkits;
     }
-    if (contents.armor) {
-        summary.armor = Math.max(0, Math.min(Number(contents.armor) || 0, entity.maxArmor - (entity.armor || 0)));
-        entity.armor = (entity.armor || 0) + summary.armor;
+    if (contents.vestLevel) {
+        const incomingLevel = normalizeVestLevel(contents.vestLevel);
+        const currentLevel = normalizeVestLevel(entity.vestLevel);
+        if (incomingLevel > currentLevel) {
+            entity.vestLevel = incomingLevel;
+            summary.vestLevel = incomingLevel;
+            summary.vestLabel = vestDefinition(incomingLevel).label;
+        }
     }
     if (contents.ammoType && contents.ammoAmount && SURVIV_AMMO[contents.ammoType]) {
         const ammoType = contents.ammoType;
@@ -4944,8 +5141,7 @@ export function createSurvivPlayer(socketId, mongoId, username, color, room) {
         angle: 0,
         hp: 100,
         maxHp: 100,
-        armor: 0,
-        maxArmor: 100,
+        vestLevel: 0,
         weapon: makeWeaponState('fists'),
         dollarBalance: eco.playerStartBalance,
         entryFeeUsd: room.entryFeeUsd,
@@ -5547,12 +5743,8 @@ function tryShoot(entity, room, now) {
 
 function applyDamage(target, damage, attacker, source = null) {
     const hpBefore = Number(target.hp) || 0;
-    let remaining = damage;
-    if (target.armor > 0) {
-        const absorbed = Math.min(target.armor, remaining * 0.7);
-        target.armor -= absorbed;
-        remaining -= absorbed * 0.5;
-    }
+    const reduction = vestDefinition(target.vestLevel).damageReduction;
+    const remaining = Math.max(0, damage * (1 - reduction));
     target.hp -= remaining;
     const damageDealt = Math.max(0, hpBefore - target.hp);
     if (damageDealt > 0 && attacker && attacker.id !== target.id) {
@@ -5615,7 +5807,7 @@ function dropDeathLoot(room, entity) {
         if (amount > 0) drops.push({ type: 'ammo', ammoType, amount });
     }
     if (inventory.grenades > 0) drops.push({ type: 'grenade', amount: inventory.grenades });
-    if (entity.armor > 0) drops.push({ type: 'armor', armorValue: Math.round(entity.armor) });
+    if (entity.vestLevel > 0) drops.push({ type: 'vest', vestLevel: normalizeVestLevel(entity.vestLevel) });
 
     drops.forEach((drop, index) => {
         const pos = scatter(index, drops.length);
@@ -5627,7 +5819,7 @@ function dropDeathLoot(room, entity) {
     });
 
     entity.dollarBalance = 0;
-    entity.armor = 0;
+    entity.vestLevel = 0;
     inventory.weapons = [];
     entity.weaponSlotAmmo = [];
     entity.weaponsAmmo = {};
@@ -5804,7 +5996,7 @@ function breakLootContainer(entity, room, item) {
         drops.push({ type: 'ammo', ammoType: contents.ammoType, amount: Number(contents.ammoAmount) });
     }
     if (Number(contents.grenades) > 0) drops.push({ type: 'grenade', amount: Number(contents.grenades) });
-    if (Number(contents.armor) > 0) drops.push({ type: 'armor', armorValue: Number(contents.armor) });
+    if (Number(contents.vestLevel) > 0) drops.push({ type: 'vest', vestLevel: normalizeVestLevel(contents.vestLevel) });
 
     removeSurvivLootAt(room, index);
     drops.forEach((drop, dropIndex) => {
@@ -5868,8 +6060,8 @@ function takeLootContainerItem(entity, room) {
         picked = { ammoType: contents.ammoType, ammoAmount: contents.ammoAmount, rarity: contents.rarity };
     } else if (itemKey === 'grenades' && contents.grenades) {
         picked = { grenades: contents.grenades, rarity: contents.rarity };
-    } else if (itemKey === 'armor' && contents.armor) {
-        picked = { armor: contents.armor, rarity: contents.rarity };
+    } else if (itemKey === 'vest' && contents.vestLevel) {
+        picked = { vestLevel: contents.vestLevel, rarity: contents.rarity };
     }
     if (!picked) return;
 
@@ -5920,6 +6112,7 @@ function takeLootContainerItem(entity, room) {
         refreshOpenedContainer(entity, room);
         return;
     }
+    const previousVestLevel = normalizeVestLevel(entity.vestLevel);
     const summary = applyLootContents(entity, picked, { countChest: false });
     if (summary.weaponType) {
         delete contents.weaponType;
@@ -5929,12 +6122,15 @@ function takeLootContainerItem(entity, room) {
     if (summary.medkits > 0) contents.medkits = Math.max(0, Number(contents.medkits || 0) - summary.medkits);
     if (summary.ammoAmount > 0) contents.ammoAmount = Math.max(0, Number(contents.ammoAmount || 0) - summary.ammoAmount);
     if (summary.grenades > 0) contents.grenades = Math.max(0, Number(contents.grenades || 0) - summary.grenades);
-    if (summary.armor > 0) contents.armor = Math.max(0, Number(contents.armor || 0) - summary.armor);
-    for (const key of ['money', 'medkits', 'ammoAmount', 'grenades', 'armor']) {
+    if (summary.vestLevel > 0) {
+        if (previousVestLevel > 0) contents.vestLevel = previousVestLevel;
+        else delete contents.vestLevel;
+    }
+    for (const key of ['money', 'medkits', 'ammoAmount', 'grenades']) {
         if (!(Number(contents[key]) > 0)) delete contents[key];
     }
     if (!contents.ammoAmount) delete contents.ammoType;
-    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoAmount > 0 || summary.grenades > 0 || summary.armor > 0;
+    const accepted = !!summary.weaponType || summary.money > 0 || summary.medkits > 0 || summary.ammoAmount > 0 || summary.grenades > 0 || summary.vestLevel > 0;
     if (!accepted) {
         refreshOpenedContainer(entity, room);
         return;
@@ -6037,10 +6233,9 @@ function putLootContainerItem(entity, room) {
     } else if (itemKey === 'grenades' && inv.grenades > 0) {
         inv.grenades -= 1;
         contents.grenades = (contents.grenades || 0) + 1;
-    } else if (itemKey === 'armor' && entity.armor > 0) {
-        const transfer = Math.min(35, Math.round(entity.armor));
-        entity.armor = Math.max(0, entity.armor - transfer);
-        contents.armor = (contents.armor || 0) + transfer;
+    } else if (itemKey === 'vest' && entity.vestLevel > 0 && !contents.vestLevel) {
+        contents.vestLevel = normalizeVestLevel(entity.vestLevel);
+        entity.vestLevel = 0;
     }
 
     refreshOpenedContainer(entity, room);
@@ -6179,10 +6374,10 @@ function dropPlayerItem(entity, room) {
     } else if (itemKey === 'grenades' && inv.grenades > 0) {
         inv.grenades -= 1;
         addSurvivLoot(room, makeGroundLoot('grenade', dropX, dropY, { amount: 1, source: 'player-drop', pickupAfter: Date.now() + 900 }));
-    } else if (itemKey === 'armor' && entity.armor > 0) {
-        const transfer = Math.min(35, Math.round(entity.armor));
-        entity.armor = Math.max(0, entity.armor - transfer);
-        addSurvivLoot(room, makeGroundLoot('armor', dropX, dropY, { armorValue: transfer, source: 'player-drop', pickupAfter: Date.now() + 900 }));
+    } else if (itemKey === 'vest' && entity.vestLevel > 0) {
+        const vestLevel = normalizeVestLevel(entity.vestLevel);
+        entity.vestLevel = 0;
+        addSurvivLoot(room, makeGroundLoot('vest', dropX, dropY, { vestLevel, source: 'player-drop', pickupAfter: Date.now() + 900 }));
     }
 }
 
@@ -6194,7 +6389,8 @@ function pickupLoot(entity, room) {
     const pickedUp = {
         money: 0,
         medkits: 0,
-        armor: 0,
+        vestLevel: 0,
+        vestLabel: null,
         ammoType: null,
         ammoAmount: 0,
         grenades: 0,
@@ -6226,18 +6422,22 @@ function pickupLoot(entity, room) {
             let quantityKey = null;
             if (item.type === 'money') requested = { money: Number(item.dollarValue || item.amount || 0) };
             if (item.type === 'medkit') { requested = { medkits: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'medkits'; }
-            if (item.type === 'armor') { requested = { armor: Math.max(1, Number(item.armorValue) || 35) }; quantityKey = 'armor'; }
+            if (item.type === 'vest') requested = { vestLevel: normalizeVestLevel(item.vestLevel) };
             if (item.type === 'ammo' && SURVIV_AMMO[item.ammoType]) { requested = { ammoType: item.ammoType, ammoAmount: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'ammoAmount'; }
             if (item.type === 'grenade') { requested = { grenades: Math.max(1, Number(item.amount) || 1) }; quantityKey = 'grenades'; }
             if (item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType]) requested = { weaponType: item.weaponType };
             if (!requested) continue;
 
+            const previousVestLevel = normalizeVestLevel(entity.vestLevel);
             const accepted = applyLootContents(entity, requested, { countChest: false });
-            const acceptedAmount = accepted.money || accepted.medkits || accepted.armor || accepted.ammoAmount || accepted.grenades || (accepted.weaponType ? 1 : 0);
+            const acceptedAmount = accepted.money || accepted.medkits || accepted.vestLevel || accepted.ammoAmount || accepted.grenades || (accepted.weaponType ? 1 : 0);
             if (!(acceptedAmount > 0)) continue;
             pickedUp.money += accepted.money;
             pickedUp.medkits += accepted.medkits;
-            pickedUp.armor += accepted.armor;
+            if (accepted.vestLevel > 0) {
+                pickedUp.vestLevel = accepted.vestLevel;
+                pickedUp.vestLabel = accepted.vestLabel;
+            }
             if (accepted.ammoAmount > 0) {
                 pickedUp.ammoType = accepted.ammoType;
                 pickedUp.ammoAmount += accepted.ammoAmount;
@@ -6252,9 +6452,15 @@ function pickupLoot(entity, room) {
             if (quantityKey) remaining = Math.max(0, Number(requested[quantityKey]) - Number(accepted[quantityKey]));
             if (remaining > 0) {
                 if (item.type === 'medkit' || item.type === 'ammo' || item.type === 'grenade') item.amount = remaining;
-                if (item.type === 'armor') item.armorValue = remaining;
             } else {
                 removeSurvivLootAt(room, index);
+            }
+            if (accepted.vestLevel > 0 && previousVestLevel > 0) {
+                addSurvivLoot(room, makeGroundLoot('vest', item.x, item.y, {
+                    vestLevel: previousVestLevel,
+                    source: 'player-swap',
+                    pickupAfter: now + 900,
+                }));
             }
             pickupCount += 1;
             pickupTier = item.tier || pickupTier;
@@ -6564,8 +6770,7 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         aimAngle: 0,
         hp: 100,
         maxHp: 100,
-        armor: 0,
-        maxArmor: 100,
+        vestLevel: 0,
         weapon: makeWeaponState('fists'),
         dollarBalance: 0,
         entryFeeUsd: room.entryFeeUsd,
@@ -6619,7 +6824,7 @@ function getBotLootScore(bot, item, itemDistance) {
         const contents = item.contents || {};
         const useful = (contents.weaponType && inventory.weapons.length < SURVIV_MAX_WEAPONS)
             || Number(contents.money) > 0
-            || (Number(contents.armor) > 0 && bot.armor < bot.maxArmor)
+            || (Number(contents.vestLevel) > normalizeVestLevel(bot.vestLevel))
             || (Number(contents.medkits) > 0 && inventory.medkits < SURVIV_MAX_MEDKITS)
             || (SURVIV_AMMO[contents.ammoType] && Number(contents.ammoAmount) > 0 && inventory.ammoReserves[contents.ammoType] < SURVIV_AMMO[contents.ammoType].max);
         return useful ? 1120 - distancePenalty : -Infinity;
@@ -6628,7 +6833,7 @@ function getBotLootScore(bot, item, itemDistance) {
         return inventory.weapons.length < SURVIV_MAX_WEAPONS ? 980 - distancePenalty : -Infinity;
     }
     if (item.type === 'money') return 820 - distancePenalty;
-    if (item.type === 'armor') return bot.armor < bot.maxArmor - 2 ? 760 - distancePenalty : -Infinity;
+    if (item.type === 'vest') return normalizeVestLevel(item.vestLevel) > normalizeVestLevel(bot.vestLevel) ? 760 - distancePenalty : -Infinity;
     if (item.type === 'medkit') return inventory.medkits < SURVIV_MAX_MEDKITS ? 700 - distancePenalty : -Infinity;
     if (item.type === 'ammo' && SURVIV_AMMO[item.ammoType]) return inventory.ammoReserves[item.ammoType] < SURVIV_AMMO[item.ammoType].max ? 640 - distancePenalty : -Infinity;
     return -Infinity;
@@ -6923,7 +7128,7 @@ function serializePlayer(p, isYou) {
         color: p.color,
         hp: p.hp,
         maxHp: p.maxHp,
-        armor: p.armor,
+        vestLevel: normalizeVestLevel(p.vestLevel),
         weapon: p.weapon?.type || 'fists',
         ammo: p.weapon?.ammo ?? 0,
         clipSize: wDef.clipSize,
@@ -7126,7 +7331,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 hitRadius: l.hitRadius,
                 amount: l.amount,
                 ammoType: l.ammoType,
-                armorValue: l.armorValue,
+                vestLevel: l.vestLevel,
                 ...(Number.isFinite(l.spawnedAt) && now - l.spawnedAt < 700 ? {
                     spawnX: l.spawnX,
                     spawnY: l.spawnY,

@@ -124,7 +124,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
 
     assert.equal(SURVIV.worldHalf, 10000);
     assert.equal(map.landmarks.length, 34);
-    assert.ok(houses.length >= 135 && houses.length <= 155,
+    assert.ok(houses.length >= 158 && houses.length <= 168,
         `expected a deliberate building budget, got ${houses.length}`);
     assert.ok(chests.length < houses.length);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
@@ -232,7 +232,7 @@ test('every Surviv house has themed furniture outside every complete door swing'
     }
 });
 
-test('surviv countryside uses curated cover routes and a limited rural building budget', () => {
+test('surviv countryside keeps dense distributed cover and frequent solo rural homes', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const coverKinds = new Set(['tree', 'bush', 'rock']);
     const openCover = map.obstacles.filter(obstacle => (
@@ -250,6 +250,17 @@ test('surviv countryside uses curated cover routes and a limited rural building 
         + ','
         + Math.floor((obstacle.y + SURVIV.worldHalf) / 1600)
     )));
+    const gameplayTreeCells = new Map();
+    for (const tree of map.obstacles.filter(obstacle => obstacle.kind === 'tree')) {
+        if (Math.abs(tree.x) >= 9500 || Math.abs(tree.y) >= 9500) continue;
+        const key = Math.floor((tree.x + 9500) / 1000)
+            + ','
+            + Math.floor((tree.y + 9500) / 650);
+        gameplayTreeCells.set(key, (gameplayTreeCells.get(key) || 0) + 1);
+    }
+    const gameplayCellCount = 19 * 30;
+    const averageTreesPerGameplayCell = [...gameplayTreeCells.values()]
+        .reduce((sum, count) => sum + count, 0) / gameplayCellCount;
     const ruralHomes = map.obstacles.filter(obstacle => (
         obstacle.kind === 'houseFloor'
         && obstacle.role === 'ruralHome'
@@ -261,14 +272,20 @@ test('surviv countryside uses curated cover routes and a limited rural building 
         + Math.floor((obstacle.y + SURVIV.worldHalf) / 600)
     )));
 
-    assert.ok(openCover.length >= 430 && openCover.length <= 620,
-        `expected readable countryside cover budget, got ${openCover.length}`);
-    assert.ok(openTrees.length >= 220 && openTrees.length <= 340,
-        `expected restrained tree budget, got ${openTrees.length}`);
+    assert.ok(openCover.length >= 5700 && openCover.length <= 6250,
+        `expected dense countryside cover across the island, got ${openCover.length}`);
+    assert.ok(openTrees.length >= 4500 && openTrees.length <= 4950,
+        `expected trees to be common in normal gameplay views, got ${openTrees.length}`);
     assert.ok(coverCells.size >= 90);
     assert.ok(treeCells.size >= 75);
-    assert.ok(ruralHomes.length >= 5 && ruralHomes.length <= 10,
-        `expected only a handful of curated rural homes, got ${ruralHomes.length}`);
+    assert.ok(gameplayTreeCells.size >= 540,
+        `trees should reach nearly every gameplay-sized countryside cell, got ${gameplayTreeCells.size}`);
+    assert.ok([...gameplayTreeCells.values()].filter(count => count >= 3).length >= 515,
+        'most gameplay-sized countryside cells should contain several visible trees');
+    assert.ok(averageTreesPerGameplayCell >= 7.4,
+        `expected multiple visible trees per desktop-scale cell, got ${averageTreesPerGameplayCell.toFixed(2)}`);
+    assert.ok(ruralHomes.length >= 20 && ruralHomes.length <= 27,
+        `expected frequent authored solo homes between POIs, got ${ruralHomes.length}`);
     assert.ok(rotationCover.length >= 155 && rotationCover.length <= 190);
     assert.ok(rotationCells.size >= 62, 'rotation cover should span distinct travel corridors');
     assert.equal(map.obstacles.some(obstacle => obstacle.role === 'gapHouse' || obstacle.role === 'gapCover'), false);
@@ -355,7 +372,7 @@ test('pond sites and the west forest camp keep readable spacing', () => {
             && obstacle.kind !== 'field'
         ));
         const campHouses = campProps.filter(obstacle => obstacle.kind === 'houseFloor');
-        assert.ok(campProps.length < 120, `west forest camp is too crowded: ${campProps.length} props`);
+        assert.ok(campProps.length < 240, `west forest camp is too crowded: ${campProps.length} props`);
         assert.ok(campHouses.length <= 4, `west forest camp has too many stacked buildings: ${campHouses.length}`);
     }
     assert.ok(pondCount > 0, 'expected at least one sampled pond site');
@@ -581,7 +598,7 @@ test('surviv roads, landmark trees, and world furniture add varied readable deta
     assert.ok(map.obstacles
         .filter(obstacle => decorKinds.has(obstacle.kind))
         .every(obstacle => obstacle.collidable === false));
-    assert.ok(map.obstacles.length < 5700, 'static map detail should stay inside the performance budget');
+    assert.ok(map.obstacles.length < 10500, 'static map detail should stay inside the performance budget');
 });
 
 test('new roadside landmarks have distinct buildings and connect to the highway network', () => {
@@ -707,7 +724,7 @@ test('urban expansion adds five dense and distinct road-connected districts', ()
         ['civic-quarter', { buildings: 6, approachRole: 'civicStreet' }],
     ]);
 
-    assert.ok(houses.length >= 135 && houses.length <= 155);
+    assert.ok(houses.length >= 158 && houses.length <= 168);
     assert.ok(roads.length >= 75);
     assert.ok(junctions.length >= 25);
     for (const [landmarkType, expected] of expectedDistricts) {
@@ -874,8 +891,8 @@ test('surviv adds curved trails and varied natural detail without another buildi
     assert.ok(trails.some(trail => trail.variant === 'boardwalk'));
     assert.ok(trails.some(trail => trail.variant === 'forest'));
     assert.ok(trails.some(trail => trail.variant === 'gravel'));
-    assert.ok(naturalDetails.length >= 280 && naturalDetails.length <= 380,
-        `natural detail should stay varied without uniform clutter, got ${naturalDetails.length}`);
+    assert.ok(naturalDetails.length >= 1180 && naturalDetails.length <= 1400,
+        `natural detail should stay varied across the denser countryside, got ${naturalDetails.length}`);
     assert.ok(bushVariants.has('bramble'));
     assert.ok(bushVariants.has('berry'));
     assert.ok(bushVariants.has('flowering'));
@@ -1415,7 +1432,7 @@ test('melee-breaking a crate bursts every item onto the ground', () => {
             ammoType: '12g',
             ammoAmount: 8,
             grenades: 1,
-            armor: 35,
+            vestLevel: 2,
             rarity: 'rare',
         },
     });
@@ -1424,7 +1441,7 @@ test('melee-breaking a crate bursts every item onto the ground', () => {
 
     assert.equal(room.loot.some(item => item.id === 'break-crate'), false);
     assert.deepEqual(new Set(room.loot.map(item => item.type)), new Set([
-        'weapon', 'money', 'medkit', 'ammo', 'grenade', 'armor',
+        'weapon', 'money', 'medkit', 'ammo', 'grenade', 'vest',
     ]));
     assert.ok(room.loot.every(item => item.source === 'chest'));
     assert.ok(room.loot.every(item => item.spawnX === 45 && item.spawnY === 0));
@@ -1473,7 +1490,7 @@ test('indoor crate drops stay inside the house when broken beside a corner', () 
             ammoType: '12g',
             ammoAmount: 8,
             grenades: 1,
-            armor: 35,
+            vestLevel: 2,
         },
     });
 
@@ -1547,7 +1564,7 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     const victim = spawnSurvivBotNear(room, player.x + 32, player.y, { adminSpawned: true });
     victim.hp = 1;
     victim.dollarBalance = 2;
-    victim.armor = 35;
+    victim.vestLevel = 2;
     victim.inventory.weapons = ['smg'];
     victim.inventory.medkits = 1;
     victim.inventory.ammoReserves = { '9mm': 60, '12g': 0, '556': 0, '762': 0 };
@@ -1561,7 +1578,7 @@ test('melee deaths scatter the full inventory instead of making a death crate', 
     assert.ok(deathDrops.some(item => item.type === 'weapon' && item.weaponType === 'smg'));
     assert.ok(deathDrops.some(item => item.type === 'medkit' && item.amount === 1));
     assert.ok(deathDrops.some(item => item.type === 'ammo' && item.ammoType === '9mm' && item.amount === 60));
-    assert.ok(deathDrops.some(item => item.type === 'armor' && item.armorValue > 0));
+    assert.ok(deathDrops.some(item => item.type === 'vest' && item.vestLevel === 2));
     assert.equal(room.loot.some(item => item.type === 'deathCrate'), false);
 });
 test('manual reload consumes only the matching caliber and only the missing rounds', () => {
@@ -1619,6 +1636,28 @@ test('ground loot creates a pickup summary for the player', () => {
     assert.equal(player.lastLoot.items.ammoType, '762');
     assert.equal(player.lastLoot.items.ammoAmount, 15);
     assert.equal(player.lastLoot.items.medkits, 1);
+});
+
+test('vest pickups equip only upgrades and leave the replaced vest on the ground', () => {
+    const room = makeRoom();
+    const player = createSurvivPlayer('human-vest', 'mongo-vest', 'Armored', '#fff', room);
+    player.vestLevel = 1;
+    room.players.push(player);
+    room.loot = [
+        { id: 'vest-upgrade', type: 'vest', vestLevel: 3, x: player.x, y: player.y, tier: 'military' },
+    ];
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(player.vestLevel, 3);
+    assert.equal(player.lastLoot.items.vestLevel, 3);
+    assert.equal(player.lastLoot.items.vestLabel, 'Level 3 Vest');
+    assert.ok(room.loot.some(item => item.type === 'vest' && item.vestLevel === 1));
+
+    room.loot.push({ id: 'worse-vest', type: 'vest', vestLevel: 2, x: player.x, y: player.y, tier: 'rare' });
+    processSurvivRoom(room, silentIo, Date.now() + 600010);
+    assert.equal(player.vestLevel, 3);
+    assert.ok(room.loot.some(item => item.id === 'worse-vest'), 'a worse vest should remain available for another player');
 });
 
 test('legacy ground ammo without a caliber is repaired and can be picked up', () => {
@@ -1698,19 +1737,22 @@ test('grenade damage is lethal at the center and falls off sharply with distance
     attacker.x = 500;
     attacker.y = 0;
 
-    const makeTarget = (id, x, armor = 0) => {
+    const makeTarget = (id, x, vestLevel = 0, y = 0) => {
         const target = createSurvivPlayer(id, `mongo-${id}`, id, '#fff', room);
         target.x = x;
-        target.y = 0;
+        target.y = y;
         target.hp = 100;
-        target.armor = armor;
+        target.vestLevel = vestLevel;
         return target;
     };
-    const direct = makeTarget('grenade-direct', 0, 20);
+    const direct = makeTarget('grenade-direct', 0, 1);
     const near = makeTarget('grenade-near', 45);
     const middle = makeTarget('grenade-middle', 105);
     const edge = makeTarget('grenade-edge', 140);
-    room.players.push(attacker, direct, near, middle, edge);
+    const middleVest1 = makeTarget('grenade-middle-vest1', 0, 1, 105);
+    const middleVest2 = makeTarget('grenade-middle-vest2', -105, 2);
+    const middleVest3 = makeTarget('grenade-middle-vest3', 0, 3, -105);
+    room.players.push(attacker, direct, near, middle, edge, middleVest1, middleVest2, middleVest3);
 
     room.bullets.push({
         id: 'grenade-falloff-test',
@@ -1732,11 +1774,14 @@ test('grenade damage is lethal at the center and falls off sharply with distance
     const middleDamage = 100 - middle.hp;
     const edgeDamage = 100 - edge.hp;
     assert.ok(direct.hp <= 0, 'standing on the grenade should kill through light armor');
-    assert.equal(direct.armor, 0);
+    assert.ok(room.loot.some(item => item.source === 'death' && item.type === 'vest' && item.vestLevel === 1), 'the vest should drop intact rather than being consumed by damage');
     assert.ok(nearDamage > 70, `near blast should hurt heavily, got ${nearDamage}`);
     assert.ok(middleDamage > 20 && middleDamage < 40, `mid-range blast should be reduced, got ${middleDamage}`);
     assert.ok(edgeDamage >= SURVIV.grenadeMinDamage && edgeDamage < 15, `blast edge should do low damage, got ${edgeDamage}`);
     assert.ok(nearDamage > middleDamage && middleDamage > edgeDamage);
+    assert.ok(Math.abs((100 - middleVest1.hp) - middleDamage * 0.75) < 0.25);
+    assert.ok(Math.abs((100 - middleVest2.hp) - middleDamage * 0.62) < 0.25);
+    assert.ok(Math.abs((100 - middleVest3.hp) - middleDamage * 0.55) < 0.25);
     assert.equal(near._damageTaken.kind, 'grenade');
     assert.equal(near._damageTaken.sourceX, 0);
     assert.equal(near._damageTaken.sourceY, 0);
