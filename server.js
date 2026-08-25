@@ -520,6 +520,14 @@ TransactionSchema.post('save', async function(doc) {
         );
         if (!unlocked) return;
 
+        await TransactionMod.updateOne(
+            { _id: doc._id },
+            { $set: {
+                'meta.starterRewardCompleted': true,
+                'meta.starterRewardCompletedAt': new Date().toISOString(),
+                'meta.starterRewardAmountUsd': Number(unlocked.sponsoredRewardsBalance) || 0,
+            } },
+        );
 
         console.log(`[Challenge Unlocked] User ${unlocked.username} completed all sponsored reward challenges!`);
     } catch (err) {
