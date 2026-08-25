@@ -426,9 +426,13 @@ test('surviv countryside keeps dense distributed cover and frequent solo rural h
     assert.ok(giantTrees.length >= 28, `expected landmark-scale giant trees, got ${giantTrees.length}`);
     assert.ok(allTrees.every(tree => (
         tree.hitboxW >= 11 && tree.hitboxH >= 11
-        && tree.hitboxW < tree.w * 0.4
-        && tree.hitboxH < tree.h * 0.4
+        && tree.hitboxW < tree.w * 0.56
+        && tree.hitboxH < tree.h * 0.56
     )), 'tree collision should cover only the trunk, never the visible canopy');
+    assert.ok(survivTrees.every(tree => tree.hitboxW >= 26 && tree.hitboxH >= 26),
+        'new tree trunks should be wide enough to function as player-sized combat cover');
+    assert.ok(survivTrees.every(tree => tree.trunkScale >= 0.44),
+        'new tree art and authoritative collision should share the broader trunk proportions');
     assert.ok(largeTrees.every(tree => tree.trunkScale > 0.255),
         'larger trees should have visibly and physically wider trunks');
     assert.ok(insetNaturalCover.length >= 600,

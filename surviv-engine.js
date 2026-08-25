@@ -4393,9 +4393,26 @@ function assignTreeCanopyStyles(obstacles) {
         const isLandmark = tree.role === 'landmarkTree';
         const isLarge = isLandmark || crownSize >= 64;
         tree.treeSize = isLandmark ? 'giant' : isLarge ? 'large' : 'standard';
-        tree.trunkScale = isLandmark ? 0.36 : isLarge ? 0.31 : 0.255;
-        tree.hitboxW = Math.max(11, Number((tree.w * tree.trunkScale).toFixed(2)));
-        tree.hitboxH = Math.max(11, Number((tree.h * tree.trunkScale).toFixed(2)));
+
+        if (tree.canopyStyle === 'surviv') {
+            // The replacement trees need a materially larger readable crown,
+            // not merely a different fill. Grow their authored bounds after
+            // placement so the map distribution is unchanged while the new
+            // silhouette becomes obvious in an ordinary gameplay viewport.
+            const crownScale = isLandmark ? 1.12 : isLarge ? 1.16 : 1.20;
+            tree.w = Math.max(52, Number((tree.w * crownScale).toFixed(2)));
+            tree.h = Math.max(52, Number((tree.h * crownScale).toFixed(2)));
+            tree.trunkScale = isLandmark ? 0.48 : isLarge ? 0.46 : 0.44;
+            // A normal player is 28 units wide. Keeping common trunks close to
+            // that width makes them real combat cover while the much larger
+            // canopy remains passable.
+            tree.hitboxW = Math.min(tree.w, Math.max(26, Number((tree.w * tree.trunkScale).toFixed(2))));
+            tree.hitboxH = Math.min(tree.h, Math.max(26, Number((tree.h * tree.trunkScale).toFixed(2))));
+        } else {
+            tree.trunkScale = isLandmark ? 0.36 : isLarge ? 0.31 : 0.255;
+            tree.hitboxW = Math.max(11, Number((tree.w * tree.trunkScale).toFixed(2)));
+            tree.hitboxH = Math.max(11, Number((tree.h * tree.trunkScale).toFixed(2)));
+        }
     }
 }
 
@@ -5530,6 +5547,10 @@ export function generateSurvivMap(worldHalf) {
     // design instead of depending on a favorable placement seed.
     addLandmarkTrees(obstacles, wh, 30, INTENTIONAL_OPEN_AREAS);
     assignTreeCanopyStyles(obstacles);
+    // The replacement crown dimensions are finalized above. Re-run the site
+    // clearance pass against those final visual bounds so a newly enlarged
+    // crown never hangs across a doorway, building shell or main road.
+    clearInvalidBuildingProps(obstacles);
     sanitizeGeneratedSpawnPoints(obstacles, spawnPoints, worldHalf);
 
     return { obstacles, loot, spawnPoints, landmarks };
