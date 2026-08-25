@@ -13,6 +13,9 @@ export const ECONOMY_TICKS_PER_SECOND = 40;
 /** Platform cut on all eligible Agar, Slither, and Surviv cashouts. */
 export const NORMAL_CASHOUT_FEE_PCT = PLATFORM_CASHOUT_FEE_BPS / 10_000;
 
+/** Hidden owner cut taken from the food/loot allocation of every paid Normal entry. */
+export const NORMAL_ENTRY_OWNER_CUT_PCT = 0.05;
+
 /** Baseline economy at $10 entry — all values scale linearly with entry fee. */
 const BASE = {
     // Normal Agar/Slither starts with 20% of the entry in cash value.
@@ -81,7 +84,7 @@ export function getGoldenBlobValue(entryFeeUsd) {
 
 /**
  * Conserved food + AI allocation for one paid join.
- * Player start value + food + AI must always equal exactly the entry fee.
+ * Player start value + food + AI + owner cut must always equal exactly the entry fee.
  */
 export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
     const eco = getEconomy(entryFeeUsd);
@@ -92,21 +95,23 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
             : eco.aiHigh;
     const distributable = Math.max(0, eco.entryFeeUsd - eco.playerStartBalance);
     const ai = Math.min(distributable, Math.max(0, aiTarget));
-    return { food: distributable - ai, ai };
+    const ownerVaultContribution = eco.entryFeeUsd * NORMAL_ENTRY_OWNER_CUT_PCT;
+    return { food: distributable - ai - ownerVaultContribution, ai, ownerVaultContribution };
 }
 
 /**
  * Modified entry split only while a user's one-time starter reward is being funded.
  * Allocations (of entry fee):
  *   20 % → player start balance (deducted before this split)
- *   40 % → food pool (includes 10 % golden blob deducted in join handler)
+ *   35 % → food pool (includes 10 % golden blob deducted in join handler)
  *   20 % → bots (AI budget)
  *   20 % → starter reward funding
+ *    5 % → owner vault (hidden entry cut)
  *
  * Dollar amounts:
- *   $5:  start $1.00, food $2.00, bots $1.00, reward $1.00
- *   $10: start $2.00, food $4.00, bots $2.00, reward $2.00
- *   $20: start $4.00, food $8.00, bots $4.00, starter reward $4.00
+ *   $5:  start $1.00, food $1.75, bots $1.00, reward $1.00, owner $0.25
+ *   $10: start $2.00, food $3.50, bots $2.00, reward $2.00, owner $0.50
+ *   $20: start $4.00, food $7.00, bots $4.00, reward $4.00, owner $1.00
  *
  * Returns { food, ai, rewardPoolContribution, ownerVaultContribution }.
  * food includes golden blob — join handler subtracts it before adding to foodPoolBalance.
@@ -114,11 +119,12 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
 export function getRewardPoolSplit(entryFeeUsd) {
     const entry = normalizeEntryFee(entryFeeUsd);
     const playerStart = entry * 0.20; // already deducted as playerStartBalance
-    const food = entry * 0.40;        // includes golden blob (10%)
+    const food = entry * 0.35;        // includes golden blob (10%)
     const ai   = entry * 0.20;
-    const contribution = entry - playerStart - food - ai; // 20 %
+    const contribution = entry * 0.20;
+    const ownerVaultContribution = entry * NORMAL_ENTRY_OWNER_CUT_PCT;
 
-    return { food, ai, rewardPoolContribution: contribution, ownerVaultContribution: 0 };
+    return { food, ai, rewardPoolContribution: contribution, ownerVaultContribution };
 }
 
 
@@ -188,10 +194,12 @@ export function getCompetitiveEconomy(entryFeeUsd) {
 export function getSurvivEconomy(entryFeeUsd) {
     const entry = normalizeSurvivEntryFee(entryFeeUsd);
     const cashoutFeePct = NORMAL_CASHOUT_FEE_PCT;
+    const entryOwnerCutUsd = entry * NORMAL_ENTRY_OWNER_CUT_PCT;
     return {
         entryFeeUsd: entry,
         playerStartBalance: 0,
-        lootPoolOnJoin: entry,
+        entryOwnerCutUsd,
+        lootPoolOnJoin: entry - entryOwnerCutUsd,
         cashoutFeePct,
         cashoutPlayerPct: 1 - cashoutFeePct,
     };

@@ -534,16 +534,17 @@ test('surviv runtime reset clears old arena state and caches', () => {
     assert.equal(room._survivViewerPayloadCache.size, 0);
     assert.equal(room._nextSurvivBotSyncAt, 0);
 });
-test('surviv economy conserves the full entry and applies only the cashout fee', () => {
+test('surviv economy takes the hidden 5% entry owner cut from map loot', () => {
     const economy = getSurvivEconomy(5);
     assert.equal(economy.entryFeeUsd, 5);
     assert.equal(economy.playerStartBalance, 0);
-    assert.equal(economy.lootPoolOnJoin, 5);
+    assert.equal(economy.entryOwnerCutUsd, 0.25);
+    assert.equal(economy.lootPoolOnJoin, 4.75);
     assert.equal(economy.cashoutFeePct, 0.08);
     assert.equal(economy.cashoutPlayerPct + economy.cashoutFeePct, 1);
 });
 test('admin public Surviv entry contributes no map money', () => {
-    assert.equal(getSurvivJoinLootFunding(5), 5);
+    assert.equal(getSurvivJoinLootFunding(5), 4.75);
     assert.equal(getSurvivJoinLootFunding(5, { adminFreeEntry: true }), 0);
 
     const room = makeRoom();
@@ -554,7 +555,7 @@ test('admin public Surviv entry contributes no map money', () => {
     assert.equal(room.loot.length, originalLootCount);
     assert.equal(room.lootPoolBalance || 0, 0);
 });
-test('each paid Surviv entry adds exactly five dollars and admin adds zero', () => {
+test('each paid Surviv entry adds 95% to loot and admin adds zero', () => {
     const room = makeRoom();
     const mapMoneyCents = () => room.loot.reduce((total, item) => {
         const dollars = item.type === 'money'
@@ -563,19 +564,19 @@ test('each paid Surviv entry adds exactly five dollars and admin adds zero', () 
         return total + Math.round(dollars * 100);
     }, 0);
 
-    assert.equal(getSurvivJoinLootFunding(5), 5);
-    assert.equal(getSurvivJoinLootFunding(999), 5);
-    assert.equal(getSurvivJoinLootFunding(null), 5);
+    assert.equal(getSurvivJoinLootFunding(5), 4.75);
+    assert.equal(getSurvivJoinLootFunding(999), 4.75);
+    assert.equal(getSurvivJoinLootFunding(null), 4.75);
     assert.equal(mapMoneyCents(), 0);
 
     spawnLootFromPool(room, getSurvivJoinLootFunding(5));
-    assert.equal(mapMoneyCents(), 500);
+    assert.equal(mapMoneyCents(), 475);
 
     spawnLootFromPool(room, getSurvivJoinLootFunding(5, { adminFreeEntry: true }));
-    assert.equal(mapMoneyCents(), 500);
+    assert.equal(mapMoneyCents(), 475);
 
     spawnLootFromPool(room, getSurvivJoinLootFunding(5));
-    assert.equal(mapMoneyCents(), 1000);
+    assert.equal(mapMoneyCents(), 950);
 });
 test('surviv join money crates vary amounts while preserving the pool', () => {
     const room = makeRoom();

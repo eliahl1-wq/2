@@ -5,15 +5,15 @@ import {
     usdToMicros,
 } from './affiliate-money.js';
 
-/** Users receive 35% of the platform/owner cut paid on eligible cashouts. */
-export const PERMANENT_REWARD_OWNER_CUT_SHARE_BPS = 3_500;
-/** Reserve 40% of that cut: 35% liability + 5% safety surplus. */
-export const PERMANENT_REWARD_POOL_SHARE_BPS = 4_000;
+/** Users receive 50% of the platform/owner cut paid on eligible cashouts. */
+export const PERMANENT_REWARD_OWNER_CUT_SHARE_BPS = 5_000;
+/** Reserve 55% of that cut: 50% liability + 5% safety surplus. */
+export const PERMANENT_REWARD_POOL_SHARE_BPS = 5_500;
 export const PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS = 50 * USD_MICROS_PER_USD;
 
 // Kept in the public payload for backwards-compatible clients. At the normal
-// 8% cashout fee, 35% of the cut equals 2.8% of gross cashout volume.
-export const PERMANENT_REWARD_RATE_BPS = 280;
+// 8% cashout fee, 50% of the cut equals 4% of gross cashout volume.
+export const PERMANENT_REWARD_RATE_BPS = 400;
 export const PERMANENT_REWARD_PER_CYCLE_USD_MICROS = multiplyMicrosByBps(
     PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS,
     PERMANENT_REWARD_RATE_BPS,

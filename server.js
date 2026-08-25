@@ -148,6 +148,7 @@ import { getAffiliatePublicConfig } from './affiliate-config.js';
 import { createAgarCommerceService } from './agar-commerce-service.js';
 import { createCachedBalanceReader } from './solana-rpc-cache.js';
 import { isQualifyingFreeTicketCompletion } from './free-ticket-challenge.js';
+import { getStarterRewardFundingRequirements } from './free-ticket-funding.js';
 import {
     calculatePermanentRewardAllocation,
     permanentProgressReserveUsd,
@@ -349,7 +350,7 @@ const UserSchema = new mongoose.Schema({
     fundedRewardsUsd: { type: Number, default: 0 }, // Amount of the reward that has been funded by the player's game entries
     permanentRewardProgressVolumeUsdMicros: { type: Number, default: 0 },
     permanentRewardProgressEarnedUsdMicros: { type: Number, default: 0 },
-    permanentRewardModelVersion: { type: Number, default: 3 },
+    permanentRewardModelVersion: { type: Number, default: 4 },
     permanentRewardsBalanceUsdMicros: { type: Number, default: 0 },
     permanentRewardLifetimeVolumeUsdMicros: { type: Number, default: 0 },
     permanentRewardLifetimeEarnedUsdMicros: { type: Number, default: 0 },
@@ -419,16 +420,6 @@ const TransactionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
-function getDynamicChallengeReqs(sponsoredRewardsBalance) {
-    const balance = sponsoredRewardsBalance || 0;
-    const requiredContribution = Math.max(5, balance);
-    const multiplier = Math.ceil(requiredContribution / 5);
-    return {
-        req5: multiplier * 3,
-        req10: multiplier * 1
-    };
-}
-
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed' || doc.excludedFromReports || doc.meta?.simulated) return;
     const TransactionMod = mongoose.model('Transaction');
@@ -490,7 +481,7 @@ TransactionSchema.post('save', async function(doc) {
         }).lean();
         if (!current) return;
 
-        const reqs = getDynamicChallengeReqs(current.sponsoredRewardsBalance);
+        const reqs = getStarterRewardFundingRequirements(current.sponsoredRewardsBalance);
         const progressField = entryFeeUsd === 5
             ? 'completedFiveDollarNormalGames'
             : 'completedTenDollarNormalGames';
@@ -576,11 +567,11 @@ TransactionSchema.post('save', async function applyPermanentCashoutRewardHook(do
         // fee-based cashout progress. Preserve already unlocked balances while
         // starting the new cashout cycle cleanly once per existing account.
         await UserMod.updateOne(
-            { _id: doc.userId, permanentRewardModelVersion: { $ne: 3 } },
+            { _id: doc.userId, permanentRewardModelVersion: { $ne: 4 } },
             { $set: {
                 permanentRewardProgressVolumeUsdMicros: 0,
                 permanentRewardProgressEarnedUsdMicros: 0,
-                permanentRewardModelVersion: 3,
+                permanentRewardModelVersion: 4,
             } },
         );
         const user = await UserMod.findOne({ _id: doc.userId, rewardsDisabled: { $ne: true } })
@@ -2583,6 +2574,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.affiliateActive = affiliateStatus.active;
         userObj.affiliateRewardsAvailable = affiliateStatus.hasRewards;
         userObj.permanentRewards = serializePermanentRewards(userObj);
+        userObj.starterRewardRequirements = getStarterRewardFundingRequirements(userObj.sponsoredRewardsBalance);
 
         res.json(userObj);
     } catch (err) {
@@ -3624,7 +3616,7 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
                     fundedRewardsUsd: 0,
                     permanentRewardProgressVolumeUsdMicros: 0,
                     permanentRewardProgressEarnedUsdMicros: 0,
-                    permanentRewardModelVersion: 3,
+                    permanentRewardModelVersion: 4,
                     permanentRewardsBalanceUsdMicros: 0,
                 } });
                 return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
@@ -6521,7 +6513,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             fundedRewardsUsd: 0,
             permanentRewardProgressVolumeUsdMicros: 0,
             permanentRewardProgressEarnedUsdMicros: 0,
-            permanentRewardModelVersion: 3,
+            permanentRewardModelVersion: 4,
             permanentRewardsBalanceUsdMicros: 0,
             permanentRewardLifetimeVolumeUsdMicros: 0,
             permanentRewardLifetimeEarnedUsdMicros: 0,
@@ -6546,7 +6538,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             fundedRewardsUsd: 0,
             permanentRewardProgressVolumeUsdMicros: 0,
             permanentRewardProgressEarnedUsdMicros: 0,
-            permanentRewardModelVersion: 3,
+            permanentRewardModelVersion: 4,
             permanentRewardsBalanceUsdMicros: 0,
             permanentRewardLifetimeVolumeUsdMicros: 0,
             permanentRewardLifetimeEarnedUsdMicros: 0,
@@ -6716,11 +6708,11 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db"
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .then(async () => {
         const permanentRewardMigration = await User.updateMany(
-            { permanentRewardModelVersion: { $ne: 3 } },
+            { permanentRewardModelVersion: { $ne: 4 } },
             { $set: {
                 permanentRewardProgressVolumeUsdMicros: 0,
                 permanentRewardProgressEarnedUsdMicros: 0,
-                permanentRewardModelVersion: 3,
+                permanentRewardModelVersion: 4,
             } },
         );
         await Promise.all([
@@ -8067,6 +8059,7 @@ io.on('connection', (socket) => {
         let userKey = null;
         let pendingPaidJoin = null;
         let pendingTicketUserId = null;
+        let pendingTicketTransactionId = null;
         let pendingJoinEconomy = null;
         try {
             if (mode === 'br-agar' || mode === 'br-slither') {
@@ -8467,6 +8460,22 @@ io.on('connection', (socket) => {
                     adminFreeEntry: useAdminFreeSurvivEntry,
                 });
                 spawnLootFromPool(room, joinLootFunding);
+                if (!freePlay && !useAdminFreeSurvivEntry) {
+                    const ownerContribution = getSurvivEconomy(entryFeeUsd).entryOwnerCutUsd;
+                    Transaction.create({
+                        userId: user._id,
+                        type: 'game',
+                        amount: ownerContribution / SOL_PRICE_USD,
+                        meta: {
+                            event: 'owner_vault_contribution',
+                            entryFeeUsd,
+                            contributionUsd: ownerContribution,
+                            roomId: room.id,
+                            mode: 'surviv',
+                        },
+                        status: 'confirmed',
+                    }).catch(err => console.error('Surviv owner vault TX log error:', err.message));
+                }
                 newPlayer.personalFreePlay = sessionFreePlay || useAdminFreeSurvivEntry;
                 newPlayer.adminFreeSurvivEntry = useAdminFreeSurvivEntry;
                 newPlayer.fundedEntryUsd = useAdminFreeSurvivEntry ? 0 : entryFeeUsd;
@@ -8650,7 +8659,7 @@ io.on('connection', (socket) => {
                     user = consumedTicket;
                     pendingTicketUserId = user._id;
 
-                    await Transaction.create({
+                    const ticketJoinTransaction = await Transaction.create({
                         userId: user._id,
                         type: 'game',
                         amount: 0,
@@ -8665,6 +8674,7 @@ io.on('connection', (socket) => {
                         excludedFromReports: sessionFreePlay,
                         status: 'confirmed'
                     });
+                    pendingTicketTransactionId = ticketJoinTransaction._id;
 
                 } else {
                     await Transaction.create({
@@ -8704,10 +8714,12 @@ io.on('connection', (socket) => {
                     rewardContribution = starterFundingUsd;
                     foodAlloc = rpSplit.food + (rpSplit.rewardPoolContribution - starterFundingUsd);
                     aiAlloc = rpSplit.ai;
+                    ownerContribution = rpSplit.ownerVaultContribution;
                 } else {
                     const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
                     foodAlloc = stdSplit.food;
                     aiAlloc = stdSplit.ai;
+                    ownerContribution = stdSplit.ownerVaultContribution;
                 }
             } else {
                 const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
@@ -8951,7 +8963,18 @@ io.on('connection', (socket) => {
                         { _id: pendingTicketUserId, freeTicketUsed: true, hasFreeTicket: false },
                         { $set: { freeTicketUsed: false, hasFreeTicket: true } },
                     );
+                    if (pendingTicketTransactionId) {
+                        await Transaction.updateOne(
+                            { _id: pendingTicketTransactionId, status: 'confirmed' },
+                            { $set: {
+                                status: 'failed',
+                                'meta.failureReason': 'duplicate_join_race',
+                                'meta.failedAt': new Date().toISOString(),
+                            } },
+                        );
+                    }
                     pendingTicketUserId = null;
+                    pendingTicketTransactionId = null;
                 }
                 raced.id = socket.id;
                 raced.disconnected = false;
@@ -8977,6 +9000,7 @@ io.on('connection', (socket) => {
             pendingJoinEconomy = null;
             pendingPaidJoin = null;
             pendingTicketUserId = null;
+            pendingTicketTransactionId = null;
 
             // Seed arena food from this join's pool share (same as agar — funded by entry, not free)
             {
@@ -9025,6 +9049,16 @@ io.on('connection', (socket) => {
                     { _id: pendingTicketUserId, freeTicketUsed: true, hasFreeTicket: false },
                     { $set: { freeTicketUsed: false, hasFreeTicket: true } },
                 ).catch(restoreErr => console.error('Ticket restore failed:', restoreErr.message));
+                if (pendingTicketTransactionId) {
+                    await Transaction.updateOne(
+                        { _id: pendingTicketTransactionId, status: 'confirmed' },
+                        { $set: {
+                            status: 'failed',
+                            'meta.failureReason': String(err.message || 'join_failed').slice(0, 300),
+                            'meta.failedAt': new Date().toISOString(),
+                        } },
+                    ).catch(logErr => console.error('Ticket join audit rollback failed:', logErr.message));
+                }
             }
             console.error('joinGame error:', err.message);
             if (err.name === 'TokenExpiredError') {
