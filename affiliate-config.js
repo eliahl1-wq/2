@@ -21,10 +21,10 @@ function readUsdMicros(name, fallbackUsd) {
     return Math.round(value * 1_000_000);
 }
 
-/** 5% of each eligible in-game cashout, expressed in basis points. */
+/** 8% of each eligible in-game cashout, expressed in basis points. */
 export const PLATFORM_CASHOUT_FEE_BPS = readInteger(
     'PLATFORM_CASHOUT_FEE_BPS',
-    500,
+    800,
     { min: 0, max: 10_000 },
 );
 

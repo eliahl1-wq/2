@@ -24,16 +24,16 @@ test('Competitive Slither exposes separate $1, $2, and $5 economies', () => {
     }
 });
 
-test('all eligible cashout modes use the global 5% platform fee', () => {
+test('all eligible cashout modes use the global 8% platform fee', () => {
     for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
-        assert.equal(getEconomy(entryFeeUsd).cashoutFeePct, 0.05);
+        assert.equal(getEconomy(entryFeeUsd).cashoutFeePct, 0.08);
     }
     for (const entryFeeUsd of COMPETITIVE_SLITHER_ENTRY_FEES) {
         const economy = getCompetitiveEconomy(entryFeeUsd);
-        assert.equal(economy.cashoutFeePct, 0.05);
-        assert.equal(economy.cashoutPlayerPct, 0.95);
+        assert.equal(economy.cashoutFeePct, 0.08);
+        assert.equal(economy.cashoutPlayerPct, 0.92);
     }
-    assert.equal(getSurvivEconomy(5).cashoutFeePct, 0.05);
+    assert.equal(getSurvivEconomy(5).cashoutFeePct, 0.08);
 });
 
 for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
@@ -78,7 +78,7 @@ for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
     });
 }
 
-test('$5 reward pool split routes extra to reward pool', () => {
+test('$5 starter-reward split routes its reserved share to the reward pool', () => {
     const split = getRewardPoolSplit(5);
     assert.equal(split.rewardPoolContribution, 1.0);
     assert.equal(split.ownerVaultContribution, 0);
@@ -86,7 +86,7 @@ test('$5 reward pool split routes extra to reward pool', () => {
     assert.equal(split.ai, 1.0);
 });
 
-test('$10 reward pool split routes extra to reward pool', () => {
+test('$10 starter-reward split routes its reserved share to the reward pool', () => {
     const split = getRewardPoolSplit(10);
     assert.equal(split.rewardPoolContribution, 2.0);
     assert.equal(split.ownerVaultContribution, 0);
@@ -94,7 +94,7 @@ test('$10 reward pool split routes extra to reward pool', () => {
     assert.equal(split.ai, 2.0);
 });
 
-test('$20 reward pool split routes the full 20% reward share to rewards', () => {
+test('$20 starter-reward split routes its reserved share to the reward pool', () => {
     const split = getRewardPoolSplit(20);
     assert.equal(split.rewardPoolContribution, 4.0);
     assert.equal(split.ownerVaultContribution, 0);

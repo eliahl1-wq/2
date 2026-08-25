@@ -7,74 +7,74 @@ import {
     serializePermanentRewards,
 } from './permanent-rewards.js';
 
-test('$20 of eligible normal volume unlocks exactly $4 and starts a fresh cycle', () => {
-    const result = calculatePermanentRewardAllocation({ entryFeeUsd: 20 });
-    assert.equal(result.contributionUsd, 4);
-    assert.equal(result.permanentVolumeUsd, 20);
-    assert.equal(result.unlockedRewardUsd, 4);
+test('$50 cashout at an 8% owner cut unlocks exactly 35% of the paid cut', () => {
+    const result = calculatePermanentRewardAllocation({ grossCashoutUsd: 50, ownerCutUsd: 4 });
+    assert.equal(result.rewardContributionUsd, 1.4);
+    assert.equal(result.poolFundingUsd, 1.6);
+    assert.equal(result.ownerSurplusUsd, 0.2);
+    assert.equal(result.unlockedRewardUsd, 1.4);
     assert.equal(result.cyclesCompleted, 1);
     assert.equal(result.nextProgressVolumeUsd, 0);
 });
 
-test('permanent rewards carry progress across mixed normal entry tiers', () => {
-    const first = calculatePermanentRewardAllocation({ entryFeeUsd: 5 });
+test('reward follows the actual charged owner cut instead of a hardcoded gross rate', () => {
+    const result = calculatePermanentRewardAllocation({ grossCashoutUsd: 50, ownerCutUsd: 5 });
+    assert.equal(result.unlockedRewardUsd, 1.75);
+    assert.equal(result.poolFundingUsd, 2);
+    assert.equal(result.ownerSurplusUsd, 0.25);
+});
+
+test('cashout progress carries across transactions', () => {
+    const first = calculatePermanentRewardAllocation({ grossCashoutUsd: 20, ownerCutUsd: 1.6 });
     const second = calculatePermanentRewardAllocation({
-        entryFeeUsd: 10,
+        grossCashoutUsd: 30,
+        ownerCutUsd: 2.4,
         progressVolumeUsdMicros: first.nextProgressVolumeUsdMicros,
+        progressRewardUsdMicros: first.nextProgressRewardUsdMicros,
     });
-    const third = calculatePermanentRewardAllocation({
-        entryFeeUsd: 5,
-        progressVolumeUsdMicros: second.nextProgressVolumeUsdMicros,
-    });
-    assert.equal(first.nextProgressVolumeUsd, 5);
-    assert.equal(second.nextProgressVolumeUsd, 15);
-    assert.equal(third.unlockedRewardUsd, 4);
-    assert.equal(third.nextProgressVolumeUsd, 0);
+    assert.equal(first.nextProgressVolumeUsd, 20);
+    assert.equal(first.nextProgressRewardUsd, 0.56);
+    assert.equal(second.unlockedRewardUsd, 1.4);
+    assert.equal(second.nextProgressVolumeUsd, 0);
 });
 
-test('ten $2 Normal entries unlock one full recurring reward', () => {
-    let progressVolumeUsdMicros = 0;
-    let unlockedRewardUsd = 0;
-    for (let index = 0; index < 10; index += 1) {
-        const result = calculatePermanentRewardAllocation({ entryFeeUsd: 2, progressVolumeUsdMicros });
-        progressVolumeUsdMicros = result.nextProgressVolumeUsdMicros;
-        unlockedRewardUsd += result.unlockedRewardUsd;
-    }
-    assert.equal(progressVolumeUsdMicros, 0);
-    assert.equal(unlockedRewardUsd, 4);
-});
-
-test('starter funding receives priority without double-counting permanent rewards', () => {
+test('a cashout crossing a cycle keeps the tail reward pending', () => {
     const result = calculatePermanentRewardAllocation({
-        entryFeeUsd: 10,
-        starterFundingRemainingUsd: 1.25,
+        grossCashoutUsd: 10,
+        ownerCutUsd: 0.8,
+        progressVolumeUsdMicros: 45_000_000,
+        progressRewardUsdMicros: 1_260_000,
     });
-    assert.equal(result.contributionUsd, 2);
-    assert.equal(result.starterFundingUsd, 1.25);
-    assert.equal(result.permanentFundingUsd, 0.75);
-    assert.equal(result.permanentVolumeUsd, 3.75);
-    assert.equal(result.unlockedRewardUsd, 0);
+    assert.equal(result.unlockedRewardUsd, 1.4);
+    assert.equal(result.nextProgressVolumeUsd, 5);
+    assert.equal(result.nextProgressRewardUsd, 0.14);
 });
 
-test('serialization exposes the current cycle and lifetime totals', () => {
+test('multiple cycles can unlock in one large cashout', () => {
+    const result = calculatePermanentRewardAllocation({ grossCashoutUsd: 105, ownerCutUsd: 8.4 });
+    assert.equal(result.cyclesCompleted, 2);
+    assert.equal(result.unlockedRewardUsd, 2.8);
+    assert.equal(result.nextProgressVolumeUsd, 5);
+    assert.equal(result.nextProgressRewardUsd, 0.14);
+});
+
+test('serialization exposes the $50 cycle and pending fee-based reward', () => {
     const data = serializePermanentRewards({
         permanentRewardProgressVolumeUsdMicros: PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS / 2,
-        permanentRewardsBalanceUsdMicros: 8_000_000,
-        permanentRewardLifetimeVolumeUsdMicros: 55_000_000,
-        permanentRewardLifetimeEarnedUsdMicros: 8_000_000,
+        permanentRewardProgressEarnedUsdMicros: 700_000,
+        permanentRewardsBalanceUsdMicros: 2_800_000,
+        permanentRewardLifetimeVolumeUsdMicros: 100_000_000,
+        permanentRewardLifetimeEarnedUsdMicros: 2_800_000,
         permanentRewardCyclesCompleted: 2,
-        sponsoredRewardsBalance: 5,
-        fundedRewardsUsd: 3,
     });
-    assert.equal(data.progressVolumeUsd, 10);
+    assert.equal(data.cycleVolumeUsd, 50);
+    assert.equal(data.rewardPerCycleUsd, 1.4);
+    assert.equal(data.progressVolumeUsd, 25);
+    assert.equal(data.progressRewardUsd, 0.7);
     assert.equal(data.progressPct, 50);
-    assert.equal(data.volumeRemainingUsd, 10);
-    assert.equal(data.balanceUsd, 8);
-    assert.equal(data.cyclesCompleted, 2);
-    assert.equal(data.starterFundingRemainingUsd, 2);
+    assert.equal(data.volumeRemainingUsd, 25);
 });
 
-test('partial cycle funding remains reserved before it becomes claimable', () => {
-    assert.equal(permanentProgressReserveUsd(5_000_000), 1);
-    assert.equal(permanentProgressReserveUsd(19_999_999), 4);
+test('partial-cycle liability uses the tracked owner-cut reward amount', () => {
+    assert.equal(permanentProgressReserveUsd(700_000), 0.7);
 });

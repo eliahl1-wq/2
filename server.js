@@ -97,6 +97,7 @@ import {
     markClaimBroadcast,
     recordDepositSource,
     reducePendingRewardUsd,
+    rollbackRewardFundingUsd,
     reserveRewardClaim,
     resetRewardPoolAccounting,
     resolveRewardSecurityAlert,
@@ -347,6 +348,8 @@ const UserSchema = new mongoose.Schema({
     sponsoredRewardsBalance: { type: Number, default: 0 }, // USD-denominated promotional reward
     fundedRewardsUsd: { type: Number, default: 0 }, // Amount of the reward that has been funded by the player's game entries
     permanentRewardProgressVolumeUsdMicros: { type: Number, default: 0 },
+    permanentRewardProgressEarnedUsdMicros: { type: Number, default: 0 },
+    permanentRewardModelVersion: { type: Number, default: 3 },
     permanentRewardsBalanceUsdMicros: { type: Number, default: 0 },
     permanentRewardLifetimeVolumeUsdMicros: { type: Number, default: 0 },
     permanentRewardLifetimeEarnedUsdMicros: { type: Number, default: 0 },
@@ -536,6 +539,119 @@ TransactionSchema.post('save', async function(doc) {
             { $unset: { 'meta.challengeProgressApplied': 1, 'meta.challengeProgressAppliedAt': 1 } },
         ).catch(() => {});
         console.error('Error in Transaction post-save challenge processing:', err.message);
+    }
+});
+
+TransactionSchema.post('save', async function applyPermanentCashoutRewardHook(doc) {
+    const meta = doc.meta || {};
+    const grossCashoutUsd = Number.isSafeInteger(meta.grossCashoutUsdMicros)
+        ? meta.grossCashoutUsdMicros / 1_000_000
+        : Number(meta.dollarBalance) || 0;
+    const ownerCutUsd = Number.isSafeInteger(meta.platformFeeUsdMicros)
+        ? meta.platformFeeUsdMicros / 1_000_000
+        : Number(meta.platformFee) || 0;
+    const eligible = doc.status === 'confirmed'
+        && doc.type === 'withdraw'
+        && !!doc.userId
+        && !doc.excludedFromReports
+        && !meta.simulated
+        && !meta.isFreeTicketPlay
+        && grossCashoutUsd > 0
+        && ownerCutUsd > 0
+        && /Arena Cashout|Auto Room Reset|Admin Forced Cashout/i.test(String(meta.reason || ''));
+    if (!eligible) return;
+
+    const TransactionMod = mongoose.model('Transaction');
+    const UserMod = mongoose.model('User');
+    let allocation = null;
+    let poolFunded = false;
+    try {
+        const marker = await TransactionMod.updateOne(
+            { _id: doc._id, 'meta.permanentRewardApplied': { $ne: true } },
+            { $set: { 'meta.permanentRewardApplied': true, 'meta.permanentRewardAppliedAt': new Date().toISOString() } },
+        );
+        if (!marker.modifiedCount) return;
+
+        // Old partial progress came from entry volume and cannot be mixed with
+        // fee-based cashout progress. Preserve already unlocked balances while
+        // starting the new cashout cycle cleanly once per existing account.
+        await UserMod.updateOne(
+            { _id: doc.userId, permanentRewardModelVersion: { $ne: 3 } },
+            { $set: {
+                permanentRewardProgressVolumeUsdMicros: 0,
+                permanentRewardProgressEarnedUsdMicros: 0,
+                permanentRewardModelVersion: 3,
+            } },
+        );
+        const user = await UserMod.findOne({ _id: doc.userId, rewardsDisabled: { $ne: true } })
+            .select('permanentRewardProgressVolumeUsdMicros permanentRewardProgressEarnedUsdMicros')
+            .lean();
+        if (!user) {
+            await TransactionMod.updateOne(
+                { _id: doc._id },
+                { $set: { 'meta.permanentRewardSkipped': true, 'meta.permanentRewardSkipReason': 'rewards_disabled' } },
+            );
+            return;
+        }
+
+        allocation = calculatePermanentRewardAllocation({
+            grossCashoutUsd,
+            ownerCutUsd,
+            progressVolumeUsdMicros: Number(user.permanentRewardProgressVolumeUsdMicros) || 0,
+            progressRewardUsdMicros: Number(user.permanentRewardProgressEarnedUsdMicros) || 0,
+        });
+
+        await addRewardFundingUsd(allocation.poolFundingUsd, {
+            ownerSurplusUsd: allocation.ownerSurplusUsd,
+        });
+        poolFunded = allocation.poolFundingUsd > 0;
+
+        const rewardUpdate = await UserMod.updateOne(
+            { _id: doc.userId, rewardsDisabled: { $ne: true } },
+            {
+                $inc: {
+                    permanentRewardsBalanceUsdMicros: allocation.unlockedRewardUsdMicros,
+                    permanentRewardLifetimeVolumeUsdMicros: allocation.cashoutVolumeUsdMicros,
+                    permanentRewardLifetimeEarnedUsdMicros: allocation.unlockedRewardUsdMicros,
+                    permanentRewardCyclesCompleted: allocation.cyclesCompleted,
+                },
+                $set: {
+                    permanentRewardProgressVolumeUsdMicros: allocation.nextProgressVolumeUsdMicros,
+                    permanentRewardProgressEarnedUsdMicros: allocation.nextProgressRewardUsdMicros,
+                },
+            },
+        );
+        if (!rewardUpdate.modifiedCount) throw new Error('Reward account became unavailable during cashout processing');
+
+        await TransactionMod.updateOne(
+            { _id: doc._id },
+            { $set: {
+                'meta.permanentCashoutVolumeUsd': allocation.cashoutVolumeUsd,
+                'meta.permanentOwnerCutUsd': allocation.ownerCutUsd,
+                'meta.permanentPoolFundingUsd': allocation.poolFundingUsd,
+                'meta.permanentOwnerSurplusUsd': allocation.ownerSurplusUsd,
+                'meta.permanentRewardContributionUsd': allocation.rewardContributionUsd,
+                'meta.permanentRewardUnlockedUsd': allocation.unlockedRewardUsd,
+                'meta.permanentRewardCyclesCompleted': allocation.cyclesCompleted,
+            } },
+        ).catch(error => console.error('[Permanent Rewards] Audit metadata update failed:', error.message));
+    } catch (error) {
+        if (poolFunded && allocation) {
+            await rollbackRewardFundingUsd(allocation.poolFundingUsd, {
+                ownerSurplusUsd: allocation.ownerSurplusUsd,
+            }).catch(() => {});
+        }
+        await TransactionMod.updateOne(
+            { _id: doc._id },
+            {
+                $unset: { 'meta.permanentRewardApplied': 1, 'meta.permanentRewardAppliedAt': 1 },
+                $set: {
+                    'meta.permanentRewardError': String(error.message || error).slice(0, 500),
+                    'meta.permanentRewardErrorAt': new Date().toISOString(),
+                },
+            },
+        ).catch(() => {});
+        console.error('[Permanent Rewards] Cashout processing failed:', error.message);
     }
 });
 
@@ -1707,7 +1823,7 @@ async function sweepHouseWalletOnReset() {
     if (totalSweepLamports <= 0) return;
 
     // Persisted contributions survive restarts. Fund the reward wallet for all
-    // player liabilities, tracked owner surplus, and the permanent $0.50 buffer.
+    // player liabilities and the separately tracked owner safety surplus.
     const rewardState = await hydrateRewardPoolState();
     const pendingRewardUsd = Math.max(0, Number(rewardState.pendingHouseUsd) || 0);
     let rewardSweepLamports = 0;
@@ -3392,14 +3508,14 @@ async function getRewardWalletLiabilityUsd() {
         _id: null,
         sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
         permanentUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
-        permanentProgressVolumeUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressVolumeUsdMicros', 0] } },
+        permanentProgressRewardUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressEarnedUsdMicros', 0] } },
         rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
         reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
     } }]);
     return Math.max(0,
         (liabilities[0]?.sponsoredUsd || 0)
         + ((liabilities[0]?.permanentUsdMicros || 0) / 1_000_000)
-        + permanentProgressReserveUsd(liabilities[0]?.permanentProgressVolumeUsdMicros)
+        + permanentProgressReserveUsd(liabilities[0]?.permanentProgressRewardUsdMicros)
         + (liabilities[0]?.rentFallbackUsd || 0)
         + (liabilities[0]?.reservedUsd || 0));
 }
@@ -3507,6 +3623,8 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
                     sponsoredRewardsBalance: 0,
                     fundedRewardsUsd: 0,
                     permanentRewardProgressVolumeUsdMicros: 0,
+                    permanentRewardProgressEarnedUsdMicros: 0,
+                    permanentRewardModelVersion: 3,
                     permanentRewardsBalanceUsdMicros: 0,
                 } });
                 return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
@@ -4260,7 +4378,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                         accountCount: { $sum: 1 },
                         totalSponsoredRewards: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
                         totalPermanentRewardsUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
-                        totalPermanentProgressVolumeUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressVolumeUsdMicros', 0] } },
+                        totalPermanentProgressRewardUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressEarnedUsdMicros', 0] } },
                         totalRetainedWinnings: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
                         activeSponsoredPlayers: { $sum: { $cond: [{ $or: [
                             { $gt: ['$sponsoredRewardsBalance', 0] },
@@ -4311,6 +4429,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerEarningsArenaSol: ownerEarnings.arenaSweepSol,
             ownerEarningsBrSol: ownerEarnings.brSweepSol,
             rewardPoolBalanceUsd: Number(getCachedPendingRewardUsd().toFixed(2)),
+            rewardOwnerSurplusUsd: Number((Number(rewardPoolState?.ownerSurplusUsd) || 0).toFixed(6)),
             totalAccounts,
             totalUserBalanceSol: Number(totalUserBalanceSol.toFixed(6)),
             totalUserBalanceUsd: Number((totalUserBalanceSol * SOL_PRICE_USD).toFixed(2)),
@@ -4319,7 +4438,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerAccountBalanceUsd: Number((ownerAccountBalanceSol * SOL_PRICE_USD).toFixed(2)),
             totalSponsoredRewards: userBalanceAgg[0]?.totalSponsoredRewards ?? 0,
             totalPermanentRewards: (userBalanceAgg[0]?.totalPermanentRewardsUsdMicros ?? 0) / 1_000_000,
-            totalPermanentProgressReserve: permanentProgressReserveUsd(userBalanceAgg[0]?.totalPermanentProgressVolumeUsdMicros),
+            totalPermanentProgressReserve: permanentProgressReserveUsd(userBalanceAgg[0]?.totalPermanentProgressRewardUsdMicros),
             totalRetainedWinnings: userBalanceAgg[0]?.totalRetainedWinnings ?? 0,
             activeSponsoredPlayers: userBalanceAgg[0]?.activeSponsoredPlayers ?? 0,
             completedBeginnerChallenges: userBalanceAgg[0]?.completedBeginnerChallenges ?? 0,
@@ -4515,7 +4634,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
         const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardProgressEarnedUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const realGameBaseMatch = {
             status: 'confirmed',
@@ -6105,6 +6224,185 @@ app.post('/api/admin/affiliate-pool/factory-reset', sensitiveRateLimit({ limit: 
     }
 });
 
+app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, res) => {
+    if (rewardPoolAdminResetting) {
+        return res.status(409).json({ message: 'Reward pool maintenance is already running.' });
+    }
+    rewardPoolAdminResetting = true;
+    let sweepId = null;
+    let signature = null;
+    try {
+        if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
+            return res.status(400).json({ message: 'Reward wallet or owner vault is not configured.' });
+        }
+        if (await RewardClaim.exists({ status: { $in: ['reserved', 'broadcast'] } })) {
+            return res.status(409).json({ message: 'Wait for active reward claims to finish.' });
+        }
+
+        const currentState = await hydrateRewardPoolState();
+        const existingSweep = currentState.ownerSurplusSweep;
+        if (existingSweep?.status === 'broadcast' && existingSweep.signature) {
+            const result = await connection.getSignatureStatuses([existingSweep.signature], { searchTransactionHistory: true });
+            const chainStatus = result.value[0];
+            if (!chainStatus) return res.status(409).json({ message: 'The previous surplus withdrawal is still awaiting confirmation.' });
+            if (chainStatus.err) {
+                await RewardPoolState.updateOne(
+                    { key: 'global', 'ownerSurplusSweep.sweepId': existingSweep.sweepId },
+                    { $set: { ownerSurplusReservedUsd: 0, 'ownerSurplusSweep.status': 'failed', 'ownerSurplusSweep.error': JSON.stringify(chainStatus.err) } },
+                );
+                return res.status(409).json({ message: 'The previous surplus withdrawal failed on-chain and was released.' });
+            }
+            if (!['confirmed', 'finalized'].includes(chainStatus.confirmationStatus)) {
+                return res.status(409).json({ message: 'The previous surplus withdrawal is still processing.' });
+            }
+            const completedUsd = Math.max(0, Number(existingSweep.amountUsd) || 0);
+            await RewardPoolState.updateOne(
+                { key: 'global', 'ownerSurplusSweep.sweepId': existingSweep.sweepId, 'ownerSurplusSweep.status': 'broadcast' },
+                {
+                    $inc: { ownerSurplusUsd: -completedUsd, totalOwnerSurplusSweptUsd: completedUsd },
+                    $set: { ownerSurplusReservedUsd: 0, 'ownerSurplusSweep.status': 'confirmed', 'ownerSurplusSweep.error': null },
+                },
+            );
+            const existingAudit = await Transaction.findOne({
+                'meta.event': 'reward_owner_surplus_sweep',
+                'meta.signature': existingSweep.signature,
+            }).select('_id').lean();
+            if (!existingAudit) {
+                await Transaction.create({
+                    userId: req.user.id,
+                    type: 'withdraw',
+                    amount: Number(existingSweep.solAmount) || 0,
+                    currency: 'SOL',
+                    meta: {
+                        event: 'reward_owner_surplus_sweep',
+                        reason: 'Reward Safety Surplus Withdrawal',
+                        amountUsd: completedUsd,
+                        solAmount: Number(existingSweep.solAmount) || 0,
+                        signature: existingSweep.signature,
+                        from: REWARD_WALLET_ADDRESS,
+                        destination: OWNER_VAULT_ADDRESS,
+                    },
+                    status: 'confirmed',
+                }).catch(error => console.error('[Reward Surplus] Reconciled audit log failed:', error.message));
+            }
+            return res.json({ success: true, message: `Reward safety surplus withdrawn: $${completedUsd.toFixed(4)}.`, signature: existingSweep.signature });
+        }
+        if (['reserved', 'broadcast'].includes(existingSweep?.status)) {
+            return res.status(409).json({ message: 'A reward surplus withdrawal is already in progress.' });
+        }
+
+        const trackedSurplusUsd = Math.max(0, Number(currentState.ownerSurplusUsd) || 0);
+        if (trackedSurplusUsd <= 0) return res.status(400).json({ message: 'No reward safety surplus is available.' });
+
+        const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex')));
+        if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
+            return res.status(500).json({ message: 'Reward wallet address does not match configured secret.' });
+        }
+        const [walletLamports, liabilityUsd, rentMinimum, latest] = await Promise.all([
+            connection.getBalance(rewardKeypair.publicKey),
+            getRewardWalletLiabilityUsd(),
+            getSystemAccountRentLamports(),
+            connection.getLatestBlockhash('confirmed'),
+        ]);
+        const liabilityLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+        const feeBufferLamports = 15_000;
+        const onChainSurplusLamports = Math.max(0, walletLamports - rentMinimum - liabilityLamports - feeBufferLamports);
+        const trackedSurplusLamports = Math.floor((trackedSurplusUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+        const sweepLamports = Math.min(onChainSurplusLamports, trackedSurplusLamports);
+        if (sweepLamports <= 0) {
+            return res.status(409).json({ message: 'The tracked surplus has not reached the reward wallet yet or is needed as liquidity.' });
+        }
+        if (!await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, sweepLamports)) {
+            return res.status(409).json({ message: 'The surplus is still below the receiving wallet rent minimum.' });
+        }
+
+        const amountUsd = (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD;
+        sweepId = randomBytes(16).toString('hex');
+        const reserved = await RewardPoolState.findOneAndUpdate(
+            { key: 'global', 'ownerSurplusSweep.status': { $nin: ['reserved', 'broadcast'] } },
+            { $set: {
+                ownerSurplusReservedUsd: amountUsd,
+                ownerSurplusSweep: {
+                    sweepId,
+                    amountUsd,
+                    solAmount: sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    status: 'reserved',
+                    signature: null,
+                    error: null,
+                    createdAt: new Date(),
+                },
+            } },
+            { new: true },
+        );
+        if (!reserved) return res.status(409).json({ message: 'Another surplus withdrawal started first.' });
+
+        const transaction = new solanaWeb3.Transaction({ feePayer: rewardKeypair.publicKey, recentBlockhash: latest.blockhash })
+            .add(solanaWeb3.SystemProgram.transfer({
+                fromPubkey: rewardKeypair.publicKey,
+                toPubkey: new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS),
+                lamports: sweepLamports,
+            }));
+        transaction.sign(rewardKeypair);
+        signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: false, maxRetries: 3 });
+        await RewardPoolState.updateOne(
+            { key: 'global', 'ownerSurplusSweep.sweepId': sweepId, 'ownerSurplusSweep.status': 'reserved' },
+            { $set: { 'ownerSurplusSweep.status': 'broadcast', 'ownerSurplusSweep.signature': signature } },
+        );
+        const confirmation = await connection.confirmTransaction({
+            signature,
+            blockhash: latest.blockhash,
+            lastValidBlockHeight: latest.lastValidBlockHeight,
+        }, 'confirmed');
+        if (confirmation.value.err) throw new Error(`Surplus withdrawal failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+
+        await RewardPoolState.updateOne(
+            { key: 'global', 'ownerSurplusSweep.sweepId': sweepId, 'ownerSurplusSweep.status': 'broadcast' },
+            {
+                $inc: { ownerSurplusUsd: -amountUsd, totalOwnerSurplusSweptUsd: amountUsd },
+                $set: { ownerSurplusReservedUsd: 0, 'ownerSurplusSweep.status': 'confirmed', 'ownerSurplusSweep.error': null },
+            },
+        );
+        await Transaction.create({
+            userId: req.user.id,
+            type: 'withdraw',
+            amount: sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+            currency: 'SOL',
+            meta: {
+                event: 'reward_owner_surplus_sweep',
+                reason: 'Reward Safety Surplus Withdrawal',
+                amountUsd,
+                solAmount: sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                signature,
+                from: REWARD_WALLET_ADDRESS,
+                destination: OWNER_VAULT_ADDRESS,
+            },
+            status: 'confirmed',
+        }).catch(error => console.error('[Reward Surplus] Audit log failed:', error.message));
+        return res.json({ success: true, message: `Reward safety surplus withdrawn: $${amountUsd.toFixed(4)}.`, signature });
+    } catch (error) {
+        if (sweepId) {
+            await RewardPoolState.updateOne(
+                { key: 'global', 'ownerSurplusSweep.sweepId': sweepId },
+                { $set: {
+                    ...(signature ? {} : { ownerSurplusReservedUsd: 0 }),
+                    ...(signature ? { 'ownerSurplusSweep.signature': signature } : {}),
+                    'ownerSurplusSweep.status': signature ? 'broadcast' : 'failed',
+                    'ownerSurplusSweep.error': String(error.message || error).slice(0, 500),
+                } },
+            ).catch(() => {});
+        }
+        await logSolanaTransactionError('[Reward Surplus] Withdrawal failed:', error);
+        return res.status(signature ? 202 : 500).json({
+            message: signature
+                ? 'Surplus withdrawal was submitted and remains locked while confirmation is checked.'
+                : error.message,
+            signature,
+        });
+    } finally {
+        rewardPoolAdminResetting = false;
+    }
+});
+
 app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, res) => {
     if (req.body?.confirmation !== 'RESET REWARD POOL') {
         return res.status(400).json({ message: 'Exact confirmation phrase required.' });
@@ -6129,7 +6427,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
                 _id: null,
                 sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
                 permanentUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
-                permanentProgressVolumeUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressVolumeUsdMicros', 0] } },
+                permanentProgressRewardUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressEarnedUsdMicros', 0] } },
                 rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
                 reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
             } }]),
@@ -6139,7 +6437,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
         const liabilityUsd = Math.max(0,
             (liabilities[0]?.sponsoredUsd || 0)
             + ((liabilities[0]?.permanentUsdMicros || 0) / 1_000_000)
-            + permanentProgressReserveUsd(liabilities[0]?.permanentProgressVolumeUsdMicros)
+            + permanentProgressReserveUsd(liabilities[0]?.permanentProgressRewardUsdMicros)
             + (liabilities[0]?.rentFallbackUsd || 0)
             + (liabilities[0]?.reservedUsd || 0));
         if (['reserved', 'broadcast'].includes(currentRewardState?.ownerSurplusSweep?.status)) {
@@ -6222,6 +6520,8 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             sponsoredRewardsBalance: 0,
             fundedRewardsUsd: 0,
             permanentRewardProgressVolumeUsdMicros: 0,
+            permanentRewardProgressEarnedUsdMicros: 0,
+            permanentRewardModelVersion: 3,
             permanentRewardsBalanceUsdMicros: 0,
             permanentRewardLifetimeVolumeUsdMicros: 0,
             permanentRewardLifetimeEarnedUsdMicros: 0,
@@ -6245,6 +6545,8 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             sponsoredRewardsBalance: 0,
             fundedRewardsUsd: 0,
             permanentRewardProgressVolumeUsdMicros: 0,
+            permanentRewardProgressEarnedUsdMicros: 0,
+            permanentRewardModelVersion: 3,
             permanentRewardsBalanceUsdMicros: 0,
             permanentRewardLifetimeVolumeUsdMicros: 0,
             permanentRewardLifetimeEarnedUsdMicros: 0,
@@ -6268,6 +6570,7 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
                 'snapshots.$[].sponsoredRewardsBalance': 0,
                 'snapshots.$[].fundedRewardsUsd': 0,
                 'snapshots.$[].permanentRewardProgressVolumeUsdMicros': 0,
+                'snapshots.$[].permanentRewardProgressEarnedUsdMicros': 0,
                 'snapshots.$[].permanentRewardsBalanceUsdMicros': 0,
                 'snapshots.$[].permanentRewardLifetimeVolumeUsdMicros': 0,
                 'snapshots.$[].permanentRewardLifetimeEarnedUsdMicros': 0,
@@ -6412,13 +6715,21 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db"
 
 mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .then(async () => {
+        const permanentRewardMigration = await User.updateMany(
+            { permanentRewardModelVersion: { $ne: 3 } },
+            { $set: {
+                permanentRewardProgressVolumeUsdMicros: 0,
+                permanentRewardProgressEarnedUsdMicros: 0,
+                permanentRewardModelVersion: 3,
+            } },
+        );
         await Promise.all([
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
         ]);
         await releaseMatureAffiliateCommissions();
         const reconciliation = await reconcileAffiliateCommissions(Transaction);
-        console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
+        console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Permanent reward migration: ${permanentRewardMigration.modifiedCount}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
     })
     .catch(err => console.error("Kunde inte ansluta:", err));
 
@@ -7414,7 +7725,7 @@ async function rollbackJoinEconomy(pending, reason) {
     room.freeTicketBotTargets = { ...pending.freeTicketBotTargets };
 
     if (pending.rewardFundingUsd > 0) {
-        await reducePendingRewardUsd(pending.rewardFundingUsd);
+        await rollbackRewardFundingUsd(pending.rewardFundingUsd);
         if (pending.rewardUserState) {
             await User.updateOne(
                 { _id: pending.userId },
@@ -8374,33 +8685,29 @@ io.on('connection', (socket) => {
                 }
             }
 
-            // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population)
-            // Every paid normal entry reserves 20% for rewards. An unfinished
-            // starter reward is funded first; the remainder advances the
-            // permanent $20 volume -> $4 reward cycle.
+            // DYNAMIC ECONOMY SPLIT (scaled to entry tier, per mode population).
+            // Entry funding is only retained while finishing the one-time
+            // starter reward. Recurring rewards now come from confirmed
+            // cashout fees, never from the player's entry value.
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
             const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
             let foodAlloc, aiAlloc, rewardContribution = 0, ownerContribution = 0;
-            let permanentRewardAllocation = null;
+            let starterFundingUsd = 0;
 
             if (!freePlay && !isFreeTicketPlay) {
-                const rpSplit = getRewardPoolSplit(entryFeeUsd);
-                foodAlloc = rpSplit.food;
-                aiAlloc = rpSplit.ai;
-
-                if (user.rewardsDisabled) {
-                    ownerContribution = rpSplit.rewardPoolContribution + rpSplit.ownerVaultContribution;
+                const remainingToFund = !user.rewardsDisabled && !user.sponsoredRewardsCompleted
+                    ? Math.max(0, (user.sponsoredRewardsBalance || 0) - (user.fundedRewardsUsd || 0))
+                    : 0;
+                if (remainingToFund > 0) {
+                    const rpSplit = getRewardPoolSplit(entryFeeUsd);
+                    starterFundingUsd = Math.min(rpSplit.rewardPoolContribution, remainingToFund);
+                    rewardContribution = starterFundingUsd;
+                    foodAlloc = rpSplit.food + (rpSplit.rewardPoolContribution - starterFundingUsd);
+                    aiAlloc = rpSplit.ai;
                 } else {
-                    const remainingToFund = user.sponsoredRewardsCompleted
-                        ? 0
-                        : Math.max(0, (user.sponsoredRewardsBalance || 0) - (user.fundedRewardsUsd || 0));
-                    permanentRewardAllocation = calculatePermanentRewardAllocation({
-                        entryFeeUsd,
-                        starterFundingRemainingUsd: remainingToFund,
-                        progressVolumeUsdMicros: user.permanentRewardProgressVolumeUsdMicros || 0,
-                    });
-                    rewardContribution = permanentRewardAllocation.contributionUsd;
-                    ownerContribution = rpSplit.ownerVaultContribution;
+                    const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
+                    foodAlloc = stdSplit.food;
+                    aiAlloc = stdSplit.ai;
                 }
             } else {
                 const stdSplit = getJoinPoolSplit(entryFeeUsd, modeHumansAfterJoin);
@@ -8430,13 +8737,8 @@ io.on('connection', (socket) => {
                 slitherBots: [...room.slitherBots],
                 freeTicketBotTargets: { ...(room.freeTicketBotTargets || { agar: 0, slither: 0 }) },
                 rewardFundingUsd: 0,
-                rewardUserState: permanentRewardAllocation ? {
+                rewardUserState: starterFundingUsd > 0 ? {
                     fundedRewardsUsd: Number(user.fundedRewardsUsd) || 0,
-                    permanentRewardProgressVolumeUsdMicros: Number(user.permanentRewardProgressVolumeUsdMicros) || 0,
-                    permanentRewardsBalanceUsdMicros: Number(user.permanentRewardsBalanceUsdMicros) || 0,
-                    permanentRewardLifetimeVolumeUsdMicros: Number(user.permanentRewardLifetimeVolumeUsdMicros) || 0,
-                    permanentRewardLifetimeEarnedUsdMicros: Number(user.permanentRewardLifetimeEarnedUsdMicros) || 0,
-                    permanentRewardCyclesCompleted: Number(user.permanentRewardCyclesCompleted) || 0,
                 } : null,
             };
 
@@ -8459,24 +8761,10 @@ io.on('connection', (socket) => {
 
                 // Reward pool / owner vault contributions
                 if (rewardContribution > 0) {
-                    const rewardUserUpdate = permanentRewardAllocation ? {
-                        $inc: {
-                            fundedRewardsUsd: permanentRewardAllocation.starterFundingUsd,
-                            permanentRewardsBalanceUsdMicros: permanentRewardAllocation.unlockedRewardUsdMicros,
-                            permanentRewardLifetimeVolumeUsdMicros: permanentRewardAllocation.permanentVolumeUsdMicros,
-                            permanentRewardLifetimeEarnedUsdMicros: permanentRewardAllocation.unlockedRewardUsdMicros,
-                            permanentRewardCyclesCompleted: permanentRewardAllocation.cyclesCompleted,
-                        },
-                        $set: {
-                            permanentRewardProgressVolumeUsdMicros: permanentRewardAllocation.nextProgressVolumeUsdMicros,
-                        },
-                    } : null;
                     await addRewardFundingUsd(rewardContribution);
                     pendingJoinEconomy.rewardFundingUsd = rewardContribution;
-                    if (rewardUserUpdate) {
-                        await User.updateOne({ _id: user._id }, rewardUserUpdate);
-                    }
-                    console.log(`🏆 REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${getCachedPendingRewardUsd().toFixed(2)}`);
+                    await User.updateOne({ _id: user._id }, { $inc: { fundedRewardsUsd: starterFundingUsd } });
+                    console.log(`🏆 STARTER REWARD POOL: +$${rewardContribution.toFixed(2)} from ${user.username} ($${entryFeeUsd} entry). Pool total: $${getCachedPendingRewardUsd().toFixed(2)}`);
                     Transaction.create({
                         userId: user._id,
                         type: 'game',
@@ -8485,11 +8773,7 @@ io.on('connection', (socket) => {
                             event: 'reward_pool_contribution',
                             entryFeeUsd,
                             contributionUsd: rewardContribution,
-                            starterFundingUsd: permanentRewardAllocation?.starterFundingUsd || 0,
-                            permanentFundingUsd: permanentRewardAllocation?.permanentFundingUsd || 0,
-                            permanentVolumeUsd: permanentRewardAllocation?.permanentVolumeUsd || 0,
-                            permanentRewardUnlockedUsd: permanentRewardAllocation?.unlockedRewardUsd || 0,
-                            permanentRewardCyclesCompleted: permanentRewardAllocation?.cyclesCompleted || 0,
+                            starterFundingUsd,
                             roomId: room.id,
                             mode: gameMode,
                         },

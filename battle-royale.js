@@ -26,7 +26,7 @@ export const BR = {
     shrinkIntervalMs: 45_000,
     shrinkFactor: 0.72,
     minZoneRadius: 380,
-    houseFeePct: 0.025,
+    houseFeePct: 0.08,
     agarStartBalance: 1.0,
     agarFoodPerPlayer: 140,
     agarFoodMin: 350,

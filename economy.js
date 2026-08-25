@@ -96,17 +96,17 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
 }
 
 /**
- * Modified entry split for users who have NOT completed Sponsored Rewards.
+ * Modified entry split only while a user's one-time starter reward is being funded.
  * Allocations (of entry fee):
  *   20 % → player start balance (deducted before this split)
  *   40 % → food pool (includes 10 % golden blob deducted in join handler)
  *   20 % → bots (AI budget)
- *   20 % → rewards (starter funding first, then the permanent reward cycle)
+ *   20 % → starter reward funding
  *
  * Dollar amounts:
  *   $5:  start $1.00, food $2.00, bots $1.00, reward $1.00
  *   $10: start $2.00, food $4.00, bots $2.00, reward $2.00
- *   $20: start $4.00, food $8.00, bots $4.00, rewards $4.00
+ *   $20: start $4.00, food $8.00, bots $4.00, starter reward $4.00
  *
  * Returns { food, ai, rewardPoolContribution, ownerVaultContribution }.
  * food includes golden blob — join handler subtracts it before adding to foodPoolBalance.

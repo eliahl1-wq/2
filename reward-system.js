@@ -61,6 +61,7 @@ const RewardSecurityAlertSchema = new mongoose.Schema({
         sponsoredRewardsBalance: Number,
         fundedRewardsUsd: Number,
         permanentRewardProgressVolumeUsdMicros: Number,
+        permanentRewardProgressEarnedUsdMicros: Number,
         permanentRewardsBalanceUsdMicros: Number,
         permanentRewardLifetimeVolumeUsdMicros: Number,
         permanentRewardLifetimeEarnedUsdMicros: Number,
@@ -113,15 +114,30 @@ export function getCachedPendingRewardUsd() {
     return cachedPendingHouseUsd;
 }
 
-export async function addRewardFundingUsd(amountUsd) {
+export async function addRewardFundingUsd(amountUsd, { ownerSurplusUsd = 0 } = {}) {
     const amount = Math.max(0, Number(amountUsd) || 0);
     if (!amount) return cachedPendingHouseUsd;
+    const surplus = Math.min(amount, Math.max(0, Number(ownerSurplusUsd) || 0));
     const state = await RewardPoolState.findOneAndUpdate(
         { key: 'global' },
-        { $inc: { pendingHouseUsd: amount, totalFundedUsd: amount } },
+        { $inc: { pendingHouseUsd: amount, totalFundedUsd: amount, ownerSurplusUsd: surplus } },
         { upsert: true, new: true },
     );
     cachedPendingHouseUsd = Math.max(0, Number(state.pendingHouseUsd) || 0);
+    return cachedPendingHouseUsd;
+}
+
+export async function rollbackRewardFundingUsd(amountUsd, { ownerSurplusUsd = 0 } = {}) {
+    const amount = Math.max(0, Number(amountUsd) || 0);
+    if (!amount) return cachedPendingHouseUsd;
+    const surplus = Math.min(amount, Math.max(0, Number(ownerSurplusUsd) || 0));
+    const state = await RewardPoolState.findOne({ key: 'global' });
+    if (!state) return cachedPendingHouseUsd;
+    state.pendingHouseUsd = Math.max(0, (Number(state.pendingHouseUsd) || 0) - amount);
+    state.totalFundedUsd = Math.max(0, (Number(state.totalFundedUsd) || 0) - amount);
+    state.ownerSurplusUsd = Math.max(0, (Number(state.ownerSurplusUsd) || 0) - surplus);
+    await state.save();
+    cachedPendingHouseUsd = state.pendingHouseUsd;
     return cachedPendingHouseUsd;
 }
 
@@ -157,6 +173,8 @@ export async function resetRewardPoolAccounting() {
             totalFundedUsd: 0,
             totalSweptUsd: 0,
             totalClaimedUsd: 0,
+            ownerSurplusUsd: 0,
+            ownerSurplusReservedUsd: 0,
         } },
         { upsert: true, new: true },
     );
@@ -346,6 +364,7 @@ async function snapshotUser(user) {
         sponsoredRewardsBalance: user.sponsoredRewardsBalance || 0,
         fundedRewardsUsd: user.fundedRewardsUsd || 0,
         permanentRewardProgressVolumeUsdMicros: user.permanentRewardProgressVolumeUsdMicros || 0,
+        permanentRewardProgressEarnedUsdMicros: user.permanentRewardProgressEarnedUsdMicros || 0,
         permanentRewardsBalanceUsdMicros: user.permanentRewardsBalanceUsdMicros || 0,
         permanentRewardLifetimeVolumeUsdMicros: user.permanentRewardLifetimeVolumeUsdMicros || 0,
         permanentRewardLifetimeEarnedUsdMicros: user.permanentRewardLifetimeEarnedUsdMicros || 0,
@@ -422,6 +441,7 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
                     sponsoredRewardsBalance: 0,
                     fundedRewardsUsd: 0,
                     permanentRewardProgressVolumeUsdMicros: 0,
+                    permanentRewardProgressEarnedUsdMicros: 0,
                     permanentRewardsBalanceUsdMicros: 0,
                 },
             },
@@ -449,6 +469,7 @@ async function restoreSharedWalletSnapshot(User, alert, snapshot) {
             sponsoredRewardsCompleted: snapshot.sponsoredRewardsCompleted,
             sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, current.sponsoredRewardsBalance || 0),
             permanentRewardProgressVolumeUsdMicros: snapshot.permanentRewardProgressVolumeUsdMicros || 0,
+            permanentRewardProgressEarnedUsdMicros: snapshot.permanentRewardProgressEarnedUsdMicros || 0,
             permanentRewardsBalanceUsdMicros: Math.max(snapshot.permanentRewardsBalanceUsdMicros || 0, current.permanentRewardsBalanceUsdMicros || 0),
             permanentRewardLifetimeVolumeUsdMicros: Math.max(snapshot.permanentRewardLifetimeVolumeUsdMicros || 0, current.permanentRewardLifetimeVolumeUsdMicros || 0),
             permanentRewardLifetimeEarnedUsdMicros: Math.max(snapshot.permanentRewardLifetimeEarnedUsdMicros || 0, current.permanentRewardLifetimeEarnedUsdMicros || 0),
@@ -531,6 +552,7 @@ export async function resolveRewardSecurityAlert(alertId, action, adminUserId, n
                     sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, (await User.findById(snapshot.userId).lean())?.sponsoredRewardsBalance || 0),
                     fundedRewardsUsd: snapshot.fundedRewardsUsd || 0,
                     permanentRewardProgressVolumeUsdMicros: snapshot.permanentRewardProgressVolumeUsdMicros || 0,
+                    permanentRewardProgressEarnedUsdMicros: snapshot.permanentRewardProgressEarnedUsdMicros || 0,
                     permanentRewardsBalanceUsdMicros: snapshot.permanentRewardsBalanceUsdMicros || 0,
                     permanentRewardLifetimeVolumeUsdMicros: snapshot.permanentRewardLifetimeVolumeUsdMicros || 0,
                     permanentRewardLifetimeEarnedUsdMicros: snapshot.permanentRewardLifetimeEarnedUsdMicros || 0,

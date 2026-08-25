@@ -84,9 +84,9 @@ export function calculateTournamentPrizes(participants, potUsd, potLamports) {
     const winnerCount = Math.min(TOURNAMENT_PRIZE_SPLITS.length, ranked.length);
     if (!winnerCount) return [];
 
-    // Deduct 5% fee from the pot, leaving it in the tournament wallet
-    const prizePotUsd = Number(potUsd) * 0.95;
-    const prizePotLamports = Math.floor(Number(potLamports) * 0.95);
+    // Deduct the global 8% owner cut from the pot, leaving it in the tournament wallet.
+    const prizePotUsd = Number(potUsd) * 0.92;
+    const prizePotLamports = Math.floor(Number(potLamports) * 0.92);
 
     // If fewer than three people entered, normalize the available placement shares
     // so the net prize pot still belongs to the tournament players.
@@ -146,7 +146,7 @@ export function serializeTournament(doc, userId = null) {
         entryFeeUsd: value.entryFeeUsd,
         maxAttempts,
         prizeSplits: value.prizeSplits,
-        prizePotUsd: Number(((value.totalEntryFeesUsd || 0) * 0.95).toFixed(2)),
+        prizePotUsd: Number(((value.totalEntryFeesUsd || 0) * 0.92).toFixed(2)),
         totalAttempts: value.totalAttempts || 0,
         participantCount: participants.length,
         leaderboard: participants.slice(0, 10).map((p, index) => ({

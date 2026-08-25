@@ -1,63 +1,91 @@
 import {
-    BPS_SCALE,
     USD_MICROS_PER_USD,
     microsToUsd,
     multiplyMicrosByBps,
     usdToMicros,
 } from './affiliate-money.js';
 
-export const PERMANENT_REWARD_RATE_BPS = 2_000;
-export const PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS = 20 * USD_MICROS_PER_USD;
+/** Users receive 35% of the platform/owner cut paid on eligible cashouts. */
+export const PERMANENT_REWARD_OWNER_CUT_SHARE_BPS = 3_500;
+/** Reserve 40% of that cut: 35% liability + 5% safety surplus. */
+export const PERMANENT_REWARD_POOL_SHARE_BPS = 4_000;
+export const PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS = 50 * USD_MICROS_PER_USD;
+
+// Kept in the public payload for backwards-compatible clients. At the normal
+// 8% cashout fee, 35% of the cut equals 2.8% of gross cashout volume.
+export const PERMANENT_REWARD_RATE_BPS = 280;
 export const PERMANENT_REWARD_PER_CYCLE_USD_MICROS = multiplyMicrosByBps(
     PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS,
     PERMANENT_REWARD_RATE_BPS,
 );
 
-export function permanentProgressReserveUsd(progressVolumeUsdMicros = 0) {
-    const progress = Math.max(0, Math.floor(Number(progressVolumeUsdMicros) || 0));
-    return microsToUsd(multiplyMicrosByBps(progress, PERMANENT_REWARD_RATE_BPS));
+export function permanentProgressReserveUsd(progressRewardUsdMicros = 0) {
+    return microsToUsd(Math.max(0, Math.floor(Number(progressRewardUsdMicros) || 0)));
 }
 
-/**
- * Allocate the existing 20% normal-entry reward share without ever creating
- * two liabilities from the same dollar. An unfinished starter reward is
- * funded first; the remainder advances the permanent $20 -> $4 cycle.
- */
+/** Apply one confirmed cashout to the recurring reward cycle. */
 export function calculatePermanentRewardAllocation({
-    entryFeeUsd,
-    starterFundingRemainingUsd = 0,
+    grossCashoutUsd,
+    ownerCutUsd,
     progressVolumeUsdMicros = 0,
+    progressRewardUsdMicros = 0,
 }) {
-    const entryVolumeUsdMicros = usdToMicros(entryFeeUsd);
-    const contributionUsdMicros = multiplyMicrosByBps(entryVolumeUsdMicros, PERMANENT_REWARD_RATE_BPS);
-    const starterRemainingUsdMicros = usdToMicros(Math.max(0, Number(starterFundingRemainingUsd) || 0));
-    const starterFundingUsdMicros = Math.min(contributionUsdMicros, starterRemainingUsdMicros);
-    const permanentFundingUsdMicros = contributionUsdMicros - starterFundingUsdMicros;
-    const permanentVolumeUsdMicros = Number(
-        (BigInt(permanentFundingUsdMicros) * BigInt(BPS_SCALE)) / BigInt(PERMANENT_REWARD_RATE_BPS),
+    const cashoutVolumeUsdMicros = usdToMicros(grossCashoutUsd);
+    const ownerCutUsdMicros = usdToMicros(ownerCutUsd);
+    const rewardContributionUsdMicros = multiplyMicrosByBps(
+        ownerCutUsdMicros,
+        PERMANENT_REWARD_OWNER_CUT_SHARE_BPS,
     );
+    const poolFundingUsdMicros = multiplyMicrosByBps(
+        ownerCutUsdMicros,
+        PERMANENT_REWARD_POOL_SHARE_BPS,
+    );
+    const ownerSurplusUsdMicros = Math.max(0, poolFundingUsdMicros - rewardContributionUsdMicros);
 
     if (!Number.isSafeInteger(progressVolumeUsdMicros) || progressVolumeUsdMicros < 0) {
-        throw new RangeError('Permanent reward progress must be non-negative USD micros');
+        throw new RangeError('Permanent reward cashout progress must be non-negative USD micros');
     }
-    const combinedProgressUsdMicros = progressVolumeUsdMicros + permanentVolumeUsdMicros;
-    const cyclesCompleted = Math.floor(combinedProgressUsdMicros / PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS);
-    const nextProgressVolumeUsdMicros = combinedProgressUsdMicros % PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS;
-    const unlockedRewardUsdMicros = cyclesCompleted * PERMANENT_REWARD_PER_CYCLE_USD_MICROS;
+    if (!Number.isSafeInteger(progressRewardUsdMicros) || progressRewardUsdMicros < 0) {
+        throw new RangeError('Permanent reward pending amount must be non-negative USD micros');
+    }
+
+    const combinedVolumeUsdMicros = progressVolumeUsdMicros + cashoutVolumeUsdMicros;
+    const cyclesCompleted = Math.floor(combinedVolumeUsdMicros / PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS);
+    const nextProgressVolumeUsdMicros = combinedVolumeUsdMicros % PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS;
+
+    let nextProgressRewardUsdMicros = progressRewardUsdMicros + rewardContributionUsdMicros;
+    let unlockedRewardUsdMicros = 0;
+    if (cyclesCompleted > 0) {
+        // The remaining progress is the tail of this cashout. Keep its matching
+        // fee share pending and unlock everything belonging to completed cycles.
+        const pendingTailUsdMicros = cashoutVolumeUsdMicros > 0
+            ? Number(
+                (BigInt(rewardContributionUsdMicros) * BigInt(nextProgressVolumeUsdMicros))
+                / BigInt(cashoutVolumeUsdMicros)
+            )
+            : 0;
+        unlockedRewardUsdMicros = progressRewardUsdMicros
+            + rewardContributionUsdMicros
+            - pendingTailUsdMicros;
+        nextProgressRewardUsdMicros = pendingTailUsdMicros;
+    }
 
     return {
-        entryVolumeUsdMicros,
-        contributionUsdMicros,
-        contributionUsd: microsToUsd(contributionUsdMicros),
-        starterFundingUsdMicros,
-        starterFundingUsd: microsToUsd(starterFundingUsdMicros),
-        permanentFundingUsdMicros,
-        permanentFundingUsd: microsToUsd(permanentFundingUsdMicros),
-        permanentVolumeUsdMicros,
-        permanentVolumeUsd: microsToUsd(permanentVolumeUsdMicros),
+        cashoutVolumeUsdMicros,
+        cashoutVolumeUsd: microsToUsd(cashoutVolumeUsdMicros),
+        ownerCutUsdMicros,
+        ownerCutUsd: microsToUsd(ownerCutUsdMicros),
+        rewardContributionUsdMicros,
+        rewardContributionUsd: microsToUsd(rewardContributionUsdMicros),
+        poolFundingUsdMicros,
+        poolFundingUsd: microsToUsd(poolFundingUsdMicros),
+        ownerSurplusUsdMicros,
+        ownerSurplusUsd: microsToUsd(ownerSurplusUsdMicros),
         cyclesCompleted,
         nextProgressVolumeUsdMicros,
         nextProgressVolumeUsd: microsToUsd(nextProgressVolumeUsdMicros),
+        nextProgressRewardUsdMicros,
+        nextProgressRewardUsd: microsToUsd(nextProgressRewardUsdMicros),
         unlockedRewardUsdMicros,
         unlockedRewardUsd: microsToUsd(unlockedRewardUsdMicros),
     };
@@ -65,6 +93,7 @@ export function calculatePermanentRewardAllocation({
 
 export function serializePermanentRewards(user = {}) {
     const progressVolumeUsdMicros = Math.max(0, Math.floor(Number(user.permanentRewardProgressVolumeUsdMicros) || 0));
+    const progressRewardUsdMicros = Math.max(0, Math.floor(Number(user.permanentRewardProgressEarnedUsdMicros) || 0));
     const balanceUsdMicros = Math.max(0, Math.floor(Number(user.permanentRewardsBalanceUsdMicros) || 0));
     const lifetimeVolumeUsdMicros = Math.max(0, Math.floor(Number(user.permanentRewardLifetimeVolumeUsdMicros) || 0));
     const lifetimeEarnedUsdMicros = Math.max(0, Math.floor(Number(user.permanentRewardLifetimeEarnedUsdMicros) || 0));
@@ -74,9 +103,12 @@ export function serializePermanentRewards(user = {}) {
     return {
         rateBps: PERMANENT_REWARD_RATE_BPS,
         ratePct: PERMANENT_REWARD_RATE_BPS / 100,
+        ownerCutShareBps: PERMANENT_REWARD_OWNER_CUT_SHARE_BPS,
+        poolShareBps: PERMANENT_REWARD_POOL_SHARE_BPS,
         cycleVolumeUsd: microsToUsd(PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS),
         rewardPerCycleUsd: microsToUsd(PERMANENT_REWARD_PER_CYCLE_USD_MICROS),
         progressVolumeUsd: microsToUsd(progressVolumeUsdMicros),
+        progressRewardUsd: microsToUsd(progressRewardUsdMicros),
         progressPct: Math.min(100, (progressVolumeUsdMicros / PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS) * 100),
         volumeRemainingUsd: microsToUsd(PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS - progressVolumeUsdMicros),
         balanceUsd: microsToUsd(balanceUsdMicros),

@@ -44,23 +44,23 @@ import {
     REFERRAL_ATTRIBUTION_DAYS,
 } from './affiliate-config.js';
 
-test('$100 cashout creates a $5 fee and $1.50 standard affiliate commission', () => {
+test('$100 cashout creates an $8 fee and $2.40 standard affiliate commission', () => {
     const cashout = calculateCashoutMoney(100);
     assert.equal(cashout.grossCashoutUsdMicros, 100_000_000);
-    assert.equal(cashout.platformFeeUsdMicros, 5_000_000);
-    assert.equal(cashout.playerPayoutUsdMicros, 95_000_000);
-    assert.equal(cashout.platformFeeUsd, 5);
-    assert.equal(cashout.playerPayoutUsd, 95);
+    assert.equal(cashout.platformFeeUsdMicros, 8_000_000);
+    assert.equal(cashout.playerPayoutUsdMicros, 92_000_000);
+    assert.equal(cashout.platformFeeUsd, 8);
+    assert.equal(cashout.playerPayoutUsd, 92);
 
     const affiliate = calculateAffiliateCommission(
         cashout.platformFeeUsdMicros,
         AFFILIATE_STANDARD_SHARE_BPS,
     );
-    assert.equal(affiliate.commissionUsdMicros, 1_500_000);
-    assert.equal(affiliate.commissionUsd, 1.5);
+    assert.equal(affiliate.commissionUsdMicros, 2_400_000);
+    assert.equal(affiliate.commissionUsd, 2.4);
     assert.equal(
         cashout.platformFeeUsdMicros - affiliate.commissionUsdMicros,
-        3_500_000,
+        5_600_000,
     );
 });
 
@@ -83,7 +83,7 @@ test('tier changes only affect newly calculated commission snapshots', () => {
 });
 
 test('affiliate configuration defaults match the business requirements', () => {
-    assert.equal(PLATFORM_CASHOUT_FEE_BPS, 500);
+    assert.equal(PLATFORM_CASHOUT_FEE_BPS, 800);
     assert.equal(AFFILIATE_STANDARD_SHARE_BPS, 3_000);
     assert.equal(AFFILIATE_HOLD_DAYS, 7);
     assert.equal(AFFILIATE_MIN_PAYOUT_USD_MICROS, 2_000_000);
@@ -113,8 +113,8 @@ function eligibleCashout(overrides = {}) {
             reason: 'Arena Cashout',
             mode: 'agar',
             dollarBalance: 100,
-            platformFee: 5,
-            cashoutFeeBps: 500,
+            platformFee: 8,
+            cashoutFeeBps: 800,
             ...overrides,
         },
     };
