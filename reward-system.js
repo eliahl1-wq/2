@@ -388,7 +388,6 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
     if (alert?.status === 'approved' && !alert.approvedUserIds?.length) {
         alert.approvedUserIds = [...alert.userIds];
     }
-    const approvedIds = new Set((alert?.approvedUserIds || []).map(id => id.toString()));
     const knownIds = new Set((alert?.userIds || []).map(id => id.toString()));
     const newlyLinkedUsers = users.filter(user => !knownIds.has(user._id.toString()));
 
@@ -422,31 +421,8 @@ export async function evaluateSharedDepositWallet(sourceWallet) {
         if (!alert) throw err;
     }
 
-    // Previously approved account ids remain approved. A newly linked account
-    // is blocked and must be reviewed explicitly in the dashboard.
-    const usersToDisable = users.filter(user => !approvedIds.has(user._id.toString()));
-    if (usersToDisable.length > 0) {
-        await User.updateMany(
-            { _id: { $in: usersToDisable.map(user => user._id) } },
-            {
-                $set: {
-                    rewardsDisabled: true,
-                    rewardsDisabledReason: `shared_wallet:${sourceWallet}`,
-                    hasFreeTicket: false,
-                    freeTicketUsed: true,
-                    completedFiveDollarNormalGames: 0,
-                    completedTenDollarNormalGames: 0,
-                    sponsoredRewardsUnlocked: false,
-                    sponsoredRewardsCompleted: false,
-                    sponsoredRewardsBalance: 0,
-                    fundedRewardsUsd: 0,
-                    permanentRewardProgressVolumeUsdMicros: 0,
-                    permanentRewardProgressEarnedUsdMicros: 0,
-                    permanentRewardsBalanceUsdMicros: 0,
-                },
-            },
-        );
-    }
+    // Detection is alert-only. Reward access is changed only by an explicit
+    // admin action, never merely because accounts share a funding wallet.
     return alert;
 }
 async function restoreSharedWalletSnapshot(User, alert, snapshot) {
@@ -468,6 +444,7 @@ async function restoreSharedWalletSnapshot(User, alert, snapshot) {
             sponsoredRewardsUnlocked: snapshot.sponsoredRewardsUnlocked,
             sponsoredRewardsCompleted: snapshot.sponsoredRewardsCompleted,
             sponsoredRewardsBalance: Math.max(snapshot.sponsoredRewardsBalance || 0, current.sponsoredRewardsBalance || 0),
+            fundedRewardsUsd: Math.max(snapshot.fundedRewardsUsd || 0, current.fundedRewardsUsd || 0),
             permanentRewardProgressVolumeUsdMicros: snapshot.permanentRewardProgressVolumeUsdMicros || 0,
             permanentRewardProgressEarnedUsdMicros: snapshot.permanentRewardProgressEarnedUsdMicros || 0,
             permanentRewardsBalanceUsdMicros: Math.max(snapshot.permanentRewardsBalanceUsdMicros || 0, current.permanentRewardsBalanceUsdMicros || 0),
@@ -476,6 +453,22 @@ async function restoreSharedWalletSnapshot(User, alert, snapshot) {
             permanentRewardCyclesCompleted: Math.max(snapshot.permanentRewardCyclesCompleted || 0, current.permanentRewardCyclesCompleted || 0),
         } },
     );
+}
+
+/** Restore accounts affected by the retired automatic shared-wallet block. */
+export async function restoreAutomaticSharedWalletBlocks() {
+    const User = mongoose.model('User');
+    const alerts = await RewardSecurityAlert.find({});
+    for (const alert of alerts) {
+        for (const snapshot of alert.snapshots || []) {
+            await restoreSharedWalletSnapshot(User, alert, snapshot);
+        }
+    }
+    const orphaned = await User.updateMany(
+        { rewardsDisabledReason: /^shared_wallet:/ },
+        { $set: { rewardsDisabled: false, rewardsDisabledReason: '' } },
+    );
+    return orphaned.modifiedCount;
 }
 
 export async function setOwnerAccountStatus(userIds, isOwnerAccount) {
@@ -563,6 +556,13 @@ export async function resolveRewardSecurityAlert(alertId, action, adminUserId, n
         alert.approvedUserIds = [...alert.userIds];
         alert.status = 'approved';
     } else {
+        await User.updateMany(
+            { _id: { $in: alert.userIds } },
+            { $set: {
+                rewardsDisabled: true,
+                rewardsDisabledReason: `manual_shared_wallet:${alert.sourceWallet}`,
+            } },
+        );
         alert.status = 'denied';
     }
     alert.resolvedBy = adminUserId;

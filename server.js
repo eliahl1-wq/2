@@ -100,6 +100,7 @@ import {
     rollbackRewardFundingUsd,
     reserveRewardClaim,
     resetRewardPoolAccounting,
+    restoreAutomaticSharedWalletBlocks,
     resolveRewardSecurityAlert,
     setOwnerAccountStatus,
 } from './reward-system.js';
@@ -3599,7 +3600,7 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
         reserved = await reserveRewardClaim(req.user.id);
         if (!reserved) {
             const user = await User.findById(req.user.id).lean();
-            if (user?.rewardsDisabled) return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
+            if (user?.rewardsDisabled) return res.status(403).json({ error: 'Rewards have been disabled by an administrator' });
             if (user?.rewardClaimInProgress) return res.status(409).json({ error: 'A reward claim is already processing' });
             return res.status(400).json({ error: 'No unlocked rewards available to claim' });
         }
@@ -3608,21 +3609,13 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
         const { user, claim } = reserved;
         const amountUsd = claim.amountUsd;
 
-        // Close the narrow race where a shared-wallet alert is raised while a
-        // promo claim is being reserved. Real retained winnings are restored.
+        // Close the narrow race where an admin disables rewards while a claim
+        // is being reserved. Releasing the claim restores every balance.
         if (claim.sponsoredAmountUsd > 0 || claim.permanentAmountUsd > 0) {
             const currentSecurity = await User.findById(req.user.id).select('rewardsDisabled').lean();
             if (currentSecurity?.rewardsDisabled) {
-                await failAndReleaseRewardClaim(claim._id, 'Promotional rewards disabled during linked-wallet review');
-                await User.updateOne({ _id: req.user.id }, { $set: {
-                    sponsoredRewardsBalance: 0,
-                    fundedRewardsUsd: 0,
-                    permanentRewardProgressVolumeUsdMicros: 0,
-                    permanentRewardProgressEarnedUsdMicros: 0,
-                    permanentRewardModelVersion: 4,
-                    permanentRewardsBalanceUsdMicros: 0,
-                } });
-                return res.status(403).json({ error: 'Rewards are disabled pending an account review' });
+                await failAndReleaseRewardClaim(claim._id, 'Rewards disabled by administrator');
+                return res.status(403).json({ error: 'Rewards have been disabled by an administrator' });
             }
         }
         if (DEV_FREE_PLAY) {
@@ -5158,7 +5151,7 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
         
         if (action === 'grant_ticket') {
             if (user.rewardsDisabled) {
-                return res.status(409).json({ message: 'Resolve the linked-wallet alert in Reward Alerts first.' });
+                return res.status(409).json({ message: 'Enable rewards for this account first.' });
             }
             user.hasFreeTicket = true;
             user.freeTicketUsed = false;
@@ -5182,7 +5175,7 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
         } else if (action === 'manual_unlock') {
             // Unlock only. Payout must go through the same atomic reward-claim ledger as every user claim.
             if (user.rewardsDisabled) {
-                return res.status(409).json({ message: 'Resolve the linked-wallet alert in Reward Alerts first.' });
+                return res.status(409).json({ message: 'Enable rewards for this account first.' });
             }
             user.sponsoredRewardsUnlocked = true;
             user.sponsoredRewardsCompleted = true;
@@ -5193,6 +5186,36 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
         }
     } catch (err) {
         console.error('Admin sponsored control error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/admin/users/:userId/reward-access', authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const enabled = req.body?.enabled;
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        if (typeof enabled !== 'boolean') return res.status(400).json({ message: 'enabled boolean required' });
+        const reason = String(req.body?.reason || '').trim().slice(0, 200);
+        if (!enabled && reason.length < 3) return res.status(400).json({ message: 'A reason is required to disable rewards' });
+
+        const user = await User.findByIdAndUpdate(
+            userId,
+            { $set: {
+                rewardsDisabled: !enabled,
+                rewardsDisabledReason: enabled ? '' : `manual:${reason}`,
+            } },
+            { new: true },
+        ).select('username rewardsDisabled rewardsDisabledReason');
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        res.json({
+            success: true,
+            rewardsDisabled: user.rewardsDisabled,
+            rewardsDisabledReason: user.rewardsDisabledReason,
+            message: enabled ? `Rewards enabled for ${user.username}.` : `Rewards disabled for ${user.username}.`,
+        });
+    } catch (err) {
+        console.error('Admin reward access update error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -6722,9 +6745,10 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
         ]);
+        const restoredSharedWalletBlocks = await restoreAutomaticSharedWalletBlocks();
         await releaseMatureAffiliateCommissions();
         const reconciliation = await reconcileAffiliateCommissions(Transaction);
-        console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Permanent reward migration: ${permanentRewardMigration.modifiedCount}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
+        console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Permanent reward migration: ${permanentRewardMigration.modifiedCount}. Shared-wallet blocks restored: ${restoredSharedWalletBlocks}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
     })
     .catch(err => console.error("Kunde inte ansluta:", err));
 
@@ -8108,7 +8132,7 @@ io.on('connection', (socket) => {
             }
             if (specialSlitherSkinId) validatedSkinColor = specialSlitherSkinId;
             if (user.rewardsDisabled && useFreeTicket) {
-                socket.emit('error', 'Rewards are disabled while your linked-wallet review is pending.');
+                socket.emit('error', 'Rewards have been disabled by an administrator.');
                 return;
             }
             user = await ensureUserDepositWallet(user);
