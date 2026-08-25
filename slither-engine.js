@@ -4,6 +4,7 @@ import {
     FREE_TICKET_MAX_BOTS_PER_MODE,
     getFreeTicketBotTarget,
 } from './free-ticket-bots.js';
+import { getFundedBotSpawnCount } from './funded-bots.js';
 
 export const SLITHER = {
     // A 2400-radius circle is approximately half the playable area of the old
@@ -457,9 +458,8 @@ export function trimSlitherBots(room, targetCount) {
 export function getSlitherTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
     
-    // Target a lively arena with a mix of players and bots.
-    // The fewer humans, the more bots we spawn to fill the room up to a target size.
-    // Max 5 bots per normal game (reduced from 8).
+    // Desired population only. The caller and addSlitherBots separately enforce
+    // the funded AI budget before any bot value can enter the room.
     const targetEntities = 8;
     if (humanCount >= targetEntities) return 0;
     
@@ -2263,8 +2263,21 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
                 const isFreePlay = room.isSandbox || room.isFreeTicketRoom || process.env.DEV_FREE_PLAY === 'true';
                 if (!isFreePlay) {
+                    const head = snake.segments?.[0];
+                    const cashoutThreat = !!head && allSnakes.some(({ entity: other }) => {
+                        if (other.id === snake.id || !other.segments?.[0]) return false;
+                        const otherBalance = other.dollarBalance ?? other.balance ?? 0;
+                        if (otherBalance <= botWealth * 1.10) return false;
+                        return dist(head.x, head.y, other.segments[0].x, other.segments[0].y)
+                            < scaleAgarBotDistance(AGAR_BOT_THREAT_RANGE);
+                    });
+
                     if (snake.isCashingOut) {
-                        if (Date.now() >= snake.cashOutEndTime) {
+                        if (cashoutThreat) {
+                            snake.isCashingOut = false;
+                            snake.cashOutEndTime = 0;
+                            snake.cashOutRetryAt = Date.now() + 1500;
+                        } else if (Date.now() >= snake.cashOutEndTime) {
                             toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: false, botCashedOut: true });
                             continue;
                         }
@@ -2273,9 +2286,11 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                             const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
                             snake.cashOutThreshold = entryFee * (1.0 + Math.random() * 0.8);
                         }
-                        if (botWealth >= snake.cashOutThreshold) {
+                        if (botWealth >= snake.cashOutThreshold
+                            && !cashoutThreat
+                            && Date.now() >= (snake.cashOutRetryAt || 0)) {
                             snake.isCashingOut = true;
-                            snake.cashOutEndTime = Date.now() + 5000;
+                            snake.cashOutEndTime = Date.now() + 3000;
                             console.log(`⏱️ Slither Bot ${snake.username} started cashout timer (threshold: $${snake.cashOutThreshold.toFixed(2)})`);
                         }
                     }
@@ -2368,7 +2383,17 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 : getSlitherTargetBots(effectiveHumans);
             const activeSlitherBots = room.slitherBots.length + (room.pendingSlitherBotSpawns || 0);
             if (activeSlitherBots < targetBots) {
-                addSlitherBots(room, targetBots - activeSlitherBots, getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance);
+                const botStake = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botStartBalance;
+                const spawnCount = room.isFreeTicketRoom
+                    ? targetBots - activeSlitherBots
+                    : getFundedBotSpawnCount({
+                        targetCount: targetBots,
+                        activeCount: room.slitherBots.length,
+                        pendingCount: room.pendingSlitherBotSpawns,
+                        aiBudget: room.aiBudgetBalance,
+                        botStake,
+                    });
+                if (spawnCount > 0) addSlitherBots(room, spawnCount, botStake);
             }
         }
     }

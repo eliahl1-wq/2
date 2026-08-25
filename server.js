@@ -149,6 +149,7 @@ import { createAgarCommerceService } from './agar-commerce-service.js';
 import { createCachedBalanceReader } from './solana-rpc-cache.js';
 import { isQualifyingFreeTicketCompletion } from './free-ticket-challenge.js';
 import { getStarterRewardFundingRequirements } from './free-ticket-funding.js';
+import { getFundedBotSpawnCount } from './funded-bots.js';
 import {
     calculatePermanentRewardAllocation,
     permanentProgressReserveUsd,
@@ -160,6 +161,7 @@ import {
     registerFreeTicketBotJoin,
     resetFreeTicketBotTargets,
 } from './free-ticket-bots.js';
+import { getAgarBotCellCenter, planAgarBotEscapeSplit, planAgarBotSplit } from './agar-bot-ai.js';
 import {
     decryptWalletSecret,
     encryptWalletSecret,
@@ -754,7 +756,8 @@ const c = {
         : 3 * 60 * 60 * 1000,
 };
 
-const BOT_CASHOUT_DURATION_MS = 5_000;
+const BOT_CASHOUT_DURATION_MS = 3_000;
+const BOT_CASHOUT_RETRY_MS = 1_500;
 const CASHOUT_HOLD_MS = 3_000;
 const joiningUsers = new Set();
 function isUserJoining(userId) {
@@ -7538,9 +7541,8 @@ function trimAgarBots(room, targetCount) {
 function getTargetBots(humanCount) {
     if (humanCount <= 0) return 0;
 
-    // Target a lively arena with a mix of players and bots.
-    // The fewer humans, the more bots we spawn to fill the room up to a target size.
-    // Max 5 bots per normal game (reduced from 8).
+    // Desired population only. Actual spawns are separately capped by the
+    // room's funded AI budget, so this target can never mint bot value.
     const targetEntities = 8;
     if (humanCount >= targetEntities) return 0;
 
@@ -7576,16 +7578,22 @@ function ensureAgarMovementInput(player) {
     }
 }
 
-function splitAgarCells(player, angle, now = Date.now()) {
+function splitAgarCells(player, angle, now = Date.now(), options = {}) {
     if (!player?.cells?.length || player.cells.length >= c.maxCells) return 0;
 
     const totalMass = playerTotalMass(player);
     const massStart = playerMassStart(player);
-    const availableSlots = c.maxCells - player.cells.length;
+    const availableSlots = Math.min(
+        c.maxCells - player.cells.length,
+        Math.max(1, Number(options.maxNewCells) || c.maxCells),
+    );
     const newCells = [];
 
     // Use a snapshot so newly-created pieces cannot split again in the same action.
-    for (const cell of [...player.cells]) {
+    const sourceCells = [...player.cells].sort((a, b) => (
+        a.id === options.preferredCellId ? -1 : b.id === options.preferredCellId ? 1 : 0
+    ));
+    for (const cell of sourceCells) {
         if (newCells.length >= availableSlots) break;
         if (cell.balance < massStart * 2) continue;
 
@@ -8823,10 +8831,15 @@ io.on('connection', (socket) => {
 
             if (gameMode === 'slither') {
                 targetBots += room.slitherBots.filter(b => b.adminSpawned).length;
-                const botsToSpawn = Math.min(
-                    isFreeTicketPlay ? 4 : 1,
-                    Math.max(0, targetBots - room.slitherBots.length),
-                );
+                const botsToSpawn = isFreeTicketPlay
+                    ? Math.min(4, Math.max(0, targetBots - room.slitherBots.length))
+                    : getFundedBotSpawnCount({
+                        targetCount: targetBots,
+                        activeCount: room.slitherBots.length,
+                        pendingCount: room.pendingSlitherBotSpawns,
+                        aiBudget: room.aiBudgetBalance,
+                        botStake: joinBotStake,
+                    });
                 if (botsToSpawn > 0) {
                     addSlitherBots(room, botsToSpawn, joinBotStake);
                 } else if (room.slitherBots.length > targetBots) {
@@ -8834,10 +8847,15 @@ io.on('connection', (socket) => {
                 }
             } else {
                 targetBots += room.bots.filter(b => b.adminSpawned).length;
-                const botsToSpawn = Math.min(
-                    isFreeTicketPlay ? 4 : 1,
-                    Math.max(0, targetBots - room.bots.length),
-                );
+                const botsToSpawn = isFreeTicketPlay
+                    ? Math.min(4, Math.max(0, targetBots - room.bots.length))
+                    : getFundedBotSpawnCount({
+                        targetCount: targetBots,
+                        activeCount: room.bots.length,
+                        pendingCount: room.pendingBotSpawns,
+                        aiBudget: room.aiBudgetBalance,
+                        botStake: joinBotStake,
+                    });
                 if (botsToSpawn > 0) {
                     addBots(room, botsToSpawn, joinBotStake);
                 } else if (room.bots.length > targetBots) {
@@ -10016,7 +10034,16 @@ function processRoom(room) {
 
         const activeBotCount = room.bots.length + (room.pendingBotSpawns || 0);
         if (activeBotCount < agarTargetBots) {
-            addBots(room, agarTargetBots - activeBotCount, agarBotStake);
+            const spawnCount = room.isFreeTicketRoom
+                ? agarTargetBots - activeBotCount
+                : getFundedBotSpawnCount({
+                    targetCount: agarTargetBots,
+                    activeCount: room.bots.length,
+                    pendingCount: room.pendingBotSpawns,
+                    aiBudget: room.aiBudgetBalance,
+                    botStake: agarBotStake,
+                });
+            if (spawnCount > 0) addBots(room, spawnCount, agarBotStake);
         } else if (room.bots.length > agarTargetBots) {
             trimAgarBots(room, agarTargetBots);
         }
@@ -10030,7 +10057,16 @@ function processRoom(room) {
 
         const activeSlitherBotCount = room.slitherBots.length + (room.pendingSlitherBotSpawns || 0);
         if (activeSlitherBotCount < slitherTargetBots) {
-            addSlitherBots(room, slitherTargetBots - activeSlitherBotCount, slitherBotStake);
+            const spawnCount = room.isFreeTicketRoom
+                ? slitherTargetBots - activeSlitherBotCount
+                : getFundedBotSpawnCount({
+                    targetCount: slitherTargetBots,
+                    activeCount: room.slitherBots.length,
+                    pendingCount: room.pendingSlitherBotSpawns,
+                    aiBudget: room.aiBudgetBalance,
+                    botStake: slitherBotStake,
+                });
+            if (spawnCount > 0) addSlitherBots(room, spawnCount, slitherBotStake);
         } else if (room.slitherBots.length > slitherTargetBots) {
             trimSlitherBots(room, slitherTargetBots);
         }
@@ -10109,8 +10145,22 @@ function processRoom(room) {
             // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
             const isFreePlay = room.isSandbox || room.isFreeTicketRoom || process.env.DEV_FREE_PLAY === 'true';
             if (!isFreePlay) {
+                const head = botCells[0];
+                const cashoutThreat = allUsers.some(other => {
+                    if (other.id === player.id || !Array.isArray(other.cells)) return false;
+                    const otherMass = playerTotalMass(other);
+                    if (otherMass <= totalBotMass * 1.10) return false;
+                    return other.cells.some(cell => Math.hypot(cell.x - head.x, cell.y - head.y) < 900);
+                }) || (totalBotMass > 5 && room.viruses.some(virus => (
+                    Math.hypot(virus.x - head.x, virus.y - head.y) < head.radius + 150
+                )));
+
                 if (player.isCashingOut) {
-                    if (Date.now() >= player.cashOutEndTime) {
+                    if (cashoutThreat) {
+                        player.isCashingOut = false;
+                        player.cashOutEndTime = 0;
+                        player.cashOutRetryAt = Date.now() + BOT_CASHOUT_RETRY_MS;
+                    } else if (Date.now() >= player.cashOutEndTime) {
                         const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
                         const botStart = getEconomy(entryFee).botStartBalance;
                         const remaining = Math.max(0, botWealth - botStart);
@@ -10140,7 +10190,9 @@ function processRoom(room) {
                         const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
                         player.cashOutThreshold = entryFee * (1.0 + Math.random() * 0.8);
                     }
-                    if (botWealth >= player.cashOutThreshold) {
+                    if (botWealth >= player.cashOutThreshold
+                        && !cashoutThreat
+                        && Date.now() >= (player.cashOutRetryAt || 0)) {
                         player.isCashingOut = true;
                         player.cashOutEndTime = Date.now() + BOT_CASHOUT_DURATION_MS;
                         console.log(`⏱️ Agar Bot ${player.username} started cashout timer (threshold: $${player.cashOutThreshold.toFixed(2)})`);
@@ -10159,8 +10211,8 @@ function processRoom(room) {
                 player.decisionDelay = 250 + Math.random() * 300;
 
                 let threat = null;
+                let threatIsVirus = false;
                 let targetPrey = null;
-                let targetPreyMass = 0;
                 let minDistThreat = 900; // Se faror på lite längre håll
                 let minDistPrey = 600;
 
@@ -10175,12 +10227,12 @@ function processRoom(room) {
                         if (otherTotalMass > totalBotMass * 1.10 && d < minDistThreat) {
                             minDistThreat = d;
                             threat = c2;
+                            threatIsVirus = false;
                         }
                         // BYTE: Om någon är liten nog att ätas
                         else if (totalBotMass > otherTotalMass * 1.10 && d < minDistPrey) {
                             minDistPrey = d;
                             targetPrey = c2;
-                            targetPreyMass = otherTotalMass;
                         }
                     });
                 });
@@ -10192,9 +10244,15 @@ function processRoom(room) {
                         if (d < head.radius + 150 && d < minDistThreat) {
                             minDistThreat = d;
                             threat = v;
+                            threatIsVirus = true;
                         }
                     });
                 }
+
+                const now = Date.now();
+                const latestCellSplitAt = botCells.reduce((latest, cell) => Math.max(latest, cell.lastSplit || 0), 0);
+                const regroupAt = player.botRegroupAt || latestCellSplitAt + 900;
+                const regrouping = botCells.length > 1 && now >= regroupAt;
 
                 // 2. BESLUTSFATTANDE (Prioritering)
                 if (threat) {
@@ -10218,28 +10276,56 @@ function processRoom(room) {
                     player.targetX = head.x + Math.cos(panicAngle) * 600;
                     player.targetY = head.y + Math.sin(panicAngle) * 600;
 
+                    const escapePlan = !threatIsVirus && !player.isCashingOut && planAgarBotEscapeSplit({
+                        cells: botCells,
+                        threat,
+                        now,
+                        lastSplitAt: player.lastBotSplitAt || 0,
+                        maxCells: c.maxCells,
+                        massStart,
+                    });
+                    if (escapePlan) {
+                        const splitCount = splitAgarCells(player, escapePlan.angle, now, {
+                            maxNewCells: 1,
+                            preferredCellId: escapePlan.sourceCellId,
+                        });
+                        if (splitCount > 0) {
+                            player.lastBotSplitAt = now;
+                            player.botRegroupAt = now + 1200;
+                        }
+                    }
+
+                } else if (regrouping) {
+                    // Equivalent to holding the mouse at the center of the screen:
+                    // every piece moves toward the shared center and merges as soon
+                    // as the normal merge timer permits it.
+                    const center = getAgarBotCellCenter(botCells);
+                    if (center) {
+                        player.targetX = center.x;
+                        player.targetY = center.y;
+                    }
                 } else if (targetPrey) {
                     // JAGA! Spring mot bytet med lite felmarginal för att simulera mänsklighet
-                    const preyAngle = Math.atan2(targetPrey.y - head.y, targetPrey.x - head.x) + (Math.random() - 0.5) * 0.2;
-                    player.targetX = head.x + Math.cos(preyAngle) * 500;
-                    player.targetY = head.y + Math.sin(preyAngle) * 500;
+                    player.targetX = targetPrey.x;
+                    player.targetY = targetPrey.y;
 
-                    // Split-kill only when the launched half will still comfortably eat
-                    // the prey. A cooldown prevents bot multi-split spam between decisions.
-                    const now = Date.now();
-                    const largestCell = botCells.reduce((largest, cell) => (
-                        cell.balance > largest.balance ? cell : largest
-                    ), botCells[0]);
-                    const splitReach = head.radius + targetPrey.radius + 165;
-                    const splitIsSafe = largestCell.balance / 2 > targetPrey.balance * 1.15
-                        && totalBotMass > targetPreyMass * 2.2;
-                    if (!player.isCashingOut
-                        && splitIsSafe
-                        && minDistPrey > head.radius + targetPrey.radius * 0.35
-                        && minDistPrey < splitReach
-                        && now - (player.lastBotSplitAt || 0) >= 2800) {
-                        const splitCount = splitAgarCells(player, preyAngle, now);
-                        if (splitCount > 0) player.lastBotSplitAt = now;
+                    const splitPlan = !player.isCashingOut && planAgarBotSplit({
+                        cells: botCells,
+                        prey: targetPrey,
+                        now,
+                        lastSplitAt: player.lastBotSplitAt || 0,
+                        maxCells: c.maxCells,
+                        massStart,
+                    });
+                    if (splitPlan) {
+                        const splitCount = splitAgarCells(player, splitPlan.angle, now, {
+                            maxNewCells: 1,
+                            preferredCellId: splitPlan.sourceCellId,
+                        });
+                        if (splitCount > 0) {
+                            player.lastBotSplitAt = now;
+                            player.botRegroupAt = now + 900;
+                        }
                     }
 
                 } else {
@@ -10261,6 +10347,8 @@ function processRoom(room) {
                     }
                 }
             }
+
+            if (botCells.length <= 1) player.botRegroupAt = 0;
 
             // Simulera input för fysikmotorn
             player.mouseX = player.targetX - head.x;
