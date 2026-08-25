@@ -86,6 +86,20 @@ function pointInRect(x, y, rect, padding = 0) {
         && y <= rect.y + rect.h / 2 + padding;
 }
 
+function pointInHouseFootprint(x, y, house) {
+    if (!Array.isArray(house.footprint) || house.footprint.length < 3) return pointInRect(x, y, house);
+    const localX = x - house.x;
+    const localY = y - house.y;
+    let inside = false;
+    for (let i = 0, j = house.footprint.length - 1; i < house.footprint.length; j = i++) {
+        const a = house.footprint[i];
+        const b = house.footprint[j];
+        if ((a.y > localY) !== (b.y > localY)
+            && localX < (b.x - a.x) * (localY - a.y) / ((b.y - a.y) || 1e-9) + a.x) inside = !inside;
+    }
+    return inside;
+}
+
 function pointToRectDistance(x, y, rect) {
     const angle = -(Number(rect.rotation) || 0);
     const cos = Math.cos(angle);
@@ -110,6 +124,27 @@ function circleRectCollision(x, y, radius, rect) {
     const closestX = Math.max(-rect.w / 2, Math.min(localX, rect.w / 2));
     const closestY = Math.max(-rect.h / 2, Math.min(localY, rect.h / 2));
     return Math.hypot(localX - closestX, localY - closestY) < radius;
+}
+
+function obstacleCollisionRectForTest(obstacle) {
+    if (obstacle.kind === 'door') return getSurvivDoorCollisionRect(obstacle);
+    const visualW = Math.abs(Number(obstacle.w) || 0);
+    const visualH = Math.abs(Number(obstacle.h) || 0);
+    let hitboxW = Number(obstacle.hitboxW) > 0 ? Number(obstacle.hitboxW) : null;
+    let hitboxH = Number(obstacle.hitboxH) > 0 ? Number(obstacle.hitboxH) : null;
+    if (obstacle.kind === 'tree') {
+        const fallbackScale = Number(obstacle.trunkScale) > 0
+            ? Number(obstacle.trunkScale)
+            : Math.max(visualW, visualH) >= 64 ? 0.31 : 0.255;
+        hitboxW ??= Math.max(11, visualW * fallbackScale);
+        hitboxH ??= Math.max(11, visualH * fallbackScale);
+    }
+    if (hitboxW == null && hitboxH == null) return obstacle;
+    return {
+        ...obstacle,
+        w: Math.max(1, Math.min(hitboxW ?? visualW, visualW)),
+        h: Math.max(1, Math.min(hitboxH ?? visualH, visualH)),
+    };
 }
 
 test('surviv map keeps its 20k world while concentrating loot inside structures', () => {
@@ -236,6 +271,10 @@ test('larger residential layer adds twenty distinct detailed homes across ten re
     assert.equal(new Set(homes.map(home => home.designId)).size, 20);
     assert.equal(new Set(homes.map(home => home.variant)).size, 10);
     assert.ok(homes.every(home => home.w >= 480 && home.h >= 360));
+    const lHomes = homes.filter(home => home.footprint?.length === 6);
+    assert.equal(lHomes.length, 6, 'three mirrored blueprint pairs should have real L-shaped footprints');
+    assert.ok(homes.filter(home => Math.max(home.w, home.h) / Math.min(home.w, home.h) >= 1.2).length >= 16,
+        'most new homes should read as rectangles rather than near-square boxes');
     assert.equal(drives.length, 20);
     assert.equal(mailboxes.length, 20);
     assert.equal(gardens.length, 40);
@@ -250,10 +289,14 @@ test('larger residential layer adds twenty distinct detailed homes across ten re
         const homeDoors = doors.filter(door => door.houseId === home.id);
         const homeFurniture = furniture.filter(item => item.houseId === home.id);
         const exteriorDoors = homeDoors.filter(door => door.entranceRole !== 'interiorDoor');
+        const interiorDoors = homeDoors.filter(door => door.entranceRole === 'interiorDoor');
         assert.ok(homeRooms.length >= 5);
         assert.equal(exteriorDoors.length, 2);
+        assert.ok(interiorDoors.length <= 2, `${home.blueprint} should not overuse interior doors`);
         assert.ok(homeFurniture.length >= 5, `${home.blueprint} should feel intentionally furnished`);
         assert.ok(homeDoors.every(door => pointInRect(door.x, door.y, home, 3)));
+        assert.ok(homeRooms.every(room => pointInHouseFootprint(room.x, room.y, home)),
+            `${home.blueprint} room centers must stay inside the actual footprint`);
         layoutSignatures.add(home.blueprint + ':' + homeRooms
             .map(room => `${room.variant}@${Math.round((room.x - home.x) / 10)},${Math.round((room.y - home.y) / 10)}`)
             .sort()
@@ -334,6 +377,12 @@ test('surviv countryside keeps dense distributed cover and frequent solo rural h
     const allTrees = map.obstacles.filter(obstacle => obstacle.kind === 'tree');
     const survivTrees = allTrees.filter(tree => tree.canopyStyle === 'surviv');
     const legacyTrees = allTrees.filter(tree => tree.canopyStyle === 'legacy');
+    const largeTrees = allTrees.filter(tree => tree.treeSize === 'large');
+    const giantTrees = allTrees.filter(tree => tree.treeSize === 'giant');
+    const insetNaturalKinds = new Set(['rock', 'bush', 'barrel', 'fallenLog', 'stump']);
+    const insetNaturalCover = map.obstacles.filter(obstacle => (
+        obstacle.collidable !== false && insetNaturalKinds.has(obstacle.kind)
+    ));
     const survivTreeCells = new Set();
     for (const tree of allTrees) {
         if (Math.abs(tree.x) >= 9500 || Math.abs(tree.y) >= 9500) continue;
@@ -373,6 +422,22 @@ test('surviv countryside keeps dense distributed cover and frequent solo rural h
         `roughly three quarters of trees should use the new canopy, got ${survivTrees.length}/${allTrees.length}`);
     assert.ok(legacyTrees.length / allTrees.length >= 0.22 && legacyTrees.length / allTrees.length <= 0.28,
         `roughly one quarter of trees should retain legacy biome art, got ${legacyTrees.length}/${allTrees.length}`);
+    assert.ok(largeTrees.length >= 900, `expected frequent larger trees, got ${largeTrees.length}`);
+    assert.ok(giantTrees.length >= 28, `expected landmark-scale giant trees, got ${giantTrees.length}`);
+    assert.ok(allTrees.every(tree => (
+        tree.hitboxW >= 11 && tree.hitboxH >= 11
+        && tree.hitboxW < tree.w * 0.4
+        && tree.hitboxH < tree.h * 0.4
+    )), 'tree collision should cover only the trunk, never the visible canopy');
+    assert.ok(largeTrees.every(tree => tree.trunkScale > 0.255),
+        'larger trees should have visibly and physically wider trunks');
+    assert.ok(insetNaturalCover.length >= 600,
+        `expected broad hitbox coverage for irregular natural props, got ${insetNaturalCover.length}`);
+    assert.ok(insetNaturalCover.every(obstacle => (
+        Number(obstacle.hitboxW) > 0 && Number(obstacle.hitboxH) > 0
+        && obstacle.hitboxW < obstacle.w
+        && obstacle.hitboxH < obstacle.h
+    )), 'irregular natural props must use an inset hitbox inside their visible bounds');
     assert.ok(survivTreeCells.size >= 520,
         `new tree canopies should appear across nearly the whole playable map, got ${survivTreeCells.size} cells`);
     assert.ok(ruralHomes.length >= 20 && ruralHomes.length <= 27,
@@ -1275,7 +1340,7 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
     ));
     assert.ok(map.spawnPoints.length >= 100);
     assert.ok(map.spawnPoints.every(point => forbidden.every(obstacle => (
-        !circleRectCollision(point.x, point.y, 28, obstacle)
+        !circleRectCollision(point.x, point.y, 28, obstacleCollisionRectForTest(obstacle))
     ))));
 
     const room = makeRoom();
@@ -1288,17 +1353,26 @@ test('generated doors, props, and player spawns keep clear traversal space', () 
     for (let i = 0; i < 500; i++) {
         const player = createSurvivPlayer('spawn-' + i, 'mongo-' + i, 'Spawn test', '#fff', room);
         assert.ok(runtimeForbidden.every(obstacle => !circleRectCollision(
-            player.x, player.y, SURVIV.playerRadius + 10, obstacle,
+            player.x, player.y, SURVIV.playerRadius + 10, obstacleCollisionRectForTest(obstacle),
         )), 'runtime spawn should stay outside structures and water');
     }
 });
 
-test('interior partitions meet nearby exterior walls without visual or collision gaps', () => {
+test('every interior partition belongs to a connected wall junction', () => {
     const map = generateSurvivMap(SURVIV.worldHalf);
     const floors = map.obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
-    const exteriorWalls = map.obstacles.filter(obstacle => obstacle.kind === 'wall');
-    const interiorWalls = map.obstacles.filter(obstacle => obstacle.kind === 'interiorWall');
-    const maxVisibleGap = 42;
+    const exteriorWalls = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'wall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
+    ));
+    const interiorWalls = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'interiorWall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
+    ));
+    const wallsTouch = (first, second, tolerance = 1.5) => (
+        Math.abs(first.x - second.x) * 2 <= first.w + second.w + tolerance * 2
+        && Math.abs(first.y - second.y) * 2 <= first.h + second.h + tolerance * 2
+    );
+    const maxVisibleGap = 76;
+    let checkedPartitions = 0;
     let joinedEndpoints = 0;
 
     for (const floor of floors) {
@@ -1306,7 +1380,11 @@ test('interior partitions meet nearby exterior walls without visual or collision
         const floorRight = floor.x + floor.w / 2;
         const floorTop = floor.y - floor.h / 2;
         const floorBottom = floor.y + floor.h / 2;
-        const partitions = interiorWalls.filter(wall => wall.houseId === floor.id);
+        const belongsToFloor = obstacle => obstacle.houseId
+            ? obstacle.houseId === floor.id
+            : pointInRect(obstacle.x, obstacle.y, floor, 22);
+        const partitions = interiorWalls.filter(belongsToFloor);
+        const structureWalls = [...exteriorWalls, ...interiorWalls].filter(belongsToFloor);
         const boundaryWalls = exteriorWalls.filter(wall => {
             if (wall.houseId && wall.houseId !== floor.id) return false;
             if (wall.h > wall.w) {
@@ -1322,6 +1400,11 @@ test('interior partitions meet nearby exterior walls without visual or collision
         });
 
         for (const partition of partitions) {
+            assert.ok(structureWalls.some(wall => (
+                wall.id !== partition.id && wallsTouch(partition, wall)
+            )), `freestanding interior wall in ${floor.label || floor.role || floor.id} (${partition.id})`);
+            checkedPartitions++;
+
             const horizontal = partition.w >= partition.h;
             const nearTargets = boundaryWalls.filter(wall => horizontal
                 ? wall.h > wall.w
@@ -1348,6 +1431,7 @@ test('interior partitions meet nearby exterior walls without visual or collision
         }
     }
 
+    assert.ok(checkedPartitions >= 500, 'expected to audit every generated building interior');
     assert.ok(joinedEndpoints >= 30, 'expected the assertion to cover many exterior-wall junctions');
 });
 
@@ -2050,13 +2134,48 @@ test('firearms retain enough range to damage destructible trees', () => {
     room.players.push(player);
 
     assert.ok(SURVIV.bulletLifetimeMs >= 1600, 'ordinary bullets should have a practical combat range');
-    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    const firedAt = Date.now() + 600000;
+    processSurvivRoom(room, silentIo, firedAt);
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, firedAt + 25);
 
     assert.equal(
         room.obstacles[0].hp,
         84 - WEAPONS.pistol.damage,
         'a pistol round should damage a destructible tree',
     );
+});
+test('firearm rounds pass through foliage beside a tree trunk', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'foliage-only-shot', kind: 'tree', x: 62, y: 0, w: 100, h: 100,
+        hitboxW: 20, hitboxH: 20, trunkScale: 0.2,
+        collidable: true, destructible: true, hp: 84, maxHp: 84,
+    }];
+    const player = createSurvivPlayer('foliage-shooter', 'foliage-shooter-mongo', 'Shooter', '#fff', room);
+    player.x = 0;
+    player.y = 30;
+    player.aimAngle = 0;
+    player.weapon = { type: 'pistol', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+    player.inventory.weapons = ['pistol'];
+    player.shooting = true;
+    const target = createSurvivPlayer('foliage-target', 'foliage-target-mongo', 'Target', '#fff', room);
+    target.x = 105;
+    target.y = 30;
+    room.players.push(player, target);
+
+    const firedAt = Date.now() + 600000;
+    processSurvivRoom(room, silentIo, firedAt);
+    player.shooting = false;
+    processSurvivRoom(room, silentIo, firedAt + 25);
+    processSurvivRoom(room, silentIo, firedAt + 50);
+
+    assert.ok(target.hp < target.maxHp, 'foliage outside the trunk should not absorb the round');
+    assert.equal(room.obstacles[0].hp, 84, 'passing through leaves should not damage the tree');
 });
 test('bullets break loot crates and release their contents', () => {
     const room = makeRoom();
@@ -2251,6 +2370,61 @@ test('analog movement strength matches mobile client prediction', () => {
     player.inputDx = 1;
     processSurvivRoom(room, silentIo, Date.now() + 600001);
     assert.ok(Math.abs((player.x - halfSpeedX) - SURVIV.playerSpeed) < 0.001);
+});
+
+test('players walk beneath tree canopies and stop only at the trunk', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'trunk-only-tree', kind: 'tree', x: 60, y: 0, w: 100, h: 100,
+        hitboxW: 20, hitboxH: 20, trunkScale: 0.2,
+        collidable: true, destructible: true, hp: 84, maxHp: 84,
+    }];
+    const player = createSurvivPlayer('tree-walker', 'tree-walker-mongo', 'Walker', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 1;
+    player.inputDy = 0;
+    room.players.push(player);
+
+    for (let tick = 0; tick < 4; tick++) {
+        processSurvivRoom(room, silentIo, Date.now() + 600000 + tick);
+    }
+    assert.ok(player.x > 18, 'the visual canopy must not block entry beneath the leaves');
+
+    for (let tick = 0; tick < 8; tick++) {
+        processSurvivRoom(room, silentIo, Date.now() + 600100 + tick);
+    }
+    assert.ok(player.x >= 35.9 && player.x <= 36.1,
+        'the player should stop at the trunk plus player radius');
+});
+
+test('explicit obstacle hitboxes are clamped inside visible bounds', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room.spawnPoints = [];
+    room.bots = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'oversized-hitbox-rock', kind: 'rock', x: 60, y: 0, w: 30, h: 30,
+        hitboxW: 120, hitboxH: 120,
+        collidable: true, destructible: true, hp: 72, maxHp: 72,
+    }];
+    const player = createSurvivPlayer('hitbox-walker', 'hitbox-walker-mongo', 'Walker', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    player.inputDx = 1;
+    player.inputDy = 0;
+    room.players.push(player);
+
+    for (let tick = 0; tick < 12; tick++) {
+        processSurvivRoom(room, silentIo, Date.now() + 700000 + tick);
+    }
+    assert.ok(player.x >= 30.9 && player.x <= 31.1,
+        'even malformed metadata must stop at the visible rock edge plus player radius');
 });
 
 test('water slows movement while bridges and indoor floors report the correct surface', () => {
@@ -2805,6 +2979,10 @@ test('surviv static terrain payload is retained between periodic sends', () => {
     const serializedTree = ticks[0].obstacles.find(obstacle => obstacle.kind === 'tree');
     assert.ok(serializedTree);
     assert.ok(serializedTree.canopyStyle === 'surviv' || serializedTree.canopyStyle === 'legacy');
+    assert.ok(serializedTree.hitboxW > 0 && serializedTree.hitboxW < serializedTree.w);
+    assert.ok(serializedTree.hitboxH > 0 && serializedTree.hitboxH < serializedTree.h);
+    assert.ok(serializedTree.trunkScale > 0);
+    assert.ok(['standard', 'large', 'giant'].includes(serializedTree.treeSize));
     assert.equal(Object.hasOwn(ticks[1], 'obstacles'), false);
     assert.equal(Object.hasOwn(ticks[1], 'minimap'), false);
     assert.equal(Object.hasOwn(ticks[1], 'fullMap'), false);

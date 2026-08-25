@@ -330,6 +330,17 @@ function fromRectLocal(px, py, rect) {
 
 function pointInRect(px, py, rect) {
     const local = toRectLocal(px, py, rect);
+    if (Array.isArray(rect.footprint) && rect.footprint.length >= 3) {
+        let inside = false;
+        for (let i = 0, j = rect.footprint.length - 1; i < rect.footprint.length; j = i++) {
+            const a = rect.footprint[i];
+            const b = rect.footprint[j];
+            const crosses = (a.y > local.y) !== (b.y > local.y)
+                && local.x < (b.x - a.x) * (local.y - a.y) / ((b.y - a.y) || 1e-9) + a.x;
+            if (crosses) inside = !inside;
+        }
+        return inside;
+    }
     return Math.abs(local.x) <= rect.w / 2 && Math.abs(local.y) <= rect.h / 2;
 }
 
@@ -407,6 +418,15 @@ function segmentCircleHitT(x1, y1, x2, y2, cx, cy, radius) {
 
 function circleRectCollision(cx, cy, r, rect) {
     const local = toRectLocal(cx, cy, rect);
+    if (Array.isArray(rect.footprint) && rect.footprint.length >= 3) {
+        if (pointInRect(cx, cy, rect)) return true;
+        for (let i = 0; i < rect.footprint.length; i++) {
+            const a = rect.footprint[i];
+            const b = rect.footprint[(i + 1) % rect.footprint.length];
+            if (distanceToSegment(local.x, local.y, a.x, a.y, b.x, b.y) < r) return true;
+        }
+        return false;
+    }
     const closestX = clamp(local.x, -rect.w / 2, rect.w / 2);
     const closestY = clamp(local.y, -rect.h / 2, rect.h / 2);
     return Math.hypot(local.x - closestX, local.y - closestY) < r;
@@ -510,6 +530,39 @@ function resolveCircleRect(cx, cy, r, rect) {
         resolvedY += (dy / distance) * overlap;
     }
     return fromRectLocal(resolvedX, resolvedY, rect);
+}
+
+function getObstacleCollisionRect(obstacle) {
+    if (obstacle.kind === 'door') return getSurvivDoorCollisionRect(obstacle);
+    const visualW = Math.abs(Number(obstacle.w) || 0);
+    const visualH = Math.abs(Number(obstacle.h) || 0);
+    let hitboxW = Number(obstacle.hitboxW) > 0 ? Number(obstacle.hitboxW) : null;
+    let hitboxH = Number(obstacle.hitboxH) > 0 ? Number(obstacle.hitboxH) : null;
+
+    if (obstacle.kind === 'tree') {
+        // w/h remain the visible crown and placement footprint. Runtime
+        // collision uses only the central trunk so players and rounds can pass
+        // under leaves.
+        const fallbackScale = Number(obstacle.trunkScale) > 0
+            ? Number(obstacle.trunkScale)
+            : Math.max(visualW, visualH) >= 64 ? 0.31 : 0.255;
+        hitboxW ??= Math.max(11, visualW * fallbackScale);
+        hitboxH ??= Math.max(11, visualH * fallbackScale);
+    }
+    if (hitboxW == null && hitboxH == null) return obstacle;
+
+    // Explicit hitboxes are always inset inside the object's authored visual
+    // bounds. This also protects older snapshots or malformed network values
+    // from creating invisible collision beyond the displayed prop.
+    hitboxW = clamp(hitboxW ?? visualW, 1, Math.max(1, visualW));
+    hitboxH = clamp(hitboxH ?? visualH, 1, Math.max(1, visualH));
+    return {
+        x: obstacle.x,
+        y: obstacle.y,
+        w: hitboxW,
+        h: hitboxH,
+        rotation: Number(obstacle.rotation) || 0,
+    };
 }
 function randomChestContents(tier = 'common', options = {}) {
     const outdoor = options.outdoor === true;
@@ -629,10 +682,23 @@ function makeGroundLoot(type, x, y, extra = {}) {
     });
 }
 
+const NATURAL_HITBOX_SCALES = Object.freeze({
+    rock: [0.72, 0.66],
+    bush: [0.60, 0.50],
+    barrel: [0.70, 0.70],
+    fallenLog: [0.88, 0.68],
+});
+
 function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
     const options = typeof opts === 'string' ? { variant: opts } : (opts || {});
     const defaultHp = options.collidable === false ? null : SURVIV_DESTRUCTIBLE_OBSTACLE_HP[kind];
     const maxHp = Number.isFinite(options.maxHp) ? Math.max(1, options.maxHp) : defaultHp;
+    const naturalScale = options.collidable === false ? null : NATURAL_HITBOX_SCALES[kind];
+    const stumpDiameter = kind === 'stump' && options.collidable !== false
+        ? Math.min(Math.abs(Number(w) || 0), Math.abs(Number(h) || 0)) * 0.68
+        : null;
+    const defaultHitboxW = stumpDiameter ?? (naturalScale ? Math.abs(Number(w) || 0) * naturalScale[0] : null);
+    const defaultHitboxH = stumpDiameter ?? (naturalScale ? Math.abs(Number(h) || 0) * naturalScale[1] : null);
 
     const obstacle = {
         id: randId(),
@@ -655,6 +721,11 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         designId: options.designId || null,
         entranceRole: options.entranceRole || null,
         orientation: options.orientation || null,
+        hitboxW: Number.isFinite(options.hitboxW) ? options.hitboxW : defaultHitboxW,
+        hitboxH: Number.isFinite(options.hitboxH) ? options.hitboxH : defaultHitboxH,
+        trunkScale: Number.isFinite(options.trunkScale) ? options.trunkScale : null,
+        treeSize: options.treeSize || null,
+        footprint: Array.isArray(options.footprint) ? options.footprint : null,
         ...(kind === 'door' ? { isOpen: !!options.isOpen } : {}),
         points: Array.isArray(options.points) ? options.points : null,
         width: Number.isFinite(options.width) ? options.width : null,
@@ -949,7 +1020,7 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
     }
 }
 
-function sealInteriorWallExteriorJunctions(obstacles) {
+function sealInteriorWallJunctions(obstacles) {
     const floors = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
     const exteriorWalls = obstacles.filter(obstacle => (
         obstacle.kind === 'wall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
@@ -957,7 +1028,8 @@ function sealInteriorWallExteriorJunctions(obstacles) {
     const interiorWalls = obstacles.filter(obstacle => (
         obstacle.kind === 'interiorWall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
     ));
-    const maxVisibleGap = 42;
+    const maxInteriorGap = 46;
+    const maxExteriorGap = 76;
 
     for (const floor of floors) {
         const floorLeft = floor.x - floor.w / 2;
@@ -992,48 +1064,60 @@ function sealInteriorWallExteriorJunctions(obstacles) {
                 && wall.x - wall.w / 2 <= floorRight + 2;
         });
 
-        for (const partition of partitions) {
-            const horizontal = partition.w >= partition.h;
-            if (horizontal) {
-                let minX = partition.x - partition.w / 2;
-                let maxX = partition.x + partition.w / 2;
-                const candidates = boundaryWalls.filter(wall => (
-                    wall.h > wall.w
-                    && partition.y + partition.h / 2 >= wall.y - wall.h / 2 - 0.5
-                    && partition.y - partition.h / 2 <= wall.y + wall.h / 2 + 0.5
-                ));
-                const leftTarget = candidates
-                    .map(wall => ({ wall, gap: minX - (wall.x + wall.w / 2) }))
-                    .filter(entry => entry.wall.x < partition.x && entry.gap >= -1 && entry.gap <= maxVisibleGap)
-                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
-                const rightTarget = candidates
-                    .map(wall => ({ wall, gap: (wall.x - wall.w / 2) - maxX }))
-                    .filter(entry => entry.wall.x > partition.x && entry.gap >= -1 && entry.gap <= maxVisibleGap)
-                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
-                if (leftTarget) minX = Math.min(minX, leftTarget.x);
-                if (rightTarget) maxX = Math.max(maxX, rightTarget.x);
-                partition.x = (minX + maxX) / 2;
-                partition.w = maxX - minX;
-            } else {
-                let minY = partition.y - partition.h / 2;
-                let maxY = partition.y + partition.h / 2;
-                const candidates = boundaryWalls.filter(wall => (
-                    wall.w >= wall.h
-                    && partition.x + partition.w / 2 >= wall.x - wall.w / 2 - 0.5
-                    && partition.x - partition.w / 2 <= wall.x + wall.w / 2 + 0.5
-                ));
-                const topTarget = candidates
-                    .map(wall => ({ wall, gap: minY - (wall.y + wall.h / 2) }))
-                    .filter(entry => entry.wall.y < partition.y && entry.gap >= -1 && entry.gap <= maxVisibleGap)
-                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
-                const bottomTarget = candidates
-                    .map(wall => ({ wall, gap: (wall.y - wall.h / 2) - maxY }))
-                    .filter(entry => entry.wall.y > partition.y && entry.gap >= -1 && entry.gap <= maxVisibleGap)
-                    .sort((a, b) => a.gap - b.gap)[0]?.wall;
-                if (topTarget) minY = Math.min(minY, topTarget.y);
-                if (bottomTarget) maxY = Math.max(maxY, bottomTarget.y);
-                partition.y = (minY + maxY) / 2;
-                partition.h = maxY - minY;
+        // Resolve both shell junctions and T/cross junctions between interior
+        // partitions. Multiple passes let two almost-meeting partitions become
+        // a real shared junction without ever bridging a collinear door gap.
+        const junctionWalls = [...boundaryWalls, ...partitions];
+        for (let pass = 0; pass < 3; pass++) {
+            for (const partition of partitions) {
+                const horizontal = partition.w >= partition.h;
+                if (horizontal) {
+                    let minX = partition.x - partition.w / 2;
+                    let maxX = partition.x + partition.w / 2;
+                    const candidates = junctionWalls.filter(wall => (
+                        wall.id !== partition.id
+                        && wall.h > wall.w
+                        && partition.y + partition.h / 2 >= wall.y - wall.h / 2 - 0.5
+                        && partition.y - partition.h / 2 <= wall.y + wall.h / 2 + 0.5
+                    ));
+                    const withinLimit = entry => entry.gap >= -1
+                        && entry.gap <= (entry.wall.kind === 'wall' ? maxExteriorGap : maxInteriorGap);
+                    const leftTarget = candidates
+                        .map(wall => ({ wall, gap: minX - (wall.x + wall.w / 2) }))
+                        .filter(entry => entry.wall.x < partition.x && withinLimit(entry))
+                        .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                    const rightTarget = candidates
+                        .map(wall => ({ wall, gap: (wall.x - wall.w / 2) - maxX }))
+                        .filter(entry => entry.wall.x > partition.x && withinLimit(entry))
+                        .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                    if (leftTarget) minX = Math.min(minX, leftTarget.x);
+                    if (rightTarget) maxX = Math.max(maxX, rightTarget.x);
+                    partition.x = (minX + maxX) / 2;
+                    partition.w = maxX - minX;
+                } else {
+                    let minY = partition.y - partition.h / 2;
+                    let maxY = partition.y + partition.h / 2;
+                    const candidates = junctionWalls.filter(wall => (
+                        wall.id !== partition.id
+                        && wall.w >= wall.h
+                        && partition.x + partition.w / 2 >= wall.x - wall.w / 2 - 0.5
+                        && partition.x - partition.w / 2 <= wall.x + wall.w / 2 + 0.5
+                    ));
+                    const withinLimit = entry => entry.gap >= -1
+                        && entry.gap <= (entry.wall.kind === 'wall' ? maxExteriorGap : maxInteriorGap);
+                    const topTarget = candidates
+                        .map(wall => ({ wall, gap: minY - (wall.y + wall.h / 2) }))
+                        .filter(entry => entry.wall.y < partition.y && withinLimit(entry))
+                        .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                    const bottomTarget = candidates
+                        .map(wall => ({ wall, gap: (wall.y - wall.h / 2) - maxY }))
+                        .filter(entry => entry.wall.y > partition.y && withinLimit(entry))
+                        .sort((a, b) => a.gap - b.gap)[0]?.wall;
+                    if (topTarget) minY = Math.min(minY, topTarget.y);
+                    if (bottomTarget) maxY = Math.max(maxY, bottomTarget.y);
+                    partition.y = (minY + maxY) / 2;
+                    partition.h = maxY - minY;
+                }
             }
         }
     }
@@ -1720,156 +1804,154 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
 // idea, real room functions, and at least two ways out.
 const LARGE_RESIDENCE_BLUEPRINTS = Object.freeze([
     {
-        id: 'center-hall', w: 540, h: 410,
-        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'north', offset: 0, role: 'gardenEntrance' }],
+        id: 'long-ranch', w: 640, h: 370,
+        exits: [{ side: 'south', offset: -0.28, role: 'mainEntrance' }, { side: 'east', offset: 0.18, role: 'sideEntrance' }],
         rooms: [
-            [0, 0, 0.17, 0.84, 'hallway'],
-            [-0.29, -0.23, 0.38, 0.38, 'bedroom'], [0.29, -0.23, 0.38, 0.38, 'dining-room'],
-            [-0.29, 0.23, 0.38, 0.38, 'living-room'], [0.29, 0.23, 0.38, 0.38, 'kitchen'],
+            [-0.34, -0.23, 0.25, 0.38, 'bedroom'], [-0.05, -0.23, 0.23, 0.38, 'bathroom'],
+            [0.28, -0.20, 0.34, 0.42, 'kitchen'], [-0.20, 0.25, 0.46, 0.34, 'living-room'],
+            [0.29, 0.25, 0.34, 0.34, 'dining-room'],
         ],
         walls: [
-            ['v', -0.10, 0, 0.86, [[-0.23, 58], [0.23, 58]]],
-            ['v', 0.10, 0, 0.86, [[-0.23, 58], [0.23, 58]]],
-            ['h', -0.30, 0, 0.38, []], ['h', 0.30, 0, 0.38, []],
-        ],
-        lootRoom: 3,
-    },
-    {
-        id: 'side-gallery', w: 500, h: 450,
-        exits: [{ side: 'west', offset: 0.24, role: 'mainEntrance' }, { side: 'east', offset: -0.24, role: 'sideEntrance' }],
-        rooms: [
-            [-0.30, 0, 0.16, 0.84, 'hallway'],
-            [0.08, 0.25, 0.50, 0.34, 'family-room'], [0.03, -0.25, 0.28, 0.34, 'bedroom'],
-            [0.31, -0.25, 0.22, 0.34, 'bathroom'], [0.31, 0.25, 0.22, 0.34, 'kitchen'],
-        ],
-        walls: [
-            ['v', -0.20, 0, 0.86, [[-0.25, 56], [0.25, 56]]],
-            ['h', 0.12, 0, 0.62, []],
-            ['v', 0.18, -0.25, 0.36, [[-0.25, 50]]],
-            ['v', 0.18, 0.25, 0.36, [[0.25, 50]]],
-        ],
-        lootRoom: 2,
-    },
-    {
-        id: 'cross-house', w: 560, h: 420,
-        exits: [{ side: 'south', offset: -0.16, role: 'mainEntrance' }, { side: 'east', offset: 0.18, role: 'sideEntrance' }],
-        rooms: [
-            [-0.25, -0.23, 0.36, 0.34, 'bedroom'], [0.25, -0.23, 0.36, 0.34, 'library'],
-            [-0.25, 0.23, 0.36, 0.34, 'living-room'], [0.25, 0.23, 0.36, 0.34, 'kitchen'],
-            [0, 0, 0.18, 0.18, 'hallway'],
-        ],
-        walls: [
-            ['v', 0, 0, 0.86, [[-0.24, 56], [0, 62], [0.24, 56]]],
-            ['h', 0, 0, 0.88, [[-0.25, 56], [0, 62], [0.25, 56]]],
-        ],
-        lootRoom: 1,
-    },
-    {
-        id: 'kitchen-heart', w: 520, h: 460,
-        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'north', offset: 0.30, role: 'rearEntrance' }],
-        rooms: [
-            [0, 0, 0.31, 0.28, 'kitchen'],
-            [-0.31, -0.27, 0.25, 0.30, 'bedroom'], [0.31, -0.27, 0.25, 0.30, 'bathroom'],
-            [-0.31, 0.24, 0.25, 0.36, 'living-room'], [0.31, 0.24, 0.25, 0.36, 'dining-room'],
-            [0, 0.34, 0.18, 0.20, 'entry'],
-        ],
-        walls: [
-            ['v', -0.18, 0, 0.72, [[-0.27, 54], [0, 56], [0.24, 54]]],
-            ['v', 0.18, 0, 0.72, [[-0.27, 54], [0, 56], [0.24, 54]]],
-            ['h', 0, -0.18, 0.34, [[0, 54]]], ['h', 0, 0.18, 0.34, [[0, 54]]],
-        ],
-        lootRoom: 3,
-    },
-    {
-        id: 'longhouse', w: 600, h: 360,
-        exits: [{ side: 'west', offset: 0, role: 'mainEntrance' }, { side: 'east', offset: 0, role: 'rearEntrance' }],
-        rooms: [
-            [0, 0, 0.86, 0.17, 'hallway'],
-            [-0.30, -0.27, 0.24, 0.30, 'bedroom'], [0, -0.27, 0.24, 0.30, 'study'], [0.30, -0.27, 0.24, 0.30, 'bathroom'],
-            [-0.30, 0.27, 0.24, 0.30, 'living-room'], [0, 0.27, 0.24, 0.30, 'dining-room'], [0.30, 0.27, 0.24, 0.30, 'kitchen'],
-        ],
-        walls: [
-            ['h', 0, -0.10, 0.88, [[-0.30, 52], [0, 52], [0.30, 52]]],
-            ['h', 0, 0.10, 0.88, [[-0.30, 52], [0, 52], [0.30, 52]]],
-            ['v', -0.17, -0.28, 0.32, []], ['v', 0.17, -0.28, 0.32, []],
-            ['v', -0.17, 0.28, 0.32, []], ['v', 0.17, 0.28, 0.32, []],
-        ],
-        lootRoom: 1,
-    },
-    {
-        id: 'sunroom-loop', w: 480, h: 470,
-        exits: [{ side: 'south', offset: -0.22, role: 'mainEntrance' }, { side: 'east', offset: -0.22, role: 'gardenEntrance' }],
-        rooms: [
-            [0, -0.33, 0.44, 0.20, 'sunroom'],
-            [-0.27, -0.05, 0.28, 0.30, 'bedroom'], [0.22, -0.05, 0.36, 0.30, 'family-room'],
-            [-0.27, 0.29, 0.28, 0.25, 'study'], [0.02, 0.29, 0.22, 0.25, 'entry'], [0.30, 0.29, 0.20, 0.25, 'kitchen'],
-        ],
-        walls: [
-            ['h', 0, -0.20, 0.86, [[0, 58]]],
-            ['v', -0.11, 0.08, 0.54, [[-0.05, 54], [0.29, 54]]],
-            ['h', 0.10, 0.14, 0.60, [[0.02, 54]]],
-            ['v', 0.18, 0.29, 0.25, [[0.29, 48]]],
+            ['h', 0, 0.02, 0.86, [[-0.30, 58], [0.20, 70]], 'arch'],
+            ['v', -0.20, -0.23, 0.40, [[-0.23, 54]], 'door'],
+            ['v', 0.10, -0.23, 0.40, [[-0.23, 54]], 'door'],
         ],
         lootRoom: 0,
     },
     {
-        id: 'library-spine', w: 570, h: 400,
-        exits: [{ side: 'south', offset: -0.13, role: 'mainEntrance' }, { side: 'north', offset: -0.13, role: 'rearEntrance' }],
+        id: 'front-gable', w: 480, h: 570,
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'west', offset: -0.30, role: 'sideEntrance' }],
         rooms: [
-            [-0.13, 0, 0.16, 0.84, 'hallway'], [-0.34, 0, 0.24, 0.78, 'library'],
-            [0.19, -0.28, 0.40, 0.25, 'bedroom'], [0.19, 0, 0.40, 0.25, 'dining-room'], [0.19, 0.28, 0.40, 0.25, 'living-room'],
+            [0, 0.42, 0.32, 0.14, 'entry'],
+            [-0.25, -0.31, 0.36, 0.25, 'bedroom'], [0.25, -0.31, 0.36, 0.25, 'bathroom'],
+            [0, 0, 0.82, 0.28, 'living-room'], [-0.24, 0.30, 0.38, 0.25, 'dining-room'],
+            [0.24, 0.30, 0.38, 0.25, 'kitchen'],
         ],
         walls: [
-            ['v', -0.23, 0, 0.86, [[0, 58]]],
-            ['v', -0.03, 0, 0.86, [[-0.28, 54], [0, 54], [0.28, 54]]],
-            ['h', 0.19, -0.14, 0.42, []], ['h', 0.19, 0.14, 0.42, []],
+            ['h', 0, -0.17, 0.86, [[-0.25, 54], [0.25, 54]], 'door'],
+            ['h', 0, 0.17, 0.86, [[0, 82]], 'arch'],
+            ['v', 0, -0.31, 0.26, [], 'wall'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'garden-l', w: 610, h: 480,
+        footprint: [[-0.5, -0.5], [0.08, -0.5], [0.08, -0.08], [0.5, -0.08], [0.5, 0.5], [-0.5, 0.5]],
+        exits: [{ side: 'south', offset: 0.24, role: 'mainEntrance' }, { side: 'west', offset: -0.24, role: 'gardenEntrance' }],
+        rooms: [
+            [-0.27, -0.29, 0.36, 0.30, 'bedroom'], [-0.27, 0.01, 0.36, 0.20, 'bathroom'],
+            [-0.25, 0.29, 0.40, 0.30, 'living-room'], [0.22, 0.27, 0.40, 0.32, 'kitchen'],
+            [0.02, 0.10, 0.22, 0.18, 'dining-room'],
+        ],
+        walls: [
+            ['v', -0.06, -0.17, 0.66, [[-0.18, 54]], 'door'],
+            ['h', 0, 0.15, 1.00, [[0.02, 82]], 'arch'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'corner-cottage-l', w: 560, h: 510,
+        footprint: [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.10, 0.5], [-0.10, 0.10], [-0.5, 0.10]],
+        exits: [{ side: 'north', offset: 0.20, role: 'mainEntrance' }, { side: 'east', offset: 0.18, role: 'sideEntrance' }],
+        rooms: [
+            [-0.26, -0.27, 0.36, 0.30, 'bedroom'], [0.22, -0.28, 0.38, 0.30, 'living-room'],
+            [0.23, 0.02, 0.38, 0.22, 'dining-room'], [0.23, 0.30, 0.38, 0.28, 'kitchen'],
+            [-0.26, -0.01, 0.34, 0.20, 'bathroom'],
+        ],
+        walls: [
+            ['h', -0.20, -0.12, 0.60, [[-0.26, 54], [0.20, 82]], 'arch'],
+            ['h', 0.20, 0.15, 0.58, [[0.23, 82]], 'arch'],
+            ['v', -0.06, -0.25, 0.46, [[-0.02, 52]], 'door'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'farmhouse-l', w: 660, h: 450,
+        footprint: [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.06], [0.12, 0.06], [0.12, 0.5], [-0.5, 0.5]],
+        exits: [{ side: 'west', offset: 0.16, role: 'mainEntrance' }, { side: 'north', offset: 0.26, role: 'rearEntrance' }],
+        rooms: [
+            [-0.30, -0.25, 0.28, 0.34, 'bedroom'], [0, -0.25, 0.24, 0.34, 'bathroom'],
+            [0.30, -0.22, 0.28, 0.38, 'kitchen'], [-0.28, 0.25, 0.34, 0.34, 'living-room'],
+            [0.02, 0.25, 0.20, 0.34, 'dining-room'],
+        ],
+        walls: [
+            ['h', -0.17, 0.04, 0.66, [[-0.08, 92]], 'arch'],
+            ['v', -0.15, -0.23, 0.48, [[-0.23, 54]], 'door'],
+            ['v', 0.16, -0.23, 0.48, [[-0.23, 80]], 'arch'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'wide-bungalow', w: 620, h: 390,
+        exits: [{ side: 'south', offset: 0.28, role: 'mainEntrance' }, { side: 'north', offset: -0.28, role: 'rearEntrance' }],
+        rooms: [
+            [-0.32, -0.24, 0.28, 0.36, 'bedroom'], [0, -0.24, 0.25, 0.36, 'bathroom'],
+            [0.31, -0.21, 0.28, 0.42, 'kitchen'], [-0.23, 0.25, 0.42, 0.34, 'living-room'],
+            [0.25, 0.25, 0.38, 0.34, 'dining-room'],
+        ],
+        walls: [
+            ['h', 0, 0.02, 0.86, [[-0.25, 80], [0.24, 84]], 'arch'],
+            ['v', -0.17, -0.24, 0.40, [[-0.24, 54]], 'door'],
+            ['v', 0.16, -0.24, 0.40, [[-0.24, 54]], 'door'],
         ],
         lootRoom: 1,
     },
     {
-        id: 'split-wing', w: 530, h: 440,
-        exits: [{ side: 'south', offset: 0.24, role: 'mainEntrance' }, { side: 'west', offset: -0.22, role: 'sideEntrance' }],
+        id: 'narrow-townhouse', w: 480, h: 590,
+        exits: [{ side: 'south', offset: -0.18, role: 'mainEntrance' }, { side: 'east', offset: -0.30, role: 'sideEntrance' }],
         rooms: [
-            [-0.25, -0.25, 0.36, 0.34, 'bedroom'], [0.24, -0.25, 0.38, 0.34, 'kitchen'],
-            [-0.28, 0.23, 0.30, 0.38, 'bathroom'], [0.18, 0.23, 0.48, 0.38, 'family-room'],
-            [0.02, -0.01, 0.18, 0.16, 'entry'],
+            [-0.24, -0.30, 0.36, 0.26, 'bedroom'], [0.24, -0.30, 0.36, 0.26, 'bathroom'],
+            [0, 0, 0.82, 0.26, 'living-room'], [-0.24, 0.30, 0.36, 0.26, 'dining-room'],
+            [0.24, 0.30, 0.36, 0.26, 'kitchen'],
         ],
         walls: [
-            ['h', 0, 0, 0.86, [[-0.28, 54], [0.02, 60], [0.26, 54]]],
-            ['v', -0.08, -0.25, 0.36, [[-0.25, 52]]],
-            ['v', -0.10, 0.23, 0.38, [[0.23, 54]]],
+            ['h', 0, -0.16, 0.86, [[-0.24, 54], [0.24, 54]], 'door'],
+            ['h', 0, 0.16, 0.86, [[0, 84]], 'arch'],
+            ['v', 0, -0.30, 0.28, [], 'wall'],
         ],
-        lootRoom: 3,
+        lootRoom: 0,
     },
     {
-        id: 'conservatory-ring', w: 560, h: 460,
-        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'west', offset: -0.30, role: 'gardenEntrance' }],
+        id: 'side-hall-home', w: 590, h: 410,
+        exits: [{ side: 'west', offset: 0.24, role: 'mainEntrance' }, { side: 'east', offset: -0.24, role: 'rearEntrance' }],
         rooms: [
-            [0, 0, 0.27, 0.27, 'sunroom'],
-            [-0.30, -0.27, 0.27, 0.28, 'bedroom'], [0.30, -0.27, 0.27, 0.28, 'library'],
-            [-0.30, 0.26, 0.27, 0.30, 'living-room'], [0.30, 0.26, 0.27, 0.30, 'dining-room'],
-            [0, -0.32, 0.20, 0.20, 'bathroom'], [0, 0.34, 0.18, 0.16, 'entry'],
+            [-0.30, -0.24, 0.30, 0.36, 'bedroom'], [-0.30, 0.25, 0.30, 0.34, 'bathroom'],
+            [0.02, -0.22, 0.24, 0.40, 'dining-room'], [0.30, -0.22, 0.26, 0.40, 'kitchen'],
+            [0.18, 0.25, 0.50, 0.34, 'living-room'],
         ],
         walls: [
-            ['v', -0.17, 0, 0.72, [[-0.27, 52], [0, 54], [0.26, 52]]],
-            ['v', 0.17, 0, 0.72, [[-0.27, 52], [0, 54], [0.26, 52]]],
-            ['h', 0, -0.17, 0.34, [[0, 52]]], ['h', 0, 0.17, 0.34, [[0, 52]]],
+            ['v', -0.13, 0, 0.86, [[-0.24, 54], [0.25, 54]], 'door'],
+            ['h', 0.18, 0.02, 0.56, [[0.15, 82]], 'arch'],
         ],
-        lootRoom: 2,
+        lootRoom: 0,
     },
     {
-        id: 'family-farmhouse', w: 590, h: 430,
-        exits: [{ side: 'south', offset: -0.28, role: 'mainEntrance' }, { side: 'east', offset: -0.20, role: 'mudroomEntrance' }],
+        id: 'open-family-home', w: 610, h: 420,
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'north', offset: 0.30, role: 'rearEntrance' }],
         rooms: [
-            [-0.31, -0.24, 0.25, 0.35, 'bedroom'], [0, -0.24, 0.25, 0.35, 'bedroom'], [0.31, -0.24, 0.25, 0.35, 'bathroom'],
-            [-0.31, 0.24, 0.25, 0.35, 'living-room'], [0, 0.24, 0.25, 0.35, 'dining-room'], [0.31, 0.16, 0.25, 0.22, 'kitchen'],
-            [0.31, 0.36, 0.25, 0.15, 'mudroom'],
+            [-0.31, -0.25, 0.28, 0.34, 'bedroom'], [0, -0.25, 0.24, 0.34, 'bathroom'],
+            [0.30, -0.22, 0.28, 0.40, 'kitchen'], [-0.24, 0.24, 0.42, 0.34, 'living-room'],
+            [0.25, 0.24, 0.38, 0.34, 'dining-room'],
         ],
         walls: [
-            ['h', 0, 0, 0.88, [[-0.31, 52], [0, 52], [0.31, 52]]],
-            ['v', -0.17, -0.24, 0.37, []], ['v', 0.17, -0.24, 0.37, []],
-            ['v', -0.17, 0.24, 0.37, [[0.24, 50]]], ['v', 0.17, 0.24, 0.37, [[0.18, 50]]],
-            ['h', 0.31, 0.29, 0.27, [[0.31, 48]]],
+            ['h', 0, 0.02, 0.86, [[-0.24, 88], [0.24, 88]], 'arch'],
+            ['v', -0.16, -0.24, 0.40, [[-0.24, 54]], 'door'],
+            ['v', 0.15, -0.24, 0.40, [[-0.24, 54]], 'door'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'split-ranch', w: 680, h: 380,
+        exits: [{ side: 'south', offset: -0.30, role: 'mainEntrance' }, { side: 'east', offset: 0.18, role: 'sideEntrance' }],
+        rooms: [
+            [-0.34, -0.23, 0.24, 0.38, 'bedroom'], [-0.08, -0.23, 0.20, 0.38, 'bathroom'],
+            [0.25, -0.21, 0.38, 0.42, 'kitchen'], [-0.24, 0.25, 0.44, 0.34, 'living-room'],
+            [0.27, 0.25, 0.36, 0.34, 'dining-room'],
+        ],
+        walls: [
+            ['h', 0, 0.02, 0.88, [[-0.26, 82], [0.24, 88]], 'arch'],
+            ['v', -0.19, -0.23, 0.40, [[-0.23, 54]], 'door'],
+            ['v', 0.05, -0.23, 0.40, [[-0.23, 54]], 'door'],
         ],
         lootRoom: 0,
     },
@@ -1896,6 +1978,13 @@ function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
         offset: mirror && (exit.side === 'north' || exit.side === 'south') ? -exit.offset : exit.offset,
     });
     const exits = blueprint.exits.map(transformExit);
+    const normalizedFootprint = blueprint.footprint || [
+        [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5],
+    ];
+    const footprint = normalizedFootprint.map(([pointX, pointY]) => ({
+        x: transformX(pointX) * blueprint.w,
+        y: pointY * blueprint.h,
+    }));
     const designId = `${blueprint.id}-${options.instanceIndex + 1}-${mirror ? 'mirror' : 'original'}-${style.variant}`;
     const floor = addObstacle(obstacles, 'houseFloor', x, y, blueprint.w, blueprint.h, {
         collidable: false,
@@ -1907,37 +1996,56 @@ function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
         blueprint: blueprint.id,
         designId,
         label: `Residence ${options.instanceIndex + 1}`,
+        footprint,
     });
     const houseId = floor.id;
-    const northY = y - blueprint.h / 2 + wall / 2;
-    const southY = y + blueprint.h / 2 - wall / 2;
-    const westX = x - blueprint.w / 2 + wall / 2;
-    const eastX = x + blueprint.w / 2 - wall / 2;
-    const exitsBySide = new Map(exits.map(exit => [exit.side, exit]));
     const exteriorWallOptions = { houseId, role: 'exteriorWall', landmarkType: 'residential' };
 
-    for (const side of ['north', 'south']) {
-        const exit = exitsBySide.get(side);
-        const wallY = side === 'north' ? northY : southY;
-        if (exit) {
-            const doorSpan = compactDoorSpan(64, style.variant);
-            const doorX = x + exit.offset * blueprint.w;
-            addHorizontalWallWithOpening(obstacles, x, wallY, blueprint.w, wall, style.variant, doorX, doorSpan, exteriorWallOptions);
-            addDoor(obstacles, houseId, doorX, wallY, doorSpan + 2, wall * 0.90, style.variant, side, exit.role);
-        } else {
-            addWall(obstacles, x, wallY, blueprint.w, wall, style.variant, exteriorWallOptions);
+    const claimedExits = new Set();
+    for (let index = 0; index < footprint.length; index++) {
+        const from = footprint[index];
+        const to = footprint[(index + 1) % footprint.length];
+        const horizontal = Math.abs(from.y - to.y) < 0.01;
+        const edgeMin = horizontal ? Math.min(from.x, to.x) : Math.min(from.y, to.y);
+        const edgeMax = horizontal ? Math.max(from.x, to.x) : Math.max(from.y, to.y);
+        const edgeCenter = (edgeMin + edgeMax) / 2;
+        const edgeLength = edgeMax - edgeMin;
+        const edgeAxis = horizontal ? from.y : from.x;
+        const exit = exits.find(candidate => {
+            if (claimedExits.has(candidate)) return false;
+            const expectedAxis = candidate.side === 'north' ? -blueprint.h / 2
+                : candidate.side === 'south' ? blueprint.h / 2
+                    : candidate.side === 'west' ? -blueprint.w / 2 : blueprint.w / 2;
+            const exitPosition = (candidate.side === 'north' || candidate.side === 'south')
+                ? candidate.offset * blueprint.w
+                : candidate.offset * blueprint.h;
+            return horizontal === (candidate.side === 'north' || candidate.side === 'south')
+                && Math.abs(edgeAxis - expectedAxis) < 1
+                && exitPosition > edgeMin + 28
+                && exitPosition < edgeMax - 28;
+        });
+        const wallX = x + (horizontal ? edgeCenter : edgeAxis);
+        const wallY = y + (horizontal ? edgeAxis : edgeCenter);
+        if (!exit) {
+            addWall(obstacles, wallX, wallY, horizontal ? edgeLength : wall, horizontal ? wall : edgeLength,
+                style.variant, exteriorWallOptions);
+            continue;
         }
-    }
-    for (const side of ['west', 'east']) {
-        const exit = exitsBySide.get(side);
-        const wallX = side === 'west' ? westX : eastX;
-        if (exit) {
-            const doorSpan = compactDoorSpan(64, style.variant);
-            const doorY = y + exit.offset * blueprint.h;
-            addVerticalWallWithOpening(obstacles, wallX, y, blueprint.h, wall, style.variant, doorY, doorSpan, exteriorWallOptions);
-            addDoor(obstacles, houseId, wallX, doorY, wall * 0.90, doorSpan + 2, style.variant, side, exit.role);
+        claimedExits.add(exit);
+        const doorSpan = compactDoorSpan(64, style.variant);
+        const doorAxis = (exit.side === 'north' || exit.side === 'south')
+            ? exit.offset * blueprint.w
+            : exit.offset * blueprint.h;
+        if (horizontal) {
+            addHorizontalWallWithOpening(obstacles, wallX, wallY, edgeLength, wall, style.variant,
+                x + doorAxis, doorSpan, exteriorWallOptions);
+            addDoor(obstacles, houseId, x + doorAxis, wallY, doorSpan + 2, wall * 0.90,
+                style.variant, exit.side, exit.role);
         } else {
-            addWall(obstacles, wallX, y, wall, blueprint.h, style.variant, exteriorWallOptions);
+            addVerticalWallWithOpening(obstacles, wallX, wallY, edgeLength, wall, style.variant,
+                y + doorAxis, doorSpan, exteriorWallOptions);
+            addDoor(obstacles, houseId, wallX, y + doorAxis, wall * 0.90, doorSpan + 2,
+                style.variant, exit.side, exit.role);
         }
     }
 
@@ -1950,8 +2058,8 @@ function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
         roomH * blueprint.h,
         roomType,
     ));
-    for (const [axis, centerX, centerY, length, gapSpecs] of blueprint.walls) {
-        const openPlanArch = blueprint.id === 'kitchen-heart' || blueprint.id === 'conservatory-ring';
+    for (const [axis, centerX, centerY, length, gapSpecs, openingType = 'door'] of blueprint.walls) {
+        const openPlanArch = openingType === 'arch';
         if (axis === 'v') {
             const transformedX = transformX(centerX);
             const wallY = y + centerY * blueprint.h;
@@ -2024,8 +2132,8 @@ function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
     const sideX = -outwardY;
     const sideY = outwardX;
     addObstacle(obstacles, 'mailbox',
-        doorX + outwardX * 118 + sideX * 78,
-        doorY + outwardY * 118 + sideY * 78,
+        doorX + outwardX * 145 + sideX * 78,
+        doorY + outwardY * 145 + sideY * 78,
         28, 34,
         {
             collidable: false,
@@ -2128,6 +2236,7 @@ function addManorHouse(obstacles, loot, spawnPoints, x, y) {
     // movement fluid and the central planter breaks long firing lanes.
     addInteriorWall(obstacles, x, y - 88, 164, wall, variant, meta);
     addInteriorWall(obstacles, x, y + 68, 164, wall, variant, meta);
+    addInteriorWall(obstacles, x + 115, y + 68, 66, wall, variant, meta);
     addInteriorWall(obstacles, x - 82, y - 64, wall, 48, variant, meta);
     addInteriorWall(obstacles, x - 82, y + 44, wall, 48, variant, meta);
     addInteriorWall(obstacles, x + 82, y - 64, wall, 48, variant, meta);
@@ -2305,17 +2414,17 @@ function addIronworks(obstacles, loot, spawnPoints, x, y) {
     addRoomZone(obstacles, houseId, x + 610, y + 265, 500, 430, 'loading-bay');
 
     addVerticalInteriorWallSegments(obstacles, x - 360, y, h - wall * 4, wall, [
-        { center: -400, size: 165 },
-        { center: 0, size: 165 },
-        { center: 400, size: 165 },
+        { center: -300, size: 165 },
+        { center: 300, size: 165 },
     ], 'metal', ironworksMeta);
     addVerticalInteriorWallSegments(obstacles, x + 360, y, h - wall * 4, wall, [
-        { center: -400, size: 165 },
-        { center: 0, size: 165 },
-        { center: 400, size: 165 },
+        { center: -300, size: 165 },
+        { center: 300, size: 165 },
     ], 'metal', ironworksMeta);
     addHorizontalInteriorWallSegments(obstacles, x - 620, y, 500, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
-    addHorizontalInteriorWallSegments(obstacles, x + 620, y, 500, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
+    addHorizontalInteriorWallSegments(obstacles, x + 620, y + 70, 500, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
+    addHorizontalInteriorWallSegments(obstacles, x, y - 180, 720, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
+    addHorizontalInteriorWallSegments(obstacles, x, y + 180, 720, wall, [{ center: 0, size: 140 }], 'metal', ironworksMeta);
 
     // The shared interior planner keeps every factory doorway and circulation
     // loop clear while giving each side room a distinct purpose.
@@ -3731,12 +3840,10 @@ function addHospital(obstacles, loot, spawnPoints, x, y) {
     // Corridor walls with doorway gaps
     addVerticalInteriorWallSegments(obstacles, x - 200, y, 800, 16, [
         { center: -200, size: 90 },
-        { center: 0, size: 90 },
         { center: 200, size: 90 },
     ], 'plaster', { houseId, doorVariant: 'plaster' });
     addVerticalInteriorWallSegments(obstacles, x + 200, y, 800, 16, [
         { center: -200, size: 90 },
-        { center: 0, size: 90 },
         { center: 200, size: 90 },
     ], 'plaster', { houseId, doorVariant: 'plaster' });
 
@@ -4281,6 +4388,14 @@ function assignTreeCanopyStyles(obstacles) {
         hash ^= Math.round((Number(tree.y) || 0) * 10);
         hash = Math.imul(hash, 16777619);
         tree.canopyStyle = (hash >>> 0) % 4 === 0 ? 'legacy' : 'surviv';
+
+        const crownSize = Math.max(Number(tree.w) || 0, Number(tree.h) || 0);
+        const isLandmark = tree.role === 'landmarkTree';
+        const isLarge = isLandmark || crownSize >= 64;
+        tree.treeSize = isLandmark ? 'giant' : isLarge ? 'large' : 'standard';
+        tree.trunkScale = isLandmark ? 0.36 : isLarge ? 0.31 : 0.255;
+        tree.hitboxW = Math.max(11, Number((tree.w * tree.trunkScale).toFixed(2)));
+        tree.hitboxH = Math.max(11, Number((tree.h * tree.trunkScale).toFixed(2)));
     }
 }
 
@@ -4612,7 +4727,7 @@ function addScatteredGroundLoot(obstacles, loot) {
             };
             const blocked = obstacles.some(obstacle => (
                 obstacle.collidable !== false
-                && circleRectCollision(pos.x, pos.y, 20, obstacle)
+                && circleRectCollision(pos.x, pos.y, 20, getObstacleCollisionRect(obstacle))
             ));
             if (blocked) continue;
 
@@ -4667,7 +4782,12 @@ function clearInvalidBuildingProps(obstacles) {
     for (let i = obstacles.length - 1; i >= 0; i--) {
         const obstacle = obstacles[i];
         if (!CLEARABLE_MAP_PROP_KINDS.has(obstacle.kind)) continue;
-        const blocksDoor = approaches.some(approach => rectsOverlap(
+        // These two non-colliding details are authored relative to their own
+        // residence entrance and are asserted as part of the house design.
+        // A nearby unrelated doorway must not randomly erase them.
+        const protectedResidenceDetail = obstacle.houseId
+            && (obstacle.role === 'residenceMailbox' || obstacle.role === 'residenceGarden');
+        const blocksDoor = !protectedResidenceDetail && approaches.some(approach => rectsOverlap(
             obstacle.x, obstacle.y, obstacle.w, obstacle.h,
             approach.x, approach.y, approach.w, approach.h,
         ));
@@ -4689,7 +4809,7 @@ function isGeneratedSpawnPointSafe(obstacles, x, y, radius = 30) {
             || obstacle.kind === 'water'
             || obstacle.kind === 'river';
         if (!forbiddenSurface && obstacle.collidable === false) continue;
-        if (circleRectCollision(x, y, radius, obstacle)) return false;
+        if (circleRectCollision(x, y, radius, getObstacleCollisionRect(obstacle))) return false;
     }
     return true;
 }
@@ -5403,7 +5523,7 @@ export function generateSurvivMap(worldHalf) {
     addCanopyInfill(obstacles, wh, 4650, INTENTIONAL_OPEN_AREAS, countrysidePlacementIndex);
     addNaturalDetailScatter(obstacles, wh, [...POI_LIST, ...INTENTIONAL_OPEN_AREAS], countrysidePlacementIndex);
     addScatteredGroundLoot(obstacles, loot);
-    sealInteriorWallExteriorJunctions(obstacles);
+    sealInteriorWallJunctions(obstacles);
     clearInvalidBuildingProps(obstacles);
     // Later residences may legitimately clear an earlier landmark tree. Top up
     // after that cleanup so every generated map still exposes the large tree
@@ -6283,7 +6403,7 @@ function removeSurvivLootAt(room, index) {
 
 function isPositionBlocked(room, x, y, r) {
     for (const o of queryObstacles(room, x, y, r + 80, true)) {
-        if (circleRectCollision(x, y, r, o)) return true;
+        if (circleRectCollision(x, y, r, getObstacleCollisionRect(o))) return true;
     }
     for (const { item } of querySurvivLoot(room, x, y, r + 32)) {
         if (!isSolidLootContainer(item)) continue;
@@ -6299,7 +6419,7 @@ function isSurvivSpawnPositionSafe(room, x, y, radius) {
             || obstacle.kind === 'water'
             || obstacle.kind === 'river';
         if (!forbiddenSurface && obstacle.collidable === false) continue;
-        if (circleRectCollision(x, y, radius, obstacle)) return false;
+        if (circleRectCollision(x, y, radius, getObstacleCollisionRect(obstacle))) return false;
     }
     for (const { item } of querySurvivLoot(room, x, y, radius + 32)) {
         if (!isSolidLootContainer(item)) continue;
@@ -6352,7 +6472,7 @@ function moveEntity(entity, room, dx, dy, speed) {
     newY = clamp(newY, -wh, wh);
 
     for (const o of getNearbyObstacles(room, newX, newY, 220)) {
-        const collisionShape = o.kind === 'door' ? getSurvivDoorCollisionRect(o) : o;
+        const collisionShape = getObstacleCollisionRect(o);
         if (circleRectCollision(newX, newY, r, collisionShape)) {
             // Bots should understand doorways instead of getting pinned against
             // a closed door forever. Human players deliberately use F.
@@ -6413,7 +6533,7 @@ function tryShoot(entity, room, now) {
         }
         let closestObstacle = null;
         for (const obstacle of queryObstacles(room, entity.x, entity.y, wDef.meleeReach + 120, true)) {
-            const collisionShape = obstacle.kind === 'door' ? getSurvivDoorCollisionRect(obstacle) : obstacle;
+            const collisionShape = getObstacleCollisionRect(obstacle);
             const local = toRectLocal(entity.x, entity.y, collisionShape);
             const contactPoint = fromRectLocal(
                 clamp(local.x, -collisionShape.w / 2, collisionShape.w / 2),
@@ -6721,7 +6841,7 @@ function isContainerDropPositionClear(room, x, y) {
         obstacle.kind !== 'houseFloor'
         && obstacle.kind !== 'roomZone'
         && obstacle.kind !== 'door'
-        && circleRectCollision(x, y, 14, obstacle)
+        && circleRectCollision(x, y, 14, getObstacleCollisionRect(obstacle))
     ));
 }
 
@@ -7298,7 +7418,7 @@ function updateBullets(room, now, effectiveRadius) {
         let nearestObstacle = null;
         let obstacleHitT = Infinity;
         for (const obstacle of getNearbyObstacles(room, midX, midY, queryRange)) {
-            const collisionShape = obstacle.kind === 'door' ? getSurvivDoorCollisionRect(obstacle) : obstacle;
+            const collisionShape = getObstacleCollisionRect(obstacle);
             const hitT = segmentRectHitT(previousX, previousY, bullet.x, bullet.y, collisionShape);
             if (hitT != null && hitT < obstacleHitT) {
                 nearestObstacle = obstacle;
@@ -7968,6 +8088,11 @@ function serializeSurvivObstacle(o) {
         ...(o.rotation ? { rotation: o.rotation } : {}),
         ...(o.variant ? { variant: o.variant } : {}),
         ...(o.canopyStyle ? { canopyStyle: o.canopyStyle } : {}),
+        ...(Number.isFinite(o.hitboxW) ? { hitboxW: o.hitboxW } : {}),
+        ...(Number.isFinite(o.hitboxH) ? { hitboxH: o.hitboxH } : {}),
+        ...(Number.isFinite(o.trunkScale) ? { trunkScale: o.trunkScale } : {}),
+        ...(o.treeSize ? { treeSize: o.treeSize } : {}),
+        ...(Array.isArray(o.footprint) ? { footprint: o.footprint } : {}),
         ...(o.biome ? { biome: o.biome } : {}),
         ...(o.label ? { label: o.label } : {}),
         ...(o.houseId ? { houseId: o.houseId } : {}),
