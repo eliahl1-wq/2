@@ -766,7 +766,20 @@ function hueFromColor(color) {
     return Math.floor(h);
 }
 
+// Apply at both AI and physics boundaries: bots do not pass through socket input
+// guards, and stale steering/boost must not survive the start of a cashout hold.
+function lockSnakeCashoutInput(snake) {
+    if (!snake.cashoutHoldActive && !snake.isCashingOut) return false;
+    const angle = snake.angle ?? Math.atan2(snake.inputDy || 0, snake.inputDx || 0);
+    snake.angle = angle;
+    snake.inputDx = Math.cos(angle);
+    snake.inputDy = Math.sin(angle);
+    snake.boost = false;
+    return true;
+}
+
 function updateSnakeMovement(snake, room = null) {
+    const cashoutLocked = lockSnakeCashoutInput(snake);
     const head = snake.segments[0];
     rememberSnakeMouthBeforeMove(snake);
     snake._prevHeadX = head.x;
@@ -775,7 +788,7 @@ function updateSnakeMovement(snake, room = null) {
 
     // slither.io-style turn-rate limit: heading rotates toward the cursor
     // instead of snapping. Bigger snakes turn slower.
-    const desired = Math.atan2(dy, dx);
+    const desired = cashoutLocked ? snake.angle : Math.atan2(dy, dx);
     const scang = scangForSegmentCount(snake.segments.length);
     const maxTurn = (SLITHER.turnRate * scang) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;
@@ -1212,6 +1225,7 @@ export function runSlitherBotAI(
     deathDrops = null,
     deathDropIds = null,
 ) {
+    if (lockSnakeCashoutInput(snake)) return;
     const head = snake.segments[0];
     const brain = ensureSlitherBotBrain(snake);
     const availableDeathDrops = deathDrops ?? food.filter(f => f.deathDrop);
@@ -1400,6 +1414,7 @@ export function runCompetitiveSlitherBotAI(
     paidDeathDropIds,
     now = Date.now(),
 ) {
+    if (lockSnakeCashoutInput(snake)) return;
     const head = snake.segments[0];
     const brain = ensureSlitherBotBrain(snake);
     brain.survivalGoal = snake._paidDeathDropTarget?.id != null && paidDeathDropIds.has(snake._paidDeathDropTarget.id) ? snake._paidDeathDropTarget : null;
@@ -2275,6 +2290,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                     if (snake.isCashingOut) {
                         if (cashoutThreat) {
                             snake.isCashingOut = false;
+                            snake.cashoutHoldActive = false;
+                            snake.cashoutHoldStartedAt = 0;
                             snake.cashOutEndTime = 0;
                             snake.cashOutRetryAt = Date.now() + 1500;
                         } else if (Date.now() >= snake.cashOutEndTime) {
@@ -2290,7 +2307,9 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                             && !cashoutThreat
                             && Date.now() >= (snake.cashOutRetryAt || 0)) {
                             snake.isCashingOut = true;
-                            snake.cashOutEndTime = Date.now() + 3000;
+                            snake.cashoutHoldActive = true;
+                            snake.cashoutHoldStartedAt = Date.now();
+                            snake.cashOutEndTime = snake.cashoutHoldStartedAt + 3000;
                             console.log(`⏱️ Slither Bot ${snake.username} started cashout timer (threshold: $${snake.cashOutThreshold.toFixed(2)})`);
                         }
                     }
@@ -2308,8 +2327,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             );
         }
 
-        // Steering input is frozen by the socket handler, while movement keeps
-        // advancing along the snake's last heading during the cashout hold.
+        // Physics enforces the same cashout lock for humans and bots while the
+        // snake still moves forward and remains vulnerable to collisions.
         updateSnakeMovement(snake, room);
         if (!sandboxSkipFoodCollisions) {
             checkFoodCollisions(snake, room, foodGrid);
@@ -2783,6 +2802,7 @@ function competitiveMinMass(entryFeeUsd) {
 }
 
 function updateCompetitiveSnakeMovement(snake) {
+    const cashoutLocked = lockSnakeCashoutInput(snake);
     const head = snake.segments[0];
     rememberSnakeMouthBeforeMove(snake);
     snake._prevHeadX = head.x;
@@ -2790,7 +2810,7 @@ function updateCompetitiveSnakeMovement(snake) {
     const { dx, dy } = normalizeSnakeInput(snake);
     const massRef = competitiveMinMass(snake.entryFeeUsd);
 
-    const desired = Math.atan2(dy, dx);
+    const desired = cashoutLocked ? snake.angle : Math.atan2(dy, dx);
     const scang = scangForSegmentCount(snake.segments.length);
     const maxTurn = (SLITHER.turnRate * scang) / SLITHER.serverTickRate;
     const current = snake.angle ?? desired;

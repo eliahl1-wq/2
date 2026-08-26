@@ -2354,6 +2354,53 @@ test('cashout hold freezes movement and discards queued gameplay actions', () =>
     assert.equal(player.openChestId, null);
     assert.equal(player.takeChestItem, null);
 });
+for (const isBot of [false, true]) {
+    for (const flag of ['cashoutHoldActive', 'isCashingOut']) {
+        test(`Surviv ${isBot ? 'bot' : 'human'} ${flag} blocks AI/actions and stays vulnerable`, () => {
+            const room = {
+                id: 'surviv-cashout', entryFeeUsd: 5, players: [], bots: [],
+                obstacles: [], loot: [], bullets: [], spawnPoints: [],
+                _nextSurvivBotSyncAt: Infinity,
+            };
+            const player = createSurvivPlayer('holding', 'mongo-holding', 'Holding', '#fff', room);
+            Object.assign(player, {
+                isBot, x: 0, y: 0, angle: 0.3, aimAngle: 0.3,
+                inputDx: 1, inputDy: 1, shooting: true, botThinkAt: 0,
+                [flag]: true, useMedkit: true, pickupWeaponPending: true,
+                equipSlotPending: 1, throwGrenadePending: true,
+                chestHoldId: 'stale', _pendingFirePressId: 123,
+            });
+            (isBot ? room.bots : room.players).push(player);
+            processSurvivRoom(room, silentIo, Date.now() + 600000);
+            assert.equal(player.x, 0);
+            assert.equal(player.y, 0);
+            assert.equal(player.angle, 0.3);
+            assert.equal(player.aimAngle, 0.3);
+            assert.equal(player.botThinkAt, 0, 'bot AI must not run');
+            assert.equal(player.shooting, false);
+            assert.equal(player.useMedkit, false);
+            assert.equal(player.pickupWeaponPending, false);
+            assert.equal(player.equipSlotPending, null);
+            assert.equal(player.throwGrenadePending, false);
+            assert.equal(player.chestHoldId, null);
+            assert.equal(player._pendingFirePressId, null);
+            assert.equal(room.bullets.length, 0);
+
+            player.x = SURVIV.worldHalf;
+            player._lastZoneDamageAt = Date.now() - 200;
+            processSurvivRoom(room, silentIo, Date.now() + 1000);
+            assert.ok(player.hp < player.maxHp, 'cashout must still take zone damage');
+
+            player[flag] = false;
+            player.x = 0;
+            player.inputDx = 1;
+            processSurvivRoom(room, silentIo, Date.now() + 600000);
+            if (isBot) assert.ok(player.botThinkAt > 0, 'AI resumes after cancellation');
+            else assert.ok(player.x > 0, 'movement resumes after cancellation');
+        });
+    }
+}
+
 test('analog movement strength matches mobile client prediction', () => {
     const room = makeRoom();
     room.obstacles = [];

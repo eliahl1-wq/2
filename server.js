@@ -9646,13 +9646,13 @@ io.on('connection', (socket) => {
             pl.id === socket.id && (pl.mode === 'slither' || pl.mode === 'competitive-slither')
         );
         if (!p) return;
-        if (p.cashoutHoldActive) {
+        if (p.cashoutHoldActive || p.isCashingOut) {
             p.boost = false;
             return;
         }
         p.inputDx = Number(dx) || 0;
         p.inputDy = Number(dy) || 0;
-        p.boost = p.isCashingOut ? false : !!boost;
+        p.boost = !!boost;
     });
 
     socket.on('survivInput', (payload = {}) => {
@@ -9697,7 +9697,7 @@ io.on('connection', (socket) => {
             dropItem,
         } = payload;
 
-        if (player.cashoutHoldActive) {
+        if (player.cashoutHoldActive || player.isCashingOut) {
             player.inputDx = 0;
             player.inputDy = 0;
             player.shooting = false;
@@ -9711,11 +9711,6 @@ io.on('connection', (socket) => {
             player.aimAngle = Math.atan2(Math.sin(parsedAim), Math.cos(parsedAim));
         }
         player.aimDistance = finiteClamp(aimDistance, SURVIV.grenadeMinRange, SURVIV.grenadeMaxRange, 300);
-
-        if (player.isCashingOut) {
-            player.shooting = false;
-            return;
-        }
 
         applySurvivFireInput(player, shooting, firePressId);
         if (useMedkit === true) player.useMedkit = true;
@@ -10182,6 +10177,8 @@ function processRoom(room) {
                 if (player.isCashingOut) {
                     if (cashoutThreat) {
                         player.isCashingOut = false;
+                        player.cashoutHoldActive = false;
+                        player.cashoutHoldStartedAt = 0;
                         player.cashOutEndTime = 0;
                         player.cashOutRetryAt = Date.now() + BOT_CASHOUT_RETRY_MS;
                     } else if (Date.now() >= player.cashOutEndTime) {
@@ -10218,7 +10215,9 @@ function processRoom(room) {
                         && !cashoutThreat
                         && Date.now() >= (player.cashOutRetryAt || 0)) {
                         player.isCashingOut = true;
-                        player.cashOutEndTime = Date.now() + BOT_CASHOUT_DURATION_MS;
+                        player.cashoutHoldActive = true;
+                        player.cashoutHoldStartedAt = Date.now();
+                        player.cashOutEndTime = player.cashoutHoldStartedAt + BOT_CASHOUT_DURATION_MS;
                         console.log(`⏱️ Agar Bot ${player.username} started cashout timer (threshold: $${player.cashOutThreshold.toFixed(2)})`);
                     }
                 }

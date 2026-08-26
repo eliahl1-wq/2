@@ -7888,7 +7888,9 @@ function updateBotAI(bot, room, now, effectiveRadius) {
 }
 function processEntity(entity, room, now, effectiveRadius, zone) {
     if (entity.hp <= 0) return;
-    if (entity.cashoutHoldActive) {
+    // Both cashout states must stop before AI, movement, aiming or queued
+    // actions, regardless of whether the entity is human or bot controlled.
+    if (entity.cashoutHoldActive || entity.isCashingOut) {
         entity.inputDx = 0;
         entity.inputDy = 0;
         entity.shooting = false;
@@ -7902,6 +7904,9 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.dropItemPending = null;
         entity.openChestId = null;
         entity.takeChestItem = null;
+        entity.chestHoldId = null;
+        entity._pendingFirePressId = null;
+        if (entity.isCashingOut) entity.medkitUseEndAt = 0;
         checkZoneDamage(entity, zone, now);
         if (entity.hp <= 0) eliminateSurvivPlayer(room, entity, room._io);
         return;
@@ -7917,15 +7922,6 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         entity.openChestId = null;
         entity.takeChestItem = null;
     }
-    if (entity.isCashingOut) {
-        entity.shooting = false;
-        entity.useMedkit = false;
-        entity.medkitUseEndAt = 0;
-        entity.pickupWeaponPending = false;
-        entity.pickupVestId = null;
-        entity.equipSlotPending = null;
-    }
-
     if (!entity.isCashingOut && entity.useMedkit) {
         beginInventoryMedkit(entity, now);
         entity.useMedkit = false;
