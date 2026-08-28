@@ -325,8 +325,23 @@ test('every Surviv house has themed furniture outside every complete door swing'
     ]) {
         assert.ok(variants.has(expected), `missing redesigned furniture type ${expected}`);
     }
-    assert.ok(furniture.filter(obstacle => obstacle.destructible).length >= 180,
-        'interiors should contain plenty of breakable cover and lightweight furniture');
+    assert.ok(furniture.every(obstacle => (
+        obstacle.destructible
+        && obstacle.hp > 0
+        && obstacle.hp === obstacle.maxHp
+    )), 'every solid furnishing must have authoritative durability');
+
+    const blockingInteriorProps = map.obstacles.filter(obstacle => (
+        obstacle.houseId
+        && obstacle.collidable !== false
+        && ['furniture', 'machine', 'container', 'crate', 'barrel'].includes(obstacle.kind)
+    ));
+    assert.ok(blockingInteriorProps.length >= furniture.length);
+    assert.ok(blockingInteriorProps.every(obstacle => (
+        obstacle.destructible
+        && obstacle.hp > 0
+        && obstacle.hp === obstacle.maxHp
+    )), 'no indoor blocker may become permanent cover or trap a player');
 
     const labFurniture = furniture.filter(obstacle => obstacle.landmarkType === 'lab');
     assert.ok(['labBench', 'specimenTank', 'serverRack']
@@ -1371,6 +1386,7 @@ test('every interior partition belongs to a connected wall junction', () => {
     const interiorWalls = map.obstacles.filter(obstacle => (
         obstacle.kind === 'interiorWall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
     ));
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door');
     const wallsTouch = (first, second, tolerance = 1.5) => (
         Math.abs(first.x - second.x) * 2 <= first.w + second.w + tolerance * 2
         && Math.abs(first.y - second.y) * 2 <= first.h + second.h + tolerance * 2
@@ -1389,6 +1405,7 @@ test('every interior partition belongs to a connected wall junction', () => {
             : pointInRect(obstacle.x, obstacle.y, floor, 22);
         const partitions = interiorWalls.filter(belongsToFloor);
         const structureWalls = [...exteriorWalls, ...interiorWalls].filter(belongsToFloor);
+        const floorDoors = doors.filter(door => door.houseId === floor.id);
         const boundaryWalls = exteriorWalls.filter(wall => {
             if (wall.houseId && wall.houseId !== floor.id) return false;
             if (wall.h > wall.w) {
@@ -1404,9 +1421,44 @@ test('every interior partition belongs to a connected wall junction', () => {
         });
 
         for (const partition of partitions) {
-            assert.ok(structureWalls.some(wall => (
+            const touchesStructure = structureWalls.some(wall => (
                 wall.id !== partition.id && wallsTouch(partition, wall)
-            )), `freestanding interior wall in ${floor.label || floor.role || floor.id} (${partition.id})`);
+            ));
+            const terminatesAtDoor = floorDoors.some(door => {
+                const horizontal = partition.w >= partition.h;
+                if ((door.w >= door.h) !== horizontal) return false;
+                const samePlane = horizontal
+                    ? Math.abs(door.y - partition.y) <= (door.h + partition.h) / 2 + 2
+                    : Math.abs(door.x - partition.x) <= (door.w + partition.w) / 2 + 2;
+                const endpointDistance = horizontal
+                    ? Math.min(
+                        Math.abs(door.x - (partition.x - partition.w / 2)),
+                        Math.abs(door.x - (partition.x + partition.w / 2)),
+                    )
+                    : Math.min(
+                        Math.abs(door.y - (partition.y - partition.h / 2)),
+                        Math.abs(door.y - (partition.y + partition.h / 2)),
+                    );
+                return samePlane && endpointDistance <= Math.max(door.w, door.h) / 2 + 3;
+            });
+            const clearedForDoorTraversal = floorDoors.some(door => {
+                if (partition.doorwayClearanceFor === door.id) return true;
+                const endpoints = partition.w >= partition.h
+                    ? [
+                        { x: partition.x - partition.w / 2, y: partition.y },
+                        { x: partition.x + partition.w / 2, y: partition.y },
+                    ]
+                    : [
+                        { x: partition.x, y: partition.y - partition.h / 2 },
+                        { x: partition.x, y: partition.y + partition.h / 2 },
+                    ];
+                return endpoints.some(endpoint => Math.hypot(
+                    endpoint.x - door.x,
+                    endpoint.y - door.y,
+                ) <= SURVIV.playerRadius + 3);
+            });
+            assert.ok(touchesStructure || terminatesAtDoor || clearedForDoorTraversal,
+                `freestanding interior wall in ${floor.label || floor.role || floor.id} (${partition.id}: ${partition.x},${partition.y} ${partition.w}x${partition.h})`);
             checkedPartitions++;
 
             const horizontal = partition.w >= partition.h;
@@ -1419,15 +1471,43 @@ test('every interior partition belongs to a connected wall junction', () => {
                     && partition.x - partition.w / 2 <= wall.x + wall.w / 2 + 0.5);
             const endpointGaps = horizontal
                 ? nearTargets.flatMap(wall => [
-                    partition.x - partition.w / 2 - (wall.x + wall.w / 2),
-                    (wall.x - wall.w / 2) - (partition.x + partition.w / 2),
+                    {
+                        gap: partition.x - partition.w / 2 - (wall.x + wall.w / 2),
+                        from: partition.x - partition.w / 2,
+                        to: wall.x,
+                    },
+                    {
+                        gap: (wall.x - wall.w / 2) - (partition.x + partition.w / 2),
+                        from: partition.x + partition.w / 2,
+                        to: wall.x,
+                    },
                 ])
                 : nearTargets.flatMap(wall => [
-                    partition.y - partition.h / 2 - (wall.y + wall.h / 2),
-                    (wall.y - wall.h / 2) - (partition.y + partition.h / 2),
+                    {
+                        gap: partition.y - partition.h / 2 - (wall.y + wall.h / 2),
+                        from: partition.y - partition.h / 2,
+                        to: wall.y,
+                    },
+                    {
+                        gap: (wall.y - wall.h / 2) - (partition.y + partition.h / 2),
+                        from: partition.y + partition.h / 2,
+                        to: wall.y,
+                    },
                 ]);
-            for (const gap of endpointGaps) {
+            for (const { gap, from, to } of endpointGaps) {
                 if (gap < -maxVisibleGap || gap > maxVisibleGap) continue;
+                const doorwayIntentionallyInterruptsJunction = gap > 0.5 && floorDoors.some(door => {
+                    if ((door.w >= door.h) !== horizontal) return false;
+                    const samePlane = horizontal
+                        ? Math.abs(door.y - partition.y) <= (door.h + partition.h) / 2 + 2
+                        : Math.abs(door.x - partition.x) <= (door.w + partition.w) / 2 + 2;
+                    const doorAxis = horizontal ? door.x : door.y;
+                    return samePlane
+                        && Math.abs(doorAxis - from) > 2
+                        && doorAxis >= Math.min(from, to) - 0.5
+                        && doorAxis <= Math.max(from, to) + 0.5;
+                });
+                if (doorwayIntentionallyInterruptsJunction || partition.doorwayClearanceFor) continue;
                 assert.ok(gap <= 0.5,
                     `detached interior-wall endpoint leaves a ${gap.toFixed(2)} unit gap in ${floor.label || floor.role || floor.id} (${partition.id})`);
                 joinedEndpoints++;
@@ -1437,6 +1517,40 @@ test('every interior partition belongs to a connected wall junction', () => {
 
     assert.ok(checkedPartitions >= 500, 'expected to audit every generated building interior');
     assert.ok(joinedEndpoints >= 30, 'expected the assertion to cover many exterior-wall junctions');
+});
+
+test('generated doorways never remain sealed by a structural wall', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door');
+    const structuralWalls = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'wall' || obstacle.kind === 'interiorWall'
+    ));
+
+    assert.ok(doors.length >= 400, 'expected to audit every generated building doorway');
+    for (const door of doors) {
+        const alignedWalls = structuralWalls.filter(wall => (
+            (!door.houseId || !wall.houseId || wall.houseId === door.houseId)
+            && Math.abs(Number(wall.rotation) || 0) < 0.001
+        ));
+        const centerBlocker = alignedWalls.find(wall => (
+            Math.abs(door.x - wall.x) * 2 < wall.w - 0.5
+            && Math.abs(door.y - wall.y) * 2 < wall.h - 0.5
+        ));
+        assert.equal(
+            centerBlocker,
+            undefined,
+            `door ${door.id} in ${door.houseId || 'untagged house'} is sealed by ${centerBlocker?.id}`,
+        );
+
+        // The opening must fit the authoritative player body after the leaf
+        // swings away, not merely expose a one-pixel visual slit.
+        assert.ok(alignedWalls.every(wall => !circleRectCollision(
+            door.x,
+            door.y,
+            SURVIV.playerRadius - 1,
+            obstacleCollisionRectForTest(wall),
+        )), `door ${door.id} does not leave player-width traversal clearance`);
+    }
 });
 
 test('river spline metadata survives generation and bridges hit both highways exactly', () => {
@@ -2967,6 +3081,79 @@ test('surviv bots automatically collect useful ground loot', () => {
 
     assert.equal(bot.inventory.medkits, 1);
     assert.equal(room.loot.some(item => item.id === 'bot-medkit'), false);
+});
+
+test('unarmed surviv bots remember valuable weapon loot across the map', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [{
+        id: 'distant-rifle', type: 'weapon', weaponType: 'm416',
+        x: 6200, y: 700, ammo: 30, tier: 'rare',
+    }];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const observer = createSurvivPlayer('distant-observer', 'distant-observer-mongo', 'Observer', '#fff', room);
+    observer.x = -9000;
+    observer.y = -9000;
+    room.players.push(observer);
+    const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(bot.botLootTargetId, 'distant-rifle');
+    assert.ok(bot.inputDx > 0.8, 'the bot should commit to the remembered loot site');
+    assert.ok(bot.inputDy > 0, 'the bot should travel toward the actual loot position');
+});
+
+test('surviv bots replace a weak full-slot weapon with a stronger pickup', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [{
+        id: 'bot-upgrade', type: 'weapon', weaponType: 'm416',
+        x: 0, y: 0, ammo: 30, tier: 'rare',
+    }];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    const observer = createSurvivPlayer('upgrade-observer', 'upgrade-observer-mongo', 'Observer', '#fff', room);
+    observer.x = 5000;
+    observer.y = 5000;
+    room.players.push(observer);
+    const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
+    bot.inventory.weapons = ['m9', 'ot38'];
+    bot.activeWeaponSlot = 0;
+    bot.weaponSlotAmmo = [15, 5];
+    bot.weapon = { type: 'm9', ammo: 15, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.ok(bot.inventory.weapons.includes('m416'));
+    assert.equal(room.loot.some(item => item.id === 'bot-upgrade' && item.weaponType === 'm416'), false);
+});
+
+test('surviv bots route around a house wall toward its exterior loot entrance', () => {
+    const room = makeRoom();
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [
+        { id: 'house-floor', kind: 'houseFloor', x: 0, y: 0, w: 220, h: 180, collidable: false },
+        { id: 'east-wall', kind: 'wall', houseId: 'house-floor', x: 110, y: 0, w: 14, h: 180, collidable: true },
+        { id: 'north-wall', kind: 'wall', houseId: 'house-floor', x: 0, y: -90, w: 220, h: 14, collidable: true },
+        { id: 'south-wall', kind: 'wall', houseId: 'house-floor', x: 0, y: 90, w: 220, h: 14, collidable: true },
+        { id: 'west-door', kind: 'door', houseId: 'house-floor', x: -110, y: 0, w: 6, h: 52, collidable: true, role: 'west', entranceRole: 'mainEntrance', isOpen: false },
+    ];
+    room.loot = [{
+        id: 'indoor-armory', type: 'chest', containerType: 'armory_crate',
+        houseId: 'house-floor', x: 0, y: 0, hp: 30, maxHp: 30,
+        hitRadius: 26, tier: 'rare', contents: { weaponType: 'm416' },
+    }];
+    const observer = createSurvivPlayer('house-observer', 'house-observer-mongo', 'Observer', '#fff', room);
+    observer.x = 5000;
+    observer.y = 5000;
+    room.players.push(observer);
+    const bot = spawnSurvivBotNear(room, 320, 0, { adminSpawned: true });
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.ok(bot.inputDx < 0, 'the bot should still make progress toward the building');
+    assert.ok(Math.abs(bot.inputDy) > 0.25, 'the bot should choose a side route instead of walking into the wall');
+    assert.equal(bot.botDoorTargetId, 'west-door');
 });
 
 test('surviv static terrain payload is retained between periodic sends', () => {

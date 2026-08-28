@@ -267,6 +267,60 @@ const SURVIV_DESTRUCTIBLE_OBSTACLE_HP = Object.freeze({
     rock: 132,
 });
 
+// Raised props inside buildings are combat cover, never permanent invisible
+// geometry. Values are intentionally material/size biased: light decor breaks
+// quickly, domestic cover survives a short burst, and heavy industrial props
+// take sustained fire. Structural walls and doors are handled separately.
+const SURVIV_INTERIOR_PROP_HP = Object.freeze({
+    floorLamp: 18,
+    housePlant: 20,
+    nightstand: 24,
+    coffeeTable: 28,
+    entryBench: 30,
+    armchair: 32,
+    toilet: 32,
+    vanity: 34,
+    dresser: 36,
+    prisonBench: 36,
+    displayShelf: 36,
+    desk: 38,
+    bookshelf: 40,
+    sideboard: 40,
+    sofa: 42,
+    bed: 44,
+    diningTable: 44,
+    salesCounter: 44,
+    wardrobe: 46,
+    kitchenCounter: 48,
+    hospitalBed: 48,
+    bunkBed: 48,
+    locker: 48,
+    medicalCabinet: 48,
+    toolCabinet: 50,
+    storageShelf: 50,
+    ammoLocker: 52,
+    workbench: 52,
+    weaponRack: 52,
+    mapTable: 52,
+    palletStack: 54,
+    labBench: 54,
+    bathtub: 56,
+    controlConsole: 58,
+    specimenTank: 58,
+    serverRack: 60,
+    generator: 64,
+});
+const SURVIV_INDOOR_BLOCKING_PROP_KINDS = new Set([
+    'furniture', 'machine', 'container', 'crate', 'barrel',
+]);
+
+function getInteriorBlockingPropHp(kind, variant) {
+    if (kind === 'furniture') return SURVIV_INTERIOR_PROP_HP[variant] || SURVIV_DESTRUCTIBLE_OBSTACLE_HP.furniture;
+    if (kind === 'machine') return 60;
+    if (kind === 'container') return 72;
+    return SURVIV_DESTRUCTIBLE_OBSTACLE_HP[kind] || null;
+}
+
 function randId() {
     return Math.random().toString(36).slice(2, 10);
 }
@@ -691,7 +745,12 @@ const NATURAL_HITBOX_SCALES = Object.freeze({
 
 function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
     const options = typeof opts === 'string' ? { variant: opts } : (opts || {});
-    const defaultHp = options.collidable === false ? null : SURVIV_DESTRUCTIBLE_OBSTACLE_HP[kind];
+    const indoorBlockingProp = options.collidable !== false
+        && !!options.houseId
+        && SURVIV_INDOOR_BLOCKING_PROP_KINDS.has(kind);
+    const defaultHp = options.collidable === false ? null
+        : indoorBlockingProp ? getInteriorBlockingPropHp(kind, options.variant)
+            : SURVIV_DESTRUCTIBLE_OBSTACLE_HP[kind];
     const maxHp = Number.isFinite(options.maxHp) ? Math.max(1, options.maxHp) : defaultHp;
     const naturalScale = options.collidable === false ? null : NATURAL_HITBOX_SCALES[kind];
     const stumpDiameter = kind === 'stump' && options.collidable !== false
@@ -731,7 +790,10 @@ function addObstacle(obstacles, kind, x, y, w, h, opts = {}) {
         width: Number.isFinite(options.width) ? options.width : null,
         widths: Array.isArray(options.widths) ? options.widths : null,
         ...(Number.isFinite(maxHp) ? {
-            destructible: options.destructible !== false,
+            // A solid room prop must always have a way out. This deliberately
+            // overrides old per-fixture `destructible: false` flags while
+            // leaving walls and other structural geometry untouched.
+            destructible: indoorBlockingProp || options.destructible !== false,
             hp: Number.isFinite(options.hp) ? clamp(options.hp, 0, maxHp) : maxHp,
             maxHp,
         } : {}),
@@ -1022,6 +1084,9 @@ function addHorizontalInteriorWallSegments(obstacles, x, y, w, wall, gaps = [], 
 
 function sealInteriorWallJunctions(obstacles) {
     const floors = obstacles.filter(obstacle => obstacle.kind === 'houseFloor');
+    const doors = obstacles.filter(obstacle => (
+        obstacle.kind === 'door' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
+    ));
     const exteriorWalls = obstacles.filter(obstacle => (
         obstacle.kind === 'wall' && Math.abs(Number(obstacle.rotation) || 0) < 0.001
     ));
@@ -1041,6 +1106,26 @@ function sealInteriorWallJunctions(obstacles) {
             : pointInRect(obstacle.x, obstacle.y, floor, 2);
         const partitions = interiorWalls.filter(belongsToFloor);
         if (!partitions.length) continue;
+        const floorDoors = doors.filter(door => door.houseId === floor.id);
+        const extensionCrossesDoor = (partition, horizontal, from, to) => {
+            const extensionMin = Math.min(from, to) - 0.5;
+            const extensionMax = Math.max(from, to) + 0.5;
+            return floorDoors.some(door => {
+                const doorHorizontal = door.w >= door.h;
+                if (doorHorizontal !== horizontal) return false;
+                const sameWallPlane = horizontal
+                    ? Math.abs(door.y - partition.y) <= (partition.h + door.h) / 2 + 1
+                    : Math.abs(door.x - partition.x) <= (partition.w + door.w) / 2 + 1;
+                if (!sameWallPlane) return false;
+                const doorAxis = horizontal ? door.x : door.y;
+                // Adjacent leaves intentionally overlap a wall endpoint by a
+                // pixel. Only reject a repair that travels across the centre
+                // of an existing doorway.
+                return Math.abs(doorAxis - from) > 2
+                    && doorAxis >= extensionMin
+                    && doorAxis <= extensionMax;
+            });
+        };
 
         // Older and hand-authored buildings do not all tag exterior segments
         // with houseId. Boundary position therefore remains the authoritative
@@ -1090,8 +1175,12 @@ function sealInteriorWallJunctions(obstacles) {
                         .map(wall => ({ wall, gap: (wall.x - wall.w / 2) - maxX }))
                         .filter(entry => entry.wall.x > partition.x && withinLimit(entry))
                         .sort((a, b) => a.gap - b.gap)[0]?.wall;
-                    if (leftTarget) minX = Math.min(minX, leftTarget.x);
-                    if (rightTarget) maxX = Math.max(maxX, rightTarget.x);
+                    if (leftTarget && !extensionCrossesDoor(partition, true, minX, leftTarget.x)) {
+                        minX = Math.min(minX, leftTarget.x);
+                    }
+                    if (rightTarget && !extensionCrossesDoor(partition, true, maxX, rightTarget.x)) {
+                        maxX = Math.max(maxX, rightTarget.x);
+                    }
                     partition.x = (minX + maxX) / 2;
                     partition.w = maxX - minX;
                 } else {
@@ -1113,11 +1202,67 @@ function sealInteriorWallJunctions(obstacles) {
                         .map(wall => ({ wall, gap: (wall.y - wall.h / 2) - maxY }))
                         .filter(entry => entry.wall.y > partition.y && withinLimit(entry))
                         .sort((a, b) => a.gap - b.gap)[0]?.wall;
-                    if (topTarget) minY = Math.min(minY, topTarget.y);
-                    if (bottomTarget) maxY = Math.max(maxY, bottomTarget.y);
+                    if (topTarget && !extensionCrossesDoor(partition, false, minY, topTarget.y)) {
+                        minY = Math.min(minY, topTarget.y);
+                    }
+                    if (bottomTarget && !extensionCrossesDoor(partition, false, maxY, bottomTarget.y)) {
+                        maxY = Math.max(maxY, bottomTarget.y);
+                    }
                     partition.y = (minY + maxY) / 2;
                     partition.h = maxY - minY;
                 }
+            }
+        }
+    }
+}
+
+function clearDoorwayTraversal(obstacles) {
+    const doors = obstacles.filter(obstacle => obstacle.kind === 'door');
+    const clearanceRadius = SURVIV.playerRadius + 2;
+
+    for (const door of doors) {
+        const walls = obstacles.filter(wall => (
+            (wall.kind === 'wall' || wall.kind === 'interiorWall')
+            && Math.abs(Number(wall.rotation) || 0) < 0.001
+            && (!door.houseId || !wall.houseId || wall.houseId === door.houseId)
+            && circleRectCollision(door.x, door.y, clearanceRadius, wall)
+        ));
+        for (const wall of walls) {
+            const horizontal = wall.w >= wall.h;
+            const wallMin = horizontal ? wall.x - wall.w / 2 : wall.y - wall.h / 2;
+            const wallMax = horizontal ? wall.x + wall.w / 2 : wall.y + wall.h / 2;
+            const doorAxis = horizontal ? door.x : door.y;
+            const cutMin = Math.max(wallMin, doorAxis - clearanceRadius);
+            const cutMax = Math.min(wallMax, doorAxis + clearanceRadius);
+            if (cutMax <= cutMin) continue;
+
+            const beforeLength = cutMin - wallMin;
+            const afterLength = wallMax - cutMax;
+            const minimumSegment = Math.min(wall.w, wall.h) * 1.5;
+            const segments = [];
+            if (beforeLength > minimumSegment) segments.push([wallMin, cutMin]);
+            if (afterLength > minimumSegment) segments.push([cutMax, wallMax]);
+            const wallIndex = obstacles.indexOf(wall);
+            if (!segments.length) {
+                if (wallIndex >= 0) obstacles.splice(wallIndex, 1);
+                continue;
+            }
+
+            const applySegment = (target, [start, end]) => {
+                target.doorwayClearanceFor = door.id;
+                if (horizontal) {
+                    target.x = (start + end) / 2;
+                    target.w = end - start;
+                } else {
+                    target.y = (start + end) / 2;
+                    target.h = end - start;
+                }
+            };
+            applySegment(wall, segments[0]);
+            if (segments[1]) {
+                const splitWall = { ...wall, id: randId() };
+                applySegment(splitWall, segments[1]);
+                obstacles.push(splitWall);
             }
         }
     }
@@ -1135,13 +1280,6 @@ function getInteriorDoorSwingRect(door) {
         h: horizontal ? panelLength * 2 + 12 : panelLength + 12,
     };
 }
-
-const BREAKABLE_INTERIOR_VARIANTS = new Set([
-    'coffeeTable', 'nightstand', 'dresser', 'armchair', 'floorLamp', 'housePlant',
-    'diningTable', 'desk', 'bookshelf', 'displayShelf', 'palletStack', 'toolCabinet',
-    'labBench', 'specimenTank', 'serverRack', 'generator', 'weaponRack', 'mapTable',
-    'bunkBed', 'toilet', 'prisonBench', 'vanity', 'wardrobe', 'sideboard', 'entryBench',
-]);
 
 function resolveHouseInteriorTheme(variant, options = {}) {
     const landmarkType = options.landmarkType || '';
@@ -1220,10 +1358,9 @@ function furnishHouseInterior(obstacles, house, options = {}) {
             // Furniture represents raised physical props. Keep it solid by
             // default; only explicit floor-level decorations may opt out.
             collidable: spec.collidable !== false,
-            // Fixed interior fixtures should not disappear after one stray hit.
-            // Individual lightweight props can opt in when they get a proper
-            // break presentation of their own.
-            destructible: spec.destructible ?? BREAKABLE_INTERIOR_VARIANTS.has(spec.variant),
+            // Every raised prop that blocks a route is destructible. Durability
+            // is resolved from its material/variant in addObstacle.
+            destructible: spec.collidable !== false,
             maxHp: spec.maxHp,
             variant: spec.variant,
             role: spec.role || room.variant,
@@ -2246,7 +2383,7 @@ function addManorHouse(obstacles, loot, spawnPoints, x, y) {
     const addManorFixture = (room, variantName, fixtureX, fixtureY, fixtureW, fixtureH, fixtureRole) => (
         addObstacle(obstacles, 'furniture', fixtureX, fixtureY, fixtureW, fixtureH, {
             collidable: true,
-            destructible: BREAKABLE_INTERIOR_VARIANTS.has(variantName),
+            destructible: true,
             maxHp: 40,
             variant: variantName,
             role: fixtureRole,
@@ -5541,6 +5678,7 @@ export function generateSurvivMap(worldHalf) {
     addNaturalDetailScatter(obstacles, wh, [...POI_LIST, ...INTENTIONAL_OPEN_AREAS], countrysidePlacementIndex);
     addScatteredGroundLoot(obstacles, loot);
     sealInteriorWallJunctions(obstacles);
+    clearDoorwayTraversal(obstacles);
     clearInvalidBuildingProps(obstacles);
     // Later residences may legitimately clear an earlier landmark tree. Top up
     // after that cleanup so every generated map still exposes the large tree
@@ -5852,11 +5990,20 @@ function updateInventoryMedkit(entity, now) {
 }
 
 function pickupGroundWeapon(entity, room) {
-    if (entity.isBot || entity.isCashingOut) return false;
+    if (entity.isCashingOut) return false;
     const inv = ensureInventory(entity);
     const nearby = querySurvivLoot(room, entity.x, entity.y, SURVIV.lootPickupRadius + 24)
         .filter(({ item }) => item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType])
-        .sort((a, b) => dist(entity.x, entity.y, a.item.x, a.item.y) - dist(entity.x, entity.y, b.item.x, b.item.y));
+        .filter(({ item }) => !entity.isBot || getBotWeaponUpgrade(entity, item.weaponType))
+        .sort((a, b) => {
+            if (entity.isBot) {
+                const gainA = getBotWeaponUpgrade(entity, a.item.weaponType)?.gain || 0;
+                const gainB = getBotWeaponUpgrade(entity, b.item.weaponType)?.gain || 0;
+                if (gainA !== gainB) return gainB - gainA;
+            }
+            return dist(entity.x, entity.y, a.item.x, a.item.y)
+                - dist(entity.x, entity.y, b.item.x, b.item.y);
+        });
     const candidate = nearby[0];
     if (!candidate) return false;
 
@@ -5890,7 +6037,9 @@ function pickupGroundWeapon(entity, room) {
         slotAmmo.push(nextAmmo);
         removeSurvivLootAt(room, candidate.index);
     } else {
-        const requestedSlot = Number.isInteger(entity.activeWeaponSlot) ? entity.activeWeaponSlot : inv.weapons.indexOf(entity.weapon?.type);
+        const requestedSlot = entity.isBot
+            ? getBotWeaponUpgrade(entity, nextType)?.slot
+            : Number.isInteger(entity.activeWeaponSlot) ? entity.activeWeaponSlot : inv.weapons.indexOf(entity.weapon?.type);
         nextSlot = requestedSlot === SURVIV_MELEE_SLOT ? 0 : requestedSlot;
         if (nextSlot < 0 || nextSlot >= inv.weapons.length) return false;
         const oldType = inv.weapons[nextSlot];
@@ -7302,6 +7451,7 @@ function pickupLoot(entity, room) {
     if (entity.isCashingOut) return;
     swapSurvivWeaponSlots(entity);
     dropPlayerItem(entity, room);
+    if (entity.isBot) pickupGroundWeapon(entity, room);
 
     const pickedUp = {
         money: 0,
@@ -7698,6 +7848,11 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
         isBot: true,
         botThinkAt: 0,
         botTargetId: null,
+        botLootTargetId: null,
+        botDoorTargetId: null,
+        botGlobalLootScanAt: 0,
+        botAvoidSide: Math.random() < 0.5 ? -1 : 1,
+        botNavCheckAt: 0,
         isCashingOut: false,
         inventory: makeInventory(),
         activeWeaponSlot: SURVIV_MELEE_SLOT,
@@ -7726,13 +7881,93 @@ function getBotLootWaypoint(bot, item, room) {
     const house = queryObstacles(room, item.x, item.y, 1, false).find(obstacle => (
         obstacle.kind === 'houseFloor' && pointInRect(item.x, item.y, obstacle)
     ));
-    if (!house || pointInRect(bot.x, bot.y, house)) return item;
+    if (!house) return item;
+    const botInsideHouse = pointInRect(bot.x, bot.y, house);
     const doorRange = Math.max(house.w || 0, house.h || 0) / 2 + 120;
-    const door = queryObstacles(room, house.x, house.y, doorRange, false)
-        .find(obstacle => obstacle.kind === 'door'
-            && obstacle.houseId === house.id
-            && obstacle.entranceRole !== 'interiorDoor');
-    return door || item;
+    const houseDoors = queryObstacles(room, house.x, house.y, doorRange, false)
+        .filter(obstacle => obstacle.kind === 'door' && obstacle.houseId === house.id);
+
+    let usableDoors = botInsideHouse
+        ? houseDoors
+        : houseDoors.filter(door => door.entranceRole !== 'interiorDoor');
+    if (usableDoors.length === 0) return item;
+
+    // Keep the chosen entrance stable so the bot does not oscillate between
+    // two equally good doors while walking around a building.
+    let door = usableDoors.find(candidate => candidate.id === bot.botDoorTargetId);
+    if (!door) {
+        door = usableDoors.reduce((best, candidate) => {
+            const score = dist(bot.x, bot.y, candidate.x, candidate.y)
+                + dist(candidate.x, candidate.y, item.x, item.y) * 0.35;
+            return !best || score < best.score ? { door: candidate, score } : best;
+        }, null)?.door;
+        bot.botDoorTargetId = door?.id || null;
+    }
+    if (!door) return item;
+
+    if (botInsideHouse) {
+        const directDistance = dist(bot.x, bot.y, item.x, item.y);
+        const midpointX = (bot.x + item.x) / 2;
+        const midpointY = (bot.y + item.y) / 2;
+        const directBlocked = queryObstacles(room, midpointX, midpointY, directDistance / 2 + 40, true)
+            .some(obstacle => obstacle.houseId === house.id
+                && obstacle.kind !== 'door'
+                && segmentRectHitT(bot.x, bot.y, item.x, item.y, getObstacleCollisionRect(obstacle)) != null);
+        if (!directBlocked) return item;
+        const interiorDoor = houseDoors
+            .filter(candidate => candidate.entranceRole === 'interiorDoor')
+            .reduce((best, candidate) => {
+                const score = dist(bot.x, bot.y, candidate.x, candidate.y)
+                    + dist(candidate.x, candidate.y, item.x, item.y);
+                return !best || score < best.score ? { door: candidate, score } : best;
+            }, null)?.door;
+        return interiorDoor || door;
+    }
+
+    const outsideOffset = 62;
+    const approach = { x: door.x, y: door.y, kind: 'doorApproach', doorId: door.id };
+    if (door.role === 'north') approach.y -= outsideOffset;
+    else if (door.role === 'south') approach.y += outsideOffset;
+    else if (door.role === 'west') approach.x -= outsideOffset;
+    else if (door.role === 'east') approach.x += outsideOffset;
+    return dist(bot.x, bot.y, approach.x, approach.y) > 48 ? approach : door;
+}
+
+function getBotWeaponValue(weaponType, targetDistance = 420) {
+    const weapon = WEAPONS[weaponType];
+    if (!weapon || weapon.melee) return weaponType === 'knife' ? 28 : 12;
+    const pellets = Math.max(1, Number(weapon.pellets) || 1);
+    const pelletFactor = weapon.family === 'shotgun' ? 0.58 : 1;
+    const damagePerSecond = weapon.damage * pellets * pelletFactor * 1000
+        / Math.max(40, weapon.fireRateMs);
+    const profile = getBotCombatProfile(weaponType);
+    const rangeFit = targetDistance < profile.preferredMin
+        ? 0.78
+        : targetDistance > profile.fireRange ? 0.46 : 1;
+    const rarityBonus = weapon.rarity === 'military' ? 22 : weapon.rarity === 'rare' ? 10 : 0;
+    return damagePerSecond * rangeFit + rarityBonus + Math.min(18, (weapon.range || 0) / 260);
+}
+
+function getBotWeaponUpgrade(bot, weaponType) {
+    const inventory = ensureInventory(bot);
+    if (!WEAPONS[weaponType]) return null;
+    if (WEAPONS[weaponType].melee) {
+        return weaponType === 'knife' && inventory.meleeWeapon !== 'knife'
+            ? { slot: SURVIV_MELEE_SLOT, gain: 16 }
+            : null;
+    }
+    if (inventory.weapons.length < SURVIV_MAX_WEAPONS) {
+        return { slot: inventory.weapons.length, gain: getBotWeaponValue(weaponType) };
+    }
+    let worst = null;
+    inventory.weapons.forEach((currentType, slot) => {
+        const value = getBotWeaponValue(currentType);
+        if (!worst || value < worst.value) worst = { slot, value };
+    });
+    const incomingValue = getBotWeaponValue(weaponType);
+    return worst && incomingValue > worst.value * 1.08
+        ? { slot: worst.slot, gain: incomingValue - worst.value }
+        : null;
 }
 
 function getBotLootScore(bot, item, itemDistance) {
@@ -7740,7 +7975,7 @@ function getBotLootScore(bot, item, itemDistance) {
     const distancePenalty = itemDistance * 0.24;
     if (item.type === 'chest' || item.type === 'deathCrate') {
         const contents = item.contents || {};
-        const useful = (contents.weaponType && inventory.weapons.length < SURVIV_MAX_WEAPONS)
+        const useful = (contents.weaponType && getBotWeaponUpgrade(bot, contents.weaponType))
             || Number(contents.money) > 0
             || (Number(contents.vestLevel) > normalizeVestLevel(bot.vestLevel))
             || (Number(contents.medkits) > 0 && inventory.medkits < SURVIV_MAX_MEDKITS)
@@ -7748,7 +7983,8 @@ function getBotLootScore(bot, item, itemDistance) {
         return useful ? 1120 - distancePenalty : -Infinity;
     }
     if (item.type === 'weapon') {
-        return inventory.weapons.length < SURVIV_MAX_WEAPONS ? 980 - distancePenalty : -Infinity;
+        const upgrade = getBotWeaponUpgrade(bot, item.weaponType);
+        return upgrade ? 980 + Math.min(180, upgrade.gain) - distancePenalty : -Infinity;
     }
     if (item.type === 'money') return 820 - distancePenalty;
     if (item.type === 'vest') return normalizeVestLevel(item.vestLevel) > normalizeVestLevel(bot.vestLevel) ? 760 - distancePenalty : -Infinity;
@@ -7757,11 +7993,21 @@ function getBotLootScore(bot, item, itemDistance) {
     return -Infinity;
 }
 
-function findBestBotLoot(bot, room, range = 2400) {
+function findBestBotLoot(bot, room, range = 3200, now = Date.now()) {
+    const lootIndex = getSurvivLootIndex(room);
+    const remembered = bot.botLootTargetId ? lootIndex.byId.get(bot.botLootTargetId)?.item : null;
+    if (remembered && (!remembered.pickupAfter || now >= remembered.pickupAfter)) {
+        const rememberedDistance = dist(bot.x, bot.y, remembered.x, remembered.y);
+        if (getBotLootScore(bot, remembered, rememberedDistance) > -Infinity) {
+            return { item: remembered, distance: rememberedDistance };
+        }
+    }
+    bot.botLootTargetId = null;
+
     let best = null;
     let bestScore = -Infinity;
     for (const { item } of querySurvivLoot(room, bot.x, bot.y, range)) {
-        if (item.pickupAfter && Date.now() < item.pickupAfter) continue;
+        if (item.pickupAfter && now < item.pickupAfter) continue;
         const itemDistance = dist(bot.x, bot.y, item.x, item.y);
         const score = getBotLootScore(bot, item, itemDistance);
         if (score > bestScore) {
@@ -7769,6 +8015,24 @@ function findBestBotLoot(bot, room, range = 2400) {
             bestScore = score;
         }
     }
+
+    // Unarmed bots occasionally make a map-level decision instead of random
+    // wandering. This models remembering that buildings/crates are loot sites
+    // without paying for a full-map scan on every think tick.
+    const inventory = ensureInventory(bot);
+    if (!best && inventory.weapons.length === 0 && now >= (bot.botGlobalLootScanAt || 0)) {
+        bot.botGlobalLootScanAt = now + 1400 + Math.random() * 500;
+        for (const item of room.loot || []) {
+            if (item.pickupAfter && now < item.pickupAfter) continue;
+            const itemDistance = dist(bot.x, bot.y, item.x, item.y);
+            const score = getBotLootScore(bot, item, itemDistance) + itemDistance * 0.15;
+            if (score > bestScore) {
+                best = { item, distance: itemDistance };
+                bestScore = score;
+            }
+        }
+    }
+    if (best) bot.botLootTargetId = best.item.id;
     return best;
 }
 
@@ -7780,6 +8044,95 @@ function getBotCombatProfile(weaponType) {
     if (family === 'smg') return { preferredMin: 150, preferredMax: 310, fireRange: 680 };
     if (family === 'pistol' || family === 'revolver') return { preferredMin: 180, preferredMax: 350, fireRange: 760 };
     return { preferredMin: 20, preferredMax: 54, fireRange: 76 };
+}
+
+function chooseBotCombatWeapon(bot, targetDistance) {
+    const inventory = ensureInventory(bot);
+    const slotAmmo = ensureWeaponSlotAmmo(bot);
+    let best = null;
+    inventory.weapons.forEach((weaponType, slot) => {
+        const weapon = WEAPONS[weaponType];
+        const availableAmmo = (Number(slotAmmo[slot]) || 0)
+            + (Number(inventory.ammoReserves[weapon?.ammoType]) || 0);
+        if (!weapon || availableAmmo <= 0) return;
+        const score = getBotWeaponValue(weaponType, targetDistance);
+        if (!best || score > best.score) best = { slot, score };
+    });
+    if (!best) {
+        if (bot.activeWeaponSlot !== SURVIV_MELEE_SLOT) {
+            equipSurvivWeaponSlot(bot, SURVIV_MELEE_SLOT);
+        }
+        return WEAPONS[bot.weapon?.type] || WEAPONS.fists;
+    }
+    if (bot.activeWeaponSlot !== best.slot) equipSurvivWeaponSlot(bot, best.slot);
+    return WEAPONS[bot.weapon?.type] || WEAPONS.fists;
+}
+
+function botHasLineOfSight(bot, target, room) {
+    const distance = dist(bot.x, bot.y, target.x, target.y);
+    const midpointX = (bot.x + target.x) / 2;
+    const midpointY = (bot.y + target.y) / 2;
+    return !queryObstacles(room, midpointX, midpointY, distance / 2 + 50, true)
+        .some(obstacle => segmentRectHitT(
+            bot.x, bot.y, target.x, target.y, getObstacleCollisionRect(obstacle),
+        ) != null);
+}
+
+function getBotNavigationDirection(bot, room, waypoint, now) {
+    const desiredAngle = Math.atan2(waypoint.y - bot.y, waypoint.x - bot.x);
+    const direct = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
+    if (waypoint.kind === 'door') return direct;
+
+    if (now >= (bot.botNavCheckAt || 0)) {
+        const moved = Number.isFinite(bot.botNavLastX)
+            ? dist(bot.x, bot.y, bot.botNavLastX, bot.botNavLastY)
+            : Infinity;
+        if (moved < 12) bot.botAvoidSide = -(bot.botAvoidSide || 1);
+        bot.botNavLastX = bot.x;
+        bot.botNavLastY = bot.y;
+        bot.botNavCheckAt = now + 650;
+    }
+
+    const radius = (bot.radius || SURVIV.playerRadius) + 3;
+    const routeIsClear = angle => {
+        const lookAhead = 260;
+        const endX = bot.x + Math.cos(angle) * lookAhead;
+        const endY = bot.y + Math.sin(angle) * lookAhead;
+        const midpointX = (bot.x + endX) / 2;
+        const midpointY = (bot.y + endY) / 2;
+        for (const obstacle of queryObstacles(room, midpointX, midpointY, lookAhead / 2 + radius + 30, true)) {
+            if (obstacle.kind === 'door') continue;
+            const shape = getObstacleCollisionRect(obstacle);
+            const paddedShape = { ...shape, w: shape.w + radius * 2, h: shape.h + radius * 2 };
+            if (segmentRectHitT(bot.x, bot.y, endX, endY, paddedShape) != null) return false;
+        }
+        for (const { item } of querySurvivLoot(room, midpointX, midpointY, lookAhead / 2 + radius + 36)) {
+            if (item.id === waypoint.id || !isSolidLootContainer(item)) continue;
+            if (segmentCircleHitT(
+                bot.x, bot.y, endX, endY, item.x, item.y,
+                radius + getLootContainerHitRadius(item),
+            ) != null) return false;
+        }
+        return true;
+    };
+
+    if (routeIsClear(desiredAngle)) {
+        bot.botAvoidSide = 0;
+        return direct;
+    }
+    const preferredSide = bot.botAvoidSide || (Math.random() < 0.5 ? -1 : 1);
+    const offsets = [0.42, 0.78, 1.15, 1.52];
+    for (const offset of offsets) {
+        for (const side of [preferredSide, -preferredSide]) {
+            const angle = desiredAngle + offset * side;
+            if (!routeIsClear(angle)) continue;
+            bot.botAvoidSide = side;
+            return { dx: Math.cos(angle), dy: Math.sin(angle) };
+        }
+    }
+    bot.botAvoidSide = -preferredSide;
+    const fallbackAngle = desiredAngle + Math.PI / 2 * bot.botAvoidSide;
+    return { dx: Math.cos(fallbackAngle), dy: Math.sin(fallbackAngle) };
 }
 
 function updateBotAI(bot, room, now, effectiveRadius) {
@@ -7830,7 +8183,9 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         return;
     }
 
-    const bestLoot = findBestBotLoot(bot, room);
+    const lootRange = inventory.weapons.length === 0 ? 4200 : 3000;
+    const bestLoot = findBestBotLoot(bot, room, lootRange, now);
+    if (nearest) chooseBotCombatWeapon(bot, nearestDist);
     const melee = !!WEAPONS[bot.weapon?.type]?.melee;
     const shouldFight = nearest && nearestDist < 1100 && (!melee || !bestLoot || nearestDist < 260);
     if (shouldFight) {
@@ -7840,7 +8195,9 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         const leadTicks = weaponDef.bulletSpeed > 0 ? clamp(nearestDist / weaponDef.bulletSpeed, 0, 18) : 0;
         const aimX = nearest.x + (nearest.inputDx || 0) * SURVIV.playerSpeed * leadTicks * 0.65;
         const aimY = nearest.y + (nearest.inputDy || 0) * SURVIV.playerSpeed * leadTicks * 0.65;
-        const direction = normalize(nearest.x - bot.x, nearest.y - bot.y);
+        const combatWaypoint = getBotLootWaypoint(bot, nearest, room);
+        const direction = getBotNavigationDirection(bot, room, combatWaypoint, now);
+        const hasLineOfSight = botHasLineOfSight(bot, nearest, room);
         if (nearestDist > profile.preferredMax) {
             bot.inputDx = direction.dx;
             bot.inputDy = direction.dy;
@@ -7853,7 +8210,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
             bot.inputDy = direction.dx * 0.72 * strafeSide;
         }
         bot.aimAngle = Math.atan2(aimY - bot.y, aimX - bot.x);
-        bot.shooting = nearestDist <= profile.fireRange;
+        bot.shooting = hasLineOfSight && nearestDist <= profile.fireRange;
         return;
     }
 
@@ -7861,7 +8218,7 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     if (bestLoot) {
         const { item, distance: lootDistance } = bestLoot;
         const waypoint = getBotLootWaypoint(bot, item, room);
-        const direction = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
+        const direction = getBotNavigationDirection(bot, room, waypoint, now);
         if (item.type === 'chest' || item.type === 'deathCrate') {
             const weaponDef = WEAPONS[bot.weapon?.type] || WEAPONS.fists;
             const hitRadius = Number(item.hitRadius) || CONTAINER_PROFILES[item.containerType]?.hitRadius || 24;
