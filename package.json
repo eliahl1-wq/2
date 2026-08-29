@@ -12,6 +12,7 @@
     "migrate:wallet-secrets": "node scripts/migrate-wallet-secrets.mjs --apply",
     "rotate:wallet-secrets": "node scripts/rotate-wallet-secrets.mjs --apply",
     "agar:readiness": "node scripts/check-agar-readiness.mjs",
+    "token:mint:pump": "node scripts/generate-pump-suffix-mint.mjs",
     "br-wallets:generate": "node scripts/generate-br-wallets.mjs",
     "test": "node --test"
   },

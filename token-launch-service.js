@@ -9,7 +9,8 @@ import { encryptWalletSecret, decryptWalletSecret } from './wallet-crypto.js';
 // publishes a native CommonJS export as well; loading that export avoids the
 // interop failure without patching anything in node_modules.
 const require = createRequire(import.meta.url);
-const { PUMP_SDK } = require('@pump-fun/pump-sdk');
+const { PUMP_SDK, OnlinePumpSdk, getBuyTokenAmountFromSolAmount } = require('@pump-fun/pump-sdk');
+const BN = require('bn.js');
 
 const TokenLaunchSchema = new mongoose.Schema({
     key: { type: String, unique: true, default: 'arenifi' },
@@ -29,6 +30,7 @@ const TokenLaunchSchema = new mongoose.Schema({
     signature: { type: String, default: '' },
     error: { type: String, default: '' },
     launchedAt: { type: Date, default: null },
+    initialBuySol: { type: Number, default: 0 },
 }, { timestamps: true });
 
 const TokenLaunch = mongoose.models.TokenLaunch || mongoose.model('TokenLaunch', TokenLaunchSchema);
@@ -56,6 +58,7 @@ function serialize(record) {
         signature: record.signature,
         error: record.error,
         launchedAt: record.launchedAt,
+        initialBuySol: record.initialBuySol || 0,
         launchEnabled: process.env.PUMP_LAUNCH_ENABLED === 'true',
         configuredMint: process.env.AGAR_TOKEN_MINT?.trim() || '',
         mintMatchesEnvironment: process.env.AGAR_TOKEN_MINT?.trim() === record.mintAddress,
@@ -162,10 +165,13 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             if (mint.publicKey.toBase58() !== record.mintAddress) throw new Error('Stored mint keypair does not match the prepared address');
 
             record.status = 'launching';
+            const initialBuySol = Number(req.body?.initialBuySol || 0);
+            if (!Number.isFinite(initialBuySol) || initialBuySol < 0 || initialBuySol > 100) return res.status(400).json({ message: 'Initial buy must be between 0 and 100 SOL.' });
+            record.initialBuySol = initialBuySol;
             record.error = '';
             await record.save();
             try {
-                const instruction = await PUMP_SDK.createV2Instruction({
+                const createParams = {
                     mint: mint.publicKey,
                     name: record.name,
                     symbol: record.symbol,
@@ -174,9 +180,22 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
                     user: payer.publicKey,
                     mayhemMode: false,
                     cashback: false,
-                });
+                };
+                let instructions;
+                if (initialBuySol > 0) {
+                    const online = new OnlinePumpSdk(connection);
+                    const [global, feeConfig] = await Promise.all([online.fetchGlobal(), online.fetchFeeConfig()]);
+                    const solAmount = new BN(Math.round(initialBuySol * solanaWeb3.LAMPORTS_PER_SOL).toString());
+                    const amount = getBuyTokenAmountFromSolAmount({
+                        global, feeConfig, mintSupply: null, bondingCurve: null,
+                        amount: solAmount, quoteMint: solanaWeb3.PublicKey.default,
+                    });
+                    instructions = await PUMP_SDK.createV2AndBuyInstructions({ ...createParams, global, amount, solAmount });
+                } else {
+                    instructions = [await PUMP_SDK.createV2Instruction(createParams)];
+                }
                 const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-                const message = new solanaWeb3.TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: blockhash, instructions: [instruction] }).compileToV0Message();
+                const message = new solanaWeb3.TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: blockhash, instructions }).compileToV0Message();
                 const transaction = new solanaWeb3.VersionedTransaction(message);
                 transaction.sign([payer, mint]);
                 const signature = await connection.sendTransaction(transaction, { maxRetries: 3, skipPreflight: false });
