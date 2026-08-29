@@ -103,6 +103,8 @@ export function createAgarCommerceService({
         shopEnabled: envBoolean('AGAR_SHOP_ENABLED'),
         swapEnabled: envBoolean('AGAR_ACCOUNT_SWAP_ENABLED'),
         mint: process.env.AGAR_TOKEN_MINT?.trim() || '',
+        name: process.env.AGAR_TOKEN_NAME?.trim() || 'Stakecoin',
+        symbol: process.env.AGAR_TOKEN_SYMBOL?.trim() || 'STAKE',
         configuredDecimals: Number.parseInt(process.env.AGAR_TOKEN_DECIMALS || '9', 10),
         treasuryAddress: process.env.AGAR_TREASURY_ADDRESS?.trim() || '',
         ownerAddress: process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim() || '',
@@ -126,7 +128,7 @@ export function createAgarCommerceService({
 
     async function requireAgarAccess(req, res) {
         if (await hasAgarAccess(req.user?.id)) return true;
-        res.status(503).json({ message: 'AGAR is coming soon.' });
+        res.status(503).json({ message: `${config.name} is coming soon.` });
         return false;
     }
 
@@ -302,14 +304,14 @@ export function createAgarCommerceService({
                 enabled: false,
                 mint: '',
                 decimals: config.configuredDecimals,
-                name: 'AGARSTAKE',
-                symbol: 'AGAR',
+                name: config.name,
+                symbol: config.symbol,
                 shopEnabled: false,
                 shopReady: false,
-                shopReason: 'AGAR is coming soon.',
+                shopReason: `${config.name} is coming soon.`,
                 swapEnabled: false,
                 swapReady: false,
-                swapReason: 'AGAR is coming soon.',
+                swapReason: `${config.name} is coming soon.`,
                 treasuryBps: config.treasuryBps,
                 ownerBps: config.ownerBps,
                 market: null,
@@ -330,8 +332,8 @@ export function createAgarCommerceService({
             enabled: config.enabled,
             mint: config.enabled ? config.mint : '',
             decimals: config.configuredDecimals,
-            name: 'AGARSTAKE',
-            symbol: 'AGAR',
+            name: config.name,
+            symbol: config.symbol,
             shopEnabled: config.shopEnabled,
             shopReady: shop.ready,
             shopReason: shop.reason,
@@ -534,7 +536,7 @@ export function createAgarCommerceService({
                 const user = await User.findById(req.user.id).select('depositAddress depositSecret');
                 if (!user?.depositAddress || !user?.depositSecret) throw Object.assign(new Error('Account wallet is unavailable.'), { status: 409 });
                 if (!isEncryptedWalletSecret(user.depositSecret)) {
-                    throw Object.assign(new Error('Account wallet must be migrated to encrypted storage before AGAR purchases.'), { status: 503 });
+                    throw Object.assign(new Error(`Account wallet must be migrated to encrypted storage before ${config.symbol} purchases.`), { status: 503 });
                 }
                 const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret, { allowLegacy: false }));
 
@@ -606,7 +608,7 @@ export function createAgarCommerceService({
                 res.status(error.status || (signature ? 202 : 500)).json({
                     message: signature
                         ? 'Payment was broadcast and is being reconciled. Do not retry.'
-                        : (error.status ? error.message : 'AGAR purchase failed.'),
+                        : (error.status ? error.message : `${config.symbol} purchase failed.`),
                     purchase: purchase ? serializePurchase(purchase) : null,
                 });
             } finally {

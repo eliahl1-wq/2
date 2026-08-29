@@ -23,6 +23,9 @@ const connection = new solanaWeb3.Connection(rpcUrl, 'confirmed');
 check('AGAR_TOKEN_ENABLED', process.env.AGAR_TOKEN_ENABLED === 'true');
 check('AGAR_SHOP_ENABLED', process.env.AGAR_SHOP_ENABLED === 'true');
 check('AGAR_ACCOUNT_SWAP_ENABLED', process.env.AGAR_ACCOUNT_SWAP_ENABLED === 'true');
+check('Public token access', process.env.AGAR_ADMIN_ONLY === 'false', 'AGAR_ADMIN_ONLY=false');
+check('Token name', process.env.AGAR_TOKEN_NAME === 'Stakecoin', process.env.AGAR_TOKEN_NAME || 'missing');
+check('Token symbol', process.env.AGAR_TOKEN_SYMBOL === 'STAKE', process.env.AGAR_TOKEN_SYMBOL || 'missing');
 check('WALLET_ENCRYPTION_KEY', hasWalletEncryptionKey());
 check('JUPITER_API_KEY', !!process.env.JUPITER_API_KEY);
 
@@ -65,6 +68,31 @@ if (mint && tokenProgram) {
         check('AGAR market price', true, `$${market.priceUsd} / liquidity $${market.liquidityUsd}`);
     } catch (error) {
         check('AGAR market price', false, error.message);
+    }
+
+    if (process.env.JUPITER_API_KEY) {
+        try {
+            const taker = new solanaWeb3.PublicKey(
+                process.env.AGAR_OWNER_REVENUE_ADDRESS || process.env.AGAR_TREASURY_ADDRESS || '',
+            );
+            const baseUrl = (process.env.JUPITER_SWAP_API_URL || 'https://api.jup.ag/swap/v2').replace(/\/$/, '');
+            const orderUrl = new URL(`${baseUrl}/order`);
+            orderUrl.searchParams.set('inputMint', 'So11111111111111111111111111111111111111112');
+            orderUrl.searchParams.set('outputMint', mint.toBase58());
+            orderUrl.searchParams.set('amount', process.env.AGAR_READINESS_SWAP_LAMPORTS || '1000000');
+            orderUrl.searchParams.set('taker', taker.toBase58());
+            const response = await fetch(orderUrl, {
+                headers: { 'x-api-key': process.env.JUPITER_API_KEY, Accept: 'application/json' },
+            });
+            const payload = await response.json().catch(() => ({}));
+            check(
+                'Jupiter SOL -> STAKE route',
+                response.ok && !!payload?.transaction && !!payload?.requestId,
+                response.ok ? `out=${payload?.outAmount || 'quoted'}` : (payload?.error || payload?.message || `HTTP ${response.status}`),
+            );
+        } catch (error) {
+            check('Jupiter SOL -> STAKE route', false, error.message);
+        }
     }
 }
 

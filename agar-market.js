@@ -4,7 +4,7 @@ let cache = null;
 export async function fetchAgarMarketPrice({
     mint,
     endpoint = process.env.AGAR_MARKET_ENDPOINT || DEFAULT_ENDPOINT,
-    minLiquidityUsd = Number(process.env.AGAR_SHOP_MIN_LIQUIDITY_USD || 10_000),
+    minLiquidityUsd = Number(process.env.AGAR_SHOP_MIN_LIQUIDITY_USD || 0),
     fetchImpl = fetch,
 }) {
     if (!mint) throw new Error('AGAR mint is not configured');
