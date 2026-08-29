@@ -16,6 +16,8 @@ const TokenLaunchSchema = new mongoose.Schema({
     key: { type: String, unique: true, default: 'arenifi' },
     mintAddress: { type: String, default: '' },
     encryptedMintSecret: { type: String, default: '', select: false },
+    launchWalletAddress: { type: String, default: '' },
+    encryptedLaunchWalletSecret: { type: String, default: '', select: false },
     name: { type: String, default: 'AreniFi Coin' },
     symbol: { type: String, default: 'ARENA' },
     description: { type: String, default: '' },
@@ -59,6 +61,7 @@ function serialize(record) {
         error: record.error,
         launchedAt: record.launchedAt,
         initialBuySol: record.initialBuySol || 0,
+        launchWalletAddress: record.launchWalletAddress || '',
         launchEnabled: process.env.PUMP_LAUNCH_ENABLED === 'true',
         configuredMint: process.env.AGAR_TOKEN_MINT?.trim() || '',
         mintMatchesEnvironment: process.env.AGAR_TOKEN_MINT?.trim() === record.mintAddress,
@@ -78,7 +81,7 @@ function validHttpUrl(value, { optional = true } = {}) {
 
 export function createTokenLaunchService({ connection, User, authenticateAdmin, sensitiveRateLimit }) {
     async function getRecord({ secret = false } = {}) {
-        return TokenLaunch.findOne({ key: 'arenifi' }).select(secret ? '+encryptedMintSecret' : undefined);
+        return TokenLaunch.findOne({ key: 'arenifi' }).select(secret ? '+encryptedMintSecret +encryptedLaunchWalletSecret' : undefined);
     }
 
     function registerRoutes(app) {
@@ -145,6 +148,8 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
                 version: 1,
                 mintAddress: record.mintAddress,
                 encryptedMintSecret: record.encryptedMintSecret,
+                launchWalletAddress: record.launchWalletAddress || '',
+                encryptedLaunchWalletSecret: record.encryptedLaunchWalletSecret || '',
                 warning: 'Requires the matching WALLET_ENCRYPTION_KEY. Never upload this backup or commit it to Git.',
             });
         });
@@ -162,29 +167,28 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             if (existingMint) return res.status(409).json({ message: 'This mint already exists on-chain.' });
             const admin = await User.findById(req.adminUser._id).select('+depositSecret depositAddress');
             if (!admin) return res.status(404).json({ message: 'Admin account was not found.' });
-            if (!admin.depositSecret && !admin.depositAddress) {
-                const wallet = solanaWeb3.Keypair.generate();
-                admin.depositAddress = wallet.publicKey.toBase58();
-                admin.depositSecret = encryptWalletSecret(wallet.secretKey);
-                await admin.save();
-                return res.status(409).json({
-                    message: `Admin launch wallet was created. Send SOL to ${admin.depositAddress}, then retry the launch.`,
-                    launchWalletAddress: admin.depositAddress,
-                });
-            }
-            if (!admin.depositSecret && admin.depositAddress) {
-                return res.status(409).json({
-                    message: `Admin wallet ${admin.depositAddress} has no recoverable signing key. It was not replaced.`,
-                    launchWalletAddress: admin.depositAddress,
-                });
-            }
+            let payer;
             if (admin.depositSecret && !admin.depositAddress) {
                 const recovered = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(admin.depositSecret));
                 admin.depositAddress = recovered.publicKey.toBase58();
                 await admin.save();
             }
-            const payer = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(admin.depositSecret));
-            if (payer.publicKey.toBase58() !== admin.depositAddress) throw new Error('Admin wallet secret does not match its address');
+            if (admin.depositSecret && admin.depositAddress) {
+                payer = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(admin.depositSecret));
+                if (payer.publicKey.toBase58() !== admin.depositAddress) throw new Error('Admin wallet secret does not match its address');
+            } else if (record.encryptedLaunchWalletSecret && record.launchWalletAddress) {
+                payer = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(record.encryptedLaunchWalletSecret));
+                if (payer.publicKey.toBase58() !== record.launchWalletAddress) throw new Error('Dedicated launch wallet secret does not match its address');
+            } else {
+                const launchWallet = solanaWeb3.Keypair.generate();
+                record.launchWalletAddress = launchWallet.publicKey.toBase58();
+                record.encryptedLaunchWalletSecret = encryptWalletSecret(launchWallet.secretKey);
+                await record.save();
+                return res.status(409).json({
+                    message: `A dedicated Pump launch wallet was created because the admin wallet has no signing key. Send SOL to ${record.launchWalletAddress}, then retry. The old admin wallet was not changed.`,
+                    launchWalletAddress: record.launchWalletAddress,
+                });
+            }
             const mint = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(record.encryptedMintSecret));
             if (mint.publicKey.toBase58() !== record.mintAddress) throw new Error('Stored mint keypair does not match the prepared address');
 
