@@ -17,6 +17,7 @@ function selectPrimaryPair(pairs, mint) {
 
 export async function fetchAgarCandles({
     mint,
+    symbol = 'ARENA',
     range = '24H',
     dexEndpoint = process.env.AGAR_MARKET_ENDPOINT
         || 'https://api.dexscreener.com/latest/dex/tokens/{mint}',
@@ -38,7 +39,7 @@ export async function fetchAgarCandles({
     if (!pairResponse.ok) throw new Error(`Market lookup failed (${pairResponse.status})`);
     const pairPayload = await pairResponse.json();
     const pair = selectPrimaryPair(pairPayload?.pairs || [], mint);
-    if (!pair?.pairAddress) throw new Error('No AGAR trading pool was found.');
+    if (!pair?.pairAddress) throw new Error(`No ${symbol} trading pool was found.`);
 
     const tokenSide = pair.baseToken?.address === mint ? 'base' : 'quote';
     const url = new URL(candlesEndpoint

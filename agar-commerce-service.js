@@ -99,6 +99,14 @@ export function createAgarCommerceService({
     authenticateToken,
     sensitiveRateLimit,
 }) {
+    const configuredTokenName = process.env.AGAR_TOKEN_NAME?.trim();
+    const configuredTokenSymbol = process.env.AGAR_TOKEN_SYMBOL?.trim().toUpperCase();
+    const tokenName = !configuredTokenName || /^(stake\s*coin|agar\s*(coin|token)?)$/i.test(configuredTokenName)
+        ? 'AreniFi Coin'
+        : configuredTokenName;
+    const tokenSymbol = !configuredTokenSymbol || ['AGAR', 'STAKECOIN'].includes(configuredTokenSymbol)
+        ? 'ARENA'
+        : configuredTokenSymbol;
     const config = {
         // Public access is the normal launched state. Admin-only preview must be
         // opted into explicitly so a missing Railway variable cannot silently
@@ -108,8 +116,8 @@ export function createAgarCommerceService({
         shopEnabled: envBoolean('AGAR_SHOP_ENABLED'),
         swapEnabled: envBoolean('AGAR_ACCOUNT_SWAP_ENABLED'),
         mint: process.env.AGAR_TOKEN_MINT?.trim() || '',
-        name: process.env.AGAR_TOKEN_NAME?.trim() || 'AreniFi Coin',
-        symbol: process.env.AGAR_TOKEN_SYMBOL?.trim() || 'ARENA',
+        name: tokenName,
+        symbol: tokenSymbol,
         configuredDecimals: Number.parseInt(process.env.AGAR_TOKEN_DECIMALS || '6', 10),
         treasuryAddress: process.env.AGAR_TREASURY_ADDRESS?.trim() || '',
         ownerAddress: process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim() || '',
@@ -138,23 +146,23 @@ export function createAgarCommerceService({
     }
 
     async function loadTokenContext({ requireDestinations = false } = {}) {
-        if (!config.enabled) throw new Error('AGAR has not launched yet');
+        if (!config.enabled) throw new Error(`${config.symbol} has not launched yet`);
         if (!hasWalletEncryptionKey()) throw new Error('Wallet encryption is not configured');
         if (tokenContextCache && Date.now() - tokenContextCache.loadedAt < 5 * 60_000) {
             if (requireDestinations && !tokenContextCache.destinationsReady) {
-                throw new Error(tokenContextCache.destinationError || 'AGAR destinations are not ready');
+                throw new Error(tokenContextCache.destinationError || `${config.symbol} destinations are not ready`);
             }
             return tokenContextCache;
         }
         const mint = publicKey(config.mint, 'AGAR_TOKEN_MINT');
         const mintAccount = await connection.getAccountInfo(mint, 'confirmed');
-        if (!mintAccount) throw new Error('AGAR mint does not exist on the configured network');
+        if (!mintAccount) throw new Error(`${config.symbol} mint does not exist on the configured network`);
         const tokenProgram = mintAccount.owner.equals(TOKEN_PROGRAM_ID)
             ? TOKEN_PROGRAM_ID
             : mintAccount.owner.equals(TOKEN_2022_PROGRAM_ID)
                 ? TOKEN_2022_PROGRAM_ID
                 : null;
-        if (!tokenProgram) throw new Error('AGAR mint is not owned by a supported token program');
+        if (!tokenProgram) throw new Error(`${config.symbol} mint is not owned by a supported token program`);
         const mintInfo = await getMint(connection, mint, 'confirmed', tokenProgram);
         if (mintInfo.decimals !== config.configuredDecimals) {
             throw new Error(`AGAR decimals mismatch: chain=${mintInfo.decimals}, config=${config.configuredDecimals}`);
@@ -162,7 +170,7 @@ export function createAgarCommerceService({
         if (tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
             const incompatible = getExtensionTypes(mintInfo.tlvData)
                 .filter((extension) => INCOMPATIBLE_TOKEN_2022_EXTENSIONS.has(extension));
-            if (incompatible.length) throw new Error(`AGAR mint has unsupported Token-2022 extensions: ${incompatible.join(',')}`);
+            if (incompatible.length) throw new Error(`${config.symbol} mint has unsupported Token-2022 extensions: ${incompatible.join(',')}`);
         }
 
         let treasuryWallet = null;
@@ -201,7 +209,7 @@ export function createAgarCommerceService({
             destinationError,
             loadedAt: Date.now(),
         };
-        if (requireDestinations && !destinationsReady) throw new Error(destinationError || 'AGAR destinations are not ready');
+        if (requireDestinations && !destinationsReady) throw new Error(destinationError || `${config.symbol} destinations are not ready`);
         return tokenContextCache;
     }
 
@@ -290,11 +298,11 @@ export function createAgarCommerceService({
     }
 
     async function shopReadiness() {
-        if (!config.enabled) return { ready: false, reason: 'AGAR has not launched yet.' };
-        if (!config.shopEnabled) return { ready: false, reason: 'AGAR shop is disabled.' };
+        if (!config.enabled) return { ready: false, reason: `${config.symbol} has not launched yet.` };
+        if (!config.shopEnabled) return { ready: false, reason: `${config.symbol} shop is disabled.` };
         try {
             await loadTokenContext({ requireDestinations: true });
-            const market = await fetchAgarMarketPrice({ mint: config.mint });
+            const market = await fetchAgarMarketPrice({ mint: config.mint, symbol: config.symbol });
             return { ready: true, reason: '', market };
         } catch (error) {
             return { ready: false, reason: error.message };
@@ -344,7 +352,7 @@ export function createAgarCommerceService({
             shopReason: shop.reason,
             swapEnabled: config.swapEnabled,
             swapReady: tokenReady && config.swapEnabled && !!config.jupiterApiKey,
-            swapReason: !config.swapEnabled ? 'AGAR account swaps are disabled.' : !config.jupiterApiKey ? 'Jupiter is not configured.' : tokenReason,
+            swapReason: !config.swapEnabled ? `${config.symbol} account swaps are disabled.` : !config.jupiterApiKey ? 'Jupiter is not configured.' : tokenReason,
             treasuryBps: config.treasuryBps,
             ownerBps: config.ownerBps,
             market: shop.market ? {
@@ -401,11 +409,12 @@ export function createAgarCommerceService({
         app.get('/api/agar/candles', authenticateToken, async (req, res) => {
             if (!await requireAgarAccess(req, res)) return;
             if (!config.enabled || !config.mint) {
-                return res.status(503).json({ message: 'AGAR has not launched yet.' });
+                return res.status(503).json({ message: `${config.symbol} has not launched yet.` });
             }
             try {
                 return res.json(await fetchAgarCandles({
                     mint: config.mint,
+                    symbol: config.symbol,
                     range: req.query.range,
                 }));
             } catch (error) {
@@ -424,7 +433,7 @@ export function createAgarCommerceService({
                 return res.json({ balance: balance.agar, launched: true });
             } catch (error) {
                 console.error('[AGAR balance]', error);
-                return res.status(502).json({ message: 'AGAR balance is temporarily unavailable.' });
+                return res.status(502).json({ message: `${config.symbol} balance is temporarily unavailable.` });
             }
         });
         app.get('/api/shop/catalog', authenticateToken, async (req, res) => {
@@ -551,7 +560,7 @@ export function createAgarCommerceService({
                 const balances = await readWalletBalances(user.depositAddress, context);
                 const totalAtomic = BigInt(purchase.tokenAmountAtomic);
                 if (!balances.tokenAccount || balances.tokenAccount.isFrozen || balances.agarAtomic < totalAtomic) {
-                    throw Object.assign(new Error('Insufficient AGAR balance.'), { status: 400 });
+                    throw Object.assign(new Error(`Insufficient ${config.symbol} balance.`), { status: 400 });
                 }
                 if (balances.sol < 0.001) {
                     throw Object.assign(new Error('At least 0.001 SOL is required for the network fee.'), { status: 400 });
@@ -623,8 +632,8 @@ export function createAgarCommerceService({
 
         app.post('/api/agar/swap', sensitiveRateLimit({ limit: 20, windowMs: 60_000 }), authenticateToken, async (req, res) => {
             if (!await requireAgarAccess(req, res)) return;
-            if (!config.enabled) return res.status(503).json({ message: 'AGAR has not launched yet.' });
-            if (!config.swapEnabled) return res.status(503).json({ message: 'AGAR account swaps are not enabled yet.' });
+            if (!config.enabled) return res.status(503).json({ message: `${config.symbol} has not launched yet.` });
+            if (!config.swapEnabled) return res.status(503).json({ message: `${config.symbol} account swaps are not enabled yet.` });
             if (!config.jupiterApiKey) return res.status(503).json({ message: 'Jupiter is not configured.' });
             const side = String(req.body?.side || '').toUpperCase();
             if (!['BUY', 'SELL'].includes(side)) return res.status(400).json({ message: 'Swap side must be BUY or SELL.' });
@@ -639,7 +648,7 @@ export function createAgarCommerceService({
                 stage = 'account_wallet';
                 const user = await User.findById(req.user.id).select('depositAddress depositSecret balance');
                 if (!user?.depositAddress || !isEncryptedWalletSecret(user.depositSecret)) {
-                    throw Object.assign(new Error('Account wallet must be encrypted before AGAR swaps.'), { status: 503 });
+                    throw Object.assign(new Error(`Account wallet must be encrypted before ${config.symbol} swaps.`), { status: 503 });
                 }
                 if (req.body?.accountAddress && req.body.accountAddress !== user.depositAddress) {
                     throw Object.assign(new Error('Swap wallet must match the wallet linked to your account.'), { status: 403 });
@@ -737,7 +746,7 @@ export function createAgarCommerceService({
                 res.status(error.status || (walletDecryptFailed || stage === 'configuration' ? 503 : 500)).json({
                     message: walletDecryptFailed
                         ? 'Account wallet encryption is temporarily unavailable. No transaction was submitted.'
-                        : (error.status ? error.message : (fallbackByStage[stage] || 'AGAR swap failed.')),
+                        : (error.status ? error.message : (fallbackByStage[stage] || `${config.symbol} swap failed.`)),
                     stage,
                     ...(walletDecryptFailed ? { code: error.code } : {}),
                 });
