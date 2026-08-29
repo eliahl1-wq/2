@@ -450,6 +450,19 @@ const SiteDisplaySettingsSchema = new mongoose.Schema({
 
 const SiteDisplaySettings = mongoose.model('SiteDisplaySettings', SiteDisplaySettingsSchema);
 
+const BugReportSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    username: { type: String, required: true, trim: true, maxlength: 80 },
+    message: { type: String, required: true, trim: true, maxlength: 2000 },
+    page: { type: String, default: '/pre-game', trim: true, maxlength: 240 },
+    gamemode: { type: String, default: '', trim: true, maxlength: 80 },
+    status: { type: String, enum: ['open', 'resolved'], default: 'open', index: true },
+    resolvedAt: { type: Date, default: null },
+}, { timestamps: true });
+
+BugReportSchema.index({ status: 1, createdAt: -1 });
+const BugReport = mongoose.model('BugReport', BugReportSchema);
+
 const TransactionSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     type: { type: String, enum: ['deposit', 'withdraw', 'game'], required: true },
@@ -2623,6 +2636,31 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/bug-reports', sensitiveRateLimit({ limit: 5, windowMs: 10 * 60_000 }), authenticateToken, async (req, res) => {
+    try {
+        const message = String(req.body?.message || '').trim();
+        const page = String(req.body?.page || '/pre-game').trim().slice(0, 240);
+        const gamemode = String(req.body?.gamemode || '').trim().slice(0, 80);
+        if (message.length < 3) return res.status(400).json({ message: 'Describe the bug in at least 3 characters.' });
+        if (message.length > 2000) return res.status(400).json({ message: 'Bug reports can contain at most 2000 characters.' });
+
+        const reporter = await User.findById(req.user.id).select('username').lean();
+        if (!reporter) return res.status(404).json({ message: 'Account not found.' });
+
+        const report = await BugReport.create({
+            userId: reporter._id,
+            username: reporter.username,
+            message,
+            page,
+            gamemode,
+        });
+        return res.status(201).json({ success: true, reportId: report._id });
+    } catch (err) {
+        console.error('Create bug report error:', err);
+        return res.status(500).json({ message: 'Could not submit the bug report.' });
+    }
+});
+
 app.get('/api/affiliate/dashboard', authenticateToken, async (req, res) => {
     try {
         const user = await User.findById(req.user.id);
@@ -4370,6 +4408,36 @@ app.put('/api/admin/pregame/display-settings', authenticateAdmin, async (req, re
     } catch (err) {
         console.error('Update pregame display settings error:', err);
         res.status(500).json({ error: 'Could not update pregame display settings' });
+    }
+});
+
+app.get('/api/admin/bug-reports', authenticateAdmin, async (req, res) => {
+    try {
+        const reports = await BugReport.find({})
+            .sort({ status: 1, createdAt: -1 })
+            .limit(300)
+            .lean();
+        return res.json({ reports });
+    } catch (err) {
+        console.error('Admin bug reports error:', err);
+        return res.status(500).json({ message: 'Could not load bug reports.' });
+    }
+});
+
+app.patch('/api/admin/bug-reports/:reportId', authenticateAdmin, async (req, res) => {
+    try {
+        const status = String(req.body?.status || '');
+        if (!['open', 'resolved'].includes(status)) return res.status(400).json({ message: 'Invalid bug report status.' });
+        const report = await BugReport.findByIdAndUpdate(
+            req.params.reportId,
+            { $set: { status, resolvedAt: status === 'resolved' ? new Date() : null } },
+            { new: true },
+        ).lean();
+        if (!report) return res.status(404).json({ message: 'Bug report not found.' });
+        return res.json({ report });
+    } catch (err) {
+        console.error('Update bug report error:', err);
+        return res.status(500).json({ message: 'Could not update the bug report.' });
     }
 });
 
@@ -9751,6 +9819,10 @@ io.on('connection', (socket) => {
         applySurvivFireInput(player, shooting, firePressId);
         if (useMedkit === true) player.useMedkit = true;
         if (pickupWeapon === true) player.pickupWeaponPending = true;
+        else {
+            const requestedWeaponId = safeId(pickupWeapon);
+            if (requestedWeaponId) player.pickupWeaponPending = requestedWeaponId;
+        }
         const requestedVestId = safeId(pickupVestId);
         if (requestedVestId) player.pickupVestId = requestedVestId;
         const requestedDoorId = safeId(toggleDoorId);

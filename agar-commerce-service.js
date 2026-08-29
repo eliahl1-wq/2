@@ -40,8 +40,10 @@ const INCOMPATIBLE_TOKEN_2022_EXTENSIONS = new Set([
     ExtensionType.ConfidentialTransferMint,
 ]);
 
-function envBoolean(name) {
-    return process.env[name] === 'true';
+function envBoolean(name, fallback = false) {
+    const value = process.env[name];
+    if (value == null || String(value).trim() === '') return fallback;
+    return ['true', '1', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }
 
 function publicKey(value, label) {
@@ -98,14 +100,17 @@ export function createAgarCommerceService({
     sensitiveRateLimit,
 }) {
     const config = {
-        adminOnly: process.env.AGAR_ADMIN_ONLY !== 'false',
+        // Public access is the normal launched state. Admin-only preview must be
+        // opted into explicitly so a missing Railway variable cannot silently
+        // force every non-admin client back into Coming Soon mode.
+        adminOnly: envBoolean('AGAR_ADMIN_ONLY', false),
         enabled: envBoolean('AGAR_TOKEN_ENABLED'),
         shopEnabled: envBoolean('AGAR_SHOP_ENABLED'),
         swapEnabled: envBoolean('AGAR_ACCOUNT_SWAP_ENABLED'),
         mint: process.env.AGAR_TOKEN_MINT?.trim() || '',
-        name: process.env.AGAR_TOKEN_NAME?.trim() || 'Stakecoin',
-        symbol: process.env.AGAR_TOKEN_SYMBOL?.trim() || 'STAKE',
-        configuredDecimals: Number.parseInt(process.env.AGAR_TOKEN_DECIMALS || '9', 10),
+        name: process.env.AGAR_TOKEN_NAME?.trim() || 'AreniFi Coin',
+        symbol: process.env.AGAR_TOKEN_SYMBOL?.trim() || 'ARENA',
+        configuredDecimals: Number.parseInt(process.env.AGAR_TOKEN_DECIMALS || '6', 10),
         treasuryAddress: process.env.AGAR_TREASURY_ADDRESS?.trim() || '',
         ownerAddress: process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim() || '',
         treasuryBps: Number.parseInt(process.env.AGAR_TREASURY_BPS || '9000', 10),

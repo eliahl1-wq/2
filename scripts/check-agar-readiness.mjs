@@ -24,8 +24,8 @@ check('AGAR_TOKEN_ENABLED', process.env.AGAR_TOKEN_ENABLED === 'true');
 check('AGAR_SHOP_ENABLED', process.env.AGAR_SHOP_ENABLED === 'true');
 check('AGAR_ACCOUNT_SWAP_ENABLED', process.env.AGAR_ACCOUNT_SWAP_ENABLED === 'true');
 check('Public token access', process.env.AGAR_ADMIN_ONLY === 'false', 'AGAR_ADMIN_ONLY=false');
-check('Token name', process.env.AGAR_TOKEN_NAME === 'Stakecoin', process.env.AGAR_TOKEN_NAME || 'missing');
-check('Token symbol', process.env.AGAR_TOKEN_SYMBOL === 'STAKE', process.env.AGAR_TOKEN_SYMBOL || 'missing');
+check('Token name', process.env.AGAR_TOKEN_NAME === 'AreniFi Coin', process.env.AGAR_TOKEN_NAME || 'missing');
+check('Token symbol', process.env.AGAR_TOKEN_SYMBOL === 'ARENA', process.env.AGAR_TOKEN_SYMBOL || 'missing');
 check('WALLET_ENCRYPTION_KEY', hasWalletEncryptionKey());
 check('JUPITER_API_KEY', !!process.env.JUPITER_API_KEY);
 
@@ -44,7 +44,7 @@ try {
     const mintInfo = await getMint(connection, mint, 'confirmed', tokenProgram);
     decimals = mintInfo.decimals;
     check('AGAR mint', true, `${mint.toBase58()} (${decimals} decimals)`);
-    check('AGAR decimals', decimals === Number(process.env.AGAR_TOKEN_DECIMALS || 9), `chain=${decimals}`);
+    check('AGAR decimals', decimals === Number(process.env.AGAR_TOKEN_DECIMALS || 6), `chain=${decimals}`);
 } catch (error) {
     check('AGAR mint', false, error.message);
 }
@@ -86,12 +86,12 @@ if (mint && tokenProgram) {
             });
             const payload = await response.json().catch(() => ({}));
             check(
-                'Jupiter SOL -> STAKE route',
+                'Jupiter SOL -> ARENA route',
                 response.ok && !!payload?.transaction && !!payload?.requestId,
                 response.ok ? `out=${payload?.outAmount || 'quoted'}` : (payload?.error || payload?.message || `HTTP ${response.status}`),
             );
         } catch (error) {
-            check('Jupiter SOL -> STAKE route', false, error.message);
+            check('Jupiter SOL -> ARENA route', false, error.message);
         }
     }
 }

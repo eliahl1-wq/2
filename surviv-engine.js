@@ -233,11 +233,6 @@ const LEGACY_WEAPONS = {
 void LEGACY_WEAPONS;
 export const WEAPONS = SURVIV_WEAPONS;
 
-const BOT_NAMES = [
-    'Scout', 'Raider', 'Ghost', 'Viper', 'Hawk', 'Wolf', 'Rogue', 'Blaze',
-    'Nomad', 'Cipher', 'Ranger', 'Striker', 'Hunter', 'Ace', 'Reaper',
-];
-
 const WEAPON_RARITY_POOLS = {
     common: SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'common'),
     rare: ['knife', ...SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'rare')],
@@ -5989,11 +5984,12 @@ function updateInventoryMedkit(entity, now) {
     return true;
 }
 
-function pickupGroundWeapon(entity, room) {
+function pickupGroundWeapon(entity, room, targetId = null) {
     if (entity.isCashingOut) return false;
     const inv = ensureInventory(entity);
     const nearby = querySurvivLoot(room, entity.x, entity.y, SURVIV.lootPickupRadius + 24)
         .filter(({ item }) => item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType])
+        .filter(({ item }) => !targetId || item.id === targetId)
         .filter(({ item }) => !entity.isBot || getBotWeaponUpgrade(entity, item.weaponType))
         .sort((a, b) => {
             if (entity.isBot) {
@@ -7828,7 +7824,7 @@ export function spawnSurvivBotNear(room, x, y, options = {}) {
     const bot = {
         id,
         mongoId: null,
-        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+        username: ' ',
         mode: 'surviv',
         color: `hsl(${Math.floor(Math.random() * 360)}, 55%, 55%)`,
         x,
@@ -8288,7 +8284,11 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
         else entity.shooting = false;
     }
     if (!entity.isCashingOut && entity.pickupWeaponPending) {
-        pickupGroundWeapon(entity, room);
+        pickupGroundWeapon(
+            entity,
+            room,
+            typeof entity.pickupWeaponPending === 'string' ? entity.pickupWeaponPending : null,
+        );
         entity.pickupWeaponPending = false;
     }
     if (!entity.isCashingOut && entity.pickupVestId) {

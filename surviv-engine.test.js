@@ -1701,6 +1701,28 @@ test('ground weapons fill empty slot first without swapping', () => {
     assert.ok(!room.loot.some(item => item.weaponType === 'pistol'), 'pistol should NOT be on the ground');
 });
 
+test('touch pickup targets the tapped weapon instead of the nearest weapon', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    const player = createSurvivPlayer('touch-weapon-pickup', 'mongo-touch-pickup', 'Tap Picker', '#fff', room);
+    player.x = 0;
+    player.y = 0;
+    room.players.push(player);
+    room.loot.push(
+        { id: 'nearest-pistol', type: 'weapon', x: 2, y: 0, weaponType: 'pistol', pickupAfter: 0 },
+        { id: 'tapped-shotgun', type: 'weapon', x: 28, y: 0, weaponType: 'shotgun', pickupAfter: 0 },
+    );
+
+    player.pickupWeaponPending = 'tapped-shotgun';
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.deepEqual(player.inventory.weapons, ['shotgun']);
+    assert.equal(player.weapon.type, 'shotgun');
+    assert.ok(room.loot.some(item => item.id === 'nearest-pistol'));
+    assert.equal(room.loot.some(item => item.id === 'tapped-shotgun'), false);
+});
+
 test('players can carry two identical guns with independent magazines', () => {
     const room = makeRoom();
     room.obstacles = [];
@@ -1894,6 +1916,7 @@ test('players and automatic bots start with fists and no dollars', () => {
     assert.equal(room.bots.length, 2);
     assert.ok(room.bots.every(bot => bot.weapon.type === 'fists'));
     assert.ok(room.bots.every(bot => bot.dollarBalance === 0));
+    assert.ok(room.bots.every(bot => bot.username === ' '), 'Surviv bot names should stay visually blank');
 });
 
 test('automatic surviv bots scale by two up to eight', () => {
