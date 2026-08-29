@@ -436,6 +436,23 @@ export function createAgarCommerceService({
                 return res.status(502).json({ message: `${config.symbol} balance is temporarily unavailable.` });
             }
         });
+        app.get('/api/agar/treasury', authenticateToken, async (req, res) => {
+            if (!await hasAgarAccess(req.user.id)) return res.status(503).json({ message: `${config.name} is coming soon.` });
+            if (!config.enabled) return res.json({ launched: false, balance: 0, address: '' });
+            try {
+                const context = await loadTokenContext();
+                const treasury = await readAgarTokenBalance(config.treasuryAddress, context);
+                return res.json({
+                    launched: true,
+                    balance: treasury.agar,
+                    address: context.treasuryWallet?.toBase58() || config.treasuryAddress,
+                    tokenAccount: treasury.ata.toBase58(),
+                });
+            } catch (error) {
+                console.error('[AGAR treasury]', error);
+                return res.status(502).json({ message: 'Treasury balance is temporarily unavailable.' });
+            }
+        });
         app.get('/api/shop/catalog', authenticateToken, async (req, res) => {
             if (!await hasAgarAccess(req.user.id)) {
                 return res.json({
