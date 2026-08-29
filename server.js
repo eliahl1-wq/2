@@ -12,6 +12,7 @@ import * as solanaWeb3 from '@solana/web3.js';
 import passport from 'passport';
 import { randomBytes } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
+import { createTokenLaunchService } from './token-launch-service.js';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { PUBLIC_FREE_PLAY_ROOM_OWNER, getPublicFreePlayEntryFee } from './public-free-mode.js';
 import {
@@ -4000,6 +4001,7 @@ const agarCommerce = createAgarCommerceService({
     sensitiveRateLimit,
 });
 agarCommerce.registerRoutes(app);
+createTokenLaunchService({ connection, User, authenticateAdmin, sensitiveRateLimit }).registerRoutes(app);
 
 const FLAG_SKIN_COLOR_RE = /^flag:(se|us|gb|de|fr|es|it|br|ca|jp|no|fi|dk|nl|pl|ua)$/;
 
