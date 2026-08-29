@@ -268,9 +268,33 @@ if (TOURNAMENT_WALLET_ADDRESS && TOURNAMENT_WALLET_SECRET) {
 }
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const PUBLIC_FRONTEND_URL = (process.env.FRONTEND_URL || (IS_PRODUCTION
-    ? 'https://arenifi.fun'
-    : 'http://localhost:5173')).replace(/\/$/, '');
+const CANONICAL_PRODUCTION_FRONTEND_URL = 'https://arenifi.fun';
+const LEGACY_FRONTEND_HOSTS = new Set(['agararena.space', 'www.agararena.space']);
+
+function resolvePublicFrontendUrl() {
+    const configuredUrl = (process.env.FRONTEND_URL || (IS_PRODUCTION
+        ? CANONICAL_PRODUCTION_FRONTEND_URL
+        : 'http://localhost:5173')).replace(/\/$/, '');
+
+    // Railway can retain the previous FRONTEND_URL after a domain migration.
+    // Never send OAuth credentials back to the retired AgarArena frontend:
+    // the query token must land directly on Arenifi so AuthContext can consume it.
+    if (IS_PRODUCTION) {
+        try {
+            if (LEGACY_FRONTEND_HOSTS.has(new URL(configuredUrl).hostname.toLowerCase())) {
+                console.warn(`FRONTEND_URL still points to legacy host ${configuredUrl}; using ${CANONICAL_PRODUCTION_FRONTEND_URL} for public redirects.`);
+                return CANONICAL_PRODUCTION_FRONTEND_URL;
+            }
+        } catch {
+            console.warn(`Invalid FRONTEND_URL ${JSON.stringify(configuredUrl)}; using ${CANONICAL_PRODUCTION_FRONTEND_URL}.`);
+            return CANONICAL_PRODUCTION_FRONTEND_URL;
+        }
+    }
+
+    return configuredUrl;
+}
+
+const PUBLIC_FRONTEND_URL = resolvePublicFrontendUrl();
 const PUBLIC_BACKEND_URL = (process.env.BACKEND_URL || (IS_PRODUCTION
     ? 'https://2-production-9e74.up.railway.app'
     : 'http://localhost:5000')).replace(/\/$/, '');
