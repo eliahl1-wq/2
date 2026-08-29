@@ -1,8 +1,15 @@
 import mongoose from 'mongoose';
 import * as solanaWeb3 from '@solana/web3.js';
 import { PinataSDK } from 'pinata';
-import { PUMP_SDK } from '@pump-fun/pump-sdk';
+import { createRequire } from 'node:module';
 import { encryptWalletSecret, decryptWalletSecret } from './wallet-crypto.js';
+
+// Pump's ESM bundle currently imports named values from Anchor's CommonJS
+// entrypoint, which crashes on some Node 20 Railway runtimes. The package
+// publishes a native CommonJS export as well; loading that export avoids the
+// interop failure without patching anything in node_modules.
+const require = createRequire(import.meta.url);
+const { PUMP_SDK } = require('@pump-fun/pump-sdk');
 
 const TokenLaunchSchema = new mongoose.Schema({
     key: { type: String, unique: true, default: 'arenifi' },
