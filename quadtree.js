@@ -1,5 +1,5 @@
 /**
- * Point Quadtree implementation for AgarStake spatial indexing.
+ * Point Quadtree implementation for Arenifi spatial indexing.
  */
 class Point {
     constructor(x, y, data) {

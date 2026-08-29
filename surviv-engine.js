@@ -1935,7 +1935,7 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     return floor;
 }
 
-// These are original AgarStake residential plans. Coordinates are normalized
+// These are original Arenifi residential plans. Coordinates are normalized
 // around each floor so one authored plan can be mirrored without turning into
 // the same generic four-room corridor. Each plan has a deliberate circulation
 // idea, real room functions, and at least two ways out.

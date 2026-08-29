@@ -106,7 +106,7 @@ const FIREARMS = {
 
 export const SURVIV_FIREARM_IDS = Object.freeze(Object.keys(FIREARMS));
 
-// The standard AgarStake Surviv roster. Event and compatibility definitions
+// The standard Arenifi Surviv roster. Event and compatibility definitions
 // remain valid for old sessions, but normal map/chest generation must only use
 // the readable core set presented in the loadout reference.
 export const SURVIV_STANDARD_FIREARM_IDS = Object.freeze([

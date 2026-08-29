@@ -267,14 +267,28 @@ if (TOURNAMENT_WALLET_ADDRESS && TOURNAMENT_WALLET_SECRET) {
     console.warn('Tournament Wallet not configured - real-money tournament entries and claims are disabled.');
 }
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const PUBLIC_FRONTEND_URL = (process.env.FRONTEND_URL || (IS_PRODUCTION
+    ? 'https://arenifi.fun'
+    : 'http://localhost:5173')).replace(/\/$/, '');
+const PUBLIC_BACKEND_URL = (process.env.BACKEND_URL || (IS_PRODUCTION
+    ? 'https://2-production-9e74.up.railway.app'
+    : 'http://localhost:5000')).replace(/\/$/, '');
+
 const allowedOrigins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://arenifi.fun",
+    "https://www.arenifi.fun",
+    // Keep the legacy hosts during the migration so cached clients can still
+    // reach the API before Vercel's path-preserving redirect takes effect.
     "https://www.agararena.space",
     "https://agararena.space",
     "https://2-production-9e74.up.railway.app",
-    /\.up\.railway\.app$/,
-    /\.agararena\.space$/,
+    /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/i,
+    /^https:\/\/(?:www\.)?arenifi\.fun$/i,
+    /^https:\/\/(?:www\.)?agararena\.space$/i,
+    PUBLIC_FRONTEND_URL,
     ...(process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
 ];
 
@@ -2393,7 +2407,7 @@ app.post('/api/referrals/click', sensitiveRateLimit({ limit: 60, windowMs: 60_00
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID || "DIN_GOOGLE_CLIENT_ID",
     clientSecret: process.env.GOOGLE_CLIENT_SECRET || "DIN_GOOGLE_CLIENT_SECRET",
-    callbackURL: `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/auth/google/callback`,
+    callbackURL: `${PUBLIC_BACKEND_URL}/api/auth/google/callback`,
     passReqToCallback: true,
 },
     async (req, accessToken, refreshToken, profile, done) => {
@@ -2446,13 +2460,12 @@ app.get('/api/auth/google', (req, res, next) => {
 });
 
 app.get('/api/auth/google/callback',
-    passport.authenticate('google', { session: false, failureRedirect: '/login' }),
+    passport.authenticate('google', { session: false, failureRedirect: `${PUBLIC_FRONTEND_URL}/login` }),
     (req, res) => {
         const secret = JWT_SECRET;
         const token = jwt.sign({ id: req.user._id, authVersion: req.user.authVersion || 0 }, secret, { expiresIn: '24h' });
         // Skicka tillbaka användaren till frontenden med token i URL:en
-        const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-        res.redirect(`${frontendUrl}/?token=${token}`);
+        res.redirect(`${PUBLIC_FRONTEND_URL}/?token=${token}`);
     }
 );
 
@@ -2465,7 +2478,7 @@ app.get('/api/health', (req, res) => {
 // Hälso-check för att se om servern är vaken
 app.get('/', (req, res) => {
     console.log("Health check requested at " + new Date().toISOString());
-    res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>AgarStake Engine v2.0 🎮</h1><p style="color:#007AFF;font-size:1.5rem;">Status: Pro Physics Enabled (v11)</p><p>Full Agar.io clone logic integrated.</p><p style="color:#00ff7f;">Ready for redeploy on Railway.</p></body></html>');
+    res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>Arenifi Engine v2.0 🎮</h1><p style="color:#8b5cf6;font-size:1.5rem;">Status: Online</p><p>Multiplayer game services are ready.</p></body></html>');
 });
 
 async function verifyAccountToken(token) {
@@ -2590,8 +2603,7 @@ app.get('/api/affiliate/dashboard', authenticateToken, async (req, res) => {
     try {
         const user = await User.findById(req.user.id);
         if (!user) return res.status(404).json({ message: 'User not found' });
-        const baseUrl = process.env.FRONTEND_URL || 'https://agararena.space';
-        return res.json(await getAffiliateDashboard(user, { baseUrl }));
+        return res.json(await getAffiliateDashboard(user, { baseUrl: PUBLIC_FRONTEND_URL }));
     } catch (error) {
         return res.status(error.status || 500).json({ message: error.message, code: error.code });
     }

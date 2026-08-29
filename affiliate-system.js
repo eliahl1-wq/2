@@ -718,7 +718,7 @@ function serializePayout(payout) {
     };
 }
 
-export async function getAffiliateDashboard(user, { baseUrl = 'https://agararena.space' } = {}) {
+export async function getAffiliateDashboard(user, { baseUrl = 'https://arenifi.fun' } = {}) {
     const profile = await ensureAffiliateProfile(user);
     await releaseMatureAffiliateCommissions(profile._id);
 
