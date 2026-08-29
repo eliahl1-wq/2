@@ -2,6 +2,8 @@ import mongoose from 'mongoose';
 import * as solanaWeb3 from '@solana/web3.js';
 import { PinataSDK } from 'pinata';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getMint, getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { encryptWalletSecret, decryptWalletSecret } from './wallet-crypto.js';
 
 // Pump's ESM bundle currently imports named values from Anchor's CommonJS
@@ -11,6 +13,7 @@ import { encryptWalletSecret, decryptWalletSecret } from './wallet-crypto.js';
 const require = createRequire(import.meta.url);
 const { PUMP_SDK, OnlinePumpSdk, getBuyTokenAmountFromSolAmount } = require('@pump-fun/pump-sdk');
 const BN = require('bn.js');
+const WRAPPED_SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 const TokenLaunchSchema = new mongoose.Schema({
     key: { type: String, unique: true, default: 'arenifi' },
@@ -33,6 +36,10 @@ const TokenLaunchSchema = new mongoose.Schema({
     error: { type: String, default: '' },
     launchedAt: { type: Date, default: null },
     initialBuySol: { type: Number, default: 0 },
+    operationLockId: { type: String, default: '' },
+    operationLockUntil: { type: Date, default: null },
+    lastSellSignature: { type: String, default: '' },
+    lastSellAt: { type: Date, default: null },
 }, { timestamps: true });
 
 const TokenLaunch = mongoose.models.TokenLaunch || mongoose.model('TokenLaunch', TokenLaunchSchema);
@@ -62,6 +69,8 @@ function serialize(record) {
         launchedAt: record.launchedAt,
         initialBuySol: record.initialBuySol || 0,
         launchWalletAddress: record.launchWalletAddress || '',
+        lastSellSignature: record.lastSellSignature || '',
+        lastSellAt: record.lastSellAt || null,
         launchEnabled: process.env.PUMP_LAUNCH_ENABLED === 'true',
         configuredMint: process.env.AGAR_TOKEN_MINT?.trim() || '',
         mintMatchesEnvironment: process.env.AGAR_TOKEN_MINT?.trim() === record.mintAddress,
@@ -79,14 +88,113 @@ function validHttpUrl(value, { optional = true } = {}) {
     return url.toString();
 }
 
+function decimalToAtomic(value, decimals) {
+    const text = String(value ?? '').trim();
+    if (!/^\d+(?:\.\d+)?$/.test(text)) throw new Error('Enter a valid token amount.');
+    const [whole, fraction = ''] = text.split('.');
+    if (fraction.length > decimals) throw new Error(`This token supports at most ${decimals} decimals.`);
+    return BigInt(whole) * (10n ** BigInt(decimals)) + BigInt((fraction + '0'.repeat(decimals)).slice(0, decimals) || '0');
+}
+
+function atomicToDecimal(amount, decimals) {
+    const base = 10n ** BigInt(decimals);
+    const whole = amount / base;
+    const fraction = (amount % base).toString().padStart(decimals, '0').replace(/0+$/, '');
+    return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
 export function createTokenLaunchService({ connection, User, authenticateAdmin, sensitiveRateLimit }) {
     async function getRecord({ secret = false } = {}) {
         return TokenLaunch.findOne({ key: 'arenifi' }).select(secret ? '+encryptedMintSecret +encryptedLaunchWalletSecret' : undefined);
     }
 
+    async function readLaunchPosition(record) {
+        if (!record?.launchWalletAddress || !record?.mintAddress) throw Object.assign(new Error('No dedicated launch-wallet position exists.'), { status: 409 });
+        const wallet = new solanaWeb3.PublicKey(record.launchWalletAddress);
+        const mint = new solanaWeb3.PublicKey(record.mintAddress);
+        const mintAccount = await connection.getAccountInfo(mint, 'confirmed');
+        if (!mintAccount) throw Object.assign(new Error('The launched mint does not exist on-chain.'), { status: 409 });
+        const tokenProgram = mintAccount.owner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+        const mintInfo = await getMint(connection, mint, 'confirmed', tokenProgram);
+        const ata = getAssociatedTokenAddressSync(mint, wallet, false, tokenProgram);
+        const tokenAccount = await getAccount(connection, ata, 'confirmed', tokenProgram).catch(() => null);
+        const tokenAtomic = tokenAccount?.amount || 0n;
+        const solLamports = await connection.getBalance(wallet, 'confirmed');
+        return {
+            walletAddress: wallet.toBase58(), mintAddress: mint.toBase58(), tokenAccount: ata.toBase58(),
+            decimals: mintInfo.decimals, tokenAtomic: tokenAtomic.toString(), tokenAmount: atomicToDecimal(tokenAtomic, mintInfo.decimals),
+            solLamports, solAmount: solLamports / solanaWeb3.LAMPORTS_PER_SOL,
+        };
+    }
+
     function registerRoutes(app) {
         app.get('/api/admin/token-launch', authenticateAdmin, async (_req, res) => {
             res.json(serialize(await getRecord()));
+        });
+
+        app.get('/api/admin/token-launch/position', authenticateAdmin, async (_req, res) => {
+            try {
+                const record = await getRecord();
+                if (!record || record.status !== 'launched') return res.status(409).json({ message: 'The token has not been launched yet.' });
+                res.json({ position: await readLaunchPosition(record), symbol: record.symbol });
+            } catch (error) {
+                res.status(error.status || 502).json({ message: error.message || 'Could not read the launch-wallet position.' });
+            }
+        });
+
+        app.post('/api/admin/token-launch/sell', sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
+            let record;
+            let lockId;
+            try {
+                const candidate = await getRecord({ secret: true });
+                if (!candidate || candidate.status !== 'launched') throw Object.assign(new Error('The token has not been launched yet.'), { status: 409 });
+                if (!candidate.encryptedLaunchWalletSecret || !candidate.launchWalletAddress) throw Object.assign(new Error('This launch did not use the dedicated server launch wallet. Sell from the wallet that made the initial purchase instead.'), { status: 409 });
+                if (req.body?.confirmation !== `SELL ${candidate.mintAddress}`) throw Object.assign(new Error('The exact sell confirmation does not match.'), { status: 400 });
+                const jupiterApiKey = process.env.JUPITER_API_KEY?.trim();
+                if (!jupiterApiKey) throw Object.assign(new Error('JUPITER_API_KEY is not configured.'), { status: 503 });
+                lockId = randomUUID();
+                record = await TokenLaunch.findOneAndUpdate({
+                    _id: candidate._id,
+                    $or: [{ operationLockUntil: null }, { operationLockUntil: { $lt: new Date() } }],
+                }, { $set: { operationLockId: lockId, operationLockUntil: new Date(Date.now() + 120_000) } }, { new: true }).select('+encryptedLaunchWalletSecret');
+                if (!record) throw Object.assign(new Error('Another launch-wallet operation is already running.'), { status: 409 });
+                const position = await readLaunchPosition(record);
+                const available = BigInt(position.tokenAtomic);
+                const amountAtomic = req.body?.max === true ? available : decimalToAtomic(req.body?.amount, position.decimals);
+                if (amountAtomic <= 0n) throw Object.assign(new Error('Sell amount must be greater than zero.'), { status: 400 });
+                if (amountAtomic > available) throw Object.assign(new Error('The launch wallet does not hold that many tokens.'), { status: 409 });
+                if (position.solLamports < 5000) throw Object.assign(new Error('The launch wallet needs a small SOL balance for network fees.'), { status: 409 });
+                const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(record.encryptedLaunchWalletSecret));
+                if (keypair.publicKey.toBase58() !== record.launchWalletAddress) throw new Error('Dedicated launch wallet secret does not match its address');
+                const baseUrl = process.env.JUPITER_SWAP_API_URL?.trim() || 'https://api.jup.ag/swap/v2';
+                const orderUrl = new URL(`${baseUrl}/order`);
+                orderUrl.searchParams.set('inputMint', record.mintAddress);
+                orderUrl.searchParams.set('outputMint', WRAPPED_SOL_MINT);
+                orderUrl.searchParams.set('amount', amountAtomic.toString());
+                orderUrl.searchParams.set('taker', record.launchWalletAddress);
+                const orderResponse = await fetch(orderUrl, { headers: { 'x-api-key': jupiterApiKey, Accept: 'application/json' } });
+                const order = await orderResponse.json();
+                if (!orderResponse.ok || !order?.transaction || !order?.requestId) throw Object.assign(new Error(order?.error || order?.message || 'Jupiter could not create a sell order.'), { status: 502 });
+                const transaction = solanaWeb3.VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
+                transaction.sign([keypair]);
+                const executeResponse = await fetch(`${baseUrl}/execute`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': jupiterApiKey },
+                    body: JSON.stringify({ signedTransaction: Buffer.from(transaction.serialize()).toString('base64'), requestId: order.requestId, ...(order.lastValidBlockHeight ? { lastValidBlockHeight: order.lastValidBlockHeight } : {}) }),
+                });
+                const result = await executeResponse.json();
+                if (!executeResponse.ok || result?.status !== 'Success' || !result?.signature) throw Object.assign(new Error(result?.error || result?.message || 'Jupiter sell failed.'), { status: 502 });
+                record.lastSellSignature = result.signature;
+                record.lastSellAt = new Date();
+                await record.save();
+                const positionAfter = await readLaunchPosition(record);
+                res.json({ success: true, signature: result.signature, inputAmountAtomic: amountAtomic.toString(), outputAmountAtomic: String(result.outputAmountResult || result.totalOutputAmount || order.outAmount || ''), position: positionAfter });
+            } catch (error) {
+                console.error('[Pump creator sell]', error);
+                res.status(error.status || 500).json({ message: error.message || 'Creator sell failed.' });
+            } finally {
+                if (record && lockId) await TokenLaunch.updateOne({ _id: record._id, operationLockId: lockId }, { $set: { operationLockId: '', operationLockUntil: null } }).catch(() => {});
+            }
         });
 
         app.post('/api/admin/token-launch/prepare', sensitiveRateLimit({ limit: 2, windowMs: 60 * 60_000 }), authenticateAdmin, async (_req, res) => {
