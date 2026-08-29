@@ -7607,7 +7607,6 @@ function rebuildQuadTree(room, allUsers) {
 }
 
 function addBots(room, n, botStake = null) {
-    const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
     const botCost = botStake ?? botStakeForRoom(room);
     const startMass = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).massStartBalance;
     const isRewardFunded = room.isFreeTicketRoom === true;
@@ -7620,11 +7619,10 @@ function addBots(room, n, botStake = null) {
         : Math.min(requestedCount, Math.floor(room.aiBudgetBalance / botCost));
     for (let i = 0; i < spawnCount; i++) {
         const id = 'bot_' + Math.random().toString(36).substr(2, 5);
-        const randomName = botNames[Math.floor(Math.random() * botNames.length)];
         if (!isRewardFunded) room.aiBudgetBalance -= botCost;
         room.bots.push({
             id: id,
-            username: randomName,
+            username: ' ',
             balance: botCost,
             dollarBalance: botCost,
             botStake: botCost,
@@ -9251,7 +9249,6 @@ io.on('connection', (socket) => {
             const isCompSlither = room.isCompetitiveSlither;
             const isSlither = isCompSlither || mode === 'slither' || (p && p.mode === 'slither') || room.id.includes('slither');
             const stake = botStakeForRoom(room);
-            const botNames = ["Sirius", "Gota", "AgarioMaster", "ProPlayer", "Legit", "Sanic", "Wojak", "Pepe", "Doge", "Spooderman", "U Mad?", "Team Me", "Solo King", "Blobby"];
             const startMass = getEconomy(room.entryFeeUsd ?? 0.10).massStartBalance;
 
             const spawnX = p ? ((isSlither || isSurviv ? p.x : p.cells?.[0]?.x) || 0) : (Math.random() * (isSlither ? SLITHER.worldHalf * 2 : isSurviv ? SURVIV.worldHalf * 0.8 : c.worldWidth));
@@ -9319,7 +9316,7 @@ io.on('connection', (socket) => {
                 const angle = Math.random() * Math.PI * 2;
                 room.slitherBots.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
-                    username: botNames[Math.floor(Math.random() * botNames.length)],
+                    username: ' ',
                     mode: 'slither',
                     kills: 0,
                     balance: startMass,
@@ -9346,7 +9343,7 @@ io.on('connection', (socket) => {
                 const offsetY = p ? (Math.random() - 0.5) * 600 : 0;
                 room.bots.push({
                     id: 'bot_' + Math.random().toString(36).substr(2, 5),
-                    username: botNames[Math.floor(Math.random() * botNames.length)],
+                    username: ' ',
                     balance: stake,
                     dollarBalance: stake,
                     botStake: stake,

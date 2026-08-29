@@ -107,11 +107,6 @@ function randId() {
     return Math.random().toString(36).substr(2, 9);
 }
 
-const BR_DEV_BOT_NAMES = [
-    'Sirius', 'Gota', 'Blobby', 'Wojak', 'Pepe', 'Doge', 'Sanic', 'Solo King',
-    'AgarioMaster', 'ProPlayer', 'Legit', 'Team Me', 'Spooderman', 'U Mad?',
-];
-
 /** DEV_FREE_PLAY only — pad queue to minPlayers so solo dev can test BR. */
 function fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay = false) {
     const fee = normalizeBREntryFee(entryFeeUsd);
@@ -121,7 +116,7 @@ function fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay = false) 
         q.push({
             socketId: `br_dev_bot_${variant}_${fee}_${randId()}`,
             mongoId: null,
-            username: `${BR_DEV_BOT_NAMES[i % BR_DEV_BOT_NAMES.length]} [AI]`,
+            username: ' ',
             entryFeeUsd: fee,
             joinedAt: Date.now(),
             socket: null,

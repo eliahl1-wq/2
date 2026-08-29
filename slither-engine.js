@@ -65,11 +65,6 @@ export const SLITHER = {
     lethalBodyStartRadius: 1.8,
 };
 
-const BOT_NAMES = [
-    'Sirius', 'Gota', 'SnakeMaster', 'ProSlither', 'Legit', 'Sanic',
-    'Wojak', 'Pepe', 'Doge', 'Viper', 'Cobra', 'Python', 'Anaconda',
-];
-
 // Agar arena is 18000×18000 — scale food count so Slither has the same visual density
 const AGAR_WORLD_SIDE = 6000;
 
@@ -407,7 +402,7 @@ export function createSlitherBot(room, botBalance = SLITHER.botStartBalance) {
     const angle = Math.random() * Math.PI * 2;
     return {
         id: 'slither_bot_' + randId(),
-        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+        username: ' ',
         isBot: true,
         balance: startMass,
         dollarBalance: botBalance,
@@ -2753,7 +2748,7 @@ export function createCompetitiveSlitherAdminBot(room, effectiveRadius, nearX = 
     return {
         id: 'bot_' + randId(),
         mongoId: null,
-        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+        username: ' ',
         mode: 'competitive-slither',
         kills: 0,
         balance: startMass,
