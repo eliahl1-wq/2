@@ -3,6 +3,7 @@ import {
     ExtensionType,
     TOKEN_2022_PROGRAM_ID,
     TOKEN_PROGRAM_ID,
+    createAssociatedTokenAccountIdempotentInstruction,
     createTransferCheckedInstruction,
     getAccount as getTokenAccount,
     getAssociatedTokenAddressSync,
@@ -177,6 +178,8 @@ export function createAgarCommerceService({
         let ownerWallet = null;
         let treasuryAta = null;
         let ownerAta = null;
+        let treasuryAccount = null;
+        let ownerAccount = null;
         let destinationsReady = false;
         let destinationError = '';
         try {
@@ -187,11 +190,11 @@ export function createAgarCommerceService({
             ownerWallet = publicKey(config.ownerAddress, 'AGAR_OWNER_REVENUE_ADDRESS');
             treasuryAta = getAssociatedTokenAddressSync(mint, treasuryWallet, false, tokenProgram);
             ownerAta = getAssociatedTokenAddressSync(mint, ownerWallet, false, tokenProgram);
-            const [treasuryAccount, ownerAccount] = await Promise.all([
-                getTokenAccount(connection, treasuryAta, 'confirmed', tokenProgram),
-                getTokenAccount(connection, ownerAta, 'confirmed', tokenProgram),
+            [treasuryAccount, ownerAccount] = await Promise.all([
+                getTokenAccount(connection, treasuryAta, 'confirmed', tokenProgram).catch(() => null),
+                getTokenAccount(connection, ownerAta, 'confirmed', tokenProgram).catch(() => null),
             ]);
-            if (treasuryAccount.isFrozen || ownerAccount.isFrozen) throw new Error('An AGAR revenue token account is frozen');
+            if (treasuryAccount?.isFrozen || ownerAccount?.isFrozen) throw new Error(`A ${config.symbol} revenue token account is frozen`);
             destinationsReady = true;
         } catch (error) {
             destinationError = error.message;
@@ -205,6 +208,8 @@ export function createAgarCommerceService({
             ownerWallet,
             treasuryAta,
             ownerAta,
+            treasuryAccount,
+            ownerAccount,
             destinationsReady,
             destinationError,
             loadedAt: Date.now(),
@@ -579,10 +584,31 @@ export function createAgarCommerceService({
                 if (!balances.tokenAccount || balances.tokenAccount.isFrozen || balances.agarAtomic < totalAtomic) {
                     throw Object.assign(new Error(`Insufficient ${config.symbol} balance.`), { status: 400 });
                 }
-                if (balances.sol < 0.001) {
-                    throw Object.assign(new Error('At least 0.001 SOL is required for the network fee.'), { status: 400 });
+                const missingDestinationAccounts = Number(!context.treasuryAccount) + Number(!context.ownerAccount && !context.ownerAta.equals(context.treasuryAta));
+                const minimumSol = missingDestinationAccounts ? 0.006 : 0.001;
+                if (balances.sol < minimumSol) {
+                    throw Object.assign(new Error(`At least ${minimumSol.toFixed(3)} SOL is required for the network fee${missingDestinationAccounts ? ' and first-time revenue token account creation' : ''}.`), { status: 400 });
                 }
-                const transaction = new solanaWeb3.Transaction().add(
+                const transaction = new solanaWeb3.Transaction();
+                if (!context.treasuryAccount) {
+                    transaction.add(createAssociatedTokenAccountIdempotentInstruction(
+                        keypair.publicKey,
+                        context.treasuryAta,
+                        context.treasuryWallet,
+                        context.mint,
+                        context.tokenProgram,
+                    ));
+                }
+                if (!context.ownerAccount && !context.ownerAta.equals(context.treasuryAta)) {
+                    transaction.add(createAssociatedTokenAccountIdempotentInstruction(
+                        keypair.publicKey,
+                        context.ownerAta,
+                        context.ownerWallet,
+                        context.mint,
+                        context.tokenProgram,
+                    ));
+                }
+                transaction.add(
                     createTransferCheckedInstruction(
                         balances.ata,
                         context.mint,
