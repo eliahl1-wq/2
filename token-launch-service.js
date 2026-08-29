@@ -136,7 +136,7 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             try {
                 const record = await getRecord();
                 if (!record || record.status !== 'launched') return res.status(409).json({ message: 'The token has not been launched yet.' });
-                res.json({ position: await readLaunchPosition(record), symbol: record.symbol });
+                res.json({ position: await readLaunchPosition(record), symbol: record.symbol, ownerRevenueAddress: process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim() || '' });
             } catch (error) {
                 res.status(error.status || 502).json({ message: error.message || 'Could not read the launch-wallet position.' });
             }
@@ -192,6 +192,64 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             } catch (error) {
                 console.error('[Pump creator sell]', error);
                 res.status(error.status || 500).json({ message: error.message || 'Creator sell failed.' });
+            } finally {
+                if (record && lockId) await TokenLaunch.updateOne({ _id: record._id, operationLockId: lockId }, { $set: { operationLockId: '', operationLockUntil: null } }).catch(() => {});
+            }
+        });
+
+        app.post('/api/admin/token-launch/withdraw-sol', sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
+            let record;
+            let lockId;
+            try {
+                const candidate = await getRecord({ secret: true });
+                if (!candidate || candidate.status !== 'launched') throw Object.assign(new Error('The token has not been launched yet.'), { status: 409 });
+                if (!candidate.encryptedLaunchWalletSecret || !candidate.launchWalletAddress) throw Object.assign(new Error('No dedicated launch wallet with a recoverable signing key exists.'), { status: 409 });
+                const destinationText = process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim();
+                if (!destinationText) throw Object.assign(new Error('AGAR_OWNER_REVENUE_ADDRESS is not configured.'), { status: 503 });
+                let destination;
+                try { destination = new solanaWeb3.PublicKey(destinationText); } catch { throw Object.assign(new Error('AGAR_OWNER_REVENUE_ADDRESS is not a valid Solana address.'), { status: 503 }); }
+                if (req.body?.confirmation !== `WITHDRAW ${candidate.launchWalletAddress}`) throw Object.assign(new Error('The exact withdrawal confirmation does not match.'), { status: 400 });
+                lockId = randomUUID();
+                record = await TokenLaunch.findOneAndUpdate({
+                    _id: candidate._id,
+                    $or: [{ operationLockUntil: null }, { operationLockUntil: { $lt: new Date() } }],
+                }, { $set: { operationLockId: lockId, operationLockUntil: new Date(Date.now() + 120_000) } }, { new: true }).select('+encryptedLaunchWalletSecret');
+                if (!record) throw Object.assign(new Error('Another launch-wallet operation is already running.'), { status: 409 });
+                const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(record.encryptedLaunchWalletSecret));
+                if (keypair.publicKey.toBase58() !== record.launchWalletAddress) throw new Error('Dedicated launch wallet secret does not match its address');
+                const balanceLamports = await connection.getBalance(keypair.publicKey, 'confirmed');
+                const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                const provisional = new solanaWeb3.TransactionMessage({
+                    payerKey: keypair.publicKey,
+                    recentBlockhash: blockhash,
+                    instructions: [solanaWeb3.SystemProgram.transfer({ fromPubkey: keypair.publicKey, toPubkey: destination, lamports: 1 })],
+                }).compileToV0Message();
+                const feeLamports = (await connection.getFeeForMessage(provisional, 'confirmed')).value;
+                if (feeLamports == null) throw Object.assign(new Error('Solana could not calculate the withdrawal fee.'), { status: 502 });
+                let sendLamports;
+                if (req.body?.max === true) {
+                    sendLamports = balanceLamports - feeLamports;
+                } else {
+                    const amountAtomic = decimalToAtomic(req.body?.amount, 9);
+                    if (amountAtomic > BigInt(Number.MAX_SAFE_INTEGER)) throw Object.assign(new Error('Withdrawal amount is too large.'), { status: 400 });
+                    sendLamports = Number(amountAtomic);
+                }
+                if (!Number.isSafeInteger(sendLamports) || sendLamports <= 0) throw Object.assign(new Error('The launch wallet does not have enough SOL after the network fee.'), { status: 409 });
+                if (sendLamports + feeLamports > balanceLamports) throw Object.assign(new Error(`Insufficient SOL. The wallet must also keep ${(feeLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(9)} SOL for the network fee.`), { status: 409 });
+                const message = new solanaWeb3.TransactionMessage({
+                    payerKey: keypair.publicKey,
+                    recentBlockhash: blockhash,
+                    instructions: [solanaWeb3.SystemProgram.transfer({ fromPubkey: keypair.publicKey, toPubkey: destination, lamports: sendLamports })],
+                }).compileToV0Message();
+                const transaction = new solanaWeb3.VersionedTransaction(message);
+                transaction.sign([keypair]);
+                const signature = await connection.sendTransaction(transaction, { maxRetries: 3, skipPreflight: false });
+                await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
+                const position = await readLaunchPosition(record);
+                res.json({ success: true, signature, destination: destination.toBase58(), sentLamports: sendLamports, sentSol: sendLamports / solanaWeb3.LAMPORTS_PER_SOL, feeLamports, position });
+            } catch (error) {
+                console.error('[Pump launch-wallet SOL withdrawal]', error);
+                res.status(error.status || 500).json({ message: error.message || 'Launch-wallet withdrawal failed.' });
             } finally {
                 if (record && lockId) await TokenLaunch.updateOne({ _id: record._id, operationLockId: lockId }, { $set: { operationLockId: '', operationLockUntil: null } }).catch(() => {});
             }
