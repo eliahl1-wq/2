@@ -149,7 +149,10 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             });
         });
 
-        app.post('/api/admin/token-launch/launch', sensitiveRateLimit({ limit: 1, windowMs: 24 * 60 * 60_000 }), authenticateAdmin, async (req, res) => {
+        // Preflight failures (missing wallet funds, disabled flag, etc.) must be
+        // retryable. The database state and on-chain mint existence provide the
+        // actual one-launch guarantee.
+        app.post('/api/admin/token-launch/launch', sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
             if (process.env.PUMP_LAUNCH_ENABLED !== 'true') return res.status(503).json({ message: 'Set PUMP_LAUNCH_ENABLED=true and redeploy before launching.' });
             const record = await getRecord({ secret: true });
             if (!record || !['metadata_ready', 'failed'].includes(record.status)) return res.status(409).json({ message: 'The mint and metadata must be prepared first.' });
@@ -158,7 +161,28 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             const existingMint = await connection.getAccountInfo(new solanaWeb3.PublicKey(record.mintAddress), 'confirmed');
             if (existingMint) return res.status(409).json({ message: 'This mint already exists on-chain.' });
             const admin = await User.findById(req.adminUser._id).select('+depositSecret depositAddress');
-            if (!admin?.depositSecret || !admin?.depositAddress) return res.status(409).json({ message: 'Admin account wallet is unavailable.' });
+            if (!admin) return res.status(404).json({ message: 'Admin account was not found.' });
+            if (!admin.depositSecret && !admin.depositAddress) {
+                const wallet = solanaWeb3.Keypair.generate();
+                admin.depositAddress = wallet.publicKey.toBase58();
+                admin.depositSecret = encryptWalletSecret(wallet.secretKey);
+                await admin.save();
+                return res.status(409).json({
+                    message: `Admin launch wallet was created. Send SOL to ${admin.depositAddress}, then retry the launch.`,
+                    launchWalletAddress: admin.depositAddress,
+                });
+            }
+            if (!admin.depositSecret && admin.depositAddress) {
+                return res.status(409).json({
+                    message: `Admin wallet ${admin.depositAddress} has no recoverable signing key. It was not replaced.`,
+                    launchWalletAddress: admin.depositAddress,
+                });
+            }
+            if (admin.depositSecret && !admin.depositAddress) {
+                const recovered = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(admin.depositSecret));
+                admin.depositAddress = recovered.publicKey.toBase58();
+                await admin.save();
+            }
             const payer = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(admin.depositSecret));
             if (payer.publicKey.toBase58() !== admin.depositAddress) throw new Error('Admin wallet secret does not match its address');
             const mint = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(record.encryptedMintSecret));
@@ -167,6 +191,16 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             record.status = 'launching';
             const initialBuySol = Number(req.body?.initialBuySol || 0);
             if (!Number.isFinite(initialBuySol) || initialBuySol < 0 || initialBuySol > 100) return res.status(400).json({ message: 'Initial buy must be between 0 and 100 SOL.' });
+            const payerLamports = await connection.getBalance(payer.publicKey, 'confirmed');
+            const requiredLamports = Math.round((initialBuySol + 0.01) * solanaWeb3.LAMPORTS_PER_SOL);
+            if (payerLamports < requiredLamports) {
+                return res.status(409).json({
+                    message: `Admin launch wallet needs at least ${(requiredLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(4)} SOL including the fee buffer. Send SOL to ${payer.publicKey.toBase58()}.`,
+                    launchWalletAddress: payer.publicKey.toBase58(),
+                    balanceSol: payerLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    requiredSol: requiredLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                });
+            }
             record.initialBuySol = initialBuySol;
             record.error = '';
             await record.save();
