@@ -103,7 +103,7 @@ if (hasWalletEncryptionKey()) {
         });
         const users = await mongoose.connection.collection('users').find({
             depositSecret: { $type: 'string', $ne: '' },
-        }, { projection: { depositSecret: 1 } }).toArray();
+        }, { projection: { depositSecret: 1, depositAddress: 1, username: 1 } }).toArray();
         const legacy = users.filter((user) => !isEncryptedWalletSecret(user.depositSecret));
         const unreadable = users.filter((user) => {
             if (!isEncryptedWalletSecret(user.depositSecret)) return false;
@@ -119,6 +119,11 @@ if (hasWalletEncryptionKey()) {
             legacy.length === 0 && unreadable.length === 0,
             `${legacy.length} legacy, ${unreadable.length} undecryptable secrets`,
         );
+        for (const user of unreadable) {
+            console.log(
+                `INFO  Undecryptable wallet — user=${user.username || user._id} address=${user.depositAddress || 'missing'}`,
+            );
+        }
     } catch (error) {
         check('Encrypted account wallets', false, error.message);
     } finally {
