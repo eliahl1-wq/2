@@ -23,6 +23,7 @@ const TokenLaunchSchema = new mongoose.Schema({
     metadataUri: { type: String, default: '' },
     website: { type: String, default: 'https://arenifi.fun' },
     twitter: { type: String, default: '' },
+    twitterPost: { type: String, default: '' },
     telegram: { type: String, default: '' },
     status: { type: String, enum: ['prepared', 'metadata_ready', 'launching', 'launched', 'failed'], default: 'prepared' },
     signature: { type: String, default: '' },
@@ -49,6 +50,7 @@ function serialize(record) {
         metadataUri: record.metadataUri,
         website: record.website,
         twitter: record.twitter,
+        twitterPost: record.twitterPost,
         telegram: record.telegram,
         status: record.status,
         signature: record.signature,
@@ -106,6 +108,7 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
             const imageSourceUrl = validHttpUrl(req.body?.imageSourceUrl, { optional: false });
             const website = validHttpUrl(req.body?.website || '', { optional: true });
             const twitter = validHttpUrl(req.body?.twitter || '', { optional: true });
+            const twitterPost = validHttpUrl(req.body?.twitterPost || '', { optional: true });
             const telegram = validHttpUrl(req.body?.telegram || '', { optional: true });
 
             const pinata = new PinataSDK({ pinataJwt: process.env.PINATA_JWT });
@@ -116,13 +119,17 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
                 showName: true,
                 createdOn: 'https://pump.fun',
                 ...(website && { website }),
-                ...(twitter && { twitter }),
+                // Axiom's tweet preview reads the standard `twitter` field and
+                // only previews direct status URLs, not profile handles.
+                ...((twitterPost || twitter) && { twitter: twitterPost || twitter }),
+                ...(twitter && { twitterAccount: twitter }),
+                ...(twitterPost && { twitterPost }),
                 ...(telegram && { telegram }),
             };
             const metadataUpload = await pinata.upload.public.json(metadata).name(`${symbol.toLowerCase()}-metadata.json`);
             const metadataUri = `https://ipfs.io/ipfs/${metadataUpload.cid}`;
             if (metadataUri.length > 200) throw new Error('Generated metadata URI exceeds Pump.fun limit');
-            Object.assign(record, { name, symbol, description, imageSourceUrl, imageUri, metadataUri, website, twitter, telegram, status: 'metadata_ready', error: '' });
+            Object.assign(record, { name, symbol, description, imageSourceUrl, imageUri, metadataUri, website, twitter, twitterPost, telegram, status: 'metadata_ready', error: '' });
             await record.save();
             res.json({ launch: serialize(record) });
         });
