@@ -72,7 +72,17 @@ if (mint && tokenProgram) {
         }
     }
     try {
-        const market = await fetchAgarMarketPrice({ mint: mint.toBase58() });
+        let market;
+        let lastMarketError;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+            try {
+                market = await fetchAgarMarketPrice({ mint: mint.toBase58() });
+                break;
+            } catch (error) {
+                lastMarketError = error;
+            }
+        }
+        if (!market) throw lastMarketError;
         check('AGAR market price', true, `$${market.priceUsd} / liquidity $${market.liquidityUsd}`);
     } catch (error) {
         check('AGAR market price', false, error.message);
@@ -96,8 +106,10 @@ if (mint && tokenProgram) {
             const payload = await response.json().catch(() => ({}));
             check(
                 'Jupiter SOL -> ARENA route',
-                response.ok && !!payload?.transaction && !!payload?.requestId,
-                response.ok ? `out=${payload?.outAmount || 'quoted'}` : (payload?.error || payload?.message || `HTTP ${response.status}`),
+                response.ok && Number(payload?.outAmount) > 0,
+                response.ok
+                    ? `out=${payload?.outAmount || 'missing'}${payload?.transaction ? ' / executable order' : ' / quote available (transaction depends on funded taker)'}`
+                    : (payload?.error || payload?.message || `HTTP ${response.status}`),
             );
         } catch (error) {
             check('Jupiter SOL -> ARENA route', false, error.message);
