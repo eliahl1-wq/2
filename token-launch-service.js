@@ -265,13 +265,15 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
                 }).compileToV0Message();
                 const feeLamports = (await connection.getFeeForMessage(provisional, 'confirmed')).value;
                 if (feeLamports == null) throw Object.assign(new Error('Solana could not calculate the withdrawal fee.'), { status: 502 });
+                const requestedAtomic = req.body?.max === true ? null : decimalToAtomic(req.body?.amount, 9);
+                if (requestedAtomic != null && requestedAtomic > BigInt(Number.MAX_SAFE_INTEGER)) throw Object.assign(new Error('Withdrawal amount is too large.'), { status: 400 });
+                const requestedLamports = requestedAtomic == null ? null : Number(requestedAtomic);
+                const withdrawAll = req.body?.max === true || requestedLamports >= balanceLamports;
                 let sendLamports;
-                if (req.body?.max === true) {
+                if (withdrawAll) {
                     sendLamports = balanceLamports - feeLamports;
                 } else {
-                    const amountAtomic = decimalToAtomic(req.body?.amount, 9);
-                    if (amountAtomic > BigInt(Number.MAX_SAFE_INTEGER)) throw Object.assign(new Error('Withdrawal amount is too large.'), { status: 400 });
-                    sendLamports = Number(amountAtomic);
+                    sendLamports = requestedLamports;
                 }
                 if (!Number.isSafeInteger(sendLamports) || sendLamports <= 0) throw Object.assign(new Error('The launch wallet does not have enough SOL after the network fee.'), { status: 409 });
                 if (sendLamports + feeLamports > balanceLamports) throw Object.assign(new Error(`Insufficient SOL. The wallet must also keep ${(feeLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(9)} SOL for the network fee.`), { status: 409 });
@@ -285,7 +287,7 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
                 const signature = await connection.sendTransaction(transaction, { maxRetries: 3, skipPreflight: false });
                 await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
                 const position = await readLaunchPosition(record);
-                res.json({ success: true, signature, destination: destination.toBase58(), sentLamports: sendLamports, sentSol: sendLamports / solanaWeb3.LAMPORTS_PER_SOL, feeLamports, position });
+                res.json({ success: true, signature, destination: destination.toBase58(), sentLamports: sendLamports, sentSol: sendLamports / solanaWeb3.LAMPORTS_PER_SOL, feeLamports, withdrawAll, position });
             } catch (error) {
                 console.error('[Pump launch-wallet SOL withdrawal]', error);
                 res.status(error.status || 500).json({ message: error.message || 'Launch-wallet withdrawal failed.' });
