@@ -129,7 +129,46 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
 
     function registerRoutes(app) {
         app.get('/api/admin/token-launch', authenticateAdmin, async (_req, res) => {
-            res.json(serialize(await getRecord()));
+            const [record, archivedLaunches] = await Promise.all([
+                getRecord(),
+                TokenLaunch.countDocuments({ key: { $ne: 'arenifi' } }),
+            ]);
+            res.json({ ...serialize(record), archivedLaunches });
+        });
+
+        app.post('/api/admin/token-launch/prepare-new', sensitiveRateLimit({ limit: 2, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
+            const current = await getRecord({ secret: true });
+            if (!current || current.status !== 'launched') return res.status(409).json({ message: 'A new coin can only be prepared after the current launch is complete.' });
+            if (req.body?.confirmation !== `NEW COIN ${current.mintAddress}`) return res.status(400).json({ message: 'The exact new-coin confirmation does not match.' });
+            if (current.launchWalletAddress && current.encryptedLaunchWalletSecret) {
+                const position = await readLaunchPosition(current);
+                if (BigInt(position.tokenAtomic) > 0n) {
+                    return res.status(409).json({ message: `Sell or transfer the remaining ${position.tokenAmount} ${current.symbol} from the launch wallet before creating another coin.` });
+                }
+                if (position.solLamports > 10_000) {
+                    return res.status(409).json({ message: `Withdraw the remaining ${position.solAmount} SOL from the launch wallet before creating another coin.` });
+                }
+            }
+            const archivedKey = `archived:${Date.now()}:${current.mintAddress}`;
+            current.key = archivedKey;
+            await current.save();
+            try {
+                const mint = solanaWeb3.Keypair.generate();
+                const record = await TokenLaunch.create({
+                    key: 'arenifi',
+                    mintAddress: mint.publicKey.toBase58(),
+                    encryptedMintSecret: encryptWalletSecret(mint.secretKey),
+                    name: 'AreniFi Coin',
+                    symbol: 'ARENA',
+                    website: 'https://arenifi.fun',
+                    status: 'prepared',
+                });
+                res.status(201).json({ launch: { ...serialize(record), archivedLaunches: await TokenLaunch.countDocuments({ key: { $ne: 'arenifi' } }) } });
+            } catch (error) {
+                current.key = 'arenifi';
+                await current.save().catch(() => {});
+                throw error;
+            }
         });
 
         app.get('/api/admin/token-launch/position', authenticateAdmin, async (_req, res) => {

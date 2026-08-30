@@ -411,8 +411,10 @@ export function createAgarCommerceService({
             res.json(await publicConfig({ accessGranted }));
         });
 
-        app.get('/api/agar/candles', authenticateToken, async (req, res) => {
-            if (!await requireAgarAccess(req, res)) return;
+        app.get('/api/agar/candles', async (req, res) => {
+            if (config.adminOnly) {
+                return res.status(403).json({ message: `${config.name} chart preview is not public yet.` });
+            }
             if (!config.enabled || !config.mint) {
                 return res.status(503).json({ message: `${config.symbol} has not launched yet.` });
             }
