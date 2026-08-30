@@ -101,7 +101,7 @@ export function createAgarCommerceService({
     sensitiveRateLimit,
 }) {
     const configuredTokenName = process.env.AGAR_TOKEN_NAME?.trim();
-    const configuredTokenSymbol = process.env.AGAR_TOKEN_SYMBOL?.trim().toUpperCase();
+    const configuredTokenSymbol = process.env.AGAR_TOKEN_SYMBOL?.trim().toUpperCase().replace(/^\$+/, '');
     const tokenName = !configuredTokenName || /^(stake\s*coin|agar\s*(coin|token)?|arenifi\s*coin)$/i.test(configuredTokenName)
         ? 'AreniFi Credits'
         : configuredTokenName;
