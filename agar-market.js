@@ -13,7 +13,10 @@ export async function fetchAgarMarketPrice({
     if (cache?.mint === mint && now - cache.fetchedAt < 15_000) return cache;
 
     const url = endpoint.replaceAll('{mint}', encodeURIComponent(mint));
-    const response = await fetchImpl(url, { headers: { Accept: 'application/json' } });
+    const response = await fetchImpl(url, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(Math.max(1_000, Number(process.env.AGAR_MARKET_TIMEOUT_MS || 8_000))),
+    });
     if (!response.ok) throw new Error(`${symbol} market provider returned ${response.status}`);
     const payload = await response.json();
     const pairs = Array.isArray(payload?.pairs) ? payload.pairs : [];

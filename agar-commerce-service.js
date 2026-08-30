@@ -335,15 +335,12 @@ export function createAgarCommerceService({
                 market: null,
             };
         }
-        const shop = await shopReadiness();
-        let tokenReady = false;
-        let tokenReason = '';
-        try {
-            await loadTokenContext();
-            tokenReady = true;
-        } catch (error) {
-            tokenReason = error.message;
-        }
+        // This endpoint controls whether the launched token is visible. Keep it
+        // independent from RPC, DexScreener and Jupiter availability: those
+        // services can be temporarily slow without un-launching the token in UI.
+        const tokenConfigured = config.enabled && !!config.mint;
+        const shopConfigured = tokenConfigured && config.shopEnabled;
+        const swapConfigured = tokenConfigured && config.swapEnabled && !!config.jupiterApiKey;
         return {
             accessGranted: true,
             adminOnly: config.adminOnly,
@@ -353,18 +350,14 @@ export function createAgarCommerceService({
             name: config.name,
             symbol: config.symbol,
             shopEnabled: config.shopEnabled,
-            shopReady: shop.ready,
-            shopReason: shop.reason,
+            shopReady: shopConfigured,
+            shopReason: !config.enabled ? `${config.symbol} has not launched yet.` : !config.shopEnabled ? `${config.symbol} shop is disabled.` : '',
             swapEnabled: config.swapEnabled,
-            swapReady: tokenReady && config.swapEnabled && !!config.jupiterApiKey,
-            swapReason: !config.swapEnabled ? `${config.symbol} account swaps are disabled.` : !config.jupiterApiKey ? 'Jupiter is not configured.' : tokenReason,
+            swapReady: swapConfigured,
+            swapReason: !config.enabled ? `${config.symbol} has not launched yet.` : !config.swapEnabled ? `${config.symbol} account swaps are disabled.` : !config.jupiterApiKey ? 'Jupiter is not configured.' : '',
             treasuryBps: config.treasuryBps,
             ownerBps: config.ownerBps,
-            market: shop.market ? {
-                priceUsd: shop.market.priceUsd,
-                liquidityUsd: shop.market.liquidityUsd,
-                source: shop.market.source,
-            } : null,
+            market: null,
         };
     }
 

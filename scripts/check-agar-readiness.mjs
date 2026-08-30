@@ -57,8 +57,16 @@ if (mint && tokenProgram) {
         try {
             const owner = new solanaWeb3.PublicKey(process.env[envName] || '');
             const ata = getAssociatedTokenAddressSync(mint, owner, false, tokenProgram);
-            const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
-            check(name, !account.isFrozen, `${owner.toBase58()} -> ${ata.toBase58()}`);
+            const accountInfo = await connection.getAccountInfo(ata, 'confirmed');
+            if (!accountInfo) {
+                // The shop creates missing destination ATAs idempotently in the
+                // first purchase transaction. A valid destination wallet is
+                // therefore ready even before it has ever held this token.
+                check(name, true, `${owner.toBase58()} -> ${ata.toBase58()} (will be created automatically on first purchase)`);
+            } else {
+                const account = await getAccount(connection, ata, 'confirmed', tokenProgram);
+                check(name, !account.isFrozen, `${owner.toBase58()} -> ${ata.toBase58()}`);
+            }
         } catch (error) {
             check(name, false, error.message);
         }
@@ -83,6 +91,7 @@ if (mint && tokenProgram) {
             orderUrl.searchParams.set('taker', taker.toBase58());
             const response = await fetch(orderUrl, {
                 headers: { 'x-api-key': process.env.JUPITER_API_KEY, Accept: 'application/json' },
+                signal: AbortSignal.timeout(Math.max(1_000, Number(process.env.AGAR_READINESS_TIMEOUT_MS || 10_000))),
             });
             const payload = await response.json().catch(() => ({}));
             check(
