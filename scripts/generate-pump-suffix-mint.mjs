@@ -24,7 +24,7 @@ try {
             status: 'prepared', signature: '', error: '', launchedAt: null,
             imageUri: '', metadataUri: '', updatedAt: new Date(),
         },
-        $setOnInsert: { key: 'arenifi', name: 'AreniFi Coin', symbol: 'ARENA', createdAt: new Date() },
+        $setOnInsert: { key: 'arenifi', name: 'AreniFi Credits', symbol: 'ARC', createdAt: new Date() },
     }, { upsert: true });
     console.log(`Prepared mint: ${mintAddress}`);
     console.log('Copy this public address to AGAR_TOKEN_MINT and VITE_AGAR_MINT. Keep token launch flags disabled.');

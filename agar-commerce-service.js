@@ -102,11 +102,11 @@ export function createAgarCommerceService({
 }) {
     const configuredTokenName = process.env.AGAR_TOKEN_NAME?.trim();
     const configuredTokenSymbol = process.env.AGAR_TOKEN_SYMBOL?.trim().toUpperCase();
-    const tokenName = !configuredTokenName || /^(stake\s*coin|agar\s*(coin|token)?)$/i.test(configuredTokenName)
-        ? 'AreniFi Coin'
+    const tokenName = !configuredTokenName || /^(stake\s*coin|agar\s*(coin|token)?|arenifi\s*coin)$/i.test(configuredTokenName)
+        ? 'AreniFi Credits'
         : configuredTokenName;
-    const tokenSymbol = !configuredTokenSymbol || ['AGAR', 'STAKECOIN'].includes(configuredTokenSymbol)
-        ? 'ARENA'
+    const tokenSymbol = !configuredTokenSymbol || ['AGAR', 'STAKECOIN', 'ARENA'].includes(configuredTokenSymbol)
+        ? 'ARC'
         : configuredTokenSymbol;
     const config = {
         // Public access is the normal launched state. Admin-only preview must be

@@ -24,8 +24,8 @@ check('AGAR_TOKEN_ENABLED', process.env.AGAR_TOKEN_ENABLED === 'true');
 check('AGAR_SHOP_ENABLED', process.env.AGAR_SHOP_ENABLED === 'true');
 check('AGAR_ACCOUNT_SWAP_ENABLED', process.env.AGAR_ACCOUNT_SWAP_ENABLED === 'true');
 check('Public token access', process.env.AGAR_ADMIN_ONLY === 'false', 'AGAR_ADMIN_ONLY=false');
-check('Token name', process.env.AGAR_TOKEN_NAME === 'AreniFi Coin', process.env.AGAR_TOKEN_NAME || 'missing');
-check('Token symbol', process.env.AGAR_TOKEN_SYMBOL === 'ARENA', process.env.AGAR_TOKEN_SYMBOL || 'missing');
+check('Token name', process.env.AGAR_TOKEN_NAME === 'AreniFi Credits', process.env.AGAR_TOKEN_NAME || 'missing');
+check('Token symbol', process.env.AGAR_TOKEN_SYMBOL === 'ARC', process.env.AGAR_TOKEN_SYMBOL || 'missing');
 check('WALLET_ENCRYPTION_KEY', hasWalletEncryptionKey());
 check('JUPITER_API_KEY', !!process.env.JUPITER_API_KEY);
 
@@ -105,14 +105,14 @@ if (mint && tokenProgram) {
             });
             const payload = await response.json().catch(() => ({}));
             check(
-                'Jupiter SOL -> ARENA route',
+                'Jupiter SOL -> ARC route',
                 response.ok && Number(payload?.outAmount) > 0,
                 response.ok
                     ? `out=${payload?.outAmount || 'missing'}${payload?.transaction ? ' / executable order' : ' / quote available (transaction depends on funded taker)'}`
                     : (payload?.error || payload?.message || `HTTP ${response.status}`),
             );
         } catch (error) {
-            check('Jupiter SOL -> ARENA route', false, error.message);
+            check('Jupiter SOL -> ARC route', false, error.message);
         }
     }
 }

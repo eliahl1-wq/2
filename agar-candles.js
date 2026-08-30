@@ -17,7 +17,7 @@ function selectPrimaryPair(pairs, mint) {
 
 export async function fetchAgarCandles({
     mint,
-    symbol = 'ARENA',
+    symbol = 'ARC',
     range = '24H',
     dexEndpoint = process.env.AGAR_MARKET_ENDPOINT
         || 'https://api.dexscreener.com/latest/dex/tokens/{mint}',

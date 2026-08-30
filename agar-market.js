@@ -57,7 +57,7 @@ async function fetchJupiterPrice({ mint, symbol, decimals, minLiquidityUsd, fetc
 
 export async function fetchAgarMarketPrice({
     mint,
-    symbol = 'ARENA',
+    symbol = 'ARC',
     decimals = Number(process.env.AGAR_TOKEN_DECIMALS || 6),
     endpoint = process.env.AGAR_MARKET_ENDPOINT || DEFAULT_ENDPOINT,
     minLiquidityUsd = Number(process.env.AGAR_SHOP_MIN_LIQUIDITY_USD || 0),
