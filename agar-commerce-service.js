@@ -406,6 +406,13 @@ export function createAgarCommerceService({
     }
 
     function registerRoutes(app) {
+        // Token launch state and market identity are public once admin-only
+        // preview is disabled. This prevents an expired login token or a brief
+        // auth outage from making a launched token appear as Coming Soon.
+        app.get('/api/agar/public-config', async (_req, res) => {
+            res.json(await publicConfig({ accessGranted: !config.adminOnly }));
+        });
+
         app.get('/api/agar/config', authenticateToken, async (req, res) => {
             const accessGranted = await hasAgarAccess(req.user.id);
             res.json(await publicConfig({ accessGranted }));
