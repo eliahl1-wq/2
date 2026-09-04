@@ -652,6 +652,7 @@ const CONTAINER_PROFILES = Object.freeze({
     ammo_crate: { hp: 32, hitRadius: 23 },
     medical_crate: { hp: 38, hitRadius: 23 },
     armory_crate: { hp: 58, hitRadius: 26 },
+    airdrop_crate: { hp: 108, hitRadius: 31 },
 });
 
 function pickContainerType(tier = 'common', options = {}) {
@@ -665,6 +666,19 @@ function pickContainerType(tier = 'common', options = {}) {
 }
 
 function randomContainerContents(containerType, tier, options = {}) {
+    if (containerType === 'airdrop_crate') {
+        const weaponType = pickWeaponForTier('military');
+        const ammoType = WEAPONS[weaponType]?.ammoType || '556';
+        return {
+            rarity: 'military',
+            weaponType,
+            ammoType,
+            ammoAmount: (SURVIV_AMMO[ammoType]?.pickup || 30) * 3,
+            grenades: Math.random() < 0.55 ? 2 : 1,
+            medkits: 2,
+            vestLevel: Math.random() < 0.36 ? 3 : 2,
+        };
+    }
     if (containerType === 'ammo_crate') {
         const ammoType = SURVIV_AMMO_TYPES[Math.floor(Math.random() * SURVIV_AMMO_TYPES.length)];
         return {
@@ -1814,18 +1828,19 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
     const southY = y + h / 2 - wall / 2;
     const westX = x - w / 2 + wall / 2;
     const eastX = x + w / 2 - wall / 2;
+    const exteriorWallOptions = opts.exteriorWallOptions || {};
 
-    if (doorSide === 'north') addHorizontalWallWithOpening(obstacles, x, northY, w, wall, variant, doorX, doorSpan);
-    else addWall(obstacles, x, northY, w, wall, variant);
+    if (doorSide === 'north') addHorizontalWallWithOpening(obstacles, x, northY, w, wall, variant, doorX, doorSpan, exteriorWallOptions);
+    else addWall(obstacles, x, northY, w, wall, variant, exteriorWallOptions);
 
-    if (doorSide === 'south') addHorizontalWallWithOpening(obstacles, x, southY, w, wall, variant, doorX, doorSpan);
-    else addWall(obstacles, x, southY, w, wall, variant);
+    if (doorSide === 'south') addHorizontalWallWithOpening(obstacles, x, southY, w, wall, variant, doorX, doorSpan, exteriorWallOptions);
+    else addWall(obstacles, x, southY, w, wall, variant, exteriorWallOptions);
 
-    if (doorSide === 'west') addVerticalWallWithOpening(obstacles, westX, y, h, wall, variant, doorY, doorSpan);
-    else addWall(obstacles, westX, y, wall, h, variant);
+    if (doorSide === 'west') addVerticalWallWithOpening(obstacles, westX, y, h, wall, variant, doorY, doorSpan, exteriorWallOptions);
+    else addWall(obstacles, westX, y, wall, h, variant, exteriorWallOptions);
 
-    if (doorSide === 'east') addVerticalWallWithOpening(obstacles, eastX, y, h, wall, variant, doorY, doorSpan);
-    else addWall(obstacles, eastX, y, wall, h, variant);
+    if (doorSide === 'east') addVerticalWallWithOpening(obstacles, eastX, y, h, wall, variant, doorY, doorSpan, exteriorWallOptions);
+    else addWall(obstacles, eastX, y, wall, h, variant, exteriorWallOptions);
 
     addDoor(obstacles, houseId, doorX, doorY, doorW, doorH, variant, doorSide, opts.entranceRole || 'mainEntrance');
 
@@ -1904,9 +1919,11 @@ function addHouse(obstacles, loot, spawnPoints, x, y, w, h, opts = {}) {
         }
     }
 
-    furnishHouseInterior(obstacles, floor, {
-        theme: resolveHouseInteriorTheme(variant, opts),
-    });
+    if (opts.furnish !== false) {
+        furnishHouseInterior(obstacles, floor, {
+            theme: resolveHouseInteriorTheme(variant, opts),
+        });
+    }
 
     const chestTier = opts.tier || (Math.random() > 0.78 ? 'rare' : 'common');
     const primaryChestChance = large ? 0.84 : layout === 'shop' ? 0.7 : (layout === 'split' || compactSplit) ? 0.62 : 0.46;
@@ -5289,6 +5306,114 @@ function addLargeResidentialLayer(obstacles, loot, spawnPoints, placedPositions,
     }
     return added;
 }
+
+function addGlasshouseGardens(obstacles, loot, spawnPoints, x, y) {
+    const landmarkType = 'glasshouse-gardens';
+    addObstacle(obstacles, 'field', x, y, 1260, 880, {
+        collidable: false,
+        variant: 'garden',
+        role: 'glasshouseGrounds',
+        landmarkType,
+    });
+
+    const greenhouse = addHouse(obstacles, loot, spawnPoints, x - 100, y - 35, 760, 570, {
+        variant: 'greenhouse',
+        hue: 164,
+        tier: 'rare',
+        doorSide: 'east',
+        layout: 'open',
+        furnish: false,
+        role: 'greenhouse',
+        landmarkType,
+        exteriorWallOptions: {
+            hue: 168,
+            role: 'greenhouseGlass',
+            landmarkType,
+            destructible: true,
+            maxHp: 48,
+        },
+    });
+    addRoomZone(obstacles, greenhouse.id, greenhouse.x, greenhouse.y, greenhouse.w - 38, greenhouse.h - 38, 'greenhouse-floor');
+
+    // Eight raised beds create readable lanes and destructible cover, echoing
+    // the classic greenhouse idea without copying its map or artwork.
+    const planterXs = [greenhouse.x - 210, greenhouse.x - 72, greenhouse.x + 72, greenhouse.x + 210];
+    for (const planterX of planterXs) {
+        for (const rowY of [greenhouse.y - 128, greenhouse.y + 118]) {
+            addObstacle(obstacles, 'furniture', planterX, rowY, 92, 148, {
+                variant: 'planterBox',
+                houseId: greenhouse.id,
+                roomId: 'greenhouse-floor',
+                role: 'greenhousePlanter',
+                landmarkType,
+                maxHp: 42,
+            });
+        }
+    }
+
+    loot.push(makeChest(greenhouse.x - 286, greenhouse.y + 214, 'rare', null, 'map', {
+        containerType: 'medical_crate',
+        houseId: greenhouse.id,
+        landmarkType,
+        room: 'greenhouse-floor',
+    }));
+    loot.push(makeChest(greenhouse.x + 268, greenhouse.y - 214, 'rare', null, 'map', {
+        containerType: 'supply_crate',
+        houseId: greenhouse.id,
+        landmarkType,
+        room: 'greenhouse-floor',
+    }));
+
+    const shed = addHouse(obstacles, loot, spawnPoints, x + 505, y + 150, 230, 190, {
+        variant: 'cabin',
+        hue: 28,
+        tier: 'common',
+        doorSide: 'west',
+        layout: 'open',
+        role: 'pottingShed',
+        landmarkType,
+    });
+    addObstacle(obstacles, 'entrancePad', x + 315, y - 35, 150, 112, {
+        collidable: false,
+        variant: 'stone',
+        role: 'greenhouseApron',
+        landmarkType,
+    });
+    addObstacle(obstacles, 'road', x + 487.5, y, 415, 92, {
+        collidable: false,
+        variant: 'gravel',
+        role: 'driveway',
+        landmarkType,
+    });
+
+    // Orchard rows and low cover make the compound useful even after it has
+    // been looted, while leaving clear north/south escape routes.
+    for (const side of [-1, 1]) {
+        const treeX = x - 485;
+        for (let row = -1; row <= 1; row++) {
+            addObstacle(obstacles, 'tree', treeX + side * 85, y + row * 205, 80, 80, {
+                hue: 92,
+                variant: 'orchard',
+                role: 'glasshouseOrchard',
+                landmarkType,
+            });
+        }
+    }
+    for (const [dx, dy] of [[360, -290], [520, -205], [555, 330], [-430, 330]]) {
+        addObstacle(obstacles, 'bush', x + dx, y + dy, 58, 46, {
+            collidable: false,
+            hue: 104,
+            variant: 'garden',
+            landmarkType,
+        });
+    }
+    spawnPoints.push(
+        { x: greenhouse.x + greenhouse.w / 2 + 92, y: greenhouse.y },
+        { x: shed.x - shed.w / 2 - 78, y: shed.y },
+        { x: x - 520, y: y - 330 },
+    );
+}
+
 export function generateSurvivMap(worldHalf) {
     const obstacles = [];
     const loot = [];
@@ -5337,6 +5462,7 @@ export function generateSurvivMap(worldHalf) {
     const westportPos = { x: -7000, y: 200, w: 1940, h: 1420 };
     const railDepotPos = { x: 700, y: 8200, w: 1860, h: 1320 };
     const civicQuarterPos = { x: -900, y: 3600, w: 1900, h: 1500 };
+    const glasshousePos = { x: -3500, y: 900, w: 1260, h: 880 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
@@ -5346,7 +5472,7 @@ export function generateSurvivMap(worldHalf) {
         northCachePos, eastCachePos, southCachePos, checkpointPos,
         servicesPos, fireStationPos, orchardPos,
         motelPos, rangerLodgePos, lumberworksPos,
-        riversidePos, eastgatePos, westportPos, railDepotPos, civicQuarterPos,
+        riversidePos, eastgatePos, westportPos, railDepotPos, civicQuarterPos, glasshousePos,
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -5496,6 +5622,9 @@ export function generateSurvivMap(worldHalf) {
     addCivicQuarter(obstacles, loot, spawnPoints, civicQuarterPos.x, civicQuarterPos.y);
     landmarks.push({ name: 'Civic Quarter', x: civicQuarterPos.x, y: civicQuarterPos.y, type: 'civic-quarter' });
 
+    addGlasshouseGardens(obstacles, loot, spawnPoints, glasshousePos.x, glasshousePos.y);
+    landmarks.push({ name: 'Glasshouse Gardens', x: glasshousePos.x, y: glasshousePos.y, type: 'glasshouse-gardens' });
+
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
     // ─────────────────────────────────────────────────────────────────────────
@@ -5541,6 +5670,7 @@ export function generateSurvivMap(worldHalf) {
     addRoad(obstacles, -2500, westportPos.y + 80, westportPos.x + 920, westportPos.y + 80, roadW); // Westport road
     addRoad(obstacles, 2500, railDepotPos.y, railDepotPos.x + 930, railDepotPos.y, roadW); // Rail depot freight approach
     addRoad(obstacles, -2500, civicQuarterPos.y + 50, civicQuarterPos.x - 900, civicQuarterPos.y + 50, roadW); // Civic boulevard
+    addRoad(obstacles, -2500, glasshousePos.y, glasshousePos.x + 320, glasshousePos.y, 92); // Glasshouse service lane
 
     // SW Town's south cobblestone lane already reaches the cross-map highway.
     // A second center driveway used to cut straight through a residence.
@@ -5717,6 +5847,98 @@ export function getSurvivZone(resetTime, now = Date.now()) {
         startsInMs: Math.max(0, shrinkStartsAt - now),
         endsInMs: Math.max(0, resetAt - now),
     };
+}
+
+const SURVIV_AIRDROP = Object.freeze({
+    firstDelayMs: 35000,
+    repeatDelayMs: 90000,
+    descentMs: 8200,
+    maximumPerMatch: 2,
+    minimumTimeBeforeResetMs: 35000,
+});
+
+function pickSurvivAirdropLanding(room, zone) {
+    const active = getActiveSurvivEntities(room);
+    const zoneX = Number(zone?.x ?? zone?.cx) || 0;
+    const zoneY = Number(zone?.y ?? zone?.cy) || 0;
+    const zoneRadius = Math.min(
+        SURVIV.worldHalf - 180,
+        Math.max(900, (Number(zone?.radius) || SURVIV.worldHalf) - 170),
+    );
+
+    for (let attempt = 0; attempt < 80; attempt++) {
+        const anchor = active.length ? active[Math.floor(Math.random() * active.length)] : { x: zoneX, y: zoneY };
+        const angle = Math.random() * Math.PI * 2;
+        const distance = active.length ? 520 + Math.random() * 860 : Math.sqrt(Math.random()) * zoneRadius * 0.76;
+        let x = clamp(anchor.x + Math.cos(angle) * distance, -SURVIV.worldHalf + 180, SURVIV.worldHalf - 180);
+        let y = clamp(anchor.y + Math.sin(angle) * distance, -SURVIV.worldHalf + 180, SURVIV.worldHalf - 180);
+        const fromZoneX = x - zoneX;
+        const fromZoneY = y - zoneY;
+        const fromZoneDistance = Math.hypot(fromZoneX, fromZoneY);
+        if (fromZoneDistance > zoneRadius) {
+            const scale = zoneRadius / Math.max(1, fromZoneDistance);
+            x = zoneX + fromZoneX * scale;
+            y = zoneY + fromZoneY * scale;
+        }
+        if (!isSurvivSpawnPositionSafe(room, x, y, 58)) return { x, y };
+    }
+
+    for (const spawn of room.spawnPoints || []) {
+        if (isSurvivSpawnPositionSafe(room, spawn.x, spawn.y, 58)) return { x: spawn.x, y: spawn.y };
+    }
+    return { x: zoneX, y: zoneY };
+}
+
+export function spawnSurvivAirdrop(room, now = Date.now(), zone = null) {
+    room.airdrops ||= [];
+    const landing = pickSurvivAirdropLanding(room, zone);
+    const drop = {
+        id: randId(),
+        x: Math.round(landing.x),
+        y: Math.round(landing.y),
+        state: 'incoming',
+        createdAt: now,
+        landsAt: now + SURVIV_AIRDROP.descentMs,
+        landedAt: 0,
+        crateId: null,
+    };
+    room.airdrops.push(drop);
+    return drop;
+}
+
+export function updateSurvivAirdrops(room, now, zone, resetTime) {
+    room.airdrops ||= [];
+    if (!Number.isFinite(room._nextSurvivAirdropAt)) {
+        room._nextSurvivAirdropAt = now + SURVIV_AIRDROP.firstDelayMs;
+    }
+
+    for (const drop of room.airdrops) {
+        if (drop.state !== 'incoming' || now < drop.landsAt) continue;
+        const crate = makeChest(drop.x, drop.y, 'military', null, 'airdrop', {
+            containerType: 'airdrop_crate',
+            landmarkType: 'airdrop',
+        });
+        addSurvivLoot(room, crate);
+        drop.state = 'landed';
+        drop.landedAt = now;
+        drop.crateId = crate.id;
+    }
+
+    room.airdrops = room.airdrops.filter(drop => (
+        drop.state === 'incoming'
+        || !drop.crateId
+        || room.loot.some(item => item.id === drop.crateId)
+    ));
+
+    const remainingMs = Number.isFinite(Number(resetTime)) ? Number(resetTime) - now : Infinity;
+    const spawned = Number(room._survivAirdropsSpawned) || 0;
+    if (now >= room._nextSurvivAirdropAt
+        && spawned < SURVIV_AIRDROP.maximumPerMatch
+        && remainingMs >= SURVIV_AIRDROP.minimumTimeBeforeResetMs) {
+        spawnSurvivAirdrop(room, now, zone);
+        room._survivAirdropsSpawned = spawned + 1;
+        room._nextSurvivAirdropAt = now + SURVIV_AIRDROP.repeatDelayMs;
+    }
 }
 
 export function getSurvivEffectiveRadius(resetTime, now = Date.now()) {
@@ -6170,6 +6392,7 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room.bullets = [];
     room.spectators = [];
     room.deathMarkers = [];
+    room.airdrops = [];
     room._pendingKillFeed = [];
     room.lootPoolBalance = 0;
     room.loot = [...(nextMap.loot || [])];
@@ -6186,6 +6409,8 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room._survivLeaderboardSignature = null;
     room._lastSurvivLbAt = 0;
     room._nextSurvivBotSyncAt = 0;
+    room._nextSurvivAirdropAt = null;
+    room._survivAirdropsSpawned = 0;
     return room;
 }
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
@@ -6294,6 +6519,18 @@ function pickSurvivSpawn(room) {
         if (isSurvivSpawnPositionSafe(room, pos.x, pos.y, SURVIV.playerRadius + 10)) {
             const clear = [...room.players, ...room.bots].every(p => dist(pos.x, pos.y, p.x, p.y) > 140);
             if (clear) return pos;
+        }
+    }
+    // Dense landmark edges can reject every jittered candidate by chance.
+    // The map's authored points were already sanitized with a larger radius,
+    // so try their exact coordinates before falling back to random terrain.
+    if (spawnPoints.length) {
+        const start = Math.floor(Math.random() * spawnPoints.length);
+        for (let offset = 0; offset < spawnPoints.length; offset++) {
+            const point = spawnPoints[(start + offset) % spawnPoints.length];
+            if (!isSurvivSpawnPositionSafe(room, point.x, point.y, SURVIV.playerRadius + 10)) continue;
+            const clear = [...room.players, ...room.bots].every(player => dist(point.x, point.y, player.x, player.y) > 140);
+            if (clear) return { x: point.x, y: point.y };
         }
     }
     for (let i = 0; i < 200; i++) {
@@ -8533,6 +8770,7 @@ export function processSurvivRoom(room, io, resetTime) {
     const effectiveRadius = zone?.radius ?? SURVIV.worldHalf;
 
     syncSurvivBots(room);
+    updateSurvivAirdrops(room, now, zone, resetTime);
 
     const entities = getActiveSurvivEntities(room);
 
@@ -8726,6 +8964,14 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             dollarBalance,
             spectating,
             activityZones,
+            airdrops: (room.airdrops || []).map(drop => ({
+                id: drop.id,
+                x: drop.x,
+                y: drop.y,
+                state: drop.state,
+                landsAt: drop.landsAt,
+                crateId: drop.crateId,
+            })),
             ...(pendingKillFeed.length ? { killFeed: pendingKillFeed.map(entry => ({ ...entry })) } : {}),
             ...(viewerEntity?._hitConfirm ? { hitConfirm: { ...viewerEntity._hitConfirm } } : {}),
             ...(viewerEntity?._damageTaken ? { damageTaken: { ...viewerEntity._damageTaken } } : {}),

@@ -17,8 +17,10 @@ import {
     processSurvivRoom,
     resetSurvivRoomRuntime,
     spawnLootFromPool,
+    spawnSurvivAirdrop,
     spawnSurvivBotNear,
     toggleSurvivDoor,
+    updateSurvivAirdrops,
 } from './surviv-engine.js';
 import { getSurvivEconomy, getSurvivJoinLootFunding } from './economy.js';
 
@@ -158,7 +160,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 34);
+    assert.equal(map.landmarks.length, 35);
     assert.ok(houses.length >= 178 && houses.length <= 188,
         `expected a deliberate building budget, got ${houses.length}`);
     assert.ok(chests.length < houses.length);
@@ -174,6 +176,88 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
         assert.ok(pointInRect(item.x, item.y, floor, -18));
     }
     assert.ok(maxExtent <= SURVIV.worldHalf);
+});
+
+test('Glasshouse Gardens fills the central-west rotation with breakable cover and useful loot', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmark = map.landmarks.find(item => item.type === 'glasshouse-gardens');
+    const greenhouse = map.obstacles.find(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && obstacle.variant === 'greenhouse'
+        && obstacle.landmarkType === 'glasshouse-gardens'
+    ));
+
+    assert.ok(landmark);
+    assert.ok(greenhouse);
+    assert.ok(Math.hypot(landmark.x + 3500, landmark.y - 900) < 1);
+
+    const glassWalls = map.obstacles.filter(obstacle => (
+        obstacle.role === 'greenhouseGlass'
+        && obstacle.landmarkType === 'glasshouse-gardens'
+    ));
+    assert.ok(glassWalls.length >= 5);
+    assert.ok(glassWalls.every(wall => wall.destructible && wall.hp === 48 && wall.maxHp === 48));
+
+    const planters = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'furniture'
+        && obstacle.variant === 'planterBox'
+        && obstacle.houseId === greenhouse.id
+    ));
+    assert.equal(planters.length, 8);
+    assert.ok(planters.every(planter => planter.collidable && planter.destructible && planter.maxHp === 42));
+
+    const doors = map.obstacles.filter(obstacle => obstacle.kind === 'door' && obstacle.houseId === greenhouse.id);
+    assert.equal(doors.length, 1);
+    const greenhouseLoot = map.loot.filter(item => item.houseId === greenhouse.id && item.type === 'chest');
+    assert.ok(greenhouseLoot.some(item => item.containerType === 'medical_crate'));
+    assert.ok(greenhouseLoot.some(item => item.containerType === 'supply_crate'));
+
+    const driveway = map.obstacles.find(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'driveway'
+        && obstacle.landmarkType === 'glasshouse-gardens'
+    ));
+    assert.ok(driveway);
+    const serviceRoad = map.obstacles.find(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'networkRoad'
+        && rectsOverlap(
+            obstacle.x, obstacle.y, obstacle.w, obstacle.h,
+            driveway.x, driveway.y, driveway.w, driveway.h,
+        )
+    ));
+    assert.ok(serviceRoad, 'glasshouse service lane should connect the compound to the west highway');
+});
+
+test('airdrop lifecycle lands a tough military crate without minting money', () => {
+    const room = {
+        players: [],
+        bots: [],
+        obstacles: [],
+        loot: [],
+        spawnPoints: [],
+        airdrops: [],
+    };
+    const now = 100000;
+    const drop = spawnSurvivAirdrop(room, now, { x: 0, y: 0, radius: 4000 });
+
+    assert.equal(drop.state, 'incoming');
+    assert.equal(room.loot.length, 0);
+    updateSurvivAirdrops(room, drop.landsAt, { x: 0, y: 0, radius: 4000 }, now + 300000);
+
+    assert.equal(drop.state, 'landed');
+    const crate = room.loot.find(item => item.id === drop.crateId);
+    assert.ok(crate);
+    assert.equal(crate.containerType, 'airdrop_crate');
+    assert.equal(crate.source, 'airdrop');
+    assert.equal(crate.hp, 108);
+    assert.equal(crate.contents.rarity, 'military');
+    assert.ok(WEAPONS[crate.contents.weaponType]);
+    assert.equal(crate.contents.ammoType, WEAPONS[crate.contents.weaponType].ammoType);
+    assert.ok(crate.contents.ammoAmount > 0);
+    assert.ok(crate.contents.medkits >= 2);
+    assert.ok(crate.contents.vestLevel >= 2);
+    assert.equal(Number(crate.contents.money || crate.contents.dollarValue || 0), 0);
 });
 
 test('prison cell blocks use a purpose-built four-cell plan facing the yard', () => {
@@ -589,6 +673,7 @@ test('surviv runtime reset clears old arena state and caches', () => {
     room.bullets.push({ id: 'old-bullet' });
     room.spectators.push({ id: 'old-spectator' });
     room.deathMarkers = [{ id: 'old-grave' }];
+    room.airdrops = [{ id: 'old-drop' }];
     room.lootPoolBalance = 5;
     room._survivObstacleIndex = { stale: true };
     room._survivLootIndex = { stale: true };
@@ -596,6 +681,8 @@ test('surviv runtime reset clears old arena state and caches', () => {
     room._survivLeaderboardSignature = 'stale';
     room._lastSurvivLbAt = 123;
     room._nextSurvivBotSyncAt = 456;
+    room._nextSurvivAirdropAt = 789;
+    room._survivAirdropsSpawned = 2;
     const nextMap = {
         loot: [{ id: 'fresh-loot' }],
         obstacles: [{ id: 'fresh-obstacle' }],
@@ -610,6 +697,7 @@ test('surviv runtime reset clears old arena state and caches', () => {
     assert.deepEqual(room.bullets, []);
     assert.deepEqual(room.spectators, []);
     assert.deepEqual(room.deathMarkers, []);
+    assert.deepEqual(room.airdrops, []);
     assert.equal(room.lootPoolBalance, 0);
     assert.equal(room.loot[0].id, 'fresh-loot');
     assert.equal(room.obstacles[0].id, 'fresh-obstacle');
@@ -617,6 +705,8 @@ test('surviv runtime reset clears old arena state and caches', () => {
     assert.equal(room._survivLootIndex, null);
     assert.equal(room._survivViewerPayloadCache.size, 0);
     assert.equal(room._nextSurvivBotSyncAt, 0);
+    assert.equal(room._nextSurvivAirdropAt, null);
+    assert.equal(room._survivAirdropsSpawned, 0);
 });
 test('surviv economy takes the hidden 5% entry owner cut from map loot', () => {
     const economy = getSurvivEconomy(5);
@@ -1935,7 +2025,15 @@ test('automatic surviv bots scale by two up to eight', () => {
 
 test('melee deaths scatter the full inventory instead of making a death crate', () => {
     const room = makeRoom();
+    // Keep this inventory/drop assertion independent of randomized map cover;
+    // a tree or crate between the two entities can legitimately absorb melee.
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [{ x: 0, y: 0 }];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
     const player = createSurvivPlayer('human-melee', 'mongo-melee', 'Boxer', '#fff', room);
+    player.x = 0;
+    player.y = 0;
     room.players.push(player);
     const victim = spawnSurvivBotNear(room, player.x + 32, player.y, { adminSpawned: true });
     victim.hp = 1;
@@ -2994,6 +3092,7 @@ test('generated cover and small props have server-authoritative durability', () 
     const structuralWalls = map.obstacles.filter(obstacle => (
         (obstacle.kind === 'wall' || obstacle.kind === 'interiorWall')
         && obstacle.role !== 'breakableBarrier'
+        && obstacle.role !== 'greenhouseGlass'
     ));
     assert.ok(structuralWalls.length > 0);
     assert.ok(structuralWalls.every(obstacle => !obstacle.destructible), 'house walls must stay indestructible');
