@@ -5855,15 +5855,24 @@ const SURVIV_AIRDROP = Object.freeze({
     descentMs: 8200,
     maximumPerMatch: 2,
     minimumTimeBeforeResetMs: 35000,
+    retryDelayMs: 5000,
 });
 
 function pickSurvivAirdropLanding(room, zone) {
     const active = getActiveSurvivEntities(room);
     const zoneX = Number(zone?.x ?? zone?.cx) || 0;
     const zoneY = Number(zone?.y ?? zone?.cy) || 0;
+    const declaredRadius = Number(zone?.radius);
     const zoneRadius = Math.min(
         SURVIV.worldHalf - 180,
-        Math.max(900, (Number(zone?.radius) || SURVIV.worldHalf) - 170),
+        Math.max(0, (Number.isFinite(declaredRadius) ? declaredRadius : SURVIV.worldHalf) - 170),
+    );
+    if (zoneRadius < 120) return null;
+    const usable = (x, y) => (
+        Math.hypot(x - zoneX, y - zoneY) <= zoneRadius
+        && isSurvivSpawnPositionSafe(room, x, y, 58)
+        && active.every(player => dist(x, y, player.x, player.y) >= 150)
+        && (room.airdrops || []).every(drop => dist(x, y, drop.x, drop.y) >= 180)
     );
 
     for (let attempt = 0; attempt < 80; attempt++) {
@@ -5880,18 +5889,24 @@ function pickSurvivAirdropLanding(room, zone) {
             x = zoneX + fromZoneX * scale;
             y = zoneY + fromZoneY * scale;
         }
-        if (!isSurvivSpawnPositionSafe(room, x, y, 58)) return { x, y };
+        x = Math.round(x);
+        y = Math.round(y);
+        if (usable(x, y)) return { x, y };
     }
 
     for (const spawn of room.spawnPoints || []) {
-        if (isSurvivSpawnPositionSafe(room, spawn.x, spawn.y, 58)) return { x: spawn.x, y: spawn.y };
+        const x = Math.round(spawn.x);
+        const y = Math.round(spawn.y);
+        if (usable(x, y)) return { x, y };
     }
-    return { x: zoneX, y: zoneY };
+    // Never substitute an unchecked point inside a roof, river, or blocker.
+    return null;
 }
 
 export function spawnSurvivAirdrop(room, now = Date.now(), zone = null) {
     room.airdrops ||= [];
     const landing = pickSurvivAirdropLanding(room, zone);
+    if (!landing) return null;
     const drop = {
         id: randId(),
         x: Math.round(landing.x),
@@ -5934,10 +5949,16 @@ export function updateSurvivAirdrops(room, now, zone, resetTime) {
     const spawned = Number(room._survivAirdropsSpawned) || 0;
     if (now >= room._nextSurvivAirdropAt
         && spawned < SURVIV_AIRDROP.maximumPerMatch
-        && remainingMs >= SURVIV_AIRDROP.minimumTimeBeforeResetMs) {
-        spawnSurvivAirdrop(room, now, zone);
-        room._survivAirdropsSpawned = spawned + 1;
-        room._nextSurvivAirdropAt = now + SURVIV_AIRDROP.repeatDelayMs;
+        && remainingMs >= SURVIV_AIRDROP.minimumTimeBeforeResetMs
+        && getActiveSurvivEntities(room).length > 0) {
+        // Choose against the zone at touchdown, not its larger current radius.
+        const touchdownZone = Number.isFinite(Number(resetTime))
+            ? getSurvivZone(Number(resetTime), now + SURVIV_AIRDROP.descentMs) : null;
+        const landingZone = zone && touchdownZone
+            ? { ...zone, radius: Math.min(zone.radius, touchdownZone.radius) } : zone;
+        const drop = spawnSurvivAirdrop(room, now, landingZone);
+        if (drop) room._survivAirdropsSpawned = spawned + 1;
+        room._nextSurvivAirdropAt = now + (drop ? SURVIV_AIRDROP.repeatDelayMs : SURVIV_AIRDROP.retryDelayMs);
     }
 }
 
@@ -6393,6 +6414,8 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room.spectators = [];
     room.deathMarkers = [];
     room.airdrops = [];
+    room._survivExplosions = [];
+    room._survivBlastQueue = null;
     room._pendingKillFeed = [];
     room.lootPoolBalance = 0;
     room.loot = [...(nextMap.loot || [])];
@@ -6669,6 +6692,8 @@ function recordSolidObjectImpact(attacker, obstacle) {
 
 function damageSurvivObstacle(room, obstacle, damage, attacker = null) {
     if (!obstacle || !(damage > 0)) return false;
+    // A chain reaction can revisit an object from an earlier spatial query.
+    if (obstacle._destroyed) return false;
     const durability = getDestructibleObstacleHp(obstacle);
     if (!durability) {
         recordSolidObjectImpact(attacker, obstacle);
@@ -6679,7 +6704,16 @@ function damageSurvivObstacle(room, obstacle, damage, attacker = null) {
     if (obstacle.hp > 0) return false;
 
     const index = room.obstacles.indexOf(obstacle);
-    if (index >= 0) room.obstacles.splice(index, 1);
+    if (index >= 0) {
+        obstacle._destroyed = true;
+        room.obstacles.splice(index, 1);
+    }
+    if (index >= 0 && obstacle.kind === 'barrel' && obstacle.variant === 'fuel') {
+        resolveSurvivExplosion(room, {
+            x: obstacle.x, y: obstacle.y, kind: 'barrel',
+            radius: 155, damage: 115, minimumDamage: 8,
+        }, attacker);
+    }
     if (index >= 0 && obstacle.kind === 'crate') {
         const droppedCrate = makeChest(obstacle.x, obstacle.y, 'common', null, 'map', {
             containerType: obstacle.variant === 'industrial' ? 'supply_crate' : 'wood_crate',
@@ -7128,7 +7162,7 @@ function dropDeathLoot(room, entity) {
     inventory.meleeWeapon = 'fists';
 }
 
-export function eliminateSurvivPlayer(room, player, io, attacker = null) {
+export function eliminateSurvivPlayer(room, player, io, attacker = null, damageKind = null) {
     if (player._eliminated) return;
     player._eliminated = true;
     const eliminatedDollarBalance = Number(player.dollarBalance) || 0;
@@ -7141,7 +7175,7 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null) {
         victimName: player.username || (player.isBot ? 'Bot' : 'Player'),
         killerId: attacker?.id || null,
         killerName: attacker?.username || null,
-        weaponType: attacker?.weapon?.type || 'fists',
+        weaponType: damageKind || attacker?.weapon?.type || 'fists',
         createdAt: Date.now(),
     });
     if (!Array.isArray(room._pendingKillFeed)) room._pendingKillFeed = [];
@@ -7149,7 +7183,7 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null) {
         id: 'kill:' + player.id + ':' + Date.now() + ':' + randId(),
         killer: attacker?.username || (attacker?.isBot ? 'Bot' : 'Zone'),
         victim: player.username || (player.isBot ? 'Bot' : 'Player'),
-        weapon: attacker?.weapon?.type || (attacker ? 'fists' : 'zone'),
+        weapon: damageKind || attacker?.weapon?.type || (attacker ? 'fists' : 'zone'),
     });
     dropDeathLoot(room, player);
     const socketId = player.id;
@@ -7168,7 +7202,7 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null) {
             killer: attacker ? {
                 id: attacker.id,
                 username: attacker.username || (attacker.isBot ? 'Bot' : 'Player'),
-                weapon: attacker.weapon?.type || 'fists',
+                weapon: damageKind || attacker.weapon?.type || 'fists',
             } : null,
             balance: player.dollarBalance,
             kills: player.kills || 0,
@@ -7576,31 +7610,63 @@ function throwSurvivGrenade(entity, room, now) {
 }
 
 function detonateGrenade(room, grenade, entitiesById) {
-    const allEntities = [...room.players.filter(player => !player.cashoutSettling), ...room.bots];
-    const attacker = entitiesById.get(grenade.ownerId) || null;
-    for (const target of allEntities) {
-        if (target.hp <= 0 || target._eliminated) continue;
-        const distance = dist(grenade.x, grenade.y, target.x, target.y);
-        if (distance > SURVIV.grenadeRadius) continue;
-        const proximity = clamp(1 - distance / SURVIV.grenadeRadius, 0, 1);
-        const minimumDamage = SURVIV.grenadeMinDamage;
-        const blastDamage = minimumDamage
-            + (grenade.damage - minimumDamage) * Math.pow(proximity, SURVIV.grenadeFalloffExponent);
-        applyDamage(target, blastDamage, attacker, { x: grenade.x, y: grenade.y, kind: 'grenade' });
-        if (target.hp <= 0) eliminateSurvivPlayer(room, target, room._io, attacker);
+    resolveSurvivExplosion(room, {
+        x: grenade.x, y: grenade.y, kind: 'grenade',
+        radius: SURVIV.grenadeRadius, damage: grenade.damage,
+        minimumDamage: SURVIV.grenadeMinDamage,
+    }, entitiesById.get(grenade.ownerId) || null);
+}
+
+function resolveSurvivExplosion(room, blast, attacker) {
+    // Drain iteratively: each destroyed fuel barrel queues exactly one blast,
+    // retaining the original attacker without recursive stack growth.
+    if (room._survivBlastQueue) {
+        room._survivBlastQueue.push({ ...blast, attacker });
+        return;
     }
-    for (const obstacle of queryObstacles(room, grenade.x, grenade.y, SURVIV.grenadeRadius, true)) {
-        if (!getDestructibleObstacleHp(obstacle)) continue;
-        const distance = Math.max(0, dist(grenade.x, grenade.y, obstacle.x, obstacle.y) - Math.max(obstacle.w || 0, obstacle.h || 0) / 2);
-        if (distance <= SURVIV.grenadeRadius) damageSurvivObstacle(room, obstacle, Math.max(12, grenade.damage * (1 - distance / SURVIV.grenadeRadius)), attacker);
-    }
-    for (const { item } of querySurvivLoot(room, grenade.x, grenade.y, SURVIV.grenadeRadius + 32)) {
-        if (item.type !== 'chest' && item.type !== 'deathCrate') continue;
-        const hitRadius = Number(item.hitRadius) || CONTAINER_PROFILES[item.containerType]?.hitRadius || 24;
-        const distance = Math.max(0, dist(grenade.x, grenade.y, item.x, item.y) - hitRadius);
-        if (distance <= SURVIV.grenadeRadius) {
-            damageLootContainer(room, item, Math.max(12, grenade.damage * (1 - distance / SURVIV.grenadeRadius)), attacker);
+    const queue = room._survivBlastQueue = [{ ...blast, attacker }];
+    try {
+        for (let index = 0; index < queue.length; index++) {
+            const { x, y, kind, radius, damage, minimumDamage, attacker: owner } = queue[index];
+            const now = Date.now();
+            room._survivExplosions = (room._survivExplosions || [])
+                .filter(event => now - event.createdAt < 600).slice(-31);
+            room._survivExplosions.push({ id: randId(), x, y, kind, radius, createdAt: now });
+            const targets = [...room.players, ...room.bots];
+            for (const target of targets) {
+                if (target.hp <= 0 || target._eliminated || target.cashoutSettling) continue;
+                const distance = dist(x, y, target.x, target.y);
+                if (distance > radius) continue;
+                const proximity = clamp(1 - distance / radius, 0, 1);
+                const amount = minimumDamage + (damage - minimumDamage)
+                    * Math.pow(proximity, SURVIV.grenadeFalloffExponent);
+                applyDamage(target, amount, owner, { x, y, kind });
+                if (target.hp <= 0) eliminateSurvivPlayer(room, target, room._io, owner, kind);
+            }
+            for (const obstacle of queryObstacles(room, x, y, radius, true)) {
+                if (obstacle._destroyed || !getDestructibleObstacleHp(obstacle)) continue;
+                const rect = getObstacleCollisionRect(obstacle);
+                const cos = Math.cos(rect.rotation || 0);
+                const sin = Math.sin(rect.rotation || 0);
+                const dx = x - rect.x;
+                const dy = y - rect.y;
+                const distance = Math.hypot(
+                    Math.max(0, Math.abs(dx * cos + dy * sin) - rect.w / 2),
+                    Math.max(0, Math.abs(dy * cos - dx * sin) - rect.h / 2),
+                );
+                if (distance <= radius) {
+                    damageSurvivObstacle(room, obstacle, Math.max(12, damage * (1 - distance / radius)), owner);
+                }
+            }
+            for (const { item } of querySurvivLoot(room, x, y, radius + 32)) {
+                if (item.type !== 'chest' && item.type !== 'deathCrate') continue;
+                const hitRadius = Number(item.hitRadius) || CONTAINER_PROFILES[item.containerType]?.hitRadius || 24;
+                const distance = Math.max(0, dist(x, y, item.x, item.y) - hitRadius);
+                if (distance <= radius) damageLootContainer(room, item, Math.max(12, damage * (1 - distance / radius)), owner);
+            }
         }
+    } finally {
+        room._survivBlastQueue = null;
     }
 }
 
@@ -8459,9 +8525,11 @@ function updateBotAI(bot, room, now, effectiveRadius) {
                 ? weaponDef.meleeReach + hitRadius - 4
                 : Math.min(620, weaponDef.range || 620);
             bot.aimAngle = Math.atan2(item.y - bot.y, item.x - bot.x);
-            bot.inputDx = lootDistance > attackRange * 0.78 ? direction.dx : 0;
-            bot.inputDy = lootDistance > attackRange * 0.78 ? direction.dy : 0;
-            bot.shooting = lootDistance <= attackRange;
+            const hasLineOfSight = botHasLineOfSight(bot, item, room);
+            const mustApproach = !hasLineOfSight || lootDistance > attackRange * 0.78;
+            bot.inputDx = mustApproach ? direction.dx : 0;
+            bot.inputDy = mustApproach ? direction.dy : 0;
+            bot.shooting = hasLineOfSight && lootDistance <= attackRange;
             return;
         }
         bot.inputDx = direction.dx;
@@ -8824,6 +8892,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         room._survivActivitySnapshot = { capturedAt: now, cells: Array.from(cells.values()) };
     }
     const pendingKillFeed = Array.isArray(room._pendingKillFeed) ? room._pendingKillFeed : [];
+    room._survivExplosions = (room._survivExplosions || []).filter(event => now - event.createdAt < 600);
     const aliveCount = Number.isFinite(lbData.aliveCount) ? lbData.aliveCount : allPlayers.length;
     room.deathMarkers = (room.deathMarkers || []).filter(marker => now - marker.createdAt < 30000).slice(-40);
 
@@ -8964,12 +9033,18 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             dollarBalance,
             spectating,
             activityZones,
+            // Short replay window survives a missed snapshot; client dedupes ids.
+            explosions: room._survivExplosions
+                .filter(event => dist(viewX, viewY, event.x, event.y) <= 1800)
+                .map(event => ({ id: event.id, x: event.x, y: event.y, kind: event.kind,
+                    radius: event.radius, ageMs: Math.max(0, now - event.createdAt) })),
             airdrops: (room.airdrops || []).map(drop => ({
                 id: drop.id,
                 x: drop.x,
                 y: drop.y,
                 state: drop.state,
                 landsAt: drop.landsAt,
+                remainingMs: Math.max(0, drop.landsAt - now),
                 crateId: drop.crateId,
             })),
             ...(pendingKillFeed.length ? { killFeed: pendingKillFeed.map(entry => ({ ...entry })) } : {}),
