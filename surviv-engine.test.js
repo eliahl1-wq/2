@@ -708,17 +708,17 @@ test('surviv runtime reset clears old arena state and caches', () => {
     assert.equal(room._nextSurvivAirdropAt, null);
     assert.equal(room._survivAirdropsSpawned, 0);
 });
-test('surviv economy takes the hidden 5% entry owner cut from map loot', () => {
+test('surviv economy puts the entire paid entry into map loot', () => {
     const economy = getSurvivEconomy(5);
     assert.equal(economy.entryFeeUsd, 5);
     assert.equal(economy.playerStartBalance, 0);
-    assert.equal(economy.entryOwnerCutUsd, 0.25);
-    assert.equal(economy.lootPoolOnJoin, 4.75);
+    assert.equal(economy.entryOwnerCutUsd, 0);
+    assert.equal(economy.lootPoolOnJoin, 5);
     assert.equal(economy.cashoutFeePct, 0.08);
     assert.equal(economy.cashoutPlayerPct + economy.cashoutFeePct, 1);
 });
 test('admin public Surviv entry contributes no map money', () => {
-    assert.equal(getSurvivJoinLootFunding(5), 4.75);
+    assert.equal(getSurvivJoinLootFunding(5), 5);
     assert.equal(getSurvivJoinLootFunding(5, { adminFreeEntry: true }), 0);
 
     const room = makeRoom();
@@ -729,7 +729,7 @@ test('admin public Surviv entry contributes no map money', () => {
     assert.equal(room.loot.length, originalLootCount);
     assert.equal(room.lootPoolBalance || 0, 0);
 });
-test('each paid Surviv entry adds 95% to loot and admin adds zero', () => {
+test('each paid Surviv entry adds exactly $5 to loot and admin adds zero', () => {
     const room = makeRoom();
     const mapMoneyCents = () => room.loot.reduce((total, item) => {
         const dollars = item.type === 'money'
@@ -738,19 +738,36 @@ test('each paid Surviv entry adds 95% to loot and admin adds zero', () => {
         return total + Math.round(dollars * 100);
     }, 0);
 
-    assert.equal(getSurvivJoinLootFunding(5), 4.75);
-    assert.equal(getSurvivJoinLootFunding(999), 4.75);
-    assert.equal(getSurvivJoinLootFunding(null), 4.75);
+    assert.equal(getSurvivJoinLootFunding(5), 5);
+    assert.equal(getSurvivJoinLootFunding(999), 5);
+    assert.equal(getSurvivJoinLootFunding(null), 5);
     assert.equal(mapMoneyCents(), 0);
 
     spawnLootFromPool(room, getSurvivJoinLootFunding(5));
-    assert.equal(mapMoneyCents(), 475);
+    assert.equal(mapMoneyCents(), 500);
 
     spawnLootFromPool(room, getSurvivJoinLootFunding(5, { adminFreeEntry: true }));
-    assert.equal(mapMoneyCents(), 475);
+    assert.equal(mapMoneyCents(), 500);
 
     spawnLootFromPool(room, getSurvivJoinLootFunding(5));
-    assert.equal(mapMoneyCents(), 950);
+    assert.equal(mapMoneyCents(), 1000);
+});
+test('free play Surviv adds exactly $20 per entry, without changing paid or admin funding', () => {
+    const room = makeRoom();
+    const moneyCents = () => room.loot.reduce((sum, item) => sum + Math.round(
+        Number(item.type === 'money' ? item.dollarValue || 0 : item.contents?.money || 0) * 100,
+    ), 0);
+    assert.equal(moneyCents(), 0);
+    for (let count = 1; count <= 4; count++) {
+        const funding = getSurvivJoinLootFunding(5, { freePlay: true });
+        assert.equal(funding, 20);
+        spawnLootFromPool(room, funding);
+        assert.equal(moneyCents(), count * 2000);
+        assert.equal(room.lootPoolBalance, 0);
+    }
+    assert.equal(getSurvivJoinLootFunding(5, { freePlay: true, adminFreeEntry: true }), 0);
+    assert.equal(getSurvivJoinLootFunding(5, { freePlay: false }), 5);
+    assert.ok(room.loot.some(item => item.type === 'chest' && item.source === 'join' && item.contents.money > 0));
 });
 test('surviv join money crates vary amounts while preserving the pool', () => {
     const room = makeRoom();
@@ -767,6 +784,36 @@ test('surviv join money crates vary amounts while preserving the pool', () => {
     assert.ok(amounts.every(amount => amount >= 0.2 && amount <= 2));
     assert.ok(new Set(amounts.map(amount => amount.toFixed(2))).size > 1);
     assert.equal(room.lootPoolBalance, 0);
+});
+
+test('funded free play money leaves a broken crate and is collected exactly once', () => {
+    const room = makeRoom();
+    room.obstacles = [];
+    room.loot = [];
+    room.spawnPoints = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    spawnLootFromPool(room, getSurvivJoinLootFunding(5, { freePlay: true }));
+    const crate = room.loot.find(item => item.contents?.money > 0);
+    const amount = crate.contents.money;
+    room.loot = [crate];
+    crate.x = 45;
+    crate.y = 0;
+    crate.hp = 1;
+    const player = createSurvivPlayer('funded-picker', 'funded-picker', 'Picker', '#fff', room);
+    Object.assign(player, { x: 0, y: 0, aimAngle: 0, shooting: true });
+    room.players.push(player);
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.ok(!room.loot.includes(crate));
+    const money = room.loot.find(item => item.type === 'money');
+    assert.equal(money?.dollarValue, amount);
+    // Advance past the cosmetic burst's pickup lock without a wall-clock sleep.
+    money.pickupAfter = 0;
+    Object.assign(player, { x: money.x, y: money.y, shooting: false });
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.dollarBalance, amount);
+    assert.ok(!room.loot.includes(money));
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+    assert.equal(player.dollarBalance, amount);
 });
 
 test('surviv town roads stay centered between rows and doors face the road', () => {

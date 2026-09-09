@@ -8596,10 +8596,11 @@ io.on('connection', (socket) => {
 
                 const joinLootFunding = getSurvivJoinLootFunding(entryFeeUsd, {
                     adminFreeEntry: useAdminFreeSurvivEntry,
+                    freePlay,
                 });
                 spawnLootFromPool(room, joinLootFunding);
-                if (!freePlay && !useAdminFreeSurvivEntry) {
-                    const ownerContribution = getSurvivEconomy(entryFeeUsd).entryOwnerCutUsd;
+                const ownerContribution = getSurvivEconomy(entryFeeUsd).entryOwnerCutUsd;
+                if (!freePlay && !useAdminFreeSurvivEntry && ownerContribution > 0) {
                     Transaction.create({
                         userId: user._id,
                         type: 'game',

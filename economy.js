@@ -194,7 +194,8 @@ export function getCompetitiveEconomy(entryFeeUsd) {
 export function getSurvivEconomy(entryFeeUsd) {
     const entry = normalizeSurvivEntryFee(entryFeeUsd);
     const cashoutFeePct = NORMAL_CASHOUT_FEE_PCT;
-    const entryOwnerCutUsd = entry * NORMAL_ENTRY_OWNER_CUT_PCT;
+    // Surviv funds the full $5 entry as loot; its platform fee is on cashout.
+    const entryOwnerCutUsd = 0;
     return {
         entryFeeUsd: entry,
         playerStartBalance: 0,
@@ -205,8 +206,10 @@ export function getSurvivEconomy(entryFeeUsd) {
     };
 }
 
-export function getSurvivJoinLootFunding(entryFeeUsd, { adminFreeEntry = false } = {}) {
+export function getSurvivJoinLootFunding(entryFeeUsd, { adminFreeEntry = false, freePlay = false } = {}) {
     if (adminFreeEntry) return 0;
+    // Only server-validated simulated sessions may mint practice money.
+    if (freePlay) return 20;
     const fundedEntry = getSurvivEconomy(entryFeeUsd).lootPoolOnJoin;
     return Math.round(fundedEntry * 100) / 100;
 }
