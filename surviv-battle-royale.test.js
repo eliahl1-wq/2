@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
-import { BR, getBRRules, setupBattleRoyale, getActiveBRMatchesRaw, getBRMatchForMongo, findBRPlayerBySocket, processBattleRoyaleMatches, getBRPlayerCountsByFee } from './battle-royale.js';
+import { BR, getBRRules, setupBattleRoyale, getActiveBRMatchesRaw, getBRMatchForMongo, findBRPlayerBySocket, processBattleRoyaleMatches, processBRQueues, getBRPlayerCountsByFee } from './battle-royale.js';
 import { SURVIV_BR, createSurvivBRZonePlan, getSurvivBRZone, initializeSurvivBRRoom } from './surviv-battle-royale.js';
 import { eliminateSurvivPlayer, processSurvivRoom } from './surviv-engine.js';
 import { brWalletEnvPrefix } from './br-wallets.js';
@@ -93,6 +93,7 @@ test('public queue, refund, max cap, rejoin, zero world money, elimination and o
     assert.ok(tenth.last('brQueueStatus').graceRemainingMs > 0);
     await tenth.receive('brLeaveQueue');
     t.mock.timers.tick(BR.gracePeriodMs + 1);
+    processBRQueues(io, deps);
     assert.equal(getActiveBRMatchesRaw().length, 0, 'dropping below ten cancels grace');
     assert.equal(transactions.filter(tx => tx.meta.event === 'br_refund').length, 1);
     for (let i = 9; i < 25; i++) players.push(await join(`player-${i}`));
@@ -211,4 +212,58 @@ test('simultaneous final deaths refund all entries once, without naming a dead w
     assert.equal(transactions.filter(tx => tx.meta.event === 'br_refund').length, 10);
     assert.equal(transactions.filter(tx => tx.meta.reason === 'BR Victory').length, 0);
     assert.equal(getActiveBRMatchesRaw().length, 0);
+});
+
+test('public free Surviv waits 15 quiet seconds, fills only missing slots, and runs real bots without payments', async t => {
+    await prepareSurvivBRMap();
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1900200000000 });
+    const io = fakeNetwork();
+    const transactions = [];
+    const deps = { DEV_FREE_PLAY: false, JWT_SECRET: 'public-free-br-test', SOL_PRICE_USD: 100, rooms: [],
+        User: { findById: async id => ({ _id: id, username: id }), findByIdAndUpdate: async () => {} },
+        Transaction: { create: async tx => { transactions.push(tx); } },
+        isPersonalFreePlayUser: async () => false,
+        ensureUserDepositWallet: async () => { throw new Error('Free queue must never touch wallets'); },
+    };
+    setupBattleRoyale(io, deps);
+    const join = async id => {
+        const socket = io.connect(id);
+        await socket.receive('brJoinQueue', { variant: 'surviv', token: jwt.sign({ id }, deps.JWT_SECRET), entryFeeUsd: 5, publicFreeMode: true });
+        assert.equal(socket.last('error'), undefined);
+        return socket;
+    };
+    const cancelled = await join('cancel-free');
+    await cancelled.receive('brLeaveQueue');
+    t.mock.timers.tick(16000);
+    processBRQueues(io, deps);
+    assert.equal(getActiveBRMatchesRaw().length, 0, 'cancelled empty queue never starts bots');
+    for (const humanCount of [1, 2]) {
+        const first = await join(`free-${humanCount}-first`);
+        t.mock.timers.tick(14000);
+        processBRQueues(io, deps);
+        assert.equal(first.last('brQueueStatus').playersInQueue, 1);
+        if (humanCount === 2) {
+            await join('free-second');
+            t.mock.timers.tick(14000);
+            processBRQueues(io, deps);
+            assert.equal(first.last('brQueueStatus').playersInQueue, 2, 'new human restarts quiet wait');
+        }
+        t.mock.timers.tick(1000);
+        processBRQueues(io, deps);
+        assert.equal(first.last('brQueueStatus').playersInQueue, 10);
+        t.mock.timers.tick(3000);
+        const room = getBRMatchForMongo(`free-${humanCount}-first`);
+        assert.ok(room.personalFreePlay);
+        assert.equal(room.players.filter(p => p.isBot).length, 10 - humanCount);
+        assert.equal(room.players.length, 10);
+        t.mock.timers.tick(3000);
+        const bots = room.players.filter(p => p.isBot);
+        const before = bots.map(p => [p.x, p.y]);
+        for (let i = 0; i < 10; i++) { t.mock.timers.tick(25); processBattleRoyaleMatches(io, deps); }
+        assert.ok(bots.some((p, i) => p.x !== before[i][0] || p.y !== before[i][1]), 'bots actually move under Surviv AI');
+        for (const player of [...room.players]) { player.hp = 0; eliminateSurvivPlayer(room, player, io); }
+        processBattleRoyaleMatches(io, deps);
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+    }
+    assert.ok(transactions.every(tx => tx.meta.simulated), 'all joins/refunds are simulated');
 });

@@ -126,6 +126,9 @@ function fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay = false) 
     if (variant === 'surviv' && !personalFreePlay) return;
     const fee = normalizeBREntryFee(entryFeeUsd);
     const q = getQueue(variant, fee, personalFreePlay);
+    const humans = q.filter(entry => !entry.isBot);
+    if (!humans.length) return;
+    if (variant === 'surviv' && Date.now() - Math.max(...humans.map(entry => entry.joinedAt)) < 15_000) return;
     const needed = Math.max(0, getBRRules(variant).minPlayers - q.length);
     for (let i = 0; i < needed; i++) {
         q.push({
@@ -136,6 +139,7 @@ function fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay = false) 
             joinedAt: Date.now(),
             socket: null,
             isBot: true,
+            personalFreePlay,
         });
     }
     if (needed > 0) {
@@ -256,6 +260,8 @@ function emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay = fals
         searching: q.length < getBRRules(variant).minPlayers
             || (graceRemainingMs != null && graceRemainingMs > 0 && q.length < getBRRules(variant).maxPlayers),
         devFreePlay: !!deps?.DEV_FREE_PLAY || personalFreePlay,
+        botFillRemainingMs: variant === 'surviv' && personalFreePlay && q.some(e => !e.isBot) && q.length < SURVIV_BR.minPlayers
+            ? Math.max(0, 15_000 - (Date.now() - Math.max(...q.filter(e => !e.isBot).map(e => e.joinedAt)))) : null,
     };
     q.forEach(e => io.to(e.socketId).emit('brQueueStatus', payload));
 }
@@ -361,6 +367,7 @@ export function processBRQueues(io, deps) {
         const personalFreePlay = scope === 'personal';
         if ((deps?.DEV_FREE_PLAY || personalFreePlay) && q.some(e => !e.isBot) && q.length < getBRRules(variant).minPlayers) {
             fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay);
+            if (variant === 'surviv' && personalFreePlay) emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay);
         }
         if (q.length >= getBRRules(variant).maxPlayers) {
             tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
@@ -612,6 +619,7 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
             meta: {
                 reason: 'BR Eliminated',
                 event: 'death',
+                ...(deps.DEV_FREE_PLAY || room.personalFreePlay ? { simulated: true, freePlay: true } : {}),
                 mode: player.mode,
                 variant: room.variant,
                 entryFeeUsd: room.entryFeeUsd,
@@ -1338,7 +1346,7 @@ export function findBRPlayerByMongo(mongoId) {
 
 export function setupBattleRoyale(io, deps) {
     io.on('connection', (socket) => {
-        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId } = {}) => {
+        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId, publicFreeMode } = {}) => {
             let joiningId = null;
             try {
                 if (!['agar', 'slither', 'surviv'].includes(variant)) {
@@ -1367,7 +1375,10 @@ export function setupBattleRoyale(io, deps) {
                     socket.emit('error', (specialSlitherSkinId === 'aurora' ? 'Aurora Veil' : 'Solar Eclipse') + ' must be purchased in the AGAR shop first.');
                     return;
                 }
-                const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user));
+                // The explicit free choice selects an isolated simulated queue,
+                // never a fee exemption inside a paid pool.
+                const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user))
+                    || (variant === 'surviv' && publicFreeMode === true);
                 const signatureSkin = await resolveSignatureSkin({ mode: variant, skinId, skinColor, hasAccess: (gameMode, id) => deps.hasSkinEntitlement?.(user, gameMode, id) });
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
