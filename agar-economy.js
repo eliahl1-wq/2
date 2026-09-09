@@ -26,6 +26,9 @@ export function splitAtomicAmount(totalAtomic, treasuryBps = 9000, ownerBps = 10
 }
 
 export const AGAR_SHOP_PRODUCTS = Object.freeze([
+    Object.freeze({ id: 'agar:prism', gameMode: 'agar', skinId: 'prism', name: 'Prism Core', usdPrice: 2 }),
+    Object.freeze({ id: 'slither:leviathan', gameMode: 'slither', skinId: 'leviathan', name: 'Leviathan', usdPrice: 2 }),
+    Object.freeze({ id: 'surviv:warden', gameMode: 'surviv', skinId: 'warden', name: 'Copper Warden', usdPrice: 2 }),
     Object.freeze({
         id: 'flags:bundle',
         gameMode: 'all',

@@ -17,7 +17,7 @@
 export const BR_ENTRY_FEES = [5, 10];
 export const DEFAULT_BR_ENTRY_FEE = 5;
 
-const VARIANTS = ['agar', 'slither'];
+const VARIANTS = ['agar', 'slither', 'surviv'];
 
 export function normalizeBREntryFee(fee) {
     const n = Number(fee);

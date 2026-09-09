@@ -31,10 +31,13 @@ test('revenue shares must total 10000 bps', () => {
     assert.throws(() => splitAtomicAmount(100n, 8000, 1000), /10000/);
 });
 
-test('shop sells the flag bundle, Rainbow skins, and two premium Slither skins', () => {
+test('shop sells the flag bundle, Rainbow skins, and mode-exclusive cosmetics', () => {
     assert.deepEqual(
         AGAR_SHOP_PRODUCTS.map(({ id, usdPrice }) => ({ id, usdPrice })),
         [
+            { id: 'agar:prism', usdPrice: 2 },
+            { id: 'slither:leviathan', usdPrice: 2 },
+            { id: 'surviv:warden', usdPrice: 2 },
             { id: 'flags:bundle', usdPrice: 1 },
             { id: 'agar:rainbow', usdPrice: 3 },
             { id: 'slither:rainbow', usdPrice: 3 },

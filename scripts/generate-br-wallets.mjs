@@ -22,6 +22,8 @@ const wallets = [
     { label: 'BR_AGAR_10', desc: 'Agar BR $10' },
     { label: 'BR_SLITHER', desc: 'Slither BR $5' },
     { label: 'BR_SLITHER_10', desc: 'Slither BR $10' },
+    { label: 'BR_SURVIV', desc: 'Surviv BR $5' },
+    { label: 'BR_SURVIV_10', desc: 'Surviv BR $10' },
 ];
 
 console.log('');

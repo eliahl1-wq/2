@@ -391,9 +391,10 @@ export function createAgarCommerceService({
             if (!['agar', 'slither'].includes(gameMode)) return false;
             return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
         }
-        if (['aurora', 'eclipse'].includes(skinId)) {
-            if (gameMode !== 'slither') return false;
-            return !!(await SkinEntitlement.exists({ userId, gameMode: 'slither', skinId }));
+        const specialProduct = AGAR_SHOP_PRODUCTS.find(product => product.skinId === skinId);
+        if (specialProduct) {
+            if (gameMode !== specialProduct.gameMode) return false;
+            return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
         }
         return true;
     }

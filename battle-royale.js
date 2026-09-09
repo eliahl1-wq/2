@@ -4,6 +4,11 @@
  */
 
 import jwt from 'jsonwebtoken';
+import { decryptWalletSecret } from './wallet-crypto.js';
+import { prepareSurvivBRMap, clonePreparedSurvivBRMap } from './surviv-br-map-cache.js';
+import { SURVIV_BR, initializeSurvivBRRoom, createSurvivBRPlayer, createSurvivBRZonePlan, getSurvivBRZone, survivBRMeta } from './surviv-battle-royale.js';
+import { processSurvivRoom, broadcastSurvivState } from './surviv-engine.js';
+import { resolveSignatureSkin } from './signature-skins.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     SLITHER,
@@ -33,6 +38,12 @@ export const BR = {
     agarWorld: 6000,
 };
 
+export function getBRRules(variant) {
+    return variant === 'surviv' ? SURVIV_BR : BR;
+}
+
+const pendingQueueJoins = new Set();
+const pendingMapQueues = new Set();
 const FLAG_SKIN_COLOR_RE = /^flag:(se|us|gb|de|fr|es|it|br|ca|jp|no|fi|dk|nl|pl|ua)$/;
 const isFlagSkinColor = (value) => typeof value === 'string' && FLAG_SKIN_COLOR_RE.test(value);
 const SPECIAL_SLITHER_SKIN_IDS = new Set(['aurora', 'eclipse']);
@@ -50,6 +61,7 @@ const MAX_RECENT_BR_VICTORIES = 5;
 const recentBRVictories = {
     agar: [],
     slither: [],
+    surviv: [],
 };
 
 function queueKey(variant, entryFeeUsd, personalFreePlay = false) {
@@ -74,10 +86,11 @@ function recordBRVictory(variant, username, amount) {
 }
 
 export function getRecentBRVictories(variant = null) {
-    if (variant === 'agar' || variant === 'slither') return recentBRVictories[variant];
+    if (recentBRVictories[variant]) return recentBRVictories[variant];
     return {
         agar: recentBRVictories.agar,
         slither: recentBRVictories.slither,
+        surviv: recentBRVictories.surviv,
     };
 }
 
@@ -86,6 +99,7 @@ export function getBRPlayerCountsByFee() {
     const result = {
         agar: { 5: 0, 10: 0 },
         slither: { 5: 0, 10: 0 },
+        surviv: { 5: 0, 10: 0 },
     };
     for (const [key, q] of queues.entries()) {
         if (key.endsWith(':personal')) continue;
@@ -109,9 +123,10 @@ function randId() {
 
 /** DEV_FREE_PLAY only — pad queue to minPlayers so solo dev can test BR. */
 function fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay = false) {
+    if (variant === 'surviv' && !personalFreePlay) return;
     const fee = normalizeBREntryFee(entryFeeUsd);
     const q = getQueue(variant, fee, personalFreePlay);
-    const needed = Math.max(0, BR.minPlayers - q.length);
+    const needed = Math.max(0, getBRRules(variant).minPlayers - q.length);
     for (let i = 0; i < needed; i++) {
         q.push({
             socketId: `br_dev_bot_${variant}_${fee}_${randId()}`,
@@ -136,11 +151,11 @@ function clearBRDevBotsFromQueue(variant, entryFeeUsd, personalFreePlay = false)
 }
 
 function variantMode(variant) {
-    return variant === 'slither' ? 'br-slither' : 'br-agar';
+    return `br-${variant}`;
 }
 
 function isBRMode(mode) {
-    return mode === 'br-agar' || mode === 'br-slither';
+    return mode === 'br-agar' || mode === 'br-slither' || mode === 'br-surviv';
 }
 
 function getZoneCenter(variant) {
@@ -193,7 +208,7 @@ function removeFromQueue(socketId) {
         const idx = q.findIndex(e => e.socketId === socketId);
         if (idx >= 0) {
             q.splice(idx, 1);
-            if (q.length < BR.minPlayers) {
+            if (q.length < getBRRules(key.split(':')[0]).minPlayers) {
                 clearQueueGrace(key);
             }
             return key;
@@ -234,12 +249,12 @@ function emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay = fals
         variant,
         entryFeeUsd: fee,
         playersInQueue: q.length,
-        minPlayers: BR.minPlayers,
-        maxPlayers: BR.maxPlayers,
+        minPlayers: getBRRules(variant).minPlayers,
+        maxPlayers: getBRRules(variant).maxPlayers,
         graceEndsAt,
         graceRemainingMs,
-        searching: q.length < BR.minPlayers
-            || (graceRemainingMs != null && graceRemainingMs > 0 && q.length < BR.maxPlayers),
+        searching: q.length < getBRRules(variant).minPlayers
+            || (graceRemainingMs != null && graceRemainingMs > 0 && q.length < getBRRules(variant).maxPlayers),
         devFreePlay: !!deps?.DEV_FREE_PLAY || personalFreePlay,
     };
     q.forEach(e => io.to(e.socketId).emit('brQueueStatus', payload));
@@ -248,12 +263,35 @@ function emitQueueStatus(io, variant, entryFeeUsd, deps, personalFreePlay = fals
 function launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay = false) {
     const key = queueKey(variant, entryFeeUsd, personalFreePlay);
     const q = getQueue(variant, entryFeeUsd, personalFreePlay);
-    if (q.length < BR.minPlayers) return;
+    if (q.length < getBRRules(variant).minPlayers) return;
+    let survivMap = null;
+    if (variant === 'surviv') {
+        if (pendingMapQueues.has(key)) return;
+        survivMap = clonePreparedSurvivBRMap();
+        if (!survivMap) {
+            pendingMapQueues.add(key);
+            prepareSurvivBRMap().then(() => {
+                pendingMapQueues.delete(key);
+                // Re-check the live queue: players can cancel while terrain loads.
+                launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
+            }).catch(error => {
+                pendingMapQueues.delete(key);
+                console.error('Surviv BR map preparation failed:', error);
+                for (const entry of [...q]) {
+                    removeFromQueue(entry.socketId);
+                    if (!entry.isBot) refundBREntryFee(entry, variant, entryFeeUsd, deps, 'map_unavailable').then(refunded => {
+                        entry.socket?.emit('error', refunded ? 'Map could not load. Your entry was refunded.' : 'Map could not load. Refund needs attention — contact support.');
+                    }).catch(() => {});
+                }
+            });
+            return;
+        }
+    }
     clearQueueGrace(key);
-    const take = Math.min(BR.maxPlayers, q.length);
+    const take = Math.min(getBRRules(variant).maxPlayers, q.length);
     const batch = q.splice(0, take);
     try {
-        startMatch(batch, variant, entryFeeUsd, io, deps);
+        startMatch(batch, variant, entryFeeUsd, io, deps, survivMap);
         console.log(`🎯 BR match started: ${variant} $${normalizeBREntryFee(entryFeeUsd)} · ${batch.length} players`);
     } catch (err) {
         console.error('BR startMatch failed:', err);
@@ -266,18 +304,18 @@ function tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay = false)
     const key = queueKey(variant, entryFeeUsd, personalFreePlay);
     const q = getQueue(variant, entryFeeUsd, personalFreePlay);
 
-    if (q.length < BR.minPlayers) {
+    if (q.length < getBRRules(variant).minPlayers) {
         clearQueueGrace(key);
         return;
     }
 
-    if (q.length >= BR.maxPlayers) {
+    if (q.length >= getBRRules(variant).maxPlayers) {
         launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
         return;
     }
 
     // Solo dev testing — skip grace wait once min players (incl. AI) are queued
-    if (deps?.DEV_FREE_PLAY && q.length >= BR.minPlayers) {
+    if (deps?.DEV_FREE_PLAY && variant !== 'surviv' && q.length >= getBRRules(variant).minPlayers) {
         launchMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
         return;
     }
@@ -321,14 +359,14 @@ export function processBRQueues(io, deps) {
         const [variant, feeStr, scope] = key.split(':');
         const entryFeeUsd = Number(feeStr);
         const personalFreePlay = scope === 'personal';
-        if ((deps?.DEV_FREE_PLAY || personalFreePlay) && q.some(e => !e.isBot) && q.length < BR.minPlayers) {
+        if ((deps?.DEV_FREE_PLAY || personalFreePlay) && q.some(e => !e.isBot) && q.length < getBRRules(variant).minPlayers) {
             fillBRQueueWithDevBots(variant, entryFeeUsd, personalFreePlay);
         }
-        if (q.length >= BR.maxPlayers) {
+        if (q.length >= getBRRules(variant).maxPlayers) {
             tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
             continue;
         }
-        if (q.length >= BR.minPlayers) {
+        if (q.length >= getBRRules(variant).minPlayers) {
             const grace = queueGrace.get(key);
             if (!grace) {
                 tryStartMatch(variant, entryFeeUsd, io, deps, personalFreePlay);
@@ -430,7 +468,7 @@ function processQueueTimeouts(io, deps) {
             if (entry.isBot) continue;
             if (now - entry.joinedAt <= BR.queueTimeoutMs) continue;
             q.splice(i, 1);
-            if (q.length < BR.minPlayers) clearQueueGrace(key);
+            if (q.length < getBRRules(variant).minPlayers) clearQueueGrace(key);
             if (deps.DEV_FREE_PLAY || personalFreePlay) clearBRDevBotsFromQueue(variant, entryFeeUsd, personalFreePlay);
             refundBREntryFee(entry, variant, entryFeeUsd, deps, 'queue_timeout').catch(err => {
                 console.error('Queue timeout refund failed:', err.message);
@@ -550,14 +588,16 @@ function isOutsideZone(room, x, y) {
 
 function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
     const { User, Transaction } = deps;
-    const alive = room.players.filter(p => !p.disconnected && p.id !== player.id);
-    const placement = alive.length + 1;
+    const alive = room.players.filter(p => p.id !== player.id && (room.variant === 'surviv' ? p.hp > 0 && !p._eliminated : !p.disconnected));
+    const placement = Math.max(room.variant === 'surviv' ? 2 : 1, alive.length + 1);
 
     io.to(player.id).emit('brEliminated', {
         placement,
         playersRemaining: alive.length,
         reason,
         prizePool: room.prizePool,
+        kills: player.kills || 0,
+        playerCount: room.playerCount,
     });
     io.to(player.id).emit('RIP');
 
@@ -587,13 +627,13 @@ function eliminateBRPlayer(room, player, io, deps, reason = 'eliminated') {
     socketToMatch.delete(player.id);
     if (player.mongoId) mongoToMatch.delete(player.mongoId.toString());
 
-    tryDeclareBRWinner(room, io, deps);
+    if (room.variant !== 'surviv') tryDeclareBRWinner(room, io, deps);
 }
 
 function tryDeclareBRWinner(room, io, deps) {
     if (room.status !== 'active') return;
     const connected = room.players.filter(p =>
-        !p.disconnected && (p.isBot || socketToMatch.has(p.id)),
+        room.variant === 'surviv' ? p.hp > 0 && !p._eliminated : !p.disconnected && (p.isBot || socketToMatch.has(p.id)),
     );
 
     if (connected.length === 1) {
@@ -604,7 +644,19 @@ function tryDeclareBRWinner(room, io, deps) {
         }
         finishMatch(room, winner, io, deps);
     } else if (room.players.length === 0) {
-        endMatchNoWinner(room, io);
+        if (room.variant === 'surviv' && room.entryParticipants?.length) {
+            room.status = 'ended'; // Lock settlement before awaiting any refund.
+            Promise.all(room.entryParticipants.filter(entry => !entry.isBot).map(entry =>
+                refundBREntryFee(entry, room.variant, room.entryFeeUsd, deps, 'simultaneous_elimination'),
+            )).then(refunds => {
+                io.to(`br:${room.id}`).emit('brMatchEnd', { cancelled: true, refunded: refunds.every(Boolean), reason: 'simultaneous_elimination', playerCount: room.playerCount });
+                matches.delete(room.id);
+            }).catch(error => {
+                console.error('Surviv BR draw refund failed:', error);
+                io.to(`br:${room.id}`).emit('error', 'Match refund needs attention — contact support.');
+                matches.delete(room.id);
+            });
+        } else endMatchNoWinner(room, io);
     } else if (connected.length === 0) {
         if (!room._allDisconnectedSince) {
             room._allDisconnectedSince = Date.now();
@@ -714,9 +766,7 @@ async function finishMatch(room, winner, io, deps) {
 
     const payout = room.prizePool;
 
-    room.players.forEach(p => {
-        io.to(p.id).emit('brMatchEnd', { winnerId: winner.id, winnerName: winner.username, prizePool: room.prizePool });
-    });
+    io.to(`br:${room.id}`).emit('brMatchEnd', { winnerId: winner.id, winnerName: winner.username, prizePool: room.prizePool, playerCount: room.playerCount });
 
     try {
         const { User, Transaction, DEV_FREE_PLAY, SOL_PRICE_USD, connection, ensureUserDepositWallet } = deps;
@@ -792,6 +842,11 @@ async function finishMatch(room, winner, io, deps) {
 
 function endMatchNoWinner(room, io) {
     room.status = 'ended';
+    io.to(`br:${room.id}`).emit('brMatchEnd', { noWinner: true, playerCount: room.playerCount });
+    for (const player of room.players) {
+        socketToMatch.delete(player.id);
+        if (player.mongoId) mongoToMatch.delete(player.mongoId.toString());
+    }
     matches.delete(room.id);
 }
 
@@ -1038,19 +1093,26 @@ function updateZone(room, io) {
     room.players.forEach(p => io.to(p.id).emit('brZoneUpdate', payload));
 }
 
-function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
+function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps, survivMap = null) {
     const fee = normalizeBREntryFee(entryFeeUsd ?? queuedPlayers[0]?.entryFeeUsd);
     const prizePool = queuedPlayers.length * fee * (1 - BR.houseFeePct);
     const personalFreePlay = queuedPlayers.some(entry => entry.personalFreePlay);
     const room = createMatchRoom(variant, prizePool, fee, personalFreePlay);
     room.playerCount = queuedPlayers.length;
-    matches.set(room.id, room);
+    if (variant === 'surviv') room.entryParticipants = queuedPlayers.map(({ mongoId, username, personalFreePlay, isBot }) => ({ mongoId, username, personalFreePlay, isBot }));
     const countdownMs = (deps.DEV_FREE_PLAY || personalFreePlay) ? 3000 : BR.countdownMs;
+    room.countdownEndsAt = Date.now() + countdownMs;
+    if (variant === 'surviv') {
+        initializeSurvivBRRoom(room, survivMap);
+        room.onBattleRoyaleEliminated = (player, info) => eliminateBRPlayer(room, player, io, deps, info.attacker ? 'eliminated' : 'red_zone');
+    }
 
     queuedPlayers.forEach(entry => {
         removeFromQueue(entry.socketId);
         let player;
-        if (variant === 'slither') {
+        if (variant === 'surviv') {
+            player = createSurvivBRPlayer(entry, room);
+        } else if (variant === 'slither') {
             const color = entry.skinColor || deps.util.randomSlitherColor();
             player = createBRSlitherPlayer(entry.socketId, entry.mongoId, entry.username, color, room);
         } else {
@@ -1058,7 +1120,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
                 if (entry.skinColor === 'random') {
                     return { fill: 'rainbow', border: 'rainbow' };
                 }
-                if (isFlagSkinColor(entry.skinColor)) {
+                if (isFlagSkinColor(entry.skinColor) || entry.skinColor === 'prism') {
                     return { fill: entry.skinColor, border: '#16161d' };
                 }
                 if (entry.skinColor) {
@@ -1088,6 +1150,12 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
         }
     });
 
+    room.countdownEndsAt = Date.now() + countdownMs;
+    if (variant === 'surviv') {
+        room.zonePlan = createSurvivBRZonePlan(room.countdownEndsAt);
+        room.zone = getSurvivBRZone(room.zonePlan, Date.now());
+    }
+    matches.set(room.id, room);
     room.players.filter(p => !p.isBot).forEach(p => {
         io.to(p.id).emit('brMatchCountdown', {
             matchId: room.id,
@@ -1103,6 +1171,10 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
         if (!matches.has(room.id)) return;
         room.status = 'active';
         room.zone.nextShrinkAt = Date.now() + BR.shrinkIntervalMs;
+        if (variant === 'surviv') {
+            room.zonePlan = createSurvivBRZonePlan(Date.now());
+            room.zone = getSurvivBRZone(room.zonePlan, Date.now());
+        }
         if (variant === 'agar') {
             addBRAgarFood(room, Math.max(BR.agarFoodMin, room.players.length * BR.agarFoodPerPlayer));
             rebuildBRQuadTree(room, room.players);
@@ -1120,6 +1192,7 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps) {
                 entryFeeUsd: room.entryFeeUsd,
                 zone: room.zone,
                 cashOutRemaining: 0,
+                ...(variant === 'surviv' ? survivBRMeta(room) : {}),
             };
             io.to(p.id).emit('welcome', p, meta);
             io.to(p.id).emit('brMatchStart', {
@@ -1159,7 +1232,7 @@ async function chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay
     if (currentLamports < feeLamports + 5000) return false;
 
     const userKeypair = solanaWeb3.Keypair.fromSecretKey(
-        Uint8Array.from(Buffer.from(user.depositSecret, 'hex'))
+        decryptWalletSecret(user.depositSecret)
     );
     const joinTx = new solanaWeb3.Transaction().add(
         solanaWeb3.SystemProgram.transfer({
@@ -1189,8 +1262,17 @@ export function processBattleRoyaleMatches(io, deps) {
     processQueueTimeouts(io, deps);
 
     for (const room of matches.values()) {
-        if (room.status === 'countdown' || room.status === 'ended') continue;
-
+        if (room.status === 'ended') continue;
+        if (room.variant === 'surviv') {
+            if (room.status === 'active') room.zone = getSurvivBRZone(room.zonePlan, Date.now());
+            const state = room.status === 'active'
+                ? processSurvivRoom(room, io, undefined)
+                : { leaderboard: [], aliveCount: room.players.length, zone: room.zone };
+            broadcastSurvivState(room, io, state, { ...survivBRMeta(room), solPrice: deps.SOL_PRICE_USD });
+            tryDeclareBRWinner(room, io, deps);
+            continue;
+        }
+        if (room.status === 'countdown') continue;
         updateZone(room, io);
 
         if (room.variant === 'slither') {
@@ -1232,7 +1314,8 @@ export function getBRMatchForMongo(mongoId) {
 }
 
 export function isPlayerInBR(mongoId) {
-    return mongoToMatch.has(mongoId?.toString());
+    const id = mongoId?.toString();
+    return mongoToMatch.has(id) || pendingQueueJoins.has(id) || !!findQueueEntry(id);
 }
 
 export function findBRPlayerBySocket(socketId) {
@@ -1255,17 +1338,21 @@ export function findBRPlayerByMongo(mongoId) {
 
 export function setupBattleRoyale(io, deps) {
     io.on('connection', (socket) => {
-        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId }) => {
+        socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId } = {}) => {
+            let joiningId = null;
             try {
-                if (variant !== 'agar' && variant !== 'slither') {
+                if (!['agar', 'slither', 'surviv'].includes(variant)) {
                     socket.emit('error', 'Invalid battle royale variant.');
                     return;
                 }
                 const entryFeeUsd = normalizeBREntryFee(rawEntryFee);
                 const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
+                if (pendingQueueJoins.has(String(decoded.id))) return;
+                joiningId = String(decoded.id);
+                pendingQueueJoins.add(joiningId);
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
-                const wantsRainbow = skinId === 'rainbow' || skinColor === 'random';
+                const wantsRainbow = variant !== 'surviv' && (skinId === 'rainbow' || skinColor === 'random');
                 if (wantsRainbow && !await deps.hasSkinEntitlement?.(user, variant, 'rainbow')) {
                     socket.emit('error', 'Rainbow for ' + (variant === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');
                     return;
@@ -1281,6 +1368,7 @@ export function setupBattleRoyale(io, deps) {
                     return;
                 }
                 const personalFreePlay = !!(await deps.isPersonalFreePlayUser?.(user));
+                const signatureSkin = await resolveSignatureSkin({ mode: variant, skinId, skinColor, hasAccess: (gameMode, id) => deps.hasSkinEntitlement?.(user, gameMode, id) });
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
 
                 if (mongoToMatch.has(user._id.toString())) {
@@ -1304,17 +1392,26 @@ export function setupBattleRoyale(io, deps) {
                     return;
                 }
 
-                const paid = await chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay);
+                if (variant === 'surviv') await prepareSurvivBRMap();
+                if (!socket.connected) return;
+
+                const paymentUser = freePlay ? user : await deps.ensureUserDepositWallet(user);
+                const paid = await chargeEntryFee(paymentUser, deps, variant, entryFeeUsd, personalFreePlay);
                 if (!paid) {
                     socket.emit('error', `Insufficient balance for $${entryFeeUsd} BR entry.`);
                     return;
                 }
 
+                if (!socket.connected) {
+                    await refundBREntryFee({ mongoId: user._id, username: user.username, personalFreePlay }, variant, entryFeeUsd, deps, 'disconnected_during_join');
+                    return;
+                }
                 let validatedSkinColor = null;
                 if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                     validatedSkinColor = skinColor;
                 }
                 if (specialSlitherSkinId) validatedSkinColor = specialSlitherSkinId;
+                if (signatureSkin) validatedSkinColor = signatureSkin;
 
                 removeFromQueue(socket.id);
                 getQueue(variant, entryFeeUsd, personalFreePlay).push({
@@ -1337,6 +1434,8 @@ export function setupBattleRoyale(io, deps) {
             } catch (err) {
                 console.error('brJoinQueue failed:', err.message);
                 socket.emit('error', 'Failed to join battle royale queue.');
+            } finally {
+                if (joiningId) pendingQueueJoins.delete(joiningId);
             }
         });
 
@@ -1358,8 +1457,20 @@ export function setupBattleRoyale(io, deps) {
                     return;
                 }
                 const { room, player } = found;
+                const previousId = player.id;
+                socketToMatch.delete(previousId);
+                if (previousId !== socket.id) {
+                    const previousSocket = io.sockets.sockets.get(previousId);
+                    previousSocket?.leave(`br:${room.id}`);
+                    previousSocket?.emit('forcedDisconnect');
+                }
                 player.id = socket.id;
                 player.disconnected = false;
+                if (room.variant === 'surviv') {
+                    for (const bullet of room.bullets) if (bullet.ownerId === previousId) bullet.ownerId = socket.id;
+                    room._survivFullMapSent?.delete(socket.id);
+                    room._survivViewerPayloadCache?.delete(socket.id);
+                }
                 socketToMatch.set(socket.id, room.id);
                 socket.brMatchId = room.id;
                 socket.join(`br:${room.id}`);
@@ -1377,8 +1488,9 @@ export function setupBattleRoyale(io, deps) {
                     entryFeeUsd: room.entryFeeUsd,
                     zone: room.zone,
                     cashOutRemaining: 0,
+                    ...(variant === 'surviv' ? survivBRMeta(room) : {}),
                 });
-                socket.emit('brMatchStart', {
+                if (room.status === 'active') socket.emit('brMatchStart', {
                     matchId: room.id,
                     variant,
                     prizePool: room.prizePool,

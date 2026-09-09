@@ -1,4 +1,6 @@
 import express from 'express';
+import { resolveSignatureSkin } from './signature-skins.js';
+import { applySurvivInputPayload } from './surviv-input.js';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
@@ -61,8 +63,6 @@ import {
 } from './economy.js';
 import {
     SURVIV,
-    applySurvivFireInput,
-    beginSurvivReload,
     createSurvivPlayer,
     eliminateSurvivPlayer,
     generateSurvivMap,
@@ -446,6 +446,7 @@ const SiteDisplaySettingsSchema = new mongoose.Schema({
         surviv: { type: Number, default: 0 },
         brAgar: { type: Number, default: 0 },
         brSlither: { type: Number, default: 0 },
+        brSurviv: { type: Number, default: 0 },
     },
 }, { timestamps: true });
 
@@ -3278,7 +3279,7 @@ app.get('/api/game-status', authenticateToken, (req, res) => {
             if (brPlayer) {
                 return res.json({
                     inGame: true,
-                    mode: brRoom.variant === 'slither' ? 'br-slither' : 'br-agar',
+                    mode: `br-${brRoom.variant}`,
                     balance: brPlayer.balance ?? null,
                     entryFeeUsd: brRoom.entryFeeUsd ?? BR.defaultEntryFee,
                     disconnected: brPlayer.disconnected ?? false,
@@ -4366,7 +4367,7 @@ async function buildAdminTxQuery({ userId, showExcluded, type, category, search 
     return clauses.length === 1 ? clauses[0] : { $and: clauses };
 }
 
-const PREGAME_PLAYING_KEYS = ['agar', 'slither', 'competitiveSlither', 'surviv', 'brAgar', 'brSlither'];
+const PREGAME_PLAYING_KEYS = ['agar', 'slither', 'competitiveSlither', 'surviv', 'brAgar', 'brSlither', 'brSurviv'];
 
 function normalizePregamePlayingOffsets(value) {
     return Object.fromEntries(PREGAME_PLAYING_KEYS.map(key => {
@@ -4650,7 +4651,7 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                     botList.push({
                         id: p.id || `bot_${Math.random()}`,
                         username: p.username,
-                        mode: room.variant === 'slither' ? 'br-slither' : 'br-agar',
+                        mode: `br-${room.variant}`,
                         entryFeeUsd: room.entryFeeUsd,
                         isBot: true,
                     });
@@ -4661,7 +4662,7 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                         inGameUsernames.push({
                             id,
                             username: p.username,
-                            mode: room.variant === 'slither' ? 'br-slither' : 'br-agar',
+                            mode: `br-${room.variant}`,
                             entryFeeUsd: room.entryFeeUsd,
                             isBot: false,
                         });
@@ -4789,7 +4790,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
         const brMatches = typeof getActiveBRMatchesRaw === 'function' ? getActiveBRMatchesRaw() : [];
         for (const room of brMatches) {
             for (const player of room.players) {
-                addPlaying(player, room.variant === 'slither' ? 'br-slither' : 'br-agar', room.entryFeeUsd);
+                addPlaying(player, `br-${room.variant}`, room.entryFeeUsd);
             }
         }
 
@@ -7098,7 +7099,7 @@ app.get('/api/stats', async (req, res) => {
             agar: { 5: 0, 10: 0, 20: 0 },
             slither: { 5: 0, 10: 0, 20: 0 },
         };
-        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, competitiveSlither: 0, surviv: 0 };
+        const playersByGamemode = { agar: 0, slither: 0, brAgar: 0, brSlither: 0, brSurviv: 0, competitiveSlither: 0, surviv: 0 };
         let totalBotsOnline = 0;
 
 
@@ -7164,6 +7165,7 @@ app.get('/api/stats', async (req, res) => {
         const brPlayersByFee = getBRPlayerCountsByFee();
         playersByGamemode.brAgar = (brPlayersByFee.agar?.[5] || 0) + (brPlayersByFee.agar?.[10] || 0);
         playersByGamemode.brSlither = (brPlayersByFee.slither?.[5] || 0) + (brPlayersByFee.slither?.[10] || 0);
+        playersByGamemode.brSurviv = (brPlayersByFee.surviv?.[5] || 0) + (brPlayersByFee.surviv?.[10] || 0);
         playersByGamemode.competitiveSlither = competitiveSlitherRooms.reduce(
             (sum, room) => sum + (room.isPersonalFreePlay ? 0 : room.players.filter(p => !p.disconnected).length),
             0,
@@ -7198,7 +7200,7 @@ app.get('/api/stats', async (req, res) => {
         );
 
         const totalPlayersOnline = playersByGamemode.agar + playersByGamemode.slither
-            + playersByGamemode.brAgar + playersByGamemode.brSlither
+            + playersByGamemode.brAgar + playersByGamemode.brSlither + playersByGamemode.brSurviv
             + playersByGamemode.competitiveSlither + playersByGamemode.surviv;
 
         if (modeFilter === 'agar') {
@@ -7951,8 +7953,6 @@ io.on('connection', (socket) => {
     const survivInputRate = { windowStartedAt: 0, count: 0 };
     const survivSpectateRate = { windowStartedAt: 0, count: 0 };
     const socialRate = { chatWindowAt: 0, chatCount: 0, emoteWindowAt: 0, emoteCount: 0 };
-    const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammo', 'grenades', 'armor']);
-    const survivAmmoTypes = new Set(['9mm', '12g', '556', '762']);
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor, skinId }) => {
         let userKey = null;
@@ -7979,6 +7979,7 @@ io.on('connection', (socket) => {
                 throw new Error((tournamentSpecialSkinId === 'aurora' ? 'Aurora Veil' : 'Solar Eclipse') + ' must be purchased in the AGAR shop first.');
             }
             if (tournamentSpecialSkinId) tournamentSkinColor = tournamentSpecialSkinId;
+            tournamentSkinColor = await resolveSignatureSkin({ mode: 'slither', skinId, skinColor, hasAccess: (gameMode, id) => hasSkinAccess(user, gameMode, id) }) || tournamentSkinColor;
             userKey = `tournament:${tournamentId}:${user._id}`;
             if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
             joiningUsers.add(userKey);
@@ -8198,7 +8199,7 @@ io.on('connection', (socket) => {
         let pendingTicketTransactionId = null;
         let pendingJoinEconomy = null;
         try {
-            if (mode === 'br-agar' || mode === 'br-slither') {
+            if (mode === 'br-agar' || mode === 'br-slither' || mode === 'br-surviv') {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
                 return;
             }
@@ -8235,6 +8236,7 @@ io.on('connection', (socket) => {
                 return;
             }
             if (specialSlitherSkinId) validatedSkinColor = specialSlitherSkinId;
+            validatedSkinColor = await resolveSignatureSkin({ mode, skinId, skinColor, hasAccess: (gameMode, id) => hasSkinAccess(user, gameMode, id) }) || validatedSkinColor;
             if (user.rewardsDisabled && useFreeTicket) {
                 socket.emit('error', 'Rewards have been disabled by an administrator.');
                 return;
@@ -8252,8 +8254,8 @@ io.on('connection', (socket) => {
                 && !sessionFreePlay;
 
 
-            if (getBRMatchForMongo(user._id.toString())) {
-                socket.emit('error', 'You are in an active Battle Royale match.');
+            if (isPlayerInBR(user._id.toString())) {
+                socket.emit('error', 'Leave your Battle Royale queue or finish your match first.');
                 return;
             }
 
@@ -9037,7 +9039,7 @@ io.on('connection', (socket) => {
                         if (validatedSkinColor === 'random') {
                             return { fill: 'rainbow', border: 'rainbow' };
                         }
-                        if (isFlagSkinColor(validatedSkinColor)) {
+                        if (isFlagSkinColor(validatedSkinColor) || validatedSkinColor === 'prism') {
                             return { fill: validatedSkinColor, border: '#16161d' };
                         }
                         if (validatedSkinColor === 'random_color') {
@@ -9737,6 +9739,7 @@ io.on('connection', (socket) => {
     socket.on('slitherInput', ({ dx, dy, boost }) => {
         const br = findBRPlayerBySocket(socket.id);
         if (br) {
+            if (br.room.variant !== 'slither' || br.room.status !== 'active') return;
             const p = br.player;
             if (p.isCashingOut) return;
             p.inputDx = Number(dx) || 0;
@@ -9769,93 +9772,12 @@ io.on('connection', (socket) => {
         survivInputRate.count += 1;
         if (survivInputRate.count > 90) return;
 
-        const room = getArenaRoomById(socket.roomId);
-        const player = room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
-        if (!player || player.disconnected) return;
-        const finiteClamp = (value, min, max, fallback = 0) => {
-            const parsed = Number(value);
-            return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
-        };
-        const safeId = (value, maxLength = 128) => (
-            typeof value === 'string' && value.length > 0 && value.length <= maxLength ? value : null
-        );
-        const {
-            dx,
-            dy,
-            aimAngle,
-            aimDistance,
-            shooting,
-            firePressId,
-            reload,
-            useMedkit,
-            pickupWeapon,
-            pickupVestId,
-            toggleDoorId,
-            equipSlot,
-            throwGrenade,
-            openChestId,
-            chestHoldId,
-            swapWeaponSlots,
-            closeChest,
-            dropItem,
-        } = payload;
-
-        if (player.cashoutHoldActive || player.isCashingOut) {
-            player.inputDx = 0;
-            player.inputDy = 0;
-            player.shooting = false;
-            return;
-        }
-
-        player.inputDx = finiteClamp(dx, -1, 1);
-        player.inputDy = finiteClamp(dy, -1, 1);
-        const parsedAim = Number(aimAngle);
-        if (Number.isFinite(parsedAim)) {
-            player.aimAngle = Math.atan2(Math.sin(parsedAim), Math.cos(parsedAim));
-        }
-        player.aimDistance = finiteClamp(aimDistance, SURVIV.grenadeMinRange, SURVIV.grenadeMaxRange, 300);
-
-        applySurvivFireInput(player, shooting, firePressId);
-        if (useMedkit === true) player.useMedkit = true;
-        if (pickupWeapon === true) player.pickupWeaponPending = true;
-        else {
-            const requestedWeaponId = safeId(pickupWeapon);
-            if (requestedWeaponId) player.pickupWeaponPending = requestedWeaponId;
-        }
-        const requestedVestId = safeId(pickupVestId);
-        if (requestedVestId) player.pickupVestId = requestedVestId;
-        const requestedDoorId = safeId(toggleDoorId);
-        if (requestedDoorId) player.toggleDoorId = requestedDoorId;
-        if (throwGrenade === true) player.throwGrenadePending = true;
-
-        const requestedChestId = safeId(openChestId);
-        if (requestedChestId) player.openChestId = requestedChestId;
-        player.chestHoldId = safeId(chestHoldId);
-        player.chestHoldSeenAt = Date.now();
-
-        if (swapWeaponSlots && typeof swapWeaponSlots === 'object' && !Array.isArray(swapWeaponSlots)) {
-            const fromSlot = Number.isInteger(swapWeaponSlots.fromSlot) && swapWeaponSlots.fromSlot >= 0 && swapWeaponSlots.fromSlot < 2
-                ? swapWeaponSlots.fromSlot
-                : null;
-            const toSlot = Number.isInteger(swapWeaponSlots.toSlot) && swapWeaponSlots.toSlot >= 0 && swapWeaponSlots.toSlot < 2
-                ? swapWeaponSlots.toSlot
-                : null;
-            if (fromSlot != null && toSlot != null && fromSlot !== toSlot) player.swapWeaponSlots = { fromSlot, toSlot };
-        }
-        if (dropItem && typeof dropItem === 'object' && !Array.isArray(dropItem)) {
-            const itemKey = safeId(dropItem.itemKey, 24);
-            const ammoType = safeId(dropItem.ammoType, 8);
-            const slotIdx = Number.isInteger(dropItem.slotIdx) && dropItem.slotIdx >= 0 && dropItem.slotIdx <= 2
-                ? dropItem.slotIdx
-                : null;
-            if (itemKey && survivItemKeys.has(itemKey)) player.dropItemPending = { itemKey, slotIdx, ammoType: survivAmmoTypes.has(ammoType) ? ammoType : null };
-        }
-        if (closeChest === true) {
-            player.openedContainerId = null;
-            player.openedContainer = null;
-        }
-        if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 2) player.equipSlotPending = equipSlot;
-        if (reload === true) beginSurvivReload(player);
+        const br = findBRPlayerBySocket(socket.id);
+        if (br && (br.room.variant !== 'surviv' || br.room.status !== 'active')) return;
+        const room = br?.room || getArenaRoomById(socket.roomId);
+        const player = br?.player || room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
+        if (!player || player.disconnected || player.hp <= 0 || player._eliminated) return;
+        applySurvivInputPayload(player, payload);
     });
 
     const resolveGameSocialContext = () => {
@@ -10017,7 +9939,7 @@ function getBattleRoyaleDeps() {
         c,
         addFood,
         calculateCellRadius,
-        rooms,
+        rooms: [...rooms, ...competitiveSlitherRooms, ...survivRooms],
         JWT_SECRET,
         DEV_FREE_PLAY,
         isPersonalFreePlayUser,

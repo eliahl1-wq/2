@@ -6849,7 +6849,7 @@ function isPositionBlocked(room, x, y, r) {
     return false;
 }
 
-function isSurvivSpawnPositionSafe(room, x, y, radius) {
+export function isSurvivSpawnPositionSafe(room, x, y, radius) {
     if (Math.abs(x) > SURVIV.worldHalf - radius || Math.abs(y) > SURVIV.worldHalf - radius) return false;
     for (const obstacle of queryObstacles(room, x, y, radius + 90, false)) {
         const forbiddenSurface = obstacle.kind === 'houseFloor'
@@ -7208,7 +7208,11 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null, damageK
             kills: player.kills || 0,
         });
     }
-    if (player.isBot) {
+    if (room.isBattleRoyale) {
+        room.players = room.players.filter(p => p.id !== player.id);
+        room.bots = room.bots.filter(b => b.id !== player.id);
+        room.onBattleRoyaleEliminated?.(player, { attacker, damageKind });
+    } else if (player.isBot) {
         room.bots = room.bots.filter(b => b.id !== player.id);
     } else {
         room.players = room.players.filter(p => p.id !== player.id);
@@ -8046,7 +8050,8 @@ function checkZoneDamage(entity, zone, now) {
 
     const elapsedMs = clamp(now - previousAt, 0, 250);
     if (elapsedMs <= 0) return;
-    entity.hp = Math.max(0, entity.hp - SURVIV.zoneDamagePerSecond * elapsedMs / 1000);
+    const damage = Number.isFinite(zone.damagePerSecond) ? zone.damagePerSecond : SURVIV.zoneDamagePerSecond;
+    entity.hp = Math.max(0, entity.hp - damage * elapsedMs / 1000);
 }
 
 
@@ -8834,10 +8839,10 @@ function pruneSurvivViewerPayloadCache(room, now) {
 export function processSurvivRoom(room, io, resetTime) {
     room._io = io;
     const now = Date.now();
-    const zone = getSurvivZone(resetTime, now);
+    const zone = room.isBattleRoyale ? room.zone : getSurvivZone(resetTime, now);
     const effectiveRadius = zone?.radius ?? SURVIV.worldHalf;
 
-    syncSurvivBots(room);
+    if (!room.isBattleRoyale) syncSurvivBots(room);
     updateSurvivAirdrops(room, now, zone, resetTime);
 
     const entities = getActiveSurvivEntities(room);
@@ -8959,6 +8964,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 .slice(0, 90)
                 .map(({ item: l }) => ({ x: l.x, y: l.y, golden: l.type !== 'chest' }));
             const minimapPlayers = allPlayers
+                .filter(p => !room.isBattleRoyale || p.id === youId)
                 .filter(p => isInView(viewX, viewY, p.x, p.y, minimapRange))
                 .map(p => ({ x: p.x, y: p.y, isYou: p.id === youId, isBot: !!p.isBot }));
             staticPayload.obstacles = visibleObstacles;
@@ -8980,7 +8986,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                     'water', 'bridge', 'container',
                 ]);
                 staticPayload.fullMap = {
-                    worldHalf: SURVIV.worldHalf,
+                    worldHalf: room.isBattleRoyale ? 4200 : SURVIV.worldHalf,
                     obstacles: (room.obstacles || [])
                         .filter(obstacle => fullMapKinds.has(obstacle.kind))
                         .map(obstacle => ({
@@ -9032,7 +9038,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             aliveCount,
             dollarBalance,
             spectating,
-            activityZones,
+            activityZones: room.isBattleRoyale ? [] : activityZones,
             // Short replay window survives a missed snapshot; client dedupes ids.
             explosions: room._survivExplosions
                 .filter(event => dist(viewX, viewY, event.x, event.y) <= 1800)
