@@ -37,7 +37,7 @@ test('shop sells the flag bundle, Rainbow skins, and mode-exclusive cosmetics', 
         [
             { id: 'agar:prism', usdPrice: 2 },
             { id: 'slither:leviathan', usdPrice: 2 },
-            { id: 'surviv:warden', usdPrice: 2 },
+            { id: 'surviv:farmer', usdPrice: 2 },
             { id: 'flags:bundle', usdPrice: 1 },
             { id: 'agar:rainbow', usdPrice: 3 },
             { id: 'slither:rainbow', usdPrice: 3 },
@@ -46,4 +46,5 @@ test('shop sells the flag bundle, Rainbow skins, and mode-exclusive cosmetics', 
         ],
     );
     assert.equal(getAgarShopProduct('surviv:rainbow'), null);
+    assert.equal(getAgarShopProduct('surviv:warden'), null);
 });

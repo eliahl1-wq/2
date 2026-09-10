@@ -1,4 +1,5 @@
 import * as solanaWeb3 from '@solana/web3.js';
+import { canonicalSignatureSkinId, presentSkinEntitlement, signatureEntitlementSkinIds } from './signature-skins.js';
 import {
     ExtensionType,
     TOKEN_2022_PROGRAM_ID,
@@ -372,7 +373,7 @@ export function createAgarCommerceService({
             SkinPurchase.find({ userId }).sort({ createdAt: -1 }).limit(50).lean(),
         ]);
         return {
-            entitlements: entitlements.map((entry) => ({
+            entitlements: entitlements.map(presentSkinEntitlement).map((entry) => ({
                 productId: entry.productId,
                 gameMode: entry.gameMode,
                 skinId: entry.skinId,
@@ -383,6 +384,7 @@ export function createAgarCommerceService({
     }
 
     async function hasSkinEntitlement(userId, gameMode, skinId) {
+        skinId = canonicalSignatureSkinId(skinId);
         if (skinId === 'flags') {
             if (!['agar', 'slither', 'all'].includes(gameMode)) return false;
             return !!(await SkinEntitlement.exists({ userId, gameMode: 'all', skinId: 'flags' }));
@@ -394,7 +396,7 @@ export function createAgarCommerceService({
         const specialProduct = AGAR_SHOP_PRODUCTS.find(product => product.skinId === skinId);
         if (specialProduct) {
             if (gameMode !== specialProduct.gameMode) return false;
-            return !!(await SkinEntitlement.exists({ userId, gameMode, skinId }));
+            return !!(await SkinEntitlement.exists({ userId, gameMode, skinId: { $in: signatureEntitlementSkinIds(skinId) } }));
         }
         return true;
     }
