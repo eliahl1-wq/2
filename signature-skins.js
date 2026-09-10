@@ -1,4 +1,4 @@
-import { getAgarShopProduct } from './agar-economy.js';
+import { getAgarShopProduct, isHiddenShopSkin } from './agar-economy.js';
 
 const MODES = Object.freeze({ prism: 'agar', leviathan: 'slither', farmer: 'surviv' });
 const getMode = value => typeof value === 'string' && Object.hasOwn(MODES, value) ? MODES[value] : null;
@@ -22,6 +22,8 @@ export async function resolveSignatureSkin({ mode, skinId, skinColor, hasAccess 
     if (!requested.length) return null;
     const id = requested[0];
     if (requested.some(value => value !== id)) throw new Error('Conflicting skin selection.');
+    // Saved selections from older clients fall back without deleting ownership.
+    if (isHiddenShopSkin(id)) return '#c080ff';
     const gameMode = mode === 'competitive-slither' ? 'slither' : mode;
     const product = getAgarShopProduct(`${getMode(id)}:${id}`);
     if (gameMode !== product.gameMode) throw new Error(`${product.name} is only available in ${product.gameMode}.`);

@@ -101,7 +101,7 @@ test('public queue, refund, max cap, rejoin, zero world money, elimination and o
     assert.ok(room);
     assert.equal(room.status, 'countdown');
     assert.equal(room.players.length, 25);
-    assert.equal(room.prizePool, 115);
+    assert.equal(room.prizePool, 230);
     assert.ok(room.players.every(player => !player.isBot && player.dollarBalance === 0));
     assert.equal(room.bots.length, 0);
     assert.ok(room.players.every(player => Math.hypot(player.x, player.y) < SURVIV_BR.initialRadius));
@@ -127,7 +127,7 @@ test('public queue, refund, max cap, rejoin, zero world money, elimination and o
     t.mock.timers.tick(3000);
     assert.equal(room.status, 'active');
     assert.equal(resumed.last('brMatchStart').variant, 'surviv');
-    assert.equal(getBRPlayerCountsByFee().surviv[5], 25);
+    assert.equal(getBRPlayerCountsByFee().surviv[10], 25);
     processBattleRoyaleMatches(io, deps);
     assert.equal(resumed.last('survivTick').aliveCount, 25);
     assert.deepEqual(resumed.last('survivTick').activityZones, [], 'BR does not expose opponent heatmaps');
@@ -146,12 +146,12 @@ test('public queue, refund, max cap, rejoin, zero world money, elimination and o
     processBattleRoyaleMatches(io, deps);
     // Payout is asynchronous but no external services are touched in this test.
     for (let i = 0; i < 12; i++) await Promise.resolve();
-    assert.equal(resumed.last('brVictory').amount, 115);
+    assert.equal(resumed.last('brVictory').amount, 230);
     assert.equal(transactions.filter(tx => tx.meta.reason === 'BR Victory').length, 1);
     assert.equal(getBRMatchForMongo('player-0'), null);
     assert.equal(getActiveBRMatchesRaw().length, 0);
     assert.equal(players[2].last('brEliminated').placement, 25);
-    assert.equal(getBRPlayerCountsByFee().surviv[5], 0);
+    assert.equal(getBRPlayerCountsByFee().surviv[10], 0);
 });
 
 test('BR zone damage uses its phase rather than normal server reset damage', t => {
@@ -254,6 +254,8 @@ test('public free Surviv waits 15 quiet seconds, fills only missing slots, and r
         t.mock.timers.tick(3000);
         const room = getBRMatchForMongo(`free-${humanCount}-first`);
         assert.ok(room.personalFreePlay);
+        assert.equal(room.entryFeeUsd, 10, 'server overrides a stale $5 practice request');
+        assert.equal(room.prizePool, 92);
         assert.equal(room.players.filter(p => p.isBot).length, 10 - humanCount);
         assert.equal(room.players.length, 10);
         t.mock.timers.tick(3000);

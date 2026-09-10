@@ -328,10 +328,49 @@ test('estate manor uses a purpose-built courtyard loop instead of the generic fo
     assert.deepEqual(new Set(doors
         .filter(door => door.entranceRole !== 'interiorDoor')
         .map(door => door.entranceRole)), new Set(['mainEntrance', 'gardenEntrance', 'serviceEntrance']));
-    assert.ok(interiorWalls.every(wall => Math.max(wall.w, wall.h) <= 210),
+    assert.ok(interiorWalls.every(wall => Math.max(wall.w, wall.h) <= 250),
         'manor should not recreate a long uninterrupted central corridor wall');
     assert.equal(manorChests.length, 2);
     assert.ok(contents.some(obstacle => obstacle.kind === 'furniture' && obstacle.role === 'winterGardenPlanter'));
+});
+
+test('estate buildings have generous separation and walkable entrances on both sides', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const estates = map.obstacles.filter(o => o.kind === 'field' && o.variant === 'estate'
+        && o.landmarkType === 'estate' && o.role === 'courtyard');
+    assert.equal(estates.length, 3);
+    for (const estate of estates) {
+        const houses = map.obstacles.filter(o => o.kind === 'houseFloor'
+            && o.landmarkType === 'estate' && pointInRect(o.x, o.y, estate));
+        assert.equal(houses.length, 3);
+        for (let i = 0; i < houses.length; i++) {
+            const house = houses[i];
+            assert.ok(Math.abs(house.x - estate.x) + house.w / 2 <= estate.w / 2 - 100);
+            assert.ok(Math.abs(house.y - estate.y) + house.h / 2 <= estate.h / 2 - 100);
+            for (const other of houses.slice(i + 1)) {
+                const gapX = Math.max(0, Math.abs(house.x - other.x) - (house.w + other.w) / 2);
+                const gapY = Math.max(0, Math.abs(house.y - other.y) - (house.h + other.h) / 2);
+                assert.ok(Math.hypot(gapX, gapY) >= 120, 'estate houses need a usable outdoor buffer');
+            }
+            const doors = map.obstacles.filter(o => o.kind === 'door' && o.houseId === house.id
+                && o.entranceRole !== 'interiorDoor');
+            assert.ok(doors.length >= 2, 'each estate house needs a second exit');
+            const blockers = map.obstacles.filter(o => o.collidable !== false && o.kind !== 'door'
+                && Math.abs(o.x - house.x) < 650 && Math.abs(o.y - house.y) < 650);
+            for (const door of doors) {
+                const dx = door.orientation === 'east' ? 1 : door.orientation === 'west' ? -1 : 0;
+                const dy = door.orientation === 'south' ? 1 : door.orientation === 'north' ? -1 : 0;
+                for (let distance = -24; distance <= 90; distance += 6) {
+                    const px = door.x + dx * distance;
+                    const py = door.y + dy * distance;
+                    const blocker = blockers.find(o => circleRectCollision(px, py, SURVIV.playerRadius,
+                        obstacleCollisionRectForTest(o)));
+                    assert.equal(blocker, undefined,
+                        `${house.role} ${door.orientation} entrance blocked at ${distance} by ${blocker?.kind}/${blocker?.role}`);
+                }
+            }
+        }
+    }
 });
 
 test('larger residential layer adds twenty distinct detailed homes across ten real blueprints', () => {
@@ -3234,6 +3273,95 @@ test('armed surviv bots aggressively engage and lead distant players', () => {
     assert.ok(bot.inputDx > 0.8, 'bot should push toward a distant target');
     assert.ok(bot.aimAngle > 0, 'bot should lead the moving target instead of aiming at the old position');
     assert.ok(room.bullets.some(bullet => bullet.ownerId === bot.id), 'bot should fire at combat range');
+});
+
+test('Battle Royale Surviv bots never target themselves or punch in place', () => {
+    const room = makeRoom();
+    room.isBattleRoyale = true;
+    room.zone = { x: 0, y: 0, radius: 3400, targetX: 0, targetY: 0, damagePerSecond: 2 };
+    room.obstacles = [];
+    room.loot = [];
+    room.bots = [];
+    const bot = createSurvivPlayer('br-bot', null, ' ', '#fff', room);
+    const enemy = createSurvivPlayer('br-enemy', 'br-enemy-mongo', 'Enemy', '#fff', room);
+    Object.assign(bot, { x: 0, y: 0, isBot: true, botThinkAt: 0 });
+    Object.assign(enemy, { x: 220, y: 0 });
+    room.players = [bot, enemy];
+
+    processSurvivRoom(room, silentIo);
+
+    assert.equal(bot.botTargetId, enemy.id);
+    assert.ok(bot.inputDx > 0.7, 'the BR bot should close distance to the actual enemy');
+    assert.equal(bot.shooting, false, 'an out-of-range BR bot must not punch empty space');
+    assert.equal(bot.meleeAttackId, undefined);
+});
+
+test('Battle Royale Surviv bots fight with guns through the shared normal AI', () => {
+    const room = makeRoom();
+    room.isBattleRoyale = true;
+    room.zone = { x: 0, y: 0, radius: 3400, targetX: 0, targetY: 0, damagePerSecond: 2 };
+    room.obstacles = [];
+    room.loot = [];
+    room.bots = [];
+    const bot = createSurvivPlayer('br-rifle-bot', null, ' ', '#fff', room);
+    const enemy = createSurvivPlayer('br-rifle-enemy', 'br-rifle-enemy-mongo', 'Enemy', '#fff', room);
+    Object.assign(bot, {
+        x: 0, y: 0, isBot: true, botThinkAt: 0,
+        activeWeaponSlot: 0,
+        weaponSlotAmmo: [30],
+        weapon: { type: 'm416', ammo: 30, reloading: false, reloadEndAt: 0, lastShotAt: 0 },
+    });
+    bot.inventory.weapons = ['m416'];
+    Object.assign(enemy, { x: 520, y: 40 });
+    room.players = [bot, enemy];
+
+    processSurvivRoom(room, silentIo);
+
+    assert.equal(bot.botTargetId, enemy.id);
+    assert.ok(room.bullets.some(bullet => bullet.ownerId === bot.id), 'the BR bot should fire its equipped gun');
+});
+
+test('Surviv bots follow a shifted Battle Royale zone instead of map center', () => {
+    const room = makeRoom();
+    room.isBattleRoyale = true;
+    room.zone = { x: -3000, y: 0, radius: 1200, targetX: -3200, targetY: 0, damagePerSecond: 5 };
+    room.obstacles = [];
+    room.loot = [];
+    room.bots = [];
+    const bot = createSurvivPlayer('shifted-zone-bot', null, ' ', '#fff', room);
+    const enemy = createSurvivPlayer('shifted-zone-enemy', 'shifted-zone-enemy-mongo', 'Enemy', '#fff', room);
+    Object.assign(bot, { x: -2500, y: 0, isBot: true, botThinkAt: 0 });
+    Object.assign(enemy, { x: -3500, y: 0 });
+    room.players = [bot, enemy];
+
+    processSurvivRoom(room, silentIo);
+
+    assert.ok(bot.inputDx < 0, 'the bot should stay with the shifted safe zone rather than run toward world center');
+});
+
+test('Surviv bots reload a low magazine while cover blocks the enemy', () => {
+    const room = makeRoom();
+    room.loot = [];
+    room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.obstacles = [{
+        id: 'reload-cover', kind: 'wall', x: 350, y: 0,
+        w: 30, h: 500, collidable: true, destructible: false,
+    }];
+    const enemy = createSurvivPlayer('reload-enemy', 'reload-enemy-mongo', 'Enemy', '#fff', room);
+    Object.assign(enemy, { x: 700, y: 0 });
+    room.players.push(enemy);
+    const bot = spawnSurvivBotNear(room, 0, 0, { adminSpawned: true });
+    bot.inventory.weapons = ['m416'];
+    bot.inventory.ammoReserves['556'] = 30;
+    bot.activeWeaponSlot = 0;
+    bot.weaponSlotAmmo = [1];
+    bot.weapon = { type: 'm416', ammo: 1, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+
+    processSurvivRoom(room, silentIo, Date.now() + 600000);
+
+    assert.equal(bot.weapon.reloading, true);
+    assert.equal(bot.shooting, false);
+    assert.ok(Math.hypot(bot.inputDx, bot.inputDy) > 0.5, 'the bot should reposition while reloading');
 });
 test('surviv bots automatically collect useful ground loot', () => {
     const room = makeRoom();

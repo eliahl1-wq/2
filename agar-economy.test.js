@@ -35,8 +35,6 @@ test('shop sells the flag bundle, Rainbow skins, and mode-exclusive cosmetics', 
     assert.deepEqual(
         AGAR_SHOP_PRODUCTS.map(({ id, usdPrice }) => ({ id, usdPrice })),
         [
-            { id: 'agar:prism', usdPrice: 2 },
-            { id: 'slither:leviathan', usdPrice: 2 },
             { id: 'surviv:farmer', usdPrice: 2 },
             { id: 'flags:bundle', usdPrice: 1 },
             { id: 'agar:rainbow', usdPrice: 3 },
@@ -47,4 +45,6 @@ test('shop sells the flag bundle, Rainbow skins, and mode-exclusive cosmetics', 
     );
     assert.equal(getAgarShopProduct('surviv:rainbow'), null);
     assert.equal(getAgarShopProduct('surviv:warden'), null);
+    assert.equal(getAgarShopProduct('agar:prism'), null);
+    assert.equal(getAgarShopProduct('slither:leviathan'), null);
 });

@@ -304,6 +304,11 @@ const SURVIV_INTERIOR_PROP_HP = Object.freeze({
     specimenTank: 58,
     serverRack: 60,
     generator: 64,
+    slotMachine: 38,
+    cardTable: 46,
+    rouletteTable: 50,
+    cashierCounter: 48,
+    casinoSafe: 64,
 });
 const SURVIV_INDOOR_BLOCKING_PROP_KINDS = new Set([
     'furniture', 'machine', 'container', 'crate', 'barrel',
@@ -2365,12 +2370,10 @@ function addManorHouse(obstacles, loot, spawnPoints, x, y) {
 
     addVerticalInteriorWallSegments(obstacles, x - 146, y, h - wall * 4, wall, [
         { center: -145, size: 82 },
-        { center: 0, size: 76 },
         { center: 142, size: 92 },
     ], variant, { ...meta, doorVariant: variant });
     addVerticalInteriorWallSegments(obstacles, x + 148, y, h - wall * 4, wall, [
         { center: -154, size: 76 },
-        { center: -2, size: 74 },
         { center: 124, size: 90 },
     ], variant, { ...meta, doorVariant: variant });
     addHorizontalInteriorWallSegments(obstacles, x - 257, y + 12, 210, wall, [
@@ -2380,16 +2383,8 @@ function addManorHouse(obstacles, loot, spawnPoints, x, y) {
         { center: 20, size: 76 },
     ], variant, { ...meta, doorVariant: variant });
 
-    // Short plaster-and-glass garden edges read as architecture without
-    // recreating four more full-height room walls. The open side arches keep
-    // movement fluid and the central planter breaks long firing lanes.
-    addInteriorWall(obstacles, x, y - 88, 164, wall, variant, meta);
-    addInteriorWall(obstacles, x, y + 68, 164, wall, variant, meta);
-    addInteriorWall(obstacles, x + 115, y + 68, 66, wall, variant, meta);
-    addInteriorWall(obstacles, x - 82, y - 64, wall, 48, variant, meta);
-    addInteriorWall(obstacles, x - 82, y + 44, wall, 48, variant, meta);
-    addInteriorWall(obstacles, x + 82, y - 64, wall, 48, variant, meta);
-    addInteriorWall(obstacles, x + 82, y + 44, wall, 48, variant, meta);
+    // The winter garden is open on all sides. Its planter provides cover
+    // without small wall stubs being snapped across the circulation routes.
 
     furnishHouseInterior(obstacles, floor, { theme: 'home' });
     const addManorFixture = (room, variantName, fixtureX, fixtureY, fixtureW, fixtureH, fixtureRole) => (
@@ -2427,29 +2422,73 @@ function addManorHouse(obstacles, loot, spawnPoints, x, y) {
     return floor;
 }
 
+function addEstateAnnex(obstacles, loot, spawnPoints, x, y, garage = false) {
+    const w = 340;
+    const h = 240;
+    const wall = 14;
+    const variant = garage ? 'garage' : 'guesthouse';
+    const side = garage ? 'west' : 'east';
+    const direction = garage ? -1 : 1;
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, {
+        collidable: false, variant, hue: garage ? 205 : 28,
+        landmarkType: 'estate', role: variant, label: garage ? 'WORKSHOP' : 'GUEST',
+        orientation: side,
+    });
+    const meta = { houseId: floor.id, landmarkType: 'estate', role: variant };
+    const doorSpan = compactDoorSpan(88, variant);
+    const frontX = x + direction * (w / 2 - wall / 2);
+    const frontY = y + 42;
+    const rearX = x - direction * 90;
+    const northY = y - h / 2 + wall / 2;
+    addHorizontalWallWithOpening(obstacles, x, northY, w, wall, variant, rearX, doorSpan, meta);
+    addWall(obstacles, x, y + h / 2 - wall / 2, w, wall, variant, meta);
+    addVerticalWallWithOpening(obstacles, frontX, y, h, wall, variant, frontY, doorSpan, meta);
+    addWall(obstacles, x - direction * (w / 2 - wall / 2), y, wall, h, variant, meta);
+    addDoor(obstacles, floor.id, frontX, frontY, wall * 0.9, doorSpan + 2,
+        variant, side, garage ? 'garageEntrance' : 'mainEntrance');
+    addDoor(obstacles, floor.id, rearX, northY, doorSpan + 2, wall * 0.9,
+        variant, 'north', 'gardenEntrance');
+
+    // Two generous rooms, with an offset connecting door. Both entrances
+    // lead into usable rooms rather than the end of a divider wall.
+    addRoomZone(obstacles, floor.id, x, y + 47, w - 44, 104, garage ? 'workshop' : 'living-room');
+    addRoomZone(obstacles, floor.id, x, y - 66, w - 44, 74, garage ? 'stockroom' : 'bedroom');
+    addHorizontalInteriorWallSegments(obstacles, x, y - 16, w - wall * 2, wall,
+        [{ center: direction * 62, size: 84 }], variant, { ...meta, doorVariant: variant });
+    furnishHouseInterior(obstacles, floor, { theme: garage ? 'industrial' : 'home' });
+    loot.push(makeChest(x + direction * 104, y - 72, garage ? 'military' : 'rare', null, 'map', {
+        houseId: floor.id, landmarkType: 'estate', room: garage ? 'stockroom' : 'bedroom',
+    }));
+    spawnPoints.push({ x: frontX + direction * 82, y: frontY });
+    return floor;
+}
+
 function addMansion(obstacles, loot, spawnPoints, x, y) {
-    addObstacle(obstacles, 'field', x, y, 1500, 1050, {
+    addObstacle(obstacles, 'field', x, y, 1500, 1180, {
         collidable: false,
         variant: 'estate',
         role: 'courtyard',
         landmarkType: 'estate',
     });
-    addObstacle(obstacles, 'road', x, y + 455, 180, 330, {
-        collidable: false,
-        variant: 'dirt',
-        role: 'driveway',
-        landmarkType: 'estate',
-    });
-    addManorHouse(obstacles, loot, spawnPoints, x, y);
-    addHouse(obstacles, loot, spawnPoints, x - 560, y + 240, 320, 260, {
-        hue: 28, variant: 'guesthouse', tier: 'rare',
-        doorSide: 'east', landmarkType: 'estate', label: 'GUEST', role: 'guesthouse',
-    });
-    addHouse(obstacles, loot, spawnPoints, x + 570, y + 250, 300, 250, {
-        hue: 28, variant: 'garage', tier: 'military',
-        doorSide: 'west', landmarkType: 'estate', label: 'GARAGE', role: 'garage',
-        entranceRole: 'garageEntrance',
-    });
+    const manor = addManorHouse(obstacles, loot, spawnPoints, x, y - 170);
+    const guest = addEstateAnnex(obstacles, loot, spawnPoints, x - 480, y + 350);
+    const garage = addEstateAnnex(obstacles, loot, spawnPoints, x + 480, y + 350, true);
+    const path = (px, py, pw, ph, role = 'estateWalk') => addObstacle(
+        obstacles, 'road', x + px, y + py, pw, ph,
+        { collidable: false, variant: 'gravel', role, landmarkType: 'estate' },
+    );
+    // Main axis, side branches and rear garden route all end at real
+    // thresholds. A 120-unit buffer separates the manor from either annex.
+    path(-34, 390, 104, 560, 'driveway');
+    path(0, 392, 620, 92);
+    path(0, 170, 1140, 76);
+    path(-570, 211.5, 76, 37);
+    path(570, 211.5, 76, 37);
+    path(224, -480, 86, 60);
+    path(112, -510, 310, 70);
+    path(0, -590, 86, 160);
+    path(480, -42, 200, 82);
+    path(570, 50, 76, 260);
     
     // Perimeter walls with gate on North and South sides
     addDestructibleBarrier(obstacles, x - 500, y - 590, 500, 18, 'stone'); // North wall left segment
@@ -2466,25 +2505,20 @@ function addMansion(obstacles, loot, spawnPoints, x, y) {
     addObstacle(obstacles, 'wall', x - 240, y - 590, 40, 40, 'stone');
     addObstacle(obstacles, 'wall', x + 240, y - 590, 40, 40, 'stone');
     
-    // Structured courtyard cover (crates and trees/hedges)
-    addObstacle(obstacles, 'crate', x - 260, y - 300, 44, 44, { rotation: 0.1 });
-    addObstacle(obstacles, 'crate', x - 300, y - 300, 44, 44, { rotation: -0.15 });
-    addObstacle(obstacles, 'crate', x - 280, y - 260, 44, 44, { rotation: 0.05 });
-    
-    addObstacle(obstacles, 'crate', x + 440, y + 380, 44, 44, { rotation: 0.08 });
-    addObstacle(obstacles, 'crate', x + 480, y + 380, 44, 44, { rotation: -0.12 });
-    addObstacle(obstacles, 'crate', x + 460, y + 420, 44, 44, { rotation: 0.03 });
-    
-    addObstacle(obstacles, 'tree', x - 580, y - 350, 46, 46, { hue: 110, rotation: 0.5 });
-    addObstacle(obstacles, 'tree', x + 580, y - 350, 46, 46, { hue: 115, rotation: 1.5 });
+    // Garden cover sits in side pockets, clear of door sweeps and paths.
+    for (const side of [-1, 1]) {
+        addObstacle(obstacles, 'tree', x + side * 570, y - 290, 96, 96, { hue: 112 });
+        addObstacle(obstacles, 'bush', x + side * 650, y - 150, 64, 52, { hue: 106 });
+        addObstacle(obstacles, 'crate', x + side * 200, y + 505, 44, 44, { rotation: side * 0.08 });
+    }
     
     // Guaranteed high-tier ground loot inside the mansion compound buildings
-    loot.push(makeGroundLoot('weapon', x, y - 50, { weaponType: 'm416', source: 'estate-loot' }));
-    loot.push(makeGroundLoot('ammo', x - 40, y - 50, { source: 'estate-loot' }));
-    loot.push(makeGroundLoot('ammo', x + 40, y - 50, { source: 'estate-loot' }));
-    loot.push(makeGroundLoot('medkit', x, y + 100, { source: 'estate-loot' }));
-    loot.push(makeGroundLoot('weapon', x - 560, y + 240, { weaponType: 'm870', source: 'estate-loot' })); // inside guesthouse
-    loot.push(makeGroundLoot('weapon', x + 570, y + 250, { weaponType: 'm249', source: 'estate-loot' })); // inside garage
+    loot.push(makeGroundLoot('weapon', manor.x, manor.y - 50, { weaponType: 'm416', source: 'estate-loot', houseId: manor.id }));
+    loot.push(makeGroundLoot('ammo', manor.x - 40, manor.y - 50, { source: 'estate-loot', houseId: manor.id }));
+    loot.push(makeGroundLoot('ammo', manor.x + 40, manor.y - 50, { source: 'estate-loot', houseId: manor.id }));
+    loot.push(makeGroundLoot('medkit', manor.x, manor.y + 100, { source: 'estate-loot', houseId: manor.id }));
+    loot.push(makeGroundLoot('weapon', guest.x, guest.y + 48, { weaponType: 'm870', source: 'estate-loot', houseId: guest.id }));
+    loot.push(makeGroundLoot('weapon', garage.x, garage.y + 48, { weaponType: 'm249', source: 'estate-loot', houseId: garage.id }));
     
     // Fairer spawn points at the outskirts of the estate
     spawnPoints.push({ x, y: y + 660 });
@@ -5307,6 +5341,141 @@ function addLargeResidentialLayer(obstacles, loot, spawnPoints, placedPositions,
     return added;
 }
 
+function addCasino(obstacles, loot, spawnPoints, x, y) {
+    const w = 920;
+    const h = 640;
+    const wall = 16;
+    const variant = 'casino';
+    const landmarkType = 'casino';
+    const northY = y - h / 2 + wall / 2;
+    const southY = y + h / 2 - wall / 2;
+    const westX = x - w / 2 + wall / 2;
+    const eastX = x + w / 2 - wall / 2;
+    const mainDoorX = x - 220;
+    const sideDoorY = y + 90;
+    const serviceDoorX = x + 320;
+    const mainDoorSpan = compactDoorSpan(92, variant);
+    const sideDoorSpan = compactDoorSpan(78, variant);
+
+    const floor = addObstacle(obstacles, 'houseFloor', x, y, w, h, {
+        collidable: false,
+        hue: 346,
+        variant,
+        label: 'CASINO',
+        role: 'casinoHall',
+        landmarkType,
+        orientation: 'south',
+        blueprint: 'casino-floor',
+    });
+    const houseId = floor.id;
+    const meta = { houseId, landmarkType, role: 'casinoStructure' };
+
+    // Three offset thresholds prevent a single straight sightline from
+    // controlling the whole landmark and give every wing a useful escape.
+    addHorizontalWallWithOpening(obstacles, x, northY, w, wall, variant, serviceDoorX, sideDoorSpan, meta);
+    addHorizontalWallWithOpening(obstacles, x, southY, w, wall, variant, mainDoorX, mainDoorSpan, meta);
+    addVerticalWallWithOpening(obstacles, westX, y, h, wall, variant, sideDoorY, sideDoorSpan, meta);
+    addWall(obstacles, eastX, y, wall, h, variant, meta);
+    addDoor(obstacles, houseId, mainDoorX, southY, mainDoorSpan + 2, wall * 0.9, variant, 'south', 'mainEntrance');
+    addDoor(obstacles, houseId, westX, sideDoorY, wall * 0.9, sideDoorSpan + 2, variant, 'west', 'sideEntrance');
+    addDoor(obstacles, houseId, serviceDoorX, northY, sideDoorSpan + 2, wall * 0.9, variant, 'north', 'serviceEntrance');
+
+    const gamingFloor = addRoomZone(obstacles, houseId, x - 135, y, 586, 574, 'gaming-floor');
+    const security = addRoomZone(obstacles, houseId, x + 310, y - 194, 230, 196, 'security-office');
+    const cashier = addRoomZone(obstacles, houseId, x + 310, y + 24, 230, 190, 'cashier');
+    const staff = addRoomZone(obstacles, houseId, x + 310, y + 220, 230, 150, 'staff-room');
+
+    // The east service wing is attached to both shell walls. Three offset
+    // doors open from the public floor; complete cross walls keep each room
+    // recognizable without producing floating interior-wall fragments.
+    addVerticalInteriorWallSegments(obstacles, x + 175, y, h - wall * 2, wall, [
+        { center: -194, size: 74 },
+        { center: 24, size: 74 },
+        { center: 220, size: 74 },
+    ], variant, { ...meta, doorVariant: variant, role: 'serviceSpine' });
+    addHorizontalInteriorWallSegments(obstacles, x + 310, y - 91, 270, wall, [], variant, meta);
+    addHorizontalInteriorWallSegments(obstacles, x + 310, y + 132, 270, wall, [], variant, meta);
+
+    const addFixture = (room, fixtureVariant, dx, dy, fixtureW, fixtureH, options = {}) => addObstacle(
+        obstacles,
+        'furniture',
+        x + dx,
+        y + dy,
+        fixtureW,
+        fixtureH,
+        {
+            collidable: true,
+            destructible: true,
+            maxHp: options.maxHp,
+            hitboxW: options.hitboxW,
+            hitboxH: options.hitboxH,
+            rotation: options.rotation || 0,
+            variant: fixtureVariant,
+            role: options.role || fixtureVariant,
+            houseId,
+            roomId: room.id,
+            landmarkType,
+        },
+    );
+
+    // The public floor has distinct table silhouettes, wall-side machines and
+    // a quiet lounge pocket. Wide lanes remain between every cover cluster.
+    addFixture(gamingFloor, 'rouletteTable', -175, -150, 108, 108, { hitboxW: 86, hitboxH: 86 });
+    addFixture(gamingFloor, 'cardTable', -145, 54, 138, 88, { hitboxW: 114, hitboxH: 68 });
+    addFixture(gamingFloor, 'cardTable', 20, 190, 128, 82, { hitboxW: 106, hitboxH: 64, rotation: -0.08 });
+    for (const [index, machineY] of [-215, -125, -35].entries()) {
+        addFixture(gamingFloor, 'slotMachine', -386, machineY, 42, 58, {
+            hitboxW: 36,
+            hitboxH: 52,
+            role: `slotMachine${index + 1}`,
+        });
+    }
+    addFixture(gamingFloor, 'sofa', -338, 214, 96, 38, { role: 'casinoLounge' });
+
+    addFixture(cashier, 'cashierCounter', 292, 25, 126, 38, { hitboxW: 118, hitboxH: 32 });
+    addFixture(cashier, 'casinoSafe', 403, 26, 34, 70, { hitboxW: 30, hitboxH: 64 });
+    addFixture(security, 'controlConsole', 292, -190, 92, 40, { role: 'securityDesk' });
+    addFixture(security, 'locker', 402, -226, 30, 62, { role: 'securityLocker' });
+    addFixture(staff, 'storageShelf', 247, 220, 34, 88, { role: 'staffStorage' });
+    addFixture(staff, 'locker', 392, 220, 34, 88, { role: 'staffLocker' });
+
+    loot.push(makeChest(x + 360, y - 190, 'rare', null, 'map', {
+        houseId, landmarkType, room: security.variant,
+    }));
+    loot.push(makeChest(x + 330, y + 220, 'common', null, 'map', {
+        houseId, landmarkType, room: staff.variant,
+    }));
+
+    // A short service drive meets the existing east north-south highway. The
+    // front apron and lamps make the landmark readable before its roof opens.
+    addObstacle(obstacles, 'road', x - 730, y + 90, 540, 88, {
+        collidable: false,
+        variant: 'service',
+        role: 'casinoDrive',
+        landmarkType,
+    });
+    addObstacle(obstacles, 'entrancePad', mainDoorX, y + h / 2 + 38, 176, 92, {
+        collidable: false,
+        variant: 'stone',
+        role: 'casinoApron',
+        landmarkType,
+    });
+    for (const lampX of [mainDoorX - 72, mainDoorX + 72]) {
+        addObstacle(obstacles, 'lampPost', lampX, y + h / 2 + 72, 22, 22, {
+            collidable: false,
+            variant: 'casino',
+            role: 'casinoEntranceLight',
+            landmarkType,
+        });
+    }
+
+    spawnPoints.push(
+        { x: mainDoorX, y: y + h / 2 + 94, role: 'casino-front' },
+        { x: x - w / 2 - 92, y: sideDoorY, role: 'casino-side' },
+    );
+    return floor;
+}
+
 function addGlasshouseGardens(obstacles, loot, spawnPoints, x, y) {
     const landmarkType = 'glasshouse-gardens';
     addObstacle(obstacles, 'field', x, y, 1260, 880, {
@@ -5463,6 +5632,7 @@ export function generateSurvivMap(worldHalf) {
     const railDepotPos = { x: 700, y: 8200, w: 1860, h: 1320 };
     const civicQuarterPos = { x: -900, y: 3600, w: 1900, h: 1500 };
     const glasshousePos = { x: -3500, y: 900, w: 1260, h: 880 };
+    const casinoPos = { x: 3500, y: 2900, w: 1300, h: 980 };
 
     const POI_LIST = [
         mansionPos, militaryPos, hospitalPos, villaPos, yardPos,
@@ -5472,7 +5642,7 @@ export function generateSurvivMap(worldHalf) {
         northCachePos, eastCachePos, southCachePos, checkpointPos,
         servicesPos, fireStationPos, orchardPos,
         motelPos, rangerLodgePos, lumberworksPos,
-        riversidePos, eastgatePos, westportPos, railDepotPos, civicQuarterPos, glasshousePos,
+        riversidePos, eastgatePos, westportPos, railDepotPos, civicQuarterPos, glasshousePos, casinoPos,
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -5624,6 +5794,9 @@ export function generateSurvivMap(worldHalf) {
 
     addGlasshouseGardens(obstacles, loot, spawnPoints, glasshousePos.x, glasshousePos.y);
     landmarks.push({ name: 'Glasshouse Gardens', x: glasshousePos.x, y: glasshousePos.y, type: 'glasshouse-gardens' });
+
+    addCasino(obstacles, loot, spawnPoints, casinoPos.x, casinoPos.y);
+    landmarks.push({ name: 'Golden Clover Casino', x: casinoPos.x, y: casinoPos.y, type: 'casino' });
 
     // ─────────────────────────────────────────────────────────────────────────
     // ROAD NETWORK (Structured Highways)
@@ -7081,6 +7254,10 @@ function applyDamage(target, damage, attacker, source = null) {
     target.hp -= remaining;
     const damageDealt = Math.max(0, hpBefore - target.hp);
     if (damageDealt > 0 && attacker && attacker.id !== target.id) {
+        if (target.isBot) {
+            target.botAttackerId = attacker.id;
+            target.botAttackerUntil = Date.now() + 2200;
+        }
         const previous = attacker._hitConfirm;
         const sameTarget = previous?.targetId === target.id;
         attacker._hitConfirm = {
@@ -8439,14 +8616,18 @@ function getBotNavigationDirection(bot, room, waypoint, now) {
     return { dx: Math.cos(fallbackAngle), dy: Math.sin(fallbackAngle) };
 }
 
-function updateBotAI(bot, room, now, effectiveRadius) {
+function updateBotAI(bot, room, now, effectiveRadius, zone = null) {
     if (now < bot.botThinkAt) return;
     bot.botThinkAt = now + 90 + Math.random() * 100;
     bot.chestHoldId = null;
     bot.chestHoldSeenAt = now;
+    if (!Number.isFinite(bot.botCombatPhase)) bot.botCombatPhase = Math.random() * Math.PI * 2;
+    if (!Number.isFinite(bot.botStrafeDirection)) bot.botStrafeDirection = Math.random() < 0.5 ? -1 : 1;
+    if (!Number.isFinite(bot.botStrafeSwitchAt)) bot.botStrafeSwitchAt = now + 650 + Math.random() * 900;
 
     const allTargets = [
-        ...room.players.filter(player => !player.cashoutSettling && !player._eliminated && player.hp > 0),
+        ...room.players.filter(player => player.id !== bot.id
+            && !player.cashoutSettling && !player._eliminated && player.hp > 0),
         ...room.bots.filter(candidate => candidate.id !== bot.id && candidate.hp > 0),
     ];
     let nearest = null;
@@ -8454,7 +8635,12 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     let bestTargetScore = Infinity;
     for (const target of allTargets) {
         const targetDistance = dist(bot.x, bot.y, target.x, target.y);
-        const targetScore = targetDistance - (target.isBot ? 0 : 140);
+        const retainedTargetBonus = target.id === bot.botTargetId ? 190 : 0;
+        const retaliationBonus = target.id === bot.botAttackerId && now < (bot.botAttackerUntil || 0)
+            ? 260
+            : 0;
+        const targetScore = targetDistance - (target.isBot ? 0 : 140)
+            - retainedTargetBonus - retaliationBonus;
         if (targetScore < bestTargetScore) {
             nearest = target;
             nearestDist = targetDistance;
@@ -8478,9 +8664,14 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     }
 
 
-    const distFromCenter = Math.hypot(bot.x, bot.y);
-    if (distFromCenter > effectiveRadius * 0.82) {
-        const direction = normalize(-bot.x, -bot.y);
+    const zoneCenterX = Number(zone?.x) || 0;
+    const zoneCenterY = Number(zone?.y) || 0;
+    const zoneTargetX = Number.isFinite(zone?.targetX) ? zone.targetX : zoneCenterX;
+    const zoneTargetY = Number.isFinite(zone?.targetY) ? zone.targetY : zoneCenterY;
+    const distFromZoneCenter = Math.hypot(bot.x - zoneCenterX, bot.y - zoneCenterY);
+    const zoneSafetyMargin = Math.min(280, Math.max(90, effectiveRadius * 0.12));
+    if (distFromZoneCenter > Math.max(0, effectiveRadius - zoneSafetyMargin)) {
+        const direction = normalize(zoneTargetX - bot.x, zoneTargetY - bot.y);
         bot.inputDx = direction.dx;
         bot.inputDy = direction.dy;
         bot.shooting = false;
@@ -8490,6 +8681,15 @@ function updateBotAI(bot, room, now, effectiveRadius) {
     const lootRange = inventory.weapons.length === 0 ? 4200 : 3000;
     const bestLoot = findBestBotLoot(bot, room, lootRange, now);
     if (nearest) chooseBotCombatWeapon(bot, nearestDist);
+    const nearestLineOfSight = nearest ? botHasLineOfSight(bot, nearest, room) : false;
+    const equippedWeapon = WEAPONS[bot.weapon?.type] || WEAPONS.fists;
+    const reserveAmmo = Number(inventory.ammoReserves[equippedWeapon.ammoType]) || 0;
+    const shouldTopUp = !equippedWeapon.melee
+        && !bot.weapon?.reloading
+        && reserveAmmo > 0
+        && Number(bot.weapon?.ammo) < Math.max(2, equippedWeapon.clipSize * 0.35)
+        && (!nearest || nearestDist > 560 || !nearestLineOfSight);
+    if (shouldTopUp) beginSurvivReload(bot, now);
     const melee = !!WEAPONS[bot.weapon?.type]?.melee;
     const shouldFight = nearest && nearestDist < 1100 && (!melee || !bestLoot || nearestDist < 260);
     if (shouldFight) {
@@ -8501,17 +8701,30 @@ function updateBotAI(bot, room, now, effectiveRadius) {
         const aimY = nearest.y + (nearest.inputDy || 0) * SURVIV.playerSpeed * leadTicks * 0.65;
         const combatWaypoint = getBotLootWaypoint(bot, nearest, room);
         const direction = getBotNavigationDirection(bot, room, combatWaypoint, now);
-        const hasLineOfSight = botHasLineOfSight(bot, nearest, room);
-        if (nearestDist > profile.preferredMax) {
+        const hasLineOfSight = nearestLineOfSight;
+        if (!hasLineOfSight) {
+            bot.inputDx = direction.dx;
+            bot.inputDy = direction.dy;
+        } else if (weaponDef.melee && nearestDist > profile.preferredMax) {
+            bot.inputDx = direction.dx;
+            bot.inputDy = direction.dy;
+        } else if (bot.weapon?.reloading) {
+            bot.inputDx = -direction.dx * 0.72 - direction.dy * 0.48 * bot.botStrafeDirection;
+            bot.inputDy = -direction.dy * 0.72 + direction.dx * 0.48 * bot.botStrafeDirection;
+        } else if (nearestDist > profile.preferredMax) {
             bot.inputDx = direction.dx;
             bot.inputDy = direction.dy;
         } else if (nearestDist < profile.preferredMin) {
             bot.inputDx = -direction.dx * (melee ? 0.15 : 0.9);
             bot.inputDy = -direction.dy * (melee ? 0.15 : 0.9);
         } else {
-            const strafeSide = Math.sin(now / 420 + bot.id.length) >= 0 ? 1 : -1;
-            bot.inputDx = -direction.dy * 0.72 * strafeSide;
-            bot.inputDy = direction.dx * 0.72 * strafeSide;
+            if (now >= bot.botStrafeSwitchAt) {
+                bot.botStrafeDirection *= -1;
+                bot.botStrafeSwitchAt = now + 650 + Math.random() * 900;
+            }
+            const weave = 0.58 + Math.sin(now / 360 + bot.botCombatPhase) * 0.16;
+            bot.inputDx = -direction.dy * weave * bot.botStrafeDirection + direction.dx * 0.18;
+            bot.inputDy = direction.dx * weave * bot.botStrafeDirection + direction.dy * 0.18;
         }
         bot.aimAngle = Math.atan2(aimY - bot.y, aimX - bot.x);
         bot.shooting = hasLineOfSight && nearestDist <= profile.fireRange;
@@ -8627,7 +8840,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
 
 
     if (entity.isBot) {
-        updateBotAI(entity, room, now, effectiveRadius);
+        updateBotAI(entity, room, now, effectiveRadius, zone);
     }
 
     const activeWeaponDef = WEAPONS[entity.weapon?.type] || WEAPONS.fists;

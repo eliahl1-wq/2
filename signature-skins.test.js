@@ -4,7 +4,7 @@ import { resolveSignatureSkin, presentSkinEntitlement, signatureEntitlementSkinI
 import { SkinEntitlement, SkinPurchase } from './agar-commerce-models.js';
 
 test('new skins enforce ownership from either payload field and remain mode-exclusive', async () => {
-    for (const [id, mode] of [['prism', 'agar'], ['leviathan', 'slither'], ['farmer', 'surviv']]) {
+    for (const [id, mode] of [['farmer', 'surviv']]) {
         for (const field of ['skinId', 'skinColor']) {
             const request = { mode, [field]: id };
             await assert.rejects(resolveSignatureSkin({ ...request, hasAccess: async () => false }), /unlocked/);
@@ -14,7 +14,9 @@ test('new skins enforce ownership from either payload field and remain mode-excl
             }
         }
     }
-    assert.equal(await resolveSignatureSkin({ mode: 'competitive-slither', skinColor: 'leviathan', hasAccess: async () => true }), 'leviathan');
+    for (const id of ['prism', 'leviathan']) for (const field of ['skinId', 'skinColor']) {
+        assert.equal(await resolveSignatureSkin({ mode: 'competitive-slither', [field]: id, hasAccess: async () => true }), '#c080ff');
+    }
     await assert.rejects(resolveSignatureSkin({ mode: 'agar', skinId: 'prism', skinColor: 'warden' }), /Conflicting/);
     assert.equal(await resolveSignatureSkin({ mode: 'surviv', skinColor: '#80d0d0' }), null);
 });

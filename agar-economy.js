@@ -25,7 +25,9 @@ export function splitAtomicAmount(totalAtomic, treasuryBps = 9000, ownerBps = 10
     };
 }
 
-export const AGAR_SHOP_PRODUCTS = Object.freeze([
+// Keep definitions for a future return; hidden products cannot be quoted or bought.
+export const isHiddenShopSkin = value => ['prism', 'agar:prism', 'leviathan', 'slither:leviathan'].includes(value);
+const ALL_SHOP_PRODUCTS = Object.freeze([
     Object.freeze({ id: 'agar:prism', gameMode: 'agar', skinId: 'prism', name: 'Prism Core', usdPrice: 2 }),
     Object.freeze({ id: 'slither:leviathan', gameMode: 'slither', skinId: 'leviathan', name: 'Leviathan', usdPrice: 2 }),
     Object.freeze({ id: 'surviv:farmer', gameMode: 'surviv', skinId: 'farmer', name: 'Farmer', usdPrice: 2 }),
@@ -69,3 +71,5 @@ export const AGAR_SHOP_PRODUCTS = Object.freeze([
 export function getAgarShopProduct(productId) {
     return AGAR_SHOP_PRODUCTS.find((product) => product.id === productId) || null;
 }
+
+export const AGAR_SHOP_PRODUCTS = Object.freeze(ALL_SHOP_PRODUCTS.filter(product => !isHiddenShopSkin(product.id)));

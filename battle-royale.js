@@ -1353,7 +1353,7 @@ export function setupBattleRoyale(io, deps) {
                     socket.emit('error', 'Invalid battle royale variant.');
                     return;
                 }
-                const entryFeeUsd = normalizeBREntryFee(rawEntryFee);
+                let entryFeeUsd = normalizeBREntryFee(rawEntryFee);
                 const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
                 if (pendingQueueJoins.has(String(decoded.id))) return;
                 joiningId = String(decoded.id);
@@ -1381,6 +1381,7 @@ export function setupBattleRoyale(io, deps) {
                     || (variant === 'surviv' && publicFreeMode === true);
                 const signatureSkin = await resolveSignatureSkin({ mode: variant, skinId, skinColor, hasAccess: (gameMode, id) => deps.hasSkinEntitlement?.(user, gameMode, id) });
                 const freePlay = !!deps.DEV_FREE_PLAY || personalFreePlay;
+                if (variant === 'surviv' && freePlay) entryFeeUsd = 10;
 
                 if (mongoToMatch.has(user._id.toString())) {
                     socket.emit('error', 'You are already in a battle royale match.');
