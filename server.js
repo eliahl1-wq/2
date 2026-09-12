@@ -5088,9 +5088,17 @@ app.post('/api/admin/users/:userId/convert-token-to-sol', authenticateAdmin, sen
         if (!process.env.JUPITER_API_KEY) return res.status(503).json({ message: 'JUPITER_API_KEY is not configured.' });
         locked = await acquireWalletOperation(userId, 'admin_token_conversion', operationId);
         if (!locked) return res.status(409).json({ message: 'Another wallet operation is already processing.' });
-        const user = await User.findById(userId).select('+depositSecret depositAddress username balance visualBalanceOverrideUsd');
-        if (!user?.depositAddress || !user.depositSecret) return res.status(409).json({ message: 'The account wallet is unavailable.' });
-        const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
+        const user = await User.findById(userId).select('depositSecret depositAddress username balance visualBalanceOverrideUsd');
+        if (!user) return res.status(404).json({ message: 'User not found.' });
+        if (!user.depositAddress) return res.status(409).json({ message: 'The account has no deposit wallet address.' });
+        if (!user.depositSecret) return res.status(409).json({ message: `Wallet ${user.depositAddress} has no recoverable signing key. It was not replaced because it may contain funds.` });
+        let secretKey;
+        try {
+            secretKey = decryptWalletSecret(user.depositSecret);
+        } catch (error) {
+            throw Object.assign(new Error(`The wallet signing key could not be decrypted: ${error.message}`), { status: 409 });
+        }
+        const keypair = solanaWeb3.Keypair.fromSecretKey(secretKey);
         if (keypair.publicKey.toBase58() !== user.depositAddress) throw new Error('The account wallet key does not match its address.');
 
         const tokenResponses = await Promise.all([
