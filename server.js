@@ -118,7 +118,7 @@ import {
     calculateTournamentPrizes,
     serializeTournament,
 } from './tournament-system.js';
-import { calculateAffordableSolanaPayout, calculateCashoutMoney, microsToUsd } from './affiliate-money.js';
+import { calculateAffordableSolanaPayout, calculateCashoutMoney, microsToUsd, usdToMicros } from './affiliate-money.js';
 import {
     AffiliatePayout,
     activateAffiliateProfile,
@@ -5484,6 +5484,132 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
     } catch (err) {
         console.error('Admin user detail error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.patch('/api/admin/rewards/self', authenticateAdmin, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const user = await User.findById(req.adminUser._id);
+        if (!user) return res.status(404).json({ message: 'Admin account not found.' });
+        if (user.rewardClaimInProgress || user.tournamentRewardClaimInProgress) {
+            return res.status(409).json({ message: 'Wait for the active reward claim to finish before editing reward state.' });
+        }
+
+        const numberValue = (key, fallback, { max = 1_000_000, integer = false } = {}) => {
+            if (body[key] == null || body[key] === '') return fallback;
+            const value = Number(body[key]);
+            if (!Number.isFinite(value) || value < 0 || value > max || (integer && !Number.isInteger(value))) {
+                const error = new Error(`${key} must be ${integer ? 'a whole number' : 'a number'} between 0 and ${max}.`);
+                error.status = 400;
+                throw error;
+            }
+            return value;
+        };
+
+        const completedFiveDollarNormalGames = numberValue(
+            'completedFiveDollarGames',
+            Number(user.completedFiveDollarNormalGames) || 0,
+            { max: 10_000, integer: true },
+        );
+        const completedTenDollarNormalGames = numberValue(
+            'completedTenDollarGames',
+            Number(user.completedTenDollarNormalGames) || 0,
+            { max: 10_000, integer: true },
+        );
+        const sponsoredRewardsBalance = numberValue('starterBalanceUsd', Number(user.sponsoredRewardsBalance) || 0);
+        const fundedRewardsUsd = numberValue('fundedRewardsUsd', Number(user.fundedRewardsUsd) || 0);
+        const permanentProgressUsd = numberValue(
+            'permanentProgressUsd',
+            microsToUsd(Number(user.permanentRewardProgressVolumeUsdMicros) || 0),
+            { max: 49.999999 },
+        );
+        const permanentBalanceUsd = numberValue(
+            'permanentBalanceUsd',
+            microsToUsd(Number(user.permanentRewardsBalanceUsdMicros) || 0),
+        );
+        const permanentCyclesCompleted = numberValue(
+            'permanentCyclesCompleted',
+            Number(user.permanentRewardCyclesCompleted) || 0,
+            { max: 100_000, integer: true },
+        );
+        const retainedBalanceUsd = numberValue('retainedBalanceUsd', Number(user.rentFallbackBalanceUsd) || 0);
+        const tournamentBalanceUsd = numberValue('tournamentBalanceUsd', Number(user.tournamentRewardsBalance) || 0);
+        const ticketState = String(body.ticketState || 'locked');
+        if (!['locked', 'ready', 'used'].includes(ticketState)) {
+            return res.status(400).json({ message: 'Invalid free ticket state.' });
+        }
+
+        const starterRequirements = getStarterRewardFundingRequirements(sponsoredRewardsBalance);
+        const starterRequirementsMet = completedFiveDollarNormalGames >= starterRequirements.req5
+            && completedTenDollarNormalGames >= starterRequirements.req10;
+        const sponsoredRewardsUnlocked = body.starterUnlocked === true || starterRequirementsMet;
+        const before = {
+            completedFiveDollarGames: user.completedFiveDollarNormalGames,
+            completedTenDollarGames: user.completedTenDollarNormalGames,
+            starterBalanceUsd: user.sponsoredRewardsBalance,
+            permanentProgressUsd: microsToUsd(Number(user.permanentRewardProgressVolumeUsdMicros) || 0),
+            permanentBalanceUsd: microsToUsd(Number(user.permanentRewardsBalanceUsdMicros) || 0),
+            permanentCyclesCompleted: user.permanentRewardCyclesCompleted,
+            retainedBalanceUsd: user.rentFallbackBalanceUsd,
+            tournamentBalanceUsd: user.tournamentRewardsBalance,
+        };
+
+        user.completedFiveDollarNormalGames = completedFiveDollarNormalGames;
+        user.completedTenDollarNormalGames = completedTenDollarNormalGames;
+        user.sponsoredRewardsBalance = sponsoredRewardsBalance;
+        user.fundedRewardsUsd = fundedRewardsUsd;
+        user.sponsoredRewardsUnlocked = sponsoredRewardsUnlocked;
+        user.sponsoredRewardsCompleted = sponsoredRewardsUnlocked;
+        user.permanentRewardModelVersion = 4;
+        user.permanentRewardProgressVolumeUsdMicros = usdToMicros(permanentProgressUsd);
+        user.permanentRewardProgressEarnedUsdMicros = usdToMicros(permanentProgressUsd * 0.04);
+        user.permanentRewardsBalanceUsdMicros = usdToMicros(permanentBalanceUsd);
+        user.permanentRewardCyclesCompleted = permanentCyclesCompleted;
+        user.rentFallbackBalanceUsd = retainedBalanceUsd;
+        user.tournamentRewardsBalance = tournamentBalanceUsd;
+        user.tournamentRewardsLamports = Math.floor((tournamentBalanceUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+        user.hasFreeTicket = ticketState === 'ready';
+        user.freeTicketUsed = ticketState === 'used';
+        user.freeTicketChallengeCompleted = ticketState !== 'locked';
+        user.freeTicketChallengeCompletedAt = ticketState !== 'locked' ? (user.freeTicketChallengeCompletedAt || new Date()) : null;
+        user.freeTicketChallengeCheckedAt = new Date();
+        await user.save();
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'game',
+            amount: 0,
+            currency: 'USD',
+            status: 'confirmed',
+            excludedFromReports: true,
+            meta: {
+                event: 'admin_reward_adjustment',
+                simulated: true,
+                before,
+                after: {
+                    completedFiveDollarGames: completedFiveDollarNormalGames,
+                    completedTenDollarGames: completedTenDollarNormalGames,
+                    starterBalanceUsd: sponsoredRewardsBalance,
+                    permanentProgressUsd,
+                    permanentBalanceUsd,
+                    permanentCyclesCompleted,
+                    retainedBalanceUsd,
+                    tournamentBalanceUsd,
+                    ticketState,
+                    starterUnlocked: sponsoredRewardsUnlocked,
+                },
+            },
+        });
+
+        return res.json({
+            success: true,
+            message: 'Admin reward values updated.',
+            rewards: serializePermanentRewards(user),
+        });
+    } catch (err) {
+        console.error('Admin self reward update error:', err);
+        return res.status(err.status || 500).json({ message: err.message || 'Could not update reward values.' });
     }
 });
 
