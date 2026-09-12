@@ -460,6 +460,9 @@ const BugReportSchema = new mongoose.Schema({
     gamemode: { type: String, default: '', trim: true, maxlength: 80 },
     status: { type: String, enum: ['open', 'resolved'], default: 'open', index: true },
     resolvedAt: { type: Date, default: null },
+    resolutionMessage: { type: String, default: '', trim: true, maxlength: 1000 },
+    resolvedNotificationAt: { type: Date, default: null },
+    resolvedNotificationReadAt: { type: Date, default: null },
 }, { timestamps: true });
 
 BugReportSchema.index({ status: 1, createdAt: -1 });
@@ -2663,6 +2666,55 @@ app.post('/api/bug-reports', sensitiveRateLimit({ limit: 5, windowMs: 10 * 60_00
     }
 });
 
+app.get('/api/bug-reports/resolved-notifications', authenticateToken, async (req, res) => {
+    try {
+        const reports = await BugReport.find({
+            userId: req.user.id,
+            status: 'resolved',
+            resolvedNotificationAt: { $ne: null },
+            resolvedNotificationReadAt: null,
+        })
+            .sort({ resolvedNotificationAt: 1 })
+            .limit(20)
+            .select('_id message page gamemode resolvedAt resolutionMessage resolvedNotificationAt')
+            .lean();
+        return res.json({
+            notifications: reports.map(report => ({
+                id: report._id,
+                message: report.message,
+                page: report.page,
+                gamemode: report.gamemode,
+                resolvedAt: report.resolvedAt,
+                resolutionMessage: report.resolutionMessage || '',
+            })),
+        });
+    } catch (err) {
+        console.error('Load resolved bug notifications error:', err);
+        return res.status(500).json({ message: 'Could not load bug report notifications.' });
+    }
+});
+
+app.post('/api/bug-reports/:reportId/resolution-read', authenticateToken, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.reportId)) return res.status(400).json({ message: 'Invalid bug report id.' });
+        const report = await BugReport.findOneAndUpdate(
+            {
+                _id: req.params.reportId,
+                userId: req.user.id,
+                status: 'resolved',
+                resolvedNotificationAt: { $ne: null },
+            },
+            { $set: { resolvedNotificationReadAt: new Date() } },
+            { new: true },
+        ).select('_id').lean();
+        if (!report) return res.status(404).json({ message: 'Bug report notification not found.' });
+        return res.json({ success: true });
+    } catch (err) {
+        console.error('Read bug notification error:', err);
+        return res.status(500).json({ message: 'Could not dismiss the notification.' });
+    }
+});
+
 app.get('/api/affiliate/dashboard', authenticateToken, async (req, res) => {
     try {
         const user = await User.findById(req.user.id);
@@ -4431,12 +4483,28 @@ app.patch('/api/admin/bug-reports/:reportId', authenticateAdmin, async (req, res
     try {
         const status = String(req.body?.status || '');
         if (!['open', 'resolved'].includes(status)) return res.status(400).json({ message: 'Invalid bug report status.' });
-        const report = await BugReport.findByIdAndUpdate(
-            req.params.reportId,
-            { $set: { status, resolvedAt: status === 'resolved' ? new Date() : null } },
-            { new: true },
-        ).lean();
-        if (!report) return res.status(404).json({ message: 'Bug report not found.' });
+        const existing = await BugReport.findById(req.params.reportId).select('status');
+        if (!existing) return res.status(404).json({ message: 'Bug report not found.' });
+        const newlyResolved = status === 'resolved' && existing.status !== 'resolved';
+        const resolutionMessage = String(req.body?.resolutionMessage || '').trim().slice(0, 1000);
+        const update = status === 'resolved'
+            ? {
+                status,
+                ...(newlyResolved ? {
+                    resolvedAt: new Date(),
+                    resolutionMessage,
+                    resolvedNotificationAt: new Date(),
+                    resolvedNotificationReadAt: null,
+                } : resolutionMessage ? { resolutionMessage } : {}),
+            }
+            : {
+                status,
+                resolvedAt: null,
+                resolutionMessage: '',
+                resolvedNotificationAt: null,
+                resolvedNotificationReadAt: null,
+            };
+        const report = await BugReport.findByIdAndUpdate(req.params.reportId, { $set: update }, { new: true }).lean();
         return res.json({ report });
     } catch (err) {
         console.error('Update bug report error:', err);
@@ -4957,6 +5025,81 @@ app.put('/api/admin/users/:userId/visual-balance', authenticateAdmin, async (req
     } catch (err) {
         console.error('Admin visual balance error:', err);
         res.status(500).json({ message: err.message || 'Could not update visual balance' });
+    }
+});
+
+app.post('/api/admin/users/:userId/refresh-balance', authenticateAdmin, sensitiveRateLimit({ limit: 30, windowMs: 60 * 60_000 }), async (req, res) => {
+    try {
+        const { userId } = req.params;
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        if (isUserJoining(userId) || processingCashouts.has(userId) || findPlayerInArena(userId) || getBRMatchForMongo(userId)) {
+            return res.status(409).json({ message: 'The account is joining, playing, or cashing out. Refresh it after the wallet operation has finished.' });
+        }
+        const user = await User.findById(userId);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+        if (!user.depositAddress) return res.status(409).json({ message: 'This account has no deposit wallet.' });
+
+        let pubKey;
+        try {
+            pubKey = new solanaWeb3.PublicKey(user.depositAddress);
+        } catch {
+            return res.status(409).json({ message: 'The account deposit wallet is invalid.' });
+        }
+
+        const previousBalanceSol = Number(user.balance) || 0;
+        let lamports;
+        let rpcSource = 'primary';
+        try {
+            const state = await getBalanceStateWithFallback(pubKey, { force: true });
+            lamports = state.lamports;
+        } catch (primaryError) {
+            try {
+                lamports = await fallbackRpcConnection.getBalance(pubKey, 'confirmed');
+                rpcSource = 'public fallback';
+                balanceReader.invalidate(pubKey);
+            } catch {
+                throw primaryError;
+            }
+        }
+
+        const balanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+        user.balance = balanceSol;
+        // The purpose of this action is to restore the real wallet value shown
+        // to the player, so any UI-only override must not hide the fresh result.
+        user.visualBalanceOverrideUsd = null;
+        await user.save();
+        if (balanceSol > previousBalanceSol + 0.000000001) queueRecentDepositSourceCapture(user, pubKey);
+
+        await Transaction.create({
+            userId: user._id,
+            type: 'game',
+            amount: 0,
+            status: 'confirmed',
+            meta: {
+                event: 'admin_action',
+                action: 'force_balance_refresh',
+                adminActorId: String(req.adminUser._id),
+                previousBalanceSol,
+                refreshedBalanceSol: balanceSol,
+                rpcSource,
+            },
+        }).catch(error => console.error('Admin balance refresh audit write failed:', error.message));
+
+        const balanceUsd = balanceSol * SOL_PRICE_USD;
+        return res.json({
+            success: true,
+            userId: user._id,
+            balanceSol: Number(balanceSol.toFixed(9)),
+            balanceUsd: Number(balanceUsd.toFixed(8)),
+            displayBalanceUsd: Number(balanceUsd.toFixed(2)),
+            visualBalanceOverrideUsd: null,
+            solPrice: SOL_PRICE_USD,
+            rpcSource,
+            message: `Real on-chain balance refreshed for ${user.username}.`,
+        });
+    } catch (err) {
+        console.error('Admin balance refresh error:', err);
+        return res.status(502).json({ message: `Could not read the real wallet balance: ${err.message || 'RPC unavailable'}` });
     }
 });
 
