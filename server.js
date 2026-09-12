@@ -11,6 +11,7 @@ import 'dotenv/config';
 import * as util from './utils.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import passport from 'passport';
 import { randomBytes } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
@@ -148,6 +149,7 @@ import {
 } from './affiliate-system.js';
 import { getAffiliatePublicConfig } from './affiliate-config.js';
 import { createAgarCommerceService } from './agar-commerce-service.js';
+import { acquireWalletOperation, releaseWalletOperation } from './agar-commerce-models.js';
 import { createCachedBalanceReader } from './solana-rpc-cache.js';
 import { isQualifyingFreeTicketCompletion } from './free-ticket-challenge.js';
 import { getStarterRewardFundingRequirements } from './free-ticket-funding.js';
@@ -5028,78 +5030,121 @@ app.put('/api/admin/users/:userId/visual-balance', authenticateAdmin, async (req
     }
 });
 
-app.post('/api/admin/users/:userId/refresh-balance', authenticateAdmin, sensitiveRateLimit({ limit: 30, windowMs: 60 * 60_000 }), async (req, res) => {
+app.get('/api/admin/users/:userId/token-balances', authenticateAdmin, sensitiveRateLimit({ limit: 30, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
         const { userId } = req.params;
         if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
-        if (isUserJoining(userId) || processingCashouts.has(userId) || findPlayerInArena(userId) || getBRMatchForMongo(userId)) {
-            return res.status(409).json({ message: 'The account is joining, playing, or cashing out. Refresh it after the wallet operation has finished.' });
-        }
-        const user = await User.findById(userId);
+        const user = await User.findById(userId).select('depositAddress username');
         if (!user) return res.status(404).json({ message: 'User not found' });
         if (!user.depositAddress) return res.status(409).json({ message: 'This account has no deposit wallet.' });
-
-        let pubKey;
-        try {
-            pubKey = new solanaWeb3.PublicKey(user.depositAddress);
-        } catch {
-            return res.status(409).json({ message: 'The account deposit wallet is invalid.' });
-        }
-
-        const previousBalanceSol = Number(user.balance) || 0;
-        let lamports;
-        let rpcSource = 'primary';
-        try {
-            const state = await getBalanceStateWithFallback(pubKey, { force: true });
-            lamports = state.lamports;
-        } catch (primaryError) {
-            try {
-                lamports = await fallbackRpcConnection.getBalance(pubKey, 'confirmed');
-                rpcSource = 'public fallback';
-                balanceReader.invalidate(pubKey);
-            } catch {
-                throw primaryError;
+        const owner = new solanaWeb3.PublicKey(user.depositAddress);
+        const responses = await Promise.all([
+            connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, 'confirmed'),
+            connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, 'confirmed'),
+        ]);
+        const balances = new Map();
+        for (const response of responses) {
+            for (const entry of response.value) {
+                const info = entry.account.data?.parsed?.info;
+                const amount = BigInt(info?.tokenAmount?.amount || '0');
+                if (amount <= 0n || !info?.mint) continue;
+                const current = balances.get(info.mint) || { mint: info.mint, amountAtomic: 0n, decimals: Number(info.tokenAmount.decimals) || 0, tokenAccounts: 0 };
+                current.amountAtomic += amount;
+                current.tokenAccounts += 1;
+                balances.set(info.mint, current);
             }
         }
+        const tokens = [...balances.values()].map(token => {
+            const scale = 10n ** BigInt(token.decimals);
+            const whole = token.amountAtomic / scale;
+            const fraction = (token.amountAtomic % scale).toString().padStart(token.decimals, '0').replace(/0+$/, '');
+            return {
+                ...token,
+                amountAtomic: token.amountAtomic.toString(),
+                amount: fraction ? `${whole}.${fraction}` : whole.toString(),
+                symbol: token.mint === process.env.AGAR_TOKEN_MINT?.trim() ? (process.env.AGAR_TOKEN_SYMBOL?.trim() || 'ARENA') : '',
+            };
+        });
+        return res.json({ walletAddress: user.depositAddress, tokens });
+    } catch (err) {
+        console.error('Admin token balance scan error:', err);
+        return res.status(502).json({ message: `Could not scan token balances: ${err.message || 'RPC unavailable'}` });
+    }
+});
 
+app.post('/api/admin/users/:userId/convert-token-to-sol', authenticateAdmin, sensitiveRateLimit({ limit: 20, windowMs: 60 * 60_000 }), async (req, res) => {
+    const { userId } = req.params;
+    const operationId = `admin-token-convert:${userId}:${Date.now()}`;
+    let locked = false;
+    try {
+        if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+        if (isUserJoining(userId) || processingCashouts.has(userId) || findPlayerInArena(userId) || getBRMatchForMongo(userId)) {
+            return res.status(409).json({ message: 'The account is joining, playing, or cashing out. Try again when it is idle.' });
+        }
+        const mint = String(req.body?.mint || '').trim();
+        let mintKey;
+        try { mintKey = new solanaWeb3.PublicKey(mint); } catch { return res.status(400).json({ message: 'Invalid token mint.' }); }
+        if (req.body?.confirmation !== `CONVERT ${mint}`) return res.status(400).json({ message: 'The exact token conversion confirmation does not match.' });
+        if (!process.env.JUPITER_API_KEY) return res.status(503).json({ message: 'JUPITER_API_KEY is not configured.' });
+        locked = await acquireWalletOperation(userId, 'admin_token_conversion', operationId);
+        if (!locked) return res.status(409).json({ message: 'Another wallet operation is already processing.' });
+        const user = await User.findById(userId).select('+depositSecret depositAddress username balance visualBalanceOverrideUsd');
+        if (!user?.depositAddress || !user.depositSecret) return res.status(409).json({ message: 'The account wallet is unavailable.' });
+        const keypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
+        if (keypair.publicKey.toBase58() !== user.depositAddress) throw new Error('The account wallet key does not match its address.');
+
+        const tokenResponses = await Promise.all([
+            connection.getParsedTokenAccountsByOwner(keypair.publicKey, { mint: mintKey }, 'confirmed'),
+        ]);
+        const tokenEntries = tokenResponses[0].value;
+        const amountAtomic = tokenEntries.reduce((sum, entry) => sum + BigInt(entry.account.data?.parsed?.info?.tokenAmount?.amount || '0'), 0n);
+        if (amountAtomic <= 0n) return res.status(409).json({ message: 'This wallet no longer holds that token.' });
+
+        const baseUrl = (process.env.JUPITER_SWAP_API_URL || 'https://api.jup.ag/swap/v2').replace(/\/$/, '');
+        const orderUrl = new URL(`${baseUrl}/order`);
+        orderUrl.searchParams.set('inputMint', mint);
+        orderUrl.searchParams.set('outputMint', 'So11111111111111111111111111111111111111112');
+        orderUrl.searchParams.set('amount', amountAtomic.toString());
+        orderUrl.searchParams.set('taker', user.depositAddress);
+        const orderResponse = await fetch(orderUrl, { headers: { 'x-api-key': process.env.JUPITER_API_KEY, Accept: 'application/json' } });
+        const order = await orderResponse.json().catch(() => ({}));
+        if (!orderResponse.ok || !order?.transaction || !order?.requestId) {
+            return res.status(409).json({ message: order?.error || order?.message || 'Jupiter has no route for this token.' });
+        }
+        const transaction = solanaWeb3.VersionedTransaction.deserialize(Buffer.from(order.transaction, 'base64'));
+        transaction.sign([keypair]);
+        const executeResponse = await fetch(`${baseUrl}/execute`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.JUPITER_API_KEY },
+            body: JSON.stringify({
+                signedTransaction: Buffer.from(transaction.serialize()).toString('base64'),
+                requestId: order.requestId,
+                ...(order.lastValidBlockHeight ? { lastValidBlockHeight: order.lastValidBlockHeight } : {}),
+            }),
+        });
+        const result = await executeResponse.json().catch(() => ({}));
+        if (!executeResponse.ok || result?.status !== 'Success' || !result?.signature) {
+            throw Object.assign(new Error(result?.error || result?.message || 'Jupiter conversion failed.'), { status: 502 });
+        }
+        const lamports = await connection.getBalance(keypair.publicKey, 'confirmed');
         const balanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
         user.balance = balanceSol;
-        // The purpose of this action is to restore the real wallet value shown
-        // to the player, so any UI-only override must not hide the fresh result.
         user.visualBalanceOverrideUsd = null;
         await user.save();
-        if (balanceSol > previousBalanceSol + 0.000000001) queueRecentDepositSourceCapture(user, pubKey);
-
+        balanceReader.invalidate(keypair.publicKey);
         await Transaction.create({
             userId: user._id,
             type: 'game',
             amount: 0,
             status: 'confirmed',
-            meta: {
-                event: 'admin_action',
-                action: 'force_balance_refresh',
-                adminActorId: String(req.adminUser._id),
-                previousBalanceSol,
-                refreshedBalanceSol: balanceSol,
-                rpcSource,
-            },
-        }).catch(error => console.error('Admin balance refresh audit write failed:', error.message));
-
-        const balanceUsd = balanceSol * SOL_PRICE_USD;
-        return res.json({
-            success: true,
-            userId: user._id,
-            balanceSol: Number(balanceSol.toFixed(9)),
-            balanceUsd: Number(balanceUsd.toFixed(8)),
-            displayBalanceUsd: Number(balanceUsd.toFixed(2)),
-            visualBalanceOverrideUsd: null,
-            solPrice: SOL_PRICE_USD,
-            rpcSource,
-            message: `Real on-chain balance refreshed for ${user.username}.`,
-        });
+            meta: { event: 'admin_action', action: 'token_converted_to_sol', mint, inputAmountAtomic: amountAtomic.toString(), outputAmountAtomic: String(result.outputAmountResult || result.totalOutputAmount || order.outAmount || ''), signature: result.signature, adminActorId: String(req.adminUser._id) },
+        }).catch(error => console.error('Admin token conversion audit write failed:', error.message));
+        return res.json({ success: true, signature: result.signature, balanceSol: Number(balanceSol.toFixed(9)), balanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(8)), displayBalanceUsd: Number((balanceSol * SOL_PRICE_USD).toFixed(2)), visualBalanceOverrideUsd: null, message: `Token converted to SOL for ${user.username}.` });
     } catch (err) {
-        console.error('Admin balance refresh error:', err);
-        return res.status(502).json({ message: `Could not read the real wallet balance: ${err.message || 'RPC unavailable'}` });
+        console.error('Admin token conversion error:', err);
+        return res.status(err.status || 500).json({ message: err.message || 'Token conversion failed.' });
+    } finally {
+        if (locked) await releaseWalletOperation(userId, operationId).catch(() => {});
     }
 });
 
