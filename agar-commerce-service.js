@@ -1,6 +1,7 @@
 import * as solanaWeb3 from '@solana/web3.js';
 import { canonicalSignatureSkinId, presentSkinEntitlement, signatureEntitlementSkinIds } from './signature-skins.js';
 import {
+    AccountLayout,
     ExtensionType,
     TOKEN_2022_PROGRAM_ID,
     TOKEN_PROGRAM_ID,
@@ -133,6 +134,7 @@ export function createAgarCommerceService({
     const agarBalanceCache = new Map();
     const agarBalanceInFlight = new Map();
     const agarBalanceCacheMs = Math.max(5_000, Number(process.env.AGAR_BALANCE_RPC_CACHE_MS || 30_000));
+    let adminOverviewStatsCache = null;
 
     async function hasAgarAccess(userId) {
         if (!config.adminOnly) return true;
@@ -259,6 +261,109 @@ export function createAgarCommerceService({
             ...tokenValue,
         };
     }
+
+    async function getAdminOverviewStats({ force = false } = {}) {
+        const now = Date.now();
+        if (!force && adminOverviewStatsCache && now - adminOverviewStatsCache.loadedAt < 60_000) {
+            return adminOverviewStatsCache.value;
+        }
+
+        const reportableUsers = {
+            excludedFromReports: { $ne: true },
+            isOwnerAccount: { $ne: true },
+        };
+        const confirmedBuyerIds = await SkinPurchase.distinct('userId', { status: 'confirmed' });
+        const [skinBuyerCount, accountRows] = await Promise.all([
+            confirmedBuyerIds.length > 0
+                ? User.countDocuments({ ...reportableUsers, _id: { $in: confirmedBuyerIds } })
+                : 0,
+            User.find({
+                ...reportableUsers,
+                depositAddress: { $type: 'string', $ne: '' },
+            }).select('depositAddress').lean(),
+        ]);
+
+        const stats = {
+            skinBuyerCount,
+            userTokenBalance: 0,
+            userTokenBalanceUsd: null,
+            tokenHolderCount: 0,
+            tokenPriceUsd: null,
+            tokenSymbol: config.symbol,
+        };
+
+        if (config.enabled && config.mint && accountRows.length > 0) {
+            try {
+                const context = await loadTokenContext();
+                const walletKeys = [];
+                const seenWallets = new Set();
+                for (const row of accountRows) {
+                    try {
+                        const wallet = publicKey(row.depositAddress, 'Account wallet');
+                        const address = wallet.toBase58();
+                        if (!seenWallets.has(address)) {
+                            seenWallets.add(address);
+                            walletKeys.push(wallet);
+                        }
+                    } catch {
+                        // Ignore malformed legacy account addresses in this aggregate only.
+                    }
+                }
+
+                const tokenAccounts = walletKeys.map((wallet) => getAssociatedTokenAddressSync(
+                    context.mint,
+                    wallet,
+                    false,
+                    context.tokenProgram,
+                ));
+                let totalAtomic = 0n;
+                let tokenHolderCount = 0;
+                for (let offset = 0; offset < tokenAccounts.length; offset += 100) {
+                    const accountInfos = await connection.getMultipleAccountsInfo(
+                        tokenAccounts.slice(offset, offset + 100),
+                        'confirmed',
+                    );
+                    for (const accountInfo of accountInfos) {
+                        if (!accountInfo || accountInfo.data.length < AccountLayout.span) continue;
+                        try {
+                            const decoded = AccountLayout.decode(accountInfo.data.subarray(0, AccountLayout.span));
+                            const amount = BigInt(decoded.amount.toString());
+                            totalAtomic += amount;
+                            if (amount > 0n) tokenHolderCount += 1;
+                        } catch {
+                            // A malformed or unsupported token account should not break the admin overview.
+                        }
+                    }
+                }
+
+                const userTokenBalance = Number(atomicToDecimal(
+                    totalAtomic,
+                    context.mintInfo.decimals,
+                    context.mintInfo.decimals,
+                ));
+                stats.userTokenBalance = Number.isFinite(userTokenBalance) ? userTokenBalance : 0;
+                stats.tokenHolderCount = tokenHolderCount;
+
+                try {
+                    const market = await fetchAgarMarketPrice({
+                        mint: config.mint,
+                        symbol: config.symbol,
+                        decimals: context.mintInfo.decimals,
+                    });
+                    stats.tokenPriceUsd = market.priceUsd;
+                    stats.userTokenBalanceUsd = Number((stats.userTokenBalance * market.priceUsd).toFixed(2));
+                } catch (error) {
+                    console.warn(`[${config.symbol} admin holdings price]`, error.message);
+                }
+            } catch (error) {
+                console.warn(`[${config.symbol} admin holdings]`, error.message);
+            }
+        }
+
+        adminOverviewStatsCache = { loadedAt: now, value: stats };
+        return stats;
+    }
+
     async function grantEntitlement(purchase) {
         const entitlement = await SkinEntitlement.findOneAndUpdate(
             {
@@ -282,6 +387,7 @@ export function createAgarCommerceService({
                 error: '',
             },
         });
+        adminOverviewStatsCache = null;
         return entitlement;
     }
 
@@ -820,5 +926,6 @@ export function createAgarCommerceService({
         listInventory,
         hasSkinEntitlement,
         loadTokenContext,
+        getAdminOverviewStats,
     };
 }

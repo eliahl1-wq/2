@@ -4452,7 +4452,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             status: 'confirmed',
             'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'] },
         });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, ownerAccountAgg, rewardPoolState] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, ownerAccountAgg, rewardPoolState, commerceStats] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -4497,6 +4497,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                 }
             ]),
             RewardPoolState.findOne({ key: 'global' }).lean(),
+            agarCommerce.getAdminOverviewStats(),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -4539,6 +4540,12 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             completedBeginnerChallenges: userBalanceAgg[0]?.completedBeginnerChallenges ?? 0,
             unusedFreeTickets: userBalanceAgg[0]?.unusedFreeTickets ?? 0,
             usedFreeTickets: userBalanceAgg[0]?.usedFreeTickets ?? 0,
+            skinBuyerCount: commerceStats.skinBuyerCount,
+            userTokenBalance: commerceStats.userTokenBalance,
+            userTokenBalanceUsd: commerceStats.userTokenBalanceUsd,
+            tokenHolderCount: commerceStats.tokenHolderCount,
+            tokenPriceUsd: commerceStats.tokenPriceUsd,
+            tokenSymbol: commerceStats.tokenSymbol,
             excludedTxCount,
             excludedUsersCount,
             solPrice: SOL_PRICE_USD,
@@ -4548,6 +4555,16 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
         res.status(500).json({ error: err.message });
     }
 });
+
+function getAdminArenaPlayType(player, room) {
+    const freePlay = DEV_FREE_PLAY
+        || player?.personalFreePlay === true
+        || room?.personalFreePlay === true
+        || room?.isSandbox === true;
+    if (freePlay) return { freePlay: true, playType: 'free-play' };
+    if (room?.isFreeTicketRoom === true) return { freePlay: false, playType: 'free-ticket' };
+    return { freePlay: false, playType: 'real-money' };
+}
 
 app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res) => {
     try {
@@ -4572,7 +4589,14 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                     const id = p.mongoId.toString();
                     if (!inGameUserIds.has(id)) {
                         inGameUserIds.add(id);
-                        inGameUsernames.push({ id, username: p.username, mode: room.mode || 'agar', entryFeeUsd: room.entryFeeUsd, isBot: false });
+                        inGameUsernames.push({
+                            id,
+                            username: p.username,
+                            mode: room.mode || 'agar',
+                            entryFeeUsd: room.entryFeeUsd,
+                            isBot: false,
+                            ...getAdminArenaPlayType(p, room),
+                        });
                     }
                 }
             }
@@ -4624,6 +4648,7 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                             mode: 'competitive-slither',
                             entryFeeUsd: room.entryFeeUsd,
                             isBot: false,
+                            ...getAdminArenaPlayType(p, room),
                         });
                     }
                 }
@@ -4665,6 +4690,28 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
                             mode: `br-${room.variant}`,
                             entryFeeUsd: room.entryFeeUsd,
                             isBot: false,
+                            ...getAdminArenaPlayType(p, room),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Surviv rooms
+        for (const room of survivRooms) {
+            for (const p of room.players) {
+                if (p.isBot) continue;
+                if (p.mongoId) {
+                    const id = p.mongoId.toString();
+                    if (!inGameUserIds.has(id)) {
+                        inGameUserIds.add(id);
+                        inGameUsernames.push({
+                            id,
+                            username: p.username,
+                            mode: 'surviv',
+                            entryFeeUsd: room.entryFeeUsd,
+                            isBot: false,
+                            ...getAdminArenaPlayType(p, room),
                         });
                     }
                 }
@@ -5627,8 +5674,9 @@ app.get('/api/admin/dashboard/live-feed', authenticateAdmin, async (req, res) =>
                             players.push({
                                 id: p.mongoId.toString(),
                                 username: p.username,
-                                mode: p.mode || 'agar',
+                                mode: room.mode || p.mode || 'agar',
                                 entryFeeUsd: room.entryFeeUsd,
+                                ...getAdminArenaPlayType(p, room),
                             });
                         }
                     }
@@ -5641,6 +5689,34 @@ app.get('/api/admin/dashboard/live-feed', authenticateAdmin, async (req, res) =>
                                 username: p.username,
                                 mode: 'competitive-slither',
                                 entryFeeUsd: room.entryFeeUsd,
+                                ...getAdminArenaPlayType(p, room),
+                            });
+                        }
+                    }
+                }
+                for (const room of survivRooms) {
+                    for (const p of room.players) {
+                        if (!p.isBot && p.mongoId) {
+                            players.push({
+                                id: p.mongoId.toString(),
+                                username: p.username,
+                                mode: 'surviv',
+                                entryFeeUsd: room.entryFeeUsd,
+                                ...getAdminArenaPlayType(p, room),
+                            });
+                        }
+                    }
+                }
+                const brMatches = typeof getActiveBRMatchesRaw === 'function' ? getActiveBRMatchesRaw() : [];
+                for (const room of brMatches) {
+                    for (const p of room.players) {
+                        if (!p.isBot && p.mongoId) {
+                            players.push({
+                                id: p.mongoId.toString(),
+                                username: p.username,
+                                mode: `br-${room.variant}`,
+                                entryFeeUsd: room.entryFeeUsd,
+                                ...getAdminArenaPlayType(p, room),
                             });
                         }
                     }
