@@ -4626,6 +4626,165 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
     }
 });
 
+app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
+    try {
+        const users = await User.find({}).select([
+            'username', 'email', 'excludedFromReports', 'isOwnerAccount',
+            'rewardsDisabled', 'rewardsDisabledReason',
+            'hasFreeTicket', 'freeTicketUsed', 'freeTicketChallengeCompleted',
+            'completedFiveDollarNormalGames', 'completedTenDollarNormalGames',
+            'sponsoredRewardsCompleted', 'sponsoredRewardsUnlocked',
+            'sponsoredRewardsBalance', 'fundedRewardsUsd',
+            'permanentRewardProgressVolumeUsdMicros', 'permanentRewardProgressEarnedUsdMicros',
+            'permanentRewardsBalanceUsdMicros', 'permanentRewardLifetimeVolumeUsdMicros',
+            'permanentRewardLifetimeEarnedUsdMicros', 'permanentRewardCyclesCompleted',
+            'rentFallbackBalanceUsd', 'rewardClaimInProgress', 'rewardClaimReservedUsd',
+            'tournamentRewardsBalance', 'tournamentRewardClaimInProgress', 'tournamentRewardClaimReservedUsd',
+            'lastActiveAt',
+        ].join(' ')).lean();
+
+        const owners = users.map(user => {
+            const permanentRewards = serializePermanentRewards(user);
+            const starterUsd = Number(user.sponsoredRewardsBalance) || 0;
+            const permanentUsd = (Number(user.permanentRewardsBalanceUsdMicros) || 0) / 1_000_000;
+            const permanentProgressUsd = (Number(user.permanentRewardProgressEarnedUsdMicros) || 0) / 1_000_000;
+            const permanentProgressVolumeUsd = (Number(user.permanentRewardProgressVolumeUsdMicros) || 0) / 1_000_000;
+            const retainedUsd = Number(user.rentFallbackBalanceUsd) || 0;
+            const reservedUsd = Number(user.rewardClaimReservedUsd) || 0;
+            const tournamentUsd = Number(user.tournamentRewardsBalance) || 0;
+            const tournamentReservedUsd = Number(user.tournamentRewardClaimReservedUsd) || 0;
+            const requirements = getStarterRewardFundingRequirements(starterUsd);
+            const rewardWalletUsd = starterUsd + permanentUsd + permanentProgressUsd + retainedUsd + reservedUsd;
+            const otherRewardsUsd = tournamentUsd + tournamentReservedUsd;
+            const reasons = [];
+            if (starterUsd > 0) reasons.push({ key: 'starter', label: 'Starter challenge', amountUsd: starterUsd });
+            if (permanentUsd > 0) reasons.push({ key: 'permanent', label: 'Permanent rewards', amountUsd: permanentUsd });
+            if (permanentProgressUsd > 0) reasons.push({ key: 'progress', label: 'Permanent progress reserve', amountUsd: permanentProgressUsd });
+            if (retainedUsd > 0) reasons.push({ key: 'retained', label: 'Retained cashout', amountUsd: retainedUsd });
+            if (reservedUsd > 0) reasons.push({ key: 'reserved', label: 'Claim reserved', amountUsd: reservedUsd });
+            if (tournamentUsd > 0 || tournamentReservedUsd > 0) reasons.push({ key: 'tournament', label: 'Tournament wallet', amountUsd: otherRewardsUsd });
+
+            return {
+                id: user._id,
+                username: user.username,
+                email: user.email || null,
+                excludedFromReports: !!user.excludedFromReports,
+                isOwnerAccount: !!user.isOwnerAccount,
+                rewardsDisabled: !!user.rewardsDisabled,
+                rewardsDisabledReason: user.rewardsDisabledReason || '',
+                lastActiveAt: user.lastActiveAt || null,
+                rewardWalletUsd: Number(rewardWalletUsd.toFixed(6)),
+                otherRewardsUsd: Number(otherRewardsUsd.toFixed(6)),
+                totalRewardsUsd: Number((rewardWalletUsd + otherRewardsUsd).toFixed(6)),
+                breakdown: {
+                    starterUsd: Number(starterUsd.toFixed(6)),
+                    starterFundedUsd: Number((Number(user.fundedRewardsUsd) || 0).toFixed(6)),
+                    permanentUsd: Number(permanentUsd.toFixed(6)),
+                    permanentProgressUsd: Number(permanentProgressUsd.toFixed(6)),
+                    permanentProgressVolumeUsd: Number(permanentProgressVolumeUsd.toFixed(6)),
+                    permanentCycleVolumeUsd: Number(permanentRewards.cycleVolumeUsd) || 50,
+                    permanentLifetimeVolumeUsd: Number(((Number(user.permanentRewardLifetimeVolumeUsdMicros) || 0) / 1_000_000).toFixed(6)),
+                    permanentLifetimeEarnedUsd: Number(((Number(user.permanentRewardLifetimeEarnedUsdMicros) || 0) / 1_000_000).toFixed(6)),
+                    permanentCyclesCompleted: Number(user.permanentRewardCyclesCompleted) || 0,
+                    retainedUsd: Number(retainedUsd.toFixed(6)),
+                    reservedUsd: Number(reservedUsd.toFixed(6)),
+                    tournamentUsd: Number(tournamentUsd.toFixed(6)),
+                    tournamentReservedUsd: Number(tournamentReservedUsd.toFixed(6)),
+                },
+                starterChallenge: {
+                    status: user.sponsoredRewardsCompleted || user.sponsoredRewardsUnlocked ? 'completed' : user.freeTicketUsed ? 'in-progress' : 'not-started',
+                    fiveDollarGames: Number(user.completedFiveDollarNormalGames) || 0,
+                    fiveDollarRequired: requirements.req5,
+                    tenDollarGames: Number(user.completedTenDollarNormalGames) || 0,
+                    tenDollarRequired: requirements.req10,
+                },
+                freeTicket: {
+                    challengeCompleted: !!user.freeTicketChallengeCompleted,
+                    available: !!user.hasFreeTicket && !user.freeTicketUsed,
+                    used: !!user.freeTicketUsed,
+                },
+                claimInProgress: !!user.rewardClaimInProgress,
+                tournamentClaimInProgress: !!user.tournamentRewardClaimInProgress,
+                reasons,
+            };
+        }).filter(owner => owner.totalRewardsUsd > 0 || owner.freeTicket.available || owner.freeTicket.used || owner.starterChallenge.status !== 'not-started')
+            .sort((a, b) => b.rewardWalletUsd - a.rewardWalletUsd || b.totalRewardsUsd - a.totalRewardsUsd);
+
+        const rewardTxs = await Transaction.find({
+            $or: [
+                { 'meta.event': { $in: ['sponsored_rewards_claim', 'tournament_reward', 'tournament_reward_claim', 'free_ticket_join'] } },
+                { 'meta.freeTicketChallengeApplied': true },
+                { 'meta.challengeProgressApplied': true },
+                { 'meta.starterRewardCompleted': true },
+                { 'meta.permanentRewardApplied': true },
+                { 'meta.isFreeTicketPlay': true },
+                { 'meta.isRentExemptFallback': true },
+            ],
+        }).sort({ createdAt: -1 }).limit(400).lean();
+        const userMap = Object.fromEntries(users.map(user => [user._id.toString(), user]));
+        const activity = [];
+        const pushActivity = (tx, kind, title, amountUsd, details, wallet = 'reward') => {
+            const user = userMap[tx.userId?.toString()];
+            activity.push({
+                id: `${tx._id}:${kind}`,
+                transactionId: tx._id,
+                userId: tx.userId || null,
+                username: user?.username || 'Unknown',
+                kind,
+                title,
+                amountUsd: Number((Number(amountUsd) || 0).toFixed(6)),
+                details,
+                wallet,
+                status: tx.status,
+                createdAt: tx.createdAt,
+            });
+        };
+        for (const tx of rewardTxs) {
+            const meta = tx.meta || {};
+            if (meta.freeTicketChallengeApplied) pushActivity(tx, 'free-ticket', 'Free ticket unlocked', 0, 'Completed the first qualifying real-money game challenge');
+            if (meta.event === 'free_ticket_join') pushActivity(tx, 'free-ticket', 'Free ticket used', 0, `${meta.mode || 'Normal'} · $${Number(meta.entryFeeUsd || 0).toFixed(2)} room`);
+            if (meta.isFreeTicketPlay && (tx.type === 'withdraw' || meta.rewardEligibleUsd != null)) {
+                const credited = Number(meta.rewardCreditedUsd) || 0;
+                const eligible = Number(meta.rewardEligibleUsd) || 0;
+                pushActivity(tx, 'starter', credited > 0 ? 'Free-ticket reward credited' : 'Free-ticket reward blocked', credited, `${meta.mode || 'Arena'} · eligible $${eligible.toFixed(2)}${meta.rewardBlocked ? ' · blocked' : ''}`);
+            }
+            if (meta.challengeProgressApplied) {
+                pushActivity(tx, 'starter-progress', meta.starterRewardCompleted ? 'Starter challenge completed' : 'Starter challenge progress', Number(meta.starterRewardAmountUsd) || 0, `$${Number(meta.entryFeeUsd || 0).toFixed(2)} ${meta.mode || 'normal'} game`);
+            }
+            if (meta.permanentRewardApplied) {
+                pushActivity(tx, 'permanent', Number(meta.permanentRewardUnlockedUsd) > 0 ? 'Permanent reward unlocked' : 'Permanent reward progress', Number(meta.permanentRewardUnlockedUsd) || Number(meta.permanentRewardContributionUsd) || 0, `$${Number(meta.permanentCashoutVolumeUsd || 0).toFixed(2)} cashout volume · ${Number(meta.permanentRewardCyclesCompleted) || 0} cycle(s)`);
+            }
+            if (meta.isRentExemptFallback) pushActivity(tx, 'retained', 'Cashout retained for player', txAmountUsd(tx), 'Destination wallet was below Solana rent minimum');
+            if (meta.event === 'sponsored_rewards_claim') {
+                pushActivity(tx, 'claim', 'Reward-wallet claim paid', -(Number(meta.amountUsd) || txAmountUsd(tx)), `Starter $${Number(meta.starterAmountUsd || 0).toFixed(2)} · permanent $${Number(meta.permanentAmountUsd || 0).toFixed(2)} · retained $${Number(meta.retainedWinningsAmountUsd || 0).toFixed(2)}`);
+            }
+            if (meta.event === 'tournament_reward') pushActivity(tx, 'tournament', 'Tournament prize credited', Number(meta.amountUsd) || txAmountUsd(tx), `${meta.tournamentName || 'Tournament'} · placement #${meta.placement || '—'}`, 'tournament');
+            if (meta.event === 'tournament_reward_claim') pushActivity(tx, 'tournament-claim', 'Tournament reward claimed', -(Number(meta.amountUsd) || txAmountUsd(tx)), 'Paid from the tournament reward balance', 'tournament');
+        }
+
+        const totals = owners.reduce((result, owner) => {
+            result.rewardWalletLiabilityUsd += owner.rewardWalletUsd;
+            result.tournamentLiabilityUsd += owner.otherRewardsUsd;
+            result.starterUsd += owner.breakdown.starterUsd;
+            result.permanentUsd += owner.breakdown.permanentUsd;
+            result.permanentProgressUsd += owner.breakdown.permanentProgressUsd;
+            result.retainedUsd += owner.breakdown.retainedUsd;
+            result.reservedUsd += owner.breakdown.reservedUsd;
+            if (owner.rewardWalletUsd > 0) result.rewardWalletOwners += 1;
+            if (owner.totalRewardsUsd > 0) result.rewardOwners += 1;
+            return result;
+        }, { rewardWalletLiabilityUsd: 0, tournamentLiabilityUsd: 0, starterUsd: 0, permanentUsd: 0, permanentProgressUsd: 0, retainedUsd: 0, reservedUsd: 0, rewardWalletOwners: 0, rewardOwners: 0 });
+        for (const key of Object.keys(totals)) {
+            if (key.endsWith('Usd')) totals[key] = Number(totals[key].toFixed(6));
+        }
+
+        return res.json({ totals, owners, activity: activity.slice(0, 250) });
+    } catch (err) {
+        console.error('Admin rewards dashboard error:', err);
+        return res.status(500).json({ message: 'Could not load reward ownership.' });
+    }
+});
+
 function getAdminArenaPlayType(player, room) {
     const freePlay = DEV_FREE_PLAY
         || player?.personalFreePlay === true
@@ -5610,6 +5769,82 @@ app.patch('/api/admin/rewards/self', authenticateAdmin, async (req, res) => {
     } catch (err) {
         console.error('Admin self reward update error:', err);
         return res.status(err.status || 500).json({ message: err.message || 'Could not update reward values.' });
+    }
+});
+
+app.post('/api/admin/performance/self/games', authenticateAdmin, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const allowedModes = new Set(['agar', 'slither', 'competitive-slither', 'surviv', 'br-agar', 'br-slither']);
+        const mode = String(body.mode || 'agar');
+        const result = String(body.result || 'win');
+        const scope = String(body.scope || 'real');
+        const count = Number(body.count);
+        const entryFeeUsd = Number(body.entryFeeUsd);
+        const cashoutUsd = result === 'loss' ? 0 : Number(body.cashoutUsd);
+        const playedAt = new Date(body.playedAt || Date.now());
+
+        if (!allowedModes.has(mode)) return res.status(400).json({ message: 'Choose a valid game.' });
+        if (!['win', 'loss'].includes(result)) return res.status(400).json({ message: 'Choose a valid result.' });
+        if (!['real', 'free'].includes(scope)) return res.status(400).json({ message: 'Choose Real play or Free play.' });
+        if (!Number.isInteger(count) || count < 1 || count > 100) return res.status(400).json({ message: 'Games must be a whole number between 1 and 100.' });
+        if (!Number.isFinite(entryFeeUsd) || entryFeeUsd <= 0 || entryFeeUsd > 10_000) return res.status(400).json({ message: 'Entry fee must be between $0.01 and $10,000.' });
+        if (!Number.isFinite(cashoutUsd) || cashoutUsd < 0 || cashoutUsd > 1_000_000) return res.status(400).json({ message: 'Cashout must be between $0 and $1,000,000.' });
+        if (result === 'win' && cashoutUsd < entryFeeUsd) return res.status(400).json({ message: 'A winning cashout must be at least the entry fee.' });
+        if (Number.isNaN(playedAt.getTime())) return res.status(400).json({ message: 'Choose a valid date.' });
+        if (playedAt.getTime() > Date.now() + 60_000) return res.status(400).json({ message: 'The game date cannot be in the future.' });
+
+        const isBattleRoyale = mode.startsWith('br-');
+        const reason = result === 'win'
+            ? (isBattleRoyale ? 'BR Victory' : 'Arena Cashout')
+            : (isBattleRoyale ? 'BR Eliminated' : mode === 'surviv' ? 'Surviv Death' : 'Arena Death');
+        const isFreePlay = scope === 'free';
+        const documents = Array.from({ length: count }, (_, index) => ({
+            userId: req.adminUser._id,
+            type: result === 'win' ? 'withdraw' : 'game',
+            amount: result === 'win' ? cashoutUsd : 0,
+            currency: 'USD',
+            status: 'confirmed',
+            excludedFromReports: true,
+            createdAt: new Date(playedAt.getTime() - ((count - index - 1) * 60_000)),
+            meta: {
+                event: 'admin_performance_game',
+                reason,
+                mode,
+                variant: isBattleRoyale ? mode : undefined,
+                entryFeeUsd,
+                simulated: isFreePlay,
+                adminFreeEntry: isFreePlay,
+                adminPerformanceAdjustment: true,
+            },
+        }));
+
+        await Transaction.insertMany(documents);
+        return res.status(201).json({
+            success: true,
+            count,
+            message: `${count} Portfolio game${count === 1 ? '' : 's'} added.`,
+        });
+    } catch (err) {
+        console.error('Admin performance game insert error:', err);
+        return res.status(500).json({ message: 'Could not add Portfolio games.' });
+    }
+});
+
+app.delete('/api/admin/performance/self/games', authenticateAdmin, async (req, res) => {
+    try {
+        const result = await Transaction.deleteMany({
+            userId: req.adminUser._id,
+            'meta.event': 'admin_performance_game',
+        });
+        return res.json({
+            success: true,
+            deletedCount: result.deletedCount,
+            message: `${result.deletedCount} added Portfolio game${result.deletedCount === 1 ? '' : 's'} removed.`,
+        });
+    } catch (err) {
+        console.error('Admin performance game delete error:', err);
+        return res.status(500).json({ message: 'Could not remove added Portfolio games.' });
     }
 });
 
