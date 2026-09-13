@@ -391,8 +391,8 @@ const UserSchema = new mongoose.Schema({
     completedFiveDollarNormalGames: { type: Number, default: 0 },
     completedTenDollarNormalGames: { type: Number, default: 0 },
     sponsoredRewardsUnlocked: { type: Boolean, default: false },
-    sponsoredRewardsBalance: { type: Number, default: 0 }, // USD-denominated promotional reward
-    fundedRewardsUsd: { type: Number, default: 0 }, // Amount of the reward that has been funded by the player's game entries
+    sponsoredRewardsBalance: { type: Number, default: 0 }, // Potential starter reward; not a liability until funded by challenge entries
+    fundedRewardsUsd: { type: Number, default: 0 }, // Amount currently earned/funded by the player's challenge entries
     permanentRewardProgressVolumeUsdMicros: { type: Number, default: 0 },
     permanentRewardProgressEarnedUsdMicros: { type: Number, default: 0 },
     permanentRewardModelVersion: { type: Number, default: 4 },
@@ -573,6 +573,10 @@ TransactionSchema.post('save', async function(doc) {
                 sponsoredRewardsUnlocked: { $ne: true },
                 completedFiveDollarNormalGames: { $gte: reqs.req5 },
                 completedTenDollarNormalGames: { $gte: reqs.req10 },
+                $expr: { $gte: [
+                    { $add: [{ $ifNull: ['$fundedRewardsUsd', 0] }, 0.000001] },
+                    { $ifNull: ['$sponsoredRewardsBalance', 0] },
+                ] },
             },
             { $set: { sponsoredRewardsUnlocked: true, sponsoredRewardsCompleted: true } },
             { new: true },
@@ -2645,6 +2649,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.affiliateRewardsAvailable = affiliateStatus.hasRewards;
         userObj.permanentRewards = serializePermanentRewards(userObj);
         userObj.starterRewardRequirements = getStarterRewardFundingRequirements(userObj.sponsoredRewardsBalance);
+        userObj.starterRewardPotentialUsd = Math.max(0, Number(userObj.sponsoredRewardsBalance) || 0);
+        userObj.starterRewardOwedUsd = getStarterRewardLiabilityUsd(userObj);
 
         res.json(userObj);
     } catch (err) {
@@ -5174,6 +5180,7 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 Number(online?.lastSeen || 0),
                 new Date(createdAt || 0).getTime() || 0,
             ));
+            const starterRewardOwedUsd = getStarterRewardLiabilityUsd(u);
             return {
                 id: u._id,
                 username: u.username,
@@ -5208,11 +5215,12 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 sponsoredRewardsCompleted: !!u.sponsoredRewardsCompleted,
                 sponsoredRewardsUnlocked: !!u.sponsoredRewardsUnlocked,
                 sponsoredRewardsBalance: Number((u.sponsoredRewardsBalance ?? 0).toFixed(2)),
+                sponsoredRewardsOwedUsd: Number(starterRewardOwedUsd.toFixed(2)),
                 permanentRewards: serializePermanentRewards(u),
                 fundedRewardsUsd: Number((u.fundedRewardsUsd ?? 0).toFixed(2)),
                 retainedRewardsUsd: Number((u.rentFallbackBalanceUsd ?? 0).toFixed(2)),
                 tournamentRewardsBalance: Number((u.tournamentRewardsBalance ?? 0).toFixed(2)),
-                totalRewardsBalance: Number(((u.sponsoredRewardsBalance ?? 0) + ((u.permanentRewardsBalanceUsdMicros ?? 0) / 1_000_000) + (u.rentFallbackBalanceUsd ?? 0) + (u.tournamentRewardsBalance ?? 0)).toFixed(2)),
+                totalRewardsBalance: Number((starterRewardOwedUsd + ((u.permanentRewardsBalanceUsdMicros ?? 0) / 1_000_000) + permanentProgressReserveUsd(u.permanentRewardProgressEarnedUsdMicros) + (u.rentFallbackBalanceUsd ?? 0) + (u.tournamentRewardsBalance ?? 0)).toFixed(2)),
                 rewardsDisabled: !!u.rewardsDisabled,
                 rewardClaimInProgress: !!u.rewardClaimInProgress,
                 tournamentRewardClaimInProgress: !!u.tournamentRewardClaimInProgress,
@@ -5584,6 +5592,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
             0,
         );
         const balanceSol = user.balance ?? 0;
+        const starterRewardOwedUsd = getStarterRewardLiabilityUsd(user);
 
         const modeMap = new Map();
         const ensureMode = (mode) => {
@@ -5678,6 +5687,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 completedFiveDollarGames: user.completedFiveDollarNormalGames ?? 0,
                 completedTenDollarGames: user.completedTenDollarNormalGames ?? 0,
                 sponsoredBalanceUsd: Number((user.sponsoredRewardsBalance ?? 0).toFixed(2)),
+                sponsoredOwedUsd: Number(starterRewardOwedUsd.toFixed(2)),
                 permanentRewards: serializePermanentRewards(user),
                 fundedUsd: Number((user.fundedRewardsUsd ?? 0).toFixed(2)),
                 retainedWinningsUsd: Number((user.rentFallbackBalanceUsd ?? 0).toFixed(2)),
@@ -5690,7 +5700,7 @@ app.get('/api/admin/dashboard/users/:userId', authenticateAdmin, async (req, res
                 tournamentClaimedUsd: Number(tournamentRewardsClaimedUsd.toFixed(2)),
                 tournamentClaimInProgress: !!user.tournamentRewardClaimInProgress,
                 tournamentClaimReservedUsd: Number((user.tournamentRewardClaimReservedUsd ?? 0).toFixed(2)),
-                totalAvailableUsd: Number(((user.sponsoredRewardsBalance ?? 0) + ((user.permanentRewardsBalanceUsdMicros ?? 0) / 1_000_000) + (user.rentFallbackBalanceUsd ?? 0) + (user.tournamentRewardsBalance ?? 0)).toFixed(2)),
+                totalAvailableUsd: Number((starterRewardOwedUsd + ((user.permanentRewardsBalanceUsdMicros ?? 0) / 1_000_000) + permanentProgressReserveUsd(user.permanentRewardProgressEarnedUsdMicros) + (user.rentFallbackBalanceUsd ?? 0) + (user.tournamentRewardsBalance ?? 0)).toFixed(2)),
             },
             stats: {
                 totalDepositedSol: Number(totalDepositedSol.toFixed(6)),
@@ -5960,6 +5970,9 @@ app.post('/api/admin/users/:userId/sponsored-control', authenticateAdmin, async 
             // Unlock only. Payout must go through the same atomic reward-claim ledger as every user claim.
             if (user.rewardsDisabled) {
                 return res.status(409).json({ message: 'Enable rewards for this account first.' });
+            }
+            if ((Number(user.fundedRewardsUsd) || 0) + 0.000001 < (Number(user.sponsoredRewardsBalance) || 0)) {
+                return res.status(409).json({ message: 'The starter reward cannot be unlocked before its full amount has been funded by challenge games.' });
             }
             user.sponsoredRewardsUnlocked = true;
             user.sponsoredRewardsCompleted = true;
@@ -7413,24 +7426,11 @@ app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, 
             return res.status(409).json({ message: `Cannot reset while ${activeHumans} human arena player(s) are still active.` });
         }
 
-        const [liabilities, activeClaims, currentRewardState] = await Promise.all([
-            User.aggregate([{ $group: {
-                _id: null,
-                sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
-                permanentUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
-                permanentProgressRewardUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressEarnedUsdMicros', 0] } },
-                rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
-                reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
-            } }]),
+        const [liabilityUsd, activeClaims, currentRewardState] = await Promise.all([
+            getRewardWalletLiabilityUsd(),
             RewardClaim.countDocuments({ status: { $in: ['reserved', 'broadcast'] } }),
             RewardPoolState.findOne({ key: 'global' }).lean(),
         ]);
-        const liabilityUsd = Math.max(0,
-            (liabilities[0]?.sponsoredUsd || 0)
-            + ((liabilities[0]?.permanentUsdMicros || 0) / 1_000_000)
-            + permanentProgressReserveUsd(liabilities[0]?.permanentProgressRewardUsdMicros)
-            + (liabilities[0]?.rentFallbackUsd || 0)
-            + (liabilities[0]?.reservedUsd || 0));
         if (['reserved', 'broadcast'].includes(currentRewardState?.ownerSurplusSweep?.status)) {
             return res.status(409).json({ message: 'Wait for the active owner-surplus sweep to finish first.' });
         }
