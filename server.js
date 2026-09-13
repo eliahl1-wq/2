@@ -4,6 +4,7 @@ import { applySurvivInputPayload } from './surviv-input.js';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
+import bs58 from 'bs58';
 import jwt from 'jsonwebtoken';
 import { Server } from 'socket.io';
 import { createServer } from 'http';
@@ -167,6 +168,12 @@ import {
     resetFreeTicketBotTargets,
 } from './free-ticket-bots.js';
 import { getAgarBotCellCenter, planAgarBotEscapeSplit, planAgarBotSplit } from './agar-bot-ai.js';
+import { createSerialOperationQueue } from './serial-operation-queue.js';
+import { calculateRoomCashoutReservation } from './cashout-accounting.js';
+import {
+    DEFAULT_MISSING_BROADCAST_TIMEOUT_MS,
+    shouldReleaseMissingBroadcastClaim,
+} from './reward-claim-reconciliation.js';
 import {
     decryptWalletSecret,
     encryptWalletSecret,
@@ -484,6 +491,7 @@ const TransactionSchema = new mongoose.Schema({
     excludedFromReports: { type: Boolean, default: false },
     createdAt: { type: Date, default: Date.now }
 });
+TransactionSchema.index({ 'meta.cashoutSettlementKey': 1 }, { unique: true, sparse: true });
 
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed' || doc.excludedFromReports || doc.meta?.simulated) return;
@@ -1045,6 +1053,10 @@ function findCompetitiveSlitherRoomById(roomId) {
 
 // In-memory locks and maps for idempotency / processing
 const processingCashouts = new Set(); // mongoId strings
+// Every normal-mode cashout, refund and reset sweep spends from the same
+// account. Serialize those mutations so concurrent users cannot all budget
+// against one stale house-wallet balance.
+const houseWalletOperations = createSerialOperationQueue();
 
 function accountSocketRoom(userId) {
     return userId ? `account:${String(userId)}` : null;
@@ -1054,13 +1066,137 @@ function emitPlayerAccountEvent(player, fallbackSocketId, fallbackUserId, eventN
     const socketId = player?.id || fallbackSocketId;
     const userRoom = accountSocketRoom(player?.mongoId || fallbackUserId);
     if (!socketId && !userRoom) return;
-    let target = socketId ? io.to(socketId) : io;
-    if (userRoom) target = target.to(userRoom);
-    target.emit(eventName, payload);
+    // Prefer the socket that owns this live player. Broadcasting to the whole
+    // account room let an old tab or another game overwrite the current
+    // result modal with an unrelated cashout amount.
+    const directSocket = socketId ? io.sockets.sockets.get(socketId) : null;
+    if (directSocket?.connected) {
+        directSocket.emit(eventName, payload);
+        return;
+    }
+    if (userRoom) io.to(userRoom).emit(eventName, payload);
 }
 
 function emitCashoutSuccess(player, fallbackSocketId, fallbackUserId, payload) {
-    emitPlayerAccountEvent(player, fallbackSocketId, fallbackUserId, 'cashOutSuccess', payload);
+    emitPlayerAccountEvent(player, fallbackSocketId, fallbackUserId, 'cashOutSuccess', {
+        ...payload,
+        gameSessionId: player?.gameSessionId || null,
+        mode: player?.mode || null,
+    });
+}
+
+async function recordCashoutFailure(player, room, reason, error) {
+    const userId = player?.mongoId || null;
+    const message = String(error?.message || error || 'Unknown cashout failure').slice(0, 500);
+    await Transaction.create({
+        userId,
+        type: 'game',
+        amount: 0,
+        currency: 'USD',
+        meta: {
+            event: 'failure',
+            reason,
+            error: message,
+            roomId: room?.id || null,
+            mode: player?.mode || null,
+            gameSessionId: player?.gameSessionId || null,
+            inGameBalanceUsd: Number(arenaCashoutUsd(player)) || 0,
+            houseWalletQueueDepth: houseWalletOperations.size,
+        },
+        status: 'failed',
+    }).catch(auditError => console.error('Cashout failure audit could not be saved:', auditError.message));
+}
+
+async function persistConfirmedCashoutTransaction(data, context) {
+    let lastError = null;
+    const settlementKey = data?.meta?.cashoutSettlementKey;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+            return await Transaction.create(data);
+        } catch (error) {
+            lastError = error;
+            // A timed-out Mongo write may still have committed. Resolve by the
+            // deterministic game-session/signature key before ever inserting
+            // again, otherwise hooks could award rewards/affiliate twice.
+            if (settlementKey) {
+                const existing = await Transaction.findOne({ 'meta.cashoutSettlementKey': settlementKey })
+                    .catch(() => null);
+                if (existing) return existing;
+            }
+            console.error(`[Cashout Audit] ${context} transaction save attempt ${attempt} failed:`, error.message);
+        }
+    }
+    // An already-confirmed Solana transfer must never be reported as failed or
+    // made retryable solely because the reporting database had a later error.
+    console.error(`[Cashout Audit] ${context} transfer is confirmed but its audit record could not be saved:`, lastError?.message);
+    return null;
+}
+
+async function persistCashoutPlaytime(user, player, context) {
+    if (!player.personalFreePlay) user.playtime += Math.max(0, Date.now() - player.startTime);
+    try {
+        await user.save();
+    } catch (error) {
+        console.error(`[Cashout Audit] ${context} playtime save failed after confirmed transfer:`, error.message);
+    }
+}
+
+async function retainCashoutForLater({
+    player,
+    room,
+    user,
+    requestedPlayerPayout,
+    platformFee,
+    logMeta,
+    keepSpectator,
+}) {
+    const mongoId = player.mongoId?.toString();
+    const playerId = player.id;
+    const playtimeDelta = player.personalFreePlay ? 0 : Math.max(0, Date.now() - player.startTime);
+    const update = await User.updateOne(
+        { _id: user._id },
+        {
+            $inc: {
+                rentFallbackBalanceUsd: requestedPlayerPayout,
+                ...(playtimeDelta > 0 ? { playtime: playtimeDelta } : {}),
+            },
+        },
+    );
+    if (update.matchedCount !== 1) throw new Error('Could not retain the cashout on the player account');
+
+    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+    keepSpectator?.(room, player);
+
+    await addRewardFundingUsd(requestedPlayerPayout).catch(error => {
+        console.error('[Cashout Fallback] Reward funding accounting failed:', error.message);
+    });
+    await Transaction.create({
+        userId: user._id,
+        type: 'withdraw',
+        amount: requestedPlayerPayout,
+        meta: {
+            ...logMeta,
+            playerPayout: requestedPlayerPayout,
+            paidOnChainUsd: 0,
+            retainedWinningsAmountUsd: requestedPlayerPayout,
+            isLiquidityFallback: true,
+            signature: 'house_liquidity_fallback',
+        },
+        excludedFromReports: !!player.personalFreePlay,
+        status: 'confirmed',
+    }).catch(error => console.error('[Cashout Fallback] Audit transaction failed:', error.message));
+
+    emitCashoutSuccess(player, playerId, mongoId, {
+        amount: requestedPlayerPayout,
+        signature: 'house_liquidity_fallback',
+        retainedForClaim: true,
+    });
+    return {
+        playerPayout: requestedPlayerPayout,
+        platformFee,
+        signature: 'house_liquidity_fallback',
+        retainedForClaim: true,
+    };
 }
 
 function keepAgarSpectator(room, player) {
@@ -1161,23 +1297,25 @@ async function executeTournamentCashout(player, room) {
 
 
 function reserveArenaCashout(room, player, requestedUsd) {
-    const requested = Math.max(0, Number(requestedUsd) || 0);
-    const funded = Math.max(0, Number(room.fundedEntryUsd) || 0);
-    const reserved = Math.max(0, Number(room.reservedCashoutUsd) || 0);
-    const paid = Math.max(0, Number(room.paidCashoutUsd) || 0);
-    const available = Math.max(0, funded - reserved - paid);
-    const amount = Math.min(requested, available);
-
-    if (amount + 1e-9 < requested) {
+    const reservation = calculateRoomCashoutReservation({
+        requestedUsd,
+        fundedUsd: room.fundedEntryUsd,
+        reservedUsd: room.reservedCashoutUsd,
+        paidUsd: room.paidCashoutUsd,
+    });
+    const amount = reservation.requestedUsd;
+    if (reservation.ledgerShortfallUsd > 1e-9) {
         console.error(
-            `ECONOMY INVARIANT: ${room.id} requested $${requested.toFixed(6)} cashout `
-            + `with only $${available.toFixed(6)} of paid entries available; payout capped.`,
+            `ECONOMY INVARIANT: ${room.id} requested $${amount.toFixed(6)} cashout `
+            + `with only $${reservation.availableUsd.toFixed(6)} in the room ledger. `
+            + 'The HUD amount was preserved and the shared wallet check remains authoritative.',
         );
     }
     if (amount <= 1e-9) throw new Error('No funded arena value available for cashout');
 
-    room.reservedCashoutUsd = reserved + amount;
+    room.reservedCashoutUsd = reservation.nextReservedUsd;
     player._arenaCashoutReservationUsd = amount;
+    player._arenaCashoutLedgerShortfallUsd = reservation.ledgerShortfallUsd;
     return amount;
 }
 
@@ -1186,6 +1324,7 @@ function releaseArenaCashoutReservation(room, player) {
     if (amount <= 0) return;
     room.reservedCashoutUsd = Math.max(0, (Number(room.reservedCashoutUsd) || 0) - amount);
     delete player._arenaCashoutReservationUsd;
+    delete player._arenaCashoutLedgerShortfallUsd;
 }
 
 function commitArenaCashoutReservation(room, player) {
@@ -1194,6 +1333,7 @@ function commitArenaCashoutReservation(room, player) {
     room.reservedCashoutUsd = Math.max(0, (Number(room.reservedCashoutUsd) || 0) - amount);
     room.paidCashoutUsd = (Number(room.paidCashoutUsd) || 0) + amount;
     delete player._arenaCashoutReservationUsd;
+    delete player._arenaCashoutLedgerShortfallUsd;
 }
 
 function applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity) {
@@ -1242,6 +1382,10 @@ async function canReceiveSystemTransfer(address, lamports) {
 }
 
 async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout') {
+    return houseWalletOperations.run(() => executeCompetitiveCashoutUnlocked(player, room, reason));
+}
+
+async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_COMPETITIVE_ENTRY_FEE;
     const { cashoutFeePct } = getCompetitiveEconomy(entryFeeUsd);
@@ -1312,6 +1456,15 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
     applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
     if (liquidity.liquidityAdjusted) {
         console.warn(`[Cashout Liquidity] Competitive payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
+        return retainCashoutForLater({
+            player,
+            room,
+            user,
+            requestedPlayerPayout,
+            platformFee,
+            logMeta,
+            keepSpectator: keepCompetitiveCashoutSpectator,
+        });
     }
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
@@ -1365,23 +1518,23 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
 
     room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
     keepCompetitiveCashoutSpectator(room, player);
-    user.playtime += (Date.now() - player.startTime);
-    await user.save();
+    await persistCashoutPlaytime(user, player, 'competitive');
 
-    await Transaction.create({
+    await persistConfirmedCashoutTransaction({
         userId: user._id,
         type: 'withdraw',
         amount: playerPayout,
         meta: {
             ...logMeta,
             signature,
+            cashoutSettlementKey: `cashout:${mongoId}:${player.gameSessionId || signature}`,
             solAmount: solPayout,
             feeSolAmount: transferredFeeLamports / solanaWeb3.LAMPORTS_PER_SOL,
             feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
             retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
         status: 'confirmed',
-    });
+    }, 'competitive');
 
     console.log(`💰 COMPETITIVE CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
     emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
@@ -1389,6 +1542,10 @@ async function executeCompetitiveCashout(player, room, reason = 'Arena Cashout')
 }
 
 async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
+    return houseWalletOperations.run(() => executeSurvivCashoutUnlocked(player, room, reason));
+}
+
+async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashout') {
     const dollarBalance = Number(player.dollarBalance) || 0;
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_SURVIV_ENTRY_FEE;
     const { cashoutFeePct } = getSurvivEconomy(entryFeeUsd);
@@ -1466,6 +1623,14 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
     if (liquidity.liquidityAdjusted) {
         console.warn(`[Cashout Liquidity] Surviv payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
+        return retainCashoutForLater({
+            player,
+            room,
+            user,
+            requestedPlayerPayout,
+            platformFee,
+            logMeta,
+        });
     }
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
@@ -1517,23 +1682,23 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
     const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
 
     room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-    user.playtime += (Date.now() - player.startTime);
-    await user.save();
+    await persistCashoutPlaytime(user, player, 'surviv');
 
-    await Transaction.create({
+    await persistConfirmedCashoutTransaction({
         userId: user._id,
         type: 'withdraw',
         amount: playerPayout,
         meta: {
             ...logMeta,
             signature,
+            cashoutSettlementKey: `cashout:${mongoId}:${player.gameSessionId || signature}`,
             solAmount: solPayout,
             feeSolAmount: transferredFeeLamports / solanaWeb3.LAMPORTS_PER_SOL,
             feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
             retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
         status: 'confirmed',
-    });
+    }, 'surviv');
 
     console.log(`💰 SURVIV CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
     emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
@@ -1541,6 +1706,10 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
 }
 
 async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
+    return houseWalletOperations.run(() => executeArenaCashoutUnlocked(player, room, reason));
+}
+
+async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout') {
     const requestedDollarBalance = arenaCashoutUsd(player);
     const dollarBalance = reserveArenaCashout(room, player, requestedDollarBalance);
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
@@ -1562,6 +1731,8 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
         mode: gameMode,
         entryFeeUsd,
         dollarBalance,
+        requestedDollarBalance,
+        roomLedgerShortfallUsd: Number(player._arenaCashoutLedgerShortfallUsd) || 0,
         playerPayout,
         platformFee,
         cashoutFeePct,
@@ -1649,6 +1820,17 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
     applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
     if (liquidity.liquidityAdjusted) {
         console.warn(`[Cashout Liquidity] Arena payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
+        const retained = await retainCashoutForLater({
+            player,
+            room,
+            user,
+            requestedPlayerPayout,
+            platformFee,
+            logMeta,
+            keepSpectator: keepArenaCashoutSpectator,
+        });
+        commitArenaCashoutReservation(room, player);
+        return retained;
     }
     // Cashout fees remain in house and are sent in the batched reset sweep.
     const canTransferOwnerFee = false;
@@ -1711,23 +1893,23 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 
     room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
     keepArenaCashoutSpectator(room, player);
-    user.playtime += (Date.now() - player.startTime);
-    await user.save();
+    await persistCashoutPlaytime(user, player, 'arena');
 
-    await Transaction.create({
+    await persistConfirmedCashoutTransaction({
         userId: user._id,
         type: 'withdraw',
         amount: playerPayout,
         meta: {
             ...logMeta,
             signature,
+            cashoutSettlementKey: `cashout:${mongoId}:${player.gameSessionId || signature}`,
             solAmount: solPayout,
             feeSolAmount: canTransferOwnerFee ? feeLamports / solanaWeb3.LAMPORTS_PER_SOL : 0,
             feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
             retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
         status: 'confirmed',
-    });
+    }, 'arena');
 
     console.log(`💰 ARENA CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
     emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
@@ -1877,6 +2059,10 @@ function resetRoomEntities(room) {
 }
 
 async function sweepHouseWalletOnReset() {
+    return houseWalletOperations.run(() => sweepHouseWalletOnResetUnlocked());
+}
+
+async function sweepHouseWalletOnResetUnlocked() {
     // Only the main arena house wallet — BR house wallets are separate env keys and never touched here.
     if (DEV_FREE_PLAY || !HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET || !OWNER_VAULT_ADDRESS) return;
 
@@ -3610,6 +3796,13 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
 });
 
 async function ensureRewardWalletLiquidity(requiredLamports) {
+    // A reward top-up spends from the same house wallet as game cashouts.
+    // Re-check every balance inside the queue so queued operations cannot make
+    // this decision stale before the transfer is submitted.
+    return houseWalletOperations.run(() => ensureRewardWalletLiquidityUnlocked(requiredLamports));
+}
+
+async function ensureRewardWalletLiquidityUnlocked(requiredLamports) {
     if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET) {
         throw new Error('Reward wallet not configured');
     }
@@ -3708,9 +3901,41 @@ async function reconcileRewardClaims() {
     const broadcast = await RewardClaim.find({ status: 'broadcast', signature: { $ne: null } }).limit(50);
     for (const claim of broadcast) {
         try {
-            const result = await connection.getSignatureStatuses([claim.signature], { searchTransactionHistory: true });
-            const status = result.value[0];
-            if (!status) continue;
+            let status = null;
+            let rpcChecked = false;
+            try {
+                const result = await connection.getSignatureStatuses([claim.signature], { searchTransactionHistory: true });
+                status = result.value[0];
+                rpcChecked = true;
+            } catch (primaryError) {
+                console.warn('[Reward Claim] Primary RPC status check failed:', primaryError.message);
+            }
+            if (!status) {
+                // A provider can prune or temporarily miss a signature. Confirm
+                // absence through an independent RPC before returning funds.
+                try {
+                    const fallbackResult = await fallbackRpcConnection.getSignatureStatuses(
+                        [claim.signature],
+                        { searchTransactionHistory: true },
+                    );
+                    status = fallbackResult.value[0];
+                    rpcChecked = true;
+                } catch (fallbackError) {
+                    console.warn('[Reward Claim] Fallback RPC status check failed:', fallbackError.message);
+                }
+            }
+            if (!status && rpcChecked) {
+                const configuredTimeoutMs = Number(process.env.REWARD_BROADCAST_STALE_MS)
+                    || DEFAULT_MISSING_BROADCAST_TIMEOUT_MS;
+                if (shouldReleaseMissingBroadcastClaim(claim, Date.now(), configuredTimeoutMs)) {
+                    await failAndReleaseRewardClaim(
+                        claim._id,
+                        'Broadcast signature was not found on either Solana RPC after the confirmation window',
+                    );
+                    console.warn(`[Reward Claim] Released missing broadcast ${claim._id} (${claim.signature})`);
+                }
+                continue;
+            }
             if (status.err) {
                 await failAndReleaseRewardClaim(claim._id, `On-chain claim failed: ${JSON.stringify(status.err)}`);
             } else if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
@@ -3790,7 +4015,11 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             });
         }
         await ensureRewardWalletLiquidity(payoutLamports);
-        const transaction = new solanaWeb3.Transaction().add(
+        const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+        const transaction = new solanaWeb3.Transaction({
+            feePayer: rewardKeypair.publicKey,
+            recentBlockhash: latestBlockhash.blockhash,
+        }).add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: rewardKeypair.publicKey,
                 toPubkey: userPubKey,
@@ -3798,9 +4027,26 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             })
         );
 
-        broadcastSignature = await connection.sendTransaction(transaction, [rewardKeypair], { maxRetries: 3 });
-        await markClaimBroadcast(claim._id, { signature: broadcastSignature, solAmount });
-        const confirmation = await connection.confirmTransaction(broadcastSignature, 'confirmed');
+        transaction.sign(rewardKeypair);
+        const signedSignature = bs58.encode(transaction.signature);
+        // Persist the deterministic signed transaction id before network I/O.
+        // If the RPC accepts the packet but the HTTP response is lost, the
+        // reconciler can still prove whether this exact payment landed.
+        const markedClaim = await markClaimBroadcast(claim._id, { signature: signedSignature, solAmount });
+        if (!markedClaim) throw new Error('Reward claim could not enter broadcast state');
+        broadcastSignature = signedSignature;
+        const submittedSignature = await connection.sendRawTransaction(transaction.serialize(), {
+            skipPreflight: false,
+            maxRetries: 3,
+        });
+        if (submittedSignature !== broadcastSignature) {
+            throw new Error('Reward transaction signature mismatch');
+        }
+        const confirmation = await connection.confirmTransaction({
+            signature: broadcastSignature,
+            blockhash: latestBlockhash.blockhash,
+            lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        }, 'confirmed');
         if (confirmation.value.err) {
             await failAndReleaseRewardClaim(claim._id, `On-chain claim failed: ${JSON.stringify(confirmation.value.err)}`);
             return res.status(502).json({ error: 'On-chain reward payment failed' });
@@ -4699,7 +4945,8 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
 
 app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
     try {
-        const users = await User.find({}).select([
+        const [users, rewardPoolState] = await Promise.all([
+            User.find({}).select([
             'username', 'email', 'excludedFromReports', 'isOwnerAccount',
             'rewardsDisabled', 'rewardsDisabledReason',
             'hasFreeTicket', 'freeTicketUsed', 'freeTicketChallengeCompleted',
@@ -4712,7 +4959,9 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
             'rentFallbackBalanceUsd', 'rewardClaimInProgress', 'rewardClaimReservedUsd',
             'tournamentRewardsBalance', 'tournamentRewardClaimInProgress', 'tournamentRewardClaimReservedUsd',
             'lastActiveAt',
-        ].join(' ')).lean();
+            ].join(' ')).lean(),
+            hydrateRewardPoolState(),
+        ]);
 
         const owners = users.map(user => {
             const permanentRewards = serializePermanentRewards(user);
@@ -4856,6 +5105,7 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
         for (const key of Object.keys(totals)) {
             if (key.endsWith('Usd')) totals[key] = Number(totals[key].toFixed(6));
         }
+        totals.pendingHouseUsd = Number((Math.max(0, Number(rewardPoolState?.pendingHouseUsd) || 0)).toFixed(6));
 
         return res.json({ totals, owners, activity: activity.slice(0, 250) });
     } catch (err) {
@@ -8746,6 +8996,10 @@ async function rollbackJoinEconomy(pending, reason) {
 }
 
 async function refundPaidJoin(pending, reason) {
+    return houseWalletOperations.run(() => refundPaidJoinUnlocked(pending, reason));
+}
+
+async function refundPaidJoinUnlocked(pending, reason) {
     if (!pending || DEV_FREE_PLAY) return;
     try {
         const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -10491,6 +10745,7 @@ io.on('connection', (socket) => {
                     await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
                     await logSolanaTransactionError('❌ Surviv cashout error:', err);
+                    await recordCashoutFailure(activePlayer, activeRoom, 'surviv_manual_cashout_failed', err);
                     emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
@@ -10505,6 +10760,7 @@ io.on('connection', (socket) => {
                     await executeCompetitiveCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
                     await logSolanaTransactionError('❌ Competitive cashout error:', err);
+                    await recordCashoutFailure(activePlayer, activeRoom, 'competitive_manual_cashout_failed', err);
                     emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
@@ -10519,6 +10775,7 @@ io.on('connection', (socket) => {
             } catch (err) {
                 releaseArenaCashoutReservation(activeRoom, activePlayer);
                 await logSolanaTransactionError('❌ Cashout error:', err);
+                await recordCashoutFailure(activePlayer, activeRoom, 'arena_manual_cashout_failed', err);
                 emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
                 if (activePlayer) {
                     activePlayer.isCashingOut = false;
