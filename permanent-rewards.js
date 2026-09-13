@@ -23,6 +23,12 @@ export function permanentProgressReserveUsd(progressRewardUsdMicros = 0) {
     return microsToUsd(Math.max(0, Math.floor(Number(progressRewardUsdMicros) || 0)));
 }
 
+export function getStarterRewardLiabilityUsd(user = {}) {
+    const potentialUsd = Math.max(0, Number(user.sponsoredRewardsBalance) || 0);
+    if (user.sponsoredRewardsCompleted || user.sponsoredRewardsUnlocked) return potentialUsd;
+    return Math.min(potentialUsd, Math.max(0, Number(user.fundedRewardsUsd) || 0));
+}
+
 /** Apply one confirmed cashout to the recurring reward cycle. */
 export function calculatePermanentRewardAllocation({
     grossCashoutUsd,

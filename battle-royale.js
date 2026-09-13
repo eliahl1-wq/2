@@ -1360,6 +1360,10 @@ export function setupBattleRoyale(io, deps) {
                 pendingQueueJoins.add(joiningId);
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
+                if (deps.isNewGameJoinLocked?.()) {
+                    socket.emit('error', 'New game entries are temporarily locked while active matches finish.');
+                    return;
+                }
                 const wantsRainbow = variant !== 'surviv' && (skinId === 'rainbow' || skinColor === 'random');
                 if (wantsRainbow && !await deps.hasSkinEntitlement?.(user, variant, 'rainbow')) {
                     socket.emit('error', 'Rainbow for ' + (variant === 'slither' ? 'Slither' : 'Agar') + ' must be purchased in the AGAR shop first.');

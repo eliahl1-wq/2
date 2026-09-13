@@ -156,6 +156,7 @@ import { getStarterRewardFundingRequirements } from './free-ticket-funding.js';
 import { getFundedBotSpawnCount } from './funded-bots.js';
 import {
     calculatePermanentRewardAllocation,
+    getStarterRewardLiabilityUsd,
     permanentProgressReserveUsd,
     serializePermanentRewards,
 } from './permanent-rewards.js';
@@ -441,6 +442,9 @@ async function isPersonalFreePlayUser(user) {
 const SiteDisplaySettingsSchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
     pregamePlayingOverride: { type: Number, default: null },
+    newGameJoinsLocked: { type: Boolean, default: false },
+    newGameJoinsLockedAt: { type: Date, default: null },
+    newGameJoinsLockedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     pregamePlayingOffsets: {
         agar: { type: Number, default: 0 },
         slither: { type: Number, default: 0 },
@@ -825,6 +829,11 @@ function isUserJoining(userId) {
 }
 let rewardPoolAdminResetting = false;
 let affiliatePoolAdminResetting = false;
+let newGameJoinsLocked = false;
+
+function isNewGameJoinLocked() {
+    return newGameJoinsLocked;
+}
 
 let GLOBAL_ARENA_START = Date.now();
 let globalArenaResetting = false;
@@ -3630,20 +3639,19 @@ async function ensureRewardWalletLiquidity(requiredLamports) {
 
 
 async function getRewardWalletLiabilityUsd() {
-    const liabilities = await User.aggregate([{ $group: {
-        _id: null,
-        sponsoredUsd: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
-        permanentUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
-        permanentProgressRewardUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressEarnedUsdMicros', 0] } },
-        rentFallbackUsd: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
-        reservedUsd: { $sum: { $ifNull: ['$rewardClaimReservedUsd', 0] } },
-    } }]);
-    return Math.max(0,
-        (liabilities[0]?.sponsoredUsd || 0)
-        + ((liabilities[0]?.permanentUsdMicros || 0) / 1_000_000)
-        + permanentProgressReserveUsd(liabilities[0]?.permanentProgressRewardUsdMicros)
-        + (liabilities[0]?.rentFallbackUsd || 0)
-        + (liabilities[0]?.reservedUsd || 0));
+    const users = await User.find({}).select([
+        'sponsoredRewardsBalance', 'fundedRewardsUsd',
+        'sponsoredRewardsCompleted', 'sponsoredRewardsUnlocked',
+        'permanentRewardsBalanceUsdMicros', 'permanentRewardProgressEarnedUsdMicros',
+        'rentFallbackBalanceUsd', 'rewardClaimReservedUsd',
+    ].join(' ')).lean();
+    return users.reduce((total, user) => Math.max(0,
+        total
+        + getStarterRewardLiabilityUsd(user)
+        + ((Number(user.permanentRewardsBalanceUsdMicros) || 0) / 1_000_000)
+        + permanentProgressReserveUsd(user.permanentRewardProgressEarnedUsdMicros)
+        + (Number(user.rentFallbackBalanceUsd) || 0)
+        + (Number(user.rewardClaimReservedUsd) || 0)), 0);
 }
 
 
@@ -4433,10 +4441,53 @@ function normalizePregamePlayingOffsets(value) {
 app.get('/api/pregame/display-settings', async (req, res) => {
     try {
         const settings = await SiteDisplaySettings.findOne({ key: 'pregame' }).lean();
-        res.json({ playingOffsets: normalizePregamePlayingOffsets(settings?.pregamePlayingOffsets) });
+        res.json({
+            playingOffsets: normalizePregamePlayingOffsets(settings?.pregamePlayingOffsets),
+            newGameJoinsLocked: !!settings?.newGameJoinsLocked,
+        });
     } catch (err) {
         console.error('Pregame display settings error:', err);
         res.status(500).json({ error: 'Could not load pregame display settings' });
+    }
+});
+
+app.put('/api/admin/runtime/join-lock', authenticateAdmin, async (req, res) => {
+    try {
+        if (typeof req.body?.locked !== 'boolean') {
+            return res.status(400).json({ message: 'locked must be true or false.' });
+        }
+        const locked = req.body.locked;
+        const settings = await SiteDisplaySettings.findOneAndUpdate(
+            { key: 'pregame' },
+            { $set: {
+                newGameJoinsLocked: locked,
+                newGameJoinsLockedAt: locked ? new Date() : null,
+                newGameJoinsLockedBy: locked ? req.user.id : null,
+            } },
+            { new: true, upsert: true, setDefaultsOnInsert: true },
+        ).lean();
+        newGameJoinsLocked = !!settings.newGameJoinsLocked;
+        io.emit('gameJoinLockChanged', { locked: newGameJoinsLocked });
+        await Transaction.create({
+            userId: req.user.id,
+            type: 'game',
+            amount: 0,
+            meta: {
+                event: 'admin_action',
+                action: newGameJoinsLocked ? 'lock_new_game_joins' : 'unlock_new_game_joins',
+            },
+            status: 'confirmed',
+        }).catch(error => console.error('Game join lock audit write failed:', error.message));
+        return res.json({
+            success: true,
+            newGameJoinsLocked,
+            message: newGameJoinsLocked
+                ? 'New game entries are locked. Players already in games can keep playing and cash out.'
+                : 'New game entries are open again.',
+        });
+    } catch (err) {
+        console.error('Update game join lock error:', err);
+        return res.status(500).json({ message: 'Could not update the game entry lock.' });
     }
 });
 
@@ -4541,7 +4592,20 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
                         _id: null,
                         totalBalanceSol: { $sum: { $ifNull: ['$balance', 0] } },
                         accountCount: { $sum: 1 },
-                        totalSponsoredRewards: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                        totalSponsoredPotentialRewards: { $sum: { $ifNull: ['$sponsoredRewardsBalance', 0] } },
+                        totalSponsoredRewards: { $sum: {
+                            $cond: [
+                                { $or: [
+                                    { $eq: ['$sponsoredRewardsCompleted', true] },
+                                    { $eq: ['$sponsoredRewardsUnlocked', true] },
+                                ] },
+                                { $ifNull: ['$sponsoredRewardsBalance', 0] },
+                                { $min: [
+                                    { $ifNull: ['$sponsoredRewardsBalance', 0] },
+                                    { $ifNull: ['$fundedRewardsUsd', 0] },
+                                ] },
+                            ],
+                        } },
                         totalPermanentRewardsUsdMicros: { $sum: { $ifNull: ['$permanentRewardsBalanceUsdMicros', 0] } },
                         totalPermanentProgressRewardUsdMicros: { $sum: { $ifNull: ['$permanentRewardProgressEarnedUsdMicros', 0] } },
                         totalRetainedWinnings: { $sum: { $ifNull: ['$rentFallbackBalanceUsd', 0] } },
@@ -4603,6 +4667,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ownerAccountBalanceSol: Number(ownerAccountBalanceSol.toFixed(6)),
             ownerAccountBalanceUsd: Number((ownerAccountBalanceSol * SOL_PRICE_USD).toFixed(2)),
             totalSponsoredRewards: userBalanceAgg[0]?.totalSponsoredRewards ?? 0,
+            totalSponsoredPotentialRewards: userBalanceAgg[0]?.totalSponsoredPotentialRewards ?? 0,
             totalPermanentRewards: (userBalanceAgg[0]?.totalPermanentRewardsUsdMicros ?? 0) / 1_000_000,
             totalPermanentProgressReserve: permanentProgressReserveUsd(userBalanceAgg[0]?.totalPermanentProgressRewardUsdMicros),
             totalRetainedWinnings: userBalanceAgg[0]?.totalRetainedWinnings ?? 0,
@@ -4645,7 +4710,9 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
 
         const owners = users.map(user => {
             const permanentRewards = serializePermanentRewards(user);
-            const starterUsd = Number(user.sponsoredRewardsBalance) || 0;
+            const starterPotentialUsd = Math.max(0, Number(user.sponsoredRewardsBalance) || 0);
+            const starterUsd = getStarterRewardLiabilityUsd(user);
+            const starterUnfundedUsd = Math.max(0, starterPotentialUsd - starterUsd);
             const permanentUsd = (Number(user.permanentRewardsBalanceUsdMicros) || 0) / 1_000_000;
             const permanentProgressUsd = (Number(user.permanentRewardProgressEarnedUsdMicros) || 0) / 1_000_000;
             const permanentProgressVolumeUsd = (Number(user.permanentRewardProgressVolumeUsdMicros) || 0) / 1_000_000;
@@ -4653,11 +4720,11 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
             const reservedUsd = Number(user.rewardClaimReservedUsd) || 0;
             const tournamentUsd = Number(user.tournamentRewardsBalance) || 0;
             const tournamentReservedUsd = Number(user.tournamentRewardClaimReservedUsd) || 0;
-            const requirements = getStarterRewardFundingRequirements(starterUsd);
+            const requirements = getStarterRewardFundingRequirements(starterPotentialUsd);
             const rewardWalletUsd = starterUsd + permanentUsd + permanentProgressUsd + retainedUsd + reservedUsd;
             const otherRewardsUsd = tournamentUsd + tournamentReservedUsd;
             const reasons = [];
-            if (starterUsd > 0) reasons.push({ key: 'starter', label: 'Starter challenge', amountUsd: starterUsd });
+            if (starterUsd > 0) reasons.push({ key: 'starter', label: 'Starter reserve', amountUsd: starterUsd });
             if (permanentUsd > 0) reasons.push({ key: 'permanent', label: 'Permanent rewards', amountUsd: permanentUsd });
             if (permanentProgressUsd > 0) reasons.push({ key: 'progress', label: 'Permanent progress reserve', amountUsd: permanentProgressUsd });
             if (retainedUsd > 0) reasons.push({ key: 'retained', label: 'Retained cashout', amountUsd: retainedUsd });
@@ -4678,6 +4745,8 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
                 totalRewardsUsd: Number((rewardWalletUsd + otherRewardsUsd).toFixed(6)),
                 breakdown: {
                     starterUsd: Number(starterUsd.toFixed(6)),
+                    starterPotentialUsd: Number(starterPotentialUsd.toFixed(6)),
+                    starterUnfundedUsd: Number(starterUnfundedUsd.toFixed(6)),
                     starterFundedUsd: Number((Number(user.fundedRewardsUsd) || 0).toFixed(6)),
                     permanentUsd: Number(permanentUsd.toFixed(6)),
                     permanentProgressUsd: Number(permanentProgressUsd.toFixed(6)),
@@ -4719,6 +4788,7 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
                 { 'meta.permanentRewardApplied': true },
                 { 'meta.isFreeTicketPlay': true },
                 { 'meta.isRentExemptFallback': true },
+                { 'meta.action': 'reset_unfinished_rewards' },
             ],
         }).sort({ createdAt: -1 }).limit(400).lean();
         const userMap = Object.fromEntries(users.map(user => [user._id.toString(), user]));
@@ -4760,12 +4830,15 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
             }
             if (meta.event === 'tournament_reward') pushActivity(tx, 'tournament', 'Tournament prize credited', Number(meta.amountUsd) || txAmountUsd(tx), `${meta.tournamentName || 'Tournament'} · placement #${meta.placement || '—'}`, 'tournament');
             if (meta.event === 'tournament_reward_claim') pushActivity(tx, 'tournament-claim', 'Tournament reward claimed', -(Number(meta.amountUsd) || txAmountUsd(tx)), 'Paid from the tournament reward balance', 'tournament');
+            if (meta.action === 'reset_unfinished_rewards') pushActivity(tx, 'reset', 'Unfinished rewards reset', -(Number(meta.releasedToOwnerSurplusUsd) || 0), 'Funded reserve released to owner surplus; lifetime and tournament history preserved');
         }
 
         const totals = owners.reduce((result, owner) => {
             result.rewardWalletLiabilityUsd += owner.rewardWalletUsd;
             result.tournamentLiabilityUsd += owner.otherRewardsUsd;
             result.starterUsd += owner.breakdown.starterUsd;
+            result.starterPotentialUsd += owner.breakdown.starterPotentialUsd;
+            result.starterUnfundedUsd += owner.breakdown.starterUnfundedUsd;
             result.permanentUsd += owner.breakdown.permanentUsd;
             result.permanentProgressUsd += owner.breakdown.permanentProgressUsd;
             result.retainedUsd += owner.breakdown.retainedUsd;
@@ -4773,7 +4846,7 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
             if (owner.rewardWalletUsd > 0) result.rewardWalletOwners += 1;
             if (owner.totalRewardsUsd > 0) result.rewardOwners += 1;
             return result;
-        }, { rewardWalletLiabilityUsd: 0, tournamentLiabilityUsd: 0, starterUsd: 0, permanentUsd: 0, permanentProgressUsd: 0, retainedUsd: 0, reservedUsd: 0, rewardWalletOwners: 0, rewardOwners: 0 });
+        }, { rewardWalletLiabilityUsd: 0, tournamentLiabilityUsd: 0, starterUsd: 0, starterPotentialUsd: 0, starterUnfundedUsd: 0, permanentUsd: 0, permanentProgressUsd: 0, retainedUsd: 0, reservedUsd: 0, rewardWalletOwners: 0, rewardOwners: 0 });
         for (const key of Object.keys(totals)) {
             if (key.endsWith('Usd')) totals[key] = Number(totals[key].toFixed(6));
         }
@@ -5931,9 +6004,163 @@ app.put('/api/admin/users/:userId/reward-access', authenticateAdmin, async (req,
     }
 });
 
+app.post('/api/admin/users/:userId/reset-unfinished-rewards', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
+    if (rewardPoolAdminResetting) return res.status(409).json({ message: 'Reward pool maintenance is already running.' });
+    if (isUserJoining(userId) || processingCashouts.has(String(userId)) || findPlayerInArena(userId) || isPlayerInBR(userId)) {
+        return res.status(409).json({ message: 'This user is joining, queued, playing, or cashing out. Wait until the account is idle.' });
+    }
+
+    rewardPoolAdminResetting = true;
+    const session = await mongoose.startSession();
+    try {
+        let result = null;
+        await session.withTransaction(async () => {
+            const user = await User.findById(userId).session(session);
+            if (!user) {
+                const error = new Error('User not found');
+                error.status = 404;
+                throw error;
+            }
+            if (req.body?.confirmation !== `RESET ${user.username}`) {
+                const error = new Error(`Type RESET ${user.username} to confirm.`);
+                error.status = 400;
+                throw error;
+            }
+            const activeClaim = await RewardClaim.exists({
+                userId: user._id,
+                status: { $in: ['reserved', 'broadcast'] },
+            }).session(session);
+            if (user.rewardClaimInProgress || (Number(user.rewardClaimReservedUsd) || 0) > 0 || activeClaim) {
+                const error = new Error('This user has an active reward claim. Let it settle first.');
+                error.status = 409;
+                throw error;
+            }
+
+            const starterPotentialUsd = Math.max(0, Number(user.sponsoredRewardsBalance) || 0);
+            const permanentAvailableUsd = Math.max(0, Number(user.permanentRewardsBalanceUsdMicros) || 0) / 1_000_000;
+            const retainedCashoutUsd = Math.max(0, Number(user.rentFallbackBalanceUsd) || 0);
+            if (user.sponsoredRewardsCompleted || user.sponsoredRewardsUnlocked || permanentAvailableUsd > 0 || retainedCashoutUsd > 0) {
+                const error = new Error('Only unfinished challenge reserves can be reset. Claimable rewards and retained cashouts are protected.');
+                error.status = 409;
+                throw error;
+            }
+
+            const releasedStarterUsd = getStarterRewardLiabilityUsd(user);
+            const releasedPermanentProgressUsd = permanentProgressReserveUsd(user.permanentRewardProgressEarnedUsdMicros);
+            const releasedUsd = releasedStarterUsd + releasedPermanentProgressUsd;
+            const hasResettableState = starterPotentialUsd > 0
+                || (Number(user.fundedRewardsUsd) || 0) > 0
+                || (Number(user.permanentRewardProgressVolumeUsdMicros) || 0) > 0
+                || (Number(user.permanentRewardProgressEarnedUsdMicros) || 0) > 0
+                || user.hasFreeTicket
+                || user.freeTicketChallengeCompleted
+                || (Number(user.completedFiveDollarNormalGames) || 0) > 0
+                || (Number(user.completedTenDollarNormalGames) || 0) > 0;
+            if (!hasResettableState) {
+                const error = new Error('This user has no unfinished reward state to reset.');
+                error.status = 400;
+                throw error;
+            }
+
+            const userReset = await User.updateOne(
+                { _id: user._id, rewardClaimInProgress: { $ne: true } },
+                { $set: {
+                    hasFreeTicket: false,
+                    freeTicketUsed: true,
+                    freeTicketChallengeCompleted: false,
+                    freeTicketChallengeCompletedAt: null,
+                    freeTicketChallengeCheckedAt: new Date(),
+                    completedFiveDollarNormalGames: 0,
+                    completedTenDollarNormalGames: 0,
+                    sponsoredRewardsCompleted: false,
+                    sponsoredRewardsUnlocked: false,
+                    sponsoredRewardsBalance: 0,
+                    fundedRewardsUsd: 0,
+                    permanentRewardProgressVolumeUsdMicros: 0,
+                    permanentRewardProgressEarnedUsdMicros: 0,
+                } },
+                { session },
+            );
+            if (userReset.matchedCount !== 1) {
+                const error = new Error('The user reward state changed while resetting. No changes were committed.');
+                error.status = 409;
+                throw error;
+            }
+
+            if (releasedUsd > 0) {
+                await RewardPoolState.updateOne(
+                    { key: 'global' },
+                    { $inc: { ownerSurplusUsd: releasedUsd }, $setOnInsert: { key: 'global' } },
+                    { upsert: true, session },
+                );
+            }
+            await RewardSecurityAlert.updateMany(
+                { 'snapshots.userId': user._id },
+                { $set: {
+                    'snapshots.$[snapshot].hasFreeTicket': false,
+                    'snapshots.$[snapshot].freeTicketUsed': true,
+                    'snapshots.$[snapshot].freeTicketChallengeCompleted': false,
+                    'snapshots.$[snapshot].freeTicketChallengeCompletedAt': null,
+                    'snapshots.$[snapshot].completedFiveDollarNormalGames': 0,
+                    'snapshots.$[snapshot].completedTenDollarNormalGames': 0,
+                    'snapshots.$[snapshot].sponsoredRewardsUnlocked': false,
+                    'snapshots.$[snapshot].sponsoredRewardsCompleted': false,
+                    'snapshots.$[snapshot].sponsoredRewardsBalance': 0,
+                    'snapshots.$[snapshot].fundedRewardsUsd': 0,
+                    'snapshots.$[snapshot].permanentRewardProgressVolumeUsdMicros': 0,
+                    'snapshots.$[snapshot].permanentRewardProgressEarnedUsdMicros': 0,
+                } },
+                { arrayFilters: [{ 'snapshot.userId': user._id }], session },
+            );
+            await Transaction.create([{
+                userId: user._id,
+                type: 'game',
+                amount: 0,
+                currency: 'USD',
+                meta: {
+                    event: 'admin_action',
+                    action: 'reset_unfinished_rewards',
+                    adminActorId: String(req.user.id),
+                    starterPotentialDiscardedUsd: starterPotentialUsd,
+                    releasedStarterReserveUsd: releasedStarterUsd,
+                    releasedPermanentProgressUsd,
+                    releasedToOwnerSurplusUsd: releasedUsd,
+                    permanentLifetimeHistoryPreserved: true,
+                    tournamentRewardsPreserved: true,
+                },
+                status: 'confirmed',
+            }], { session });
+
+            result = {
+                username: user.username,
+                releasedUsd,
+                discardedPotentialUsd: Math.max(0, starterPotentialUsd - releasedStarterUsd),
+            };
+        });
+        return res.json({
+            success: true,
+            ...result,
+            message: `Unfinished rewards reset for ${result.username}. $${result.releasedUsd.toFixed(2)} of funded reserve is now tracked as owner surplus.`,
+        });
+    } catch (err) {
+        console.error('Reset unfinished rewards error:', err);
+        const transactionUnsupported = /Transaction numbers are only allowed|replica set|Transaction is not supported/i.test(err.message || '');
+        return res.status(err.status || (transactionUnsupported ? 503 : 500)).json({
+            message: transactionUnsupported
+                ? 'Safe reward reset requires MongoDB transaction support. No reward data was changed.'
+                : (err.message || 'Could not reset unfinished rewards.'),
+        });
+    } finally {
+        await session.endSession();
+        rewardPoolAdminResetting = false;
+    }
+});
+
 app.get('/api/admin/reward-security-alerts', authenticateAdmin, async (req, res) => {
     try {
-        const [alerts, pendingClaims] = await Promise.all([
+        const [alerts, pendingClaims, failedClaims] = await Promise.all([
             RewardSecurityAlert.find({})
                 .sort({ status: -1, createdAt: -1 })
                 .limit(200)
@@ -5943,8 +6170,13 @@ app.get('/api/admin/reward-security-alerts', authenticateAdmin, async (req, res)
                 .sort({ createdAt: 1 })
                 .populate('userId', 'username email')
                 .lean(),
+            RewardClaim.find({ status: 'failed' })
+                .sort({ updatedAt: -1 })
+                .limit(50)
+                .populate('userId', 'username email')
+                .lean(),
         ]);
-        res.json({ alerts, pendingClaims });
+        res.json({ alerts, pendingClaims, failedClaims });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -6727,6 +6959,7 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
         msUntilReset: resetting ? 0 : msUntilReset,
         msElapsed: now - GLOBAL_ARENA_START,
         isResetting: resetting,
+        newGameJoinsLocked,
         devFreePlay: DEV_FREE_PLAY,
         sweepScope: 'main_house_wallet_only',
         brUntouchedOnArenaReset: true,
@@ -7481,10 +7714,12 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
                 permanentRewardModelVersion: 4,
             } },
         );
-        await Promise.all([
+        const [, , displaySettings] = await Promise.all([
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
+            SiteDisplaySettings.findOne({ key: 'pregame' }).lean(),
         ]);
+        newGameJoinsLocked = !!displaySettings?.newGameJoinsLocked;
         const restoredSharedWalletBlocks = await restoreAutomaticSharedWalletBlocks();
         await releaseMatureAffiliateCommissions();
         const reconciliation = await reconcileAffiliateCommissions(Transaction);
@@ -8653,6 +8888,10 @@ io.on('connection', (socket) => {
                 return;
             }
 
+            if (isNewGameJoinLocked()) {
+                throw new Error('New game entries are temporarily locked while active matches finish.');
+            }
+
             const activeGame = findPlayerInArena(user._id);
             if (activeGame) throw new Error('Finish or leave your active game before entering the tournament');
             const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
@@ -8956,6 +9195,11 @@ io.on('connection', (socket) => {
                     return;
                 }
 
+                if (isNewGameJoinLocked()) {
+                    socket.emit('error', 'New game entries are temporarily locked while active matches finish.');
+                    return;
+                }
+
                 const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
                 if (!freePlay) {
@@ -9126,6 +9370,11 @@ io.on('connection', (socket) => {
                     return;
                 }
 
+                if (isNewGameJoinLocked()) {
+                    socket.emit('error', 'New game entries are temporarily locked while active matches finish.');
+                    return;
+                }
+
                 const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
 
                 if (!freePlay && !useAdminFreeSurvivEntry) {
@@ -9276,6 +9525,11 @@ io.on('connection', (socket) => {
 
             const existing = findPlayerInArena(userKey);
             const isFreeTicketPlay = !sessionFreePlay && (!!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom));
+
+            if (!existing && isNewGameJoinLocked()) {
+                socket.emit('error', 'New game entries are temporarily locked while active matches finish.');
+                return;
+            }
 
             if (isFreeTicketPlay && !existing) {
                 // First time joining with a free ticket
@@ -10582,6 +10836,7 @@ function getBattleRoyaleDeps() {
         ensureUserDepositWallet,
         OWNER_VAULT_ADDRESS,
         hasSkinEntitlement: hasSkinAccess,
+        isNewGameJoinLocked,
     };
 }
 

@@ -3,9 +3,23 @@ import assert from 'node:assert/strict';
 import {
     PERMANENT_REWARD_CYCLE_VOLUME_USD_MICROS,
     calculatePermanentRewardAllocation,
+    getStarterRewardLiabilityUsd,
     permanentProgressReserveUsd,
     serializePermanentRewards,
 } from './permanent-rewards.js';
+
+test('unfinished starter rewards reserve only the funded amount', () => {
+    assert.equal(getStarterRewardLiabilityUsd({ sponsoredRewardsBalance: 150, fundedRewardsUsd: 12 }), 12);
+    assert.equal(getStarterRewardLiabilityUsd({ sponsoredRewardsBalance: 150, fundedRewardsUsd: 0 }), 0);
+});
+
+test('completed starter rewards reserve the full claimable balance', () => {
+    assert.equal(getStarterRewardLiabilityUsd({
+        sponsoredRewardsBalance: 150,
+        fundedRewardsUsd: 12,
+        sponsoredRewardsCompleted: true,
+    }), 150);
+});
 
 test('$50 cashout at an 8% owner cut unlocks exactly 50% of the paid cut', () => {
     const result = calculatePermanentRewardAllocation({ grossCashoutUsd: 50, ownerCutUsd: 4 });

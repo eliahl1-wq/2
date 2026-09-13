@@ -1118,7 +1118,7 @@ export async function getAdminAffiliateOverview() {
         .populate('userId', 'username email walletAddress')
         .sort({ createdAt: -1 })
         .lean();
-    const [attributions, commissions, payouts, risks, tiers] = await Promise.all([
+    const [attributions, commissions, commissionTotals, payouts, risks, tiers] = await Promise.all([
         ReferralAttribution.find().lean(),
         AffiliateCommission.find()
             .sort({ createdAt: -1 })
@@ -1126,14 +1126,36 @@ export async function getAdminAffiliateOverview() {
             .populate('referredUserId', 'username')
             .populate('affiliateUserId', 'username')
             .lean(),
+        AffiliateCommission.aggregate([
+            {
+                $group: {
+                    _id: { affiliateProfileId: '$affiliateProfileId', status: '$status' },
+                    amountUsdMicros: { $sum: '$commissionUsdMicros' },
+                    grossCashoutUsdMicros: { $sum: '$grossCashoutUsdMicros' },
+                    count: { $sum: 1 },
+                },
+            },
+        ]),
         AffiliatePayout.find().sort({ createdAt: -1 }).lean(),
         AffiliateRiskFlag.find({ status: 'open' }).sort({ createdAt: -1 }).lean(),
         AffiliateTier.find().sort({ shareBps: 1 }).lean(),
     ]);
+    const totalsByProfile = new Map();
+    for (const row of commissionTotals) {
+        const profileId = String(row._id?.affiliateProfileId || '');
+        if (!totalsByProfile.has(profileId)) totalsByProfile.set(profileId, {});
+        totalsByProfile.get(profileId)[row._id?.status] = {
+            commissionUsdMicros: Number(row.amountUsdMicros) || 0,
+            grossCashoutUsdMicros: Number(row.grossCashoutUsdMicros) || 0,
+        };
+    }
     const affiliates = profiles.map(profile => {
         const ownAttributions = attributions.filter(item => sameId(item.affiliateProfileId, profile._id));
-        const ownCommissions = commissions.filter(item => sameId(item.affiliateProfileId, profile._id));
-        const amountFor = status => sumMicros(ownCommissions.filter(item => item.status === status));
+        const profileTotals = totalsByProfile.get(String(profile._id)) || {};
+        const amountFor = status => Number(profileTotals[status]?.commissionUsdMicros) || 0;
+        const referredCashoutVolumeUsdMicros = Object.entries(profileTotals)
+            .filter(([status]) => status !== 'reversed')
+            .reduce((total, [, row]) => total + (Number(row.grossCashoutUsdMicros) || 0), 0);
         return {
             id: profile._id,
             userId: profile.userId?._id,
@@ -1142,10 +1164,7 @@ export async function getAdminAffiliateOverview() {
             payoutWallet: profile.userId?.walletAddress || null,
             referralCode: profile.referralCode,
             referralCount: ownAttributions.length,
-            referredCashoutVolumeUsd: microsToUsd(sumMicros(
-                ownCommissions.filter(item => item.status !== 'reversed'),
-                'grossCashoutUsdMicros',
-            )),
+            referredCashoutVolumeUsd: microsToUsd(referredCashoutVolumeUsdMicros),
             pendingCommissionUsd: microsToUsd(amountFor('pending')),
             availableCommissionUsd: microsToUsd(amountFor('available')),
             paidCommissionUsd: microsToUsd(amountFor('paid')),
@@ -1159,8 +1178,22 @@ export async function getAdminAffiliateOverview() {
             createdAt: profile.createdAt,
         };
     });
+    const totals = affiliates.reduce((result, affiliate) => {
+        result.pendingCommissionUsd += affiliate.pendingCommissionUsd;
+        result.availableCommissionUsd += affiliate.availableCommissionUsd;
+        result.paidCommissionUsd += affiliate.paidCommissionUsd;
+        result.reversedCommissionUsd += affiliate.reversedCommissionUsd;
+        if (affiliate.pendingCommissionUsd + affiliate.availableCommissionUsd > 0) result.affiliateOwners += 1;
+        return result;
+    }, { pendingCommissionUsd: 0, availableCommissionUsd: 0, paidCommissionUsd: 0, reversedCommissionUsd: 0, affiliateOwners: 0 });
+    totals.outstandingCommissionUsd = totals.pendingCommissionUsd + totals.availableCommissionUsd;
+    for (const key of Object.keys(totals)) {
+        if (key.endsWith('Usd')) totals[key] = Number(totals[key].toFixed(6));
+    }
+    const profileById = new Map(profiles.map(profile => [String(profile._id), profile]));
     return {
         affiliates,
+        totals,
         commissions: commissions.map(commission => ({
             ...serializeCommission(commission),
             affiliateUsername: commission.affiliateUserId?.username || 'Unknown',
@@ -1168,7 +1201,12 @@ export async function getAdminAffiliateOverview() {
             cashoutTransactionId: commission.cashoutTransactionId,
             reversalReason: commission.reversalReason,
         })),
-        payouts: payouts.map(serializePayout),
+        payouts: payouts.map(payout => ({
+            ...serializePayout(payout),
+            affiliateProfileId: payout.affiliateProfileId,
+            affiliateUserId: payout.affiliateUserId,
+            affiliateUsername: profileById.get(String(payout.affiliateProfileId))?.userId?.username || 'Unknown',
+        })),
         riskFlags: risks,
         tiers,
         config: getAffiliatePublicConfig(),
