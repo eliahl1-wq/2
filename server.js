@@ -9609,27 +9609,37 @@ async function initializeDatabaseBackedSystems() {
 
     databaseStartupPromise = (async () => {
         console.log('[Startup] Initializing database-backed systems...');
-        const permanentRewardMigration = await User.updateMany(
-            { permanentRewardModelVersion: { $ne: 4 } },
-            { $set: {
-                permanentRewardProgressVolumeUsdMicros: 0,
-                permanentRewardProgressEarnedUsdMicros: 0,
-                permanentRewardModelVersion: 4,
-            } },
-        );
-        const [, , displaySettings] = await Promise.all([
+        const [permanentRewardMigration, , , displaySettings] = await Promise.all([
+            User.updateMany(
+                { permanentRewardModelVersion: { $ne: 4 } },
+                { $set: {
+                    permanentRewardProgressVolumeUsdMicros: 0,
+                    permanentRewardProgressEarnedUsdMicros: 0,
+                    permanentRewardModelVersion: 4,
+                } },
+            ),
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
             SiteDisplaySettings.findOne({ key: 'pregame' }).lean(),
         ]);
         newGameJoinsLocked = !!displaySettings?.newGameJoinsLocked;
-        const restoredSharedWalletBlocks = await restoreAutomaticSharedWalletBlocks();
-        await releaseMatureAffiliateCommissions();
-        const reconciliation = await reconcileAffiliateCommissions(Transaction);
         await loadReleaseStateOnStartup();
         serverReady = true;
         emitReleaseState();
-        console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Permanent reward migration: ${permanentRewardMigration.modifiedCount}. Shared-wallet blocks restored: ${restoredSharedWalletBlocks}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
+        console.log(`Core startup complete. Permanent reward migration: ${permanentRewardMigration.modifiedCount}.`);
+
+        // Historical repair/reconciliation can involve hundreds of sequential
+        // database operations. It is idempotent and is not required to safely
+        // accept game traffic, so it must never keep /ready closed after a
+        // successful Railway restart.
+        void (async () => {
+            const restoredSharedWalletBlocks = await restoreAutomaticSharedWalletBlocks();
+            await releaseMatureAffiliateCommissions();
+            const reconciliation = await reconcileAffiliateCommissions(Transaction);
+            console.log(`Background startup maintenance complete. Shared-wallet blocks restored: ${restoredSharedWalletBlocks}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} created.`);
+        })().catch(error => {
+            console.error('[Startup] Background reward/affiliate maintenance failed:', error);
+        });
     })();
 
     try {
