@@ -181,6 +181,7 @@ import { getAgarBotCellCenter, planAgarBotEscapeSplit, planAgarBotSplit } from '
 import { createSerialOperationQueue } from './serial-operation-queue.js';
 import { calculateRoomCashoutReservation } from './cashout-accounting.js';
 import { calculateReferredCashoutFeeRouting } from './affiliate-fee-routing.js';
+import { allocateAgarEjectionValue, calculateNormalRoomValue } from './game-value-accounting.js';
 import {
     DEFAULT_MISSING_BROADCAST_TIMEOUT_MS,
     shouldReleaseMissingBroadcastClaim,
@@ -575,6 +576,96 @@ const BugReportSchema = new mongoose.Schema({
 
 BugReportSchema.index({ status: 1, createdAt: -1 });
 const BugReport = mongoose.model('BugReport', BugReportSchema);
+
+const AdminIssueSchema = new mongoose.Schema({
+    fingerprint: { type: String, required: true, trim: true, maxlength: 240, index: true },
+    activeKey: { type: String, trim: true, maxlength: 240 },
+    severity: { type: String, enum: ['critical', 'error', 'warning'], default: 'error', index: true },
+    category: { type: String, enum: ['cashout', 'economy', 'wallet', 'solana', 'system'], default: 'system', index: true },
+    code: { type: String, required: true, trim: true, maxlength: 100, index: true },
+    title: { type: String, required: true, trim: true, maxlength: 180 },
+    message: { type: String, required: true, trim: true, maxlength: 1200 },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+    username: { type: String, default: '', trim: true, maxlength: 80 },
+    roomId: { type: String, default: '', trim: true, maxlength: 160 },
+    gameSessionId: { type: String, default: '', trim: true, maxlength: 160 },
+    mode: { type: String, default: '', trim: true, maxlength: 80 },
+    expectedUsd: { type: Number, default: null },
+    actualUsd: { type: Number, default: null },
+    differenceUsd: { type: Number, default: null },
+    context: { type: Object, default: {} },
+    status: { type: String, enum: ['open', 'resolved'], default: 'open', index: true },
+    occurrences: { type: Number, default: 0, min: 0 },
+    firstSeenAt: { type: Date, default: Date.now },
+    lastSeenAt: { type: Date, default: Date.now, index: true },
+    resolvedAt: { type: Date, default: null },
+}, { timestamps: true });
+
+AdminIssueSchema.index({ activeKey: 1 }, { unique: true, sparse: true });
+AdminIssueSchema.index({ status: 1, severity: 1, lastSeenAt: -1 });
+const AdminIssue = mongoose.model('AdminIssue', AdminIssueSchema);
+
+function finiteIssueNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+}
+
+async function recordAdminIssue(details = {}) {
+    if (mongoose.connection.readyState !== 1) return null;
+    const code = String(details.code || 'unknown_error').slice(0, 100);
+    const fingerprint = String(details.fingerprint || `${code}:${details.userId || ''}:${details.gameSessionId || details.roomId || ''}`).slice(0, 240);
+    const now = new Date();
+    const update = {
+        severity: ['critical', 'error', 'warning'].includes(details.severity) ? details.severity : 'error',
+        category: ['cashout', 'economy', 'wallet', 'solana', 'system'].includes(details.category) ? details.category : 'system',
+        code,
+        title: String(details.title || 'Backend issue').slice(0, 180),
+        message: String(details.message || 'No details available').slice(0, 1200),
+        userId: details.userId || null,
+        username: String(details.username || '').slice(0, 80),
+        roomId: String(details.roomId || '').slice(0, 160),
+        gameSessionId: String(details.gameSessionId || '').slice(0, 160),
+        mode: String(details.mode || '').slice(0, 80),
+        expectedUsd: finiteIssueNumber(details.expectedUsd),
+        actualUsd: finiteIssueNumber(details.actualUsd),
+        differenceUsd: finiteIssueNumber(details.differenceUsd),
+        context: details.context && typeof details.context === 'object' ? details.context : {},
+        status: 'open',
+        resolvedAt: null,
+        lastSeenAt: now,
+    };
+    try {
+        return await AdminIssue.findOneAndUpdate(
+            { activeKey: fingerprint },
+            {
+                $set: update,
+                $setOnInsert: { fingerprint, firstSeenAt: now },
+                $inc: { occurrences: 1 },
+            },
+            { new: true, upsert: true, setDefaultsOnInsert: false },
+        );
+    } catch (error) {
+        // A simultaneous report may win the unique-key upsert. Update that row
+        // once instead of allowing issue logging to affect gameplay.
+        if (error?.code === 11000) {
+            return AdminIssue.findOneAndUpdate(
+                { activeKey: fingerprint },
+                { $set: update, $inc: { occurrences: 1 } },
+                { new: true },
+            ).catch(() => null);
+        }
+        console.error('[Admin Issues] Could not persist issue:', error.message);
+        return null;
+    }
+}
+
+async function resolveAdminIssue(fingerprint) {
+    if (!fingerprint || mongoose.connection.readyState !== 1) return;
+    await AdminIssue.updateOne(
+        { activeKey: String(fingerprint), status: 'open' },
+        { $set: { status: 'resolved', resolvedAt: new Date() }, $unset: { activeKey: 1 } },
+    ).catch(error => console.error('[Admin Issues] Could not auto-resolve issue:', error.message));
+}
 
 const TransactionSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -1207,6 +1298,9 @@ function createArenaRoom(entryFeeUsd) {
         fundedEntryUsd: 0,
         reservedCashoutUsd: 0,
         paidCashoutUsd: 0,
+        botCashoutCount: 0,
+        botCashoutUsd: 0,
+        sessionPlayerCashoutUsd: 0,
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
         qt: new QuadTree(new Rectangle(c.worldWidth / 2, c.worldHeight / 2, c.worldWidth / 2, c.worldHeight / 2), 4),
@@ -1262,6 +1356,7 @@ function createCompetitiveSlitherRoom(entryFeeUsd) {
         players: [],
         competitiveSpectators: [],
         slitherFood: [],
+        sessionPlayerCashoutUsd: 0,
         startTime: GLOBAL_ARENA_START,
         isResetting: false,
     };
@@ -1283,6 +1378,7 @@ function createSurvivRoom(entryFeeUsd) {
         spawnPoints: map.spawnPoints,
         landmarks: map.landmarks,
         lootPoolBalance: 0,
+        sessionPlayerCashoutUsd: 0,
         spectators: [],
         deathMarkers: [],
         onHumanEliminated: async (player, { dollarBalance = 0 } = {}) => {
@@ -1452,6 +1548,23 @@ async function recordCashoutFailure(player, room, reason, error) {
         },
         status: 'failed',
     }).catch(auditError => console.error('Cashout failure audit could not be saved:', auditError.message));
+    await recordAdminIssue({
+        fingerprint: `cashout-failure:${player?.gameSessionId || player?.id || userId || reason}`,
+        severity: 'error',
+        category: 'cashout',
+        code: reason,
+        title: 'Player could not cash out',
+        message,
+        userId,
+        username: player?.username,
+        roomId: room?.id,
+        gameSessionId: player?.gameSessionId,
+        mode: player?.mode,
+        expectedUsd: Number(arenaCashoutUsd(player)) || 0,
+        actualUsd: 0,
+        differenceUsd: -(Number(arenaCashoutUsd(player)) || 0),
+        context: { houseWalletQueueDepth: houseWalletOperations.size },
+    });
 }
 
 async function persistCashoutPlaytime(user, player, context) {
@@ -1473,49 +1586,142 @@ async function emitPersistedCashoutResult(record, payload) {
     });
 }
 
-async function settleTrackedCashoutToAccount(record, reason) {
-    const amountUsd = Math.max(0, Number(record.amount) || 0);
-    const solAmount = Math.max(0, Number(record.meta?.solAmount) || 0);
-    const credited = await User.updateOne(
-        {
-            _id: record.userId,
-            retainedCashoutSettlementIds: { $ne: record._id },
-        },
-        {
-            $inc: { balance: solAmount },
-            $addToSet: { retainedCashoutSettlementIds: record._id },
-        },
-    );
-    record.status = 'confirmed';
-    record.meta = {
-        ...(record.meta || {}),
-        attemptedSignature: record.meta?.signature || null,
-        signature: 'house_cashout_account_credit',
-        paidOnChainUsd: 0,
-        accountCreditSol: solAmount,
-        accountCreditUsd: amountUsd,
-        retainedForAccountWithdrawal: true,
-        settlementError: String(reason || 'On-chain settlement unavailable').slice(0, 500),
-        fallbackCreditedNow: credited.modifiedCount === 1,
-    };
-    await record.save();
-    await emitPersistedCashoutResult(record, {
-        amount: amountUsd,
-        signature: 'house_cashout_account_credit',
-        retainedForAccountWithdrawal: true,
-    });
-    return { playerPayout: amountUsd, signature: 'house_cashout_account_credit', retainedForAccountWithdrawal: true };
-}
-
 async function confirmTrackedCashout(record) {
     record.status = 'confirmed';
     record.meta = { ...(record.meta || {}), confirmedAt: new Date().toISOString() };
     await record.save();
+    await Promise.all([
+        resolveAdminIssue(`cashout-pending:${record._id}`),
+        resolveAdminIssue(`cashout-chain-failed:${record._id}`),
+        resolveAdminIssue(`cashout-retry-failed:${record._id}`),
+    ]);
     await emitPersistedCashoutResult(record, {
         amount: Number(record.amount) || 0,
         signature: record.meta?.signature,
     });
     return { playerPayout: Number(record.amount) || 0, signature: record.meta?.signature };
+}
+
+async function retryTrackedCashout(record) {
+    if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
+        await recordAdminIssue({
+            fingerprint: `cashout-pending:${record._id}`,
+            severity: 'critical', category: 'wallet', code: 'cashout_house_wallet_unconfigured',
+            title: 'Cashout retry is blocked', message: 'House Wallet configuration is unavailable.',
+            userId: record.userId, mode: record.meta?.mode, gameSessionId: record.meta?.gameSessionId,
+            expectedUsd: record.amount, actualUsd: 0, differenceUsd: -(Number(record.amount) || 0),
+            context: { transactionId: String(record._id) },
+        });
+        return false;
+    }
+    const user = await User.findById(record.userId).select('depositAddress').lean();
+    if (!user?.depositAddress) {
+        await recordAdminIssue({
+            fingerprint: `cashout-pending:${record._id}`,
+            severity: 'error', category: 'cashout', code: 'cashout_destination_unavailable',
+            title: 'Cashout retry has no destination', message: 'The account has no usable deposit address for the pending cashout.',
+            userId: record.userId, mode: record.meta?.mode, gameSessionId: record.meta?.gameSessionId,
+            expectedUsd: record.amount, actualUsd: 0, differenceUsd: -(Number(record.amount) || 0),
+            context: { transactionId: String(record._id) },
+        });
+        return false;
+    }
+    const payoutLamports = Math.max(0, Math.floor(Number(record.meta?.payoutLamports) || 0));
+    if (!payoutLamports) {
+        await recordAdminIssue({
+            fingerprint: `cashout-pending:${record._id}`,
+            severity: 'error', category: 'cashout', code: 'cashout_amount_unavailable',
+            title: 'Cashout retry has no transfer amount', message: 'The pending cashout is missing a valid on-chain payout amount.',
+            userId: record.userId, mode: record.meta?.mode, gameSessionId: record.meta?.gameSessionId,
+            expectedUsd: record.amount, actualUsd: 0, differenceUsd: -(Number(record.amount) || 0),
+            context: { transactionId: String(record._id) },
+        });
+        return false;
+    }
+
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex')),
+    );
+    if (houseKeypair.publicKey.toBase58() !== HOUSE_WALLET_ADDRESS) {
+        throw new Error('House wallet address does not match configured secret');
+    }
+    const houseBalance = await connection.getBalance(houseKeypair.publicKey);
+    if (houseBalance < payoutLamports + 20_000) {
+        await recordAdminIssue({
+            fingerprint: `cashout-pending:${record._id}`,
+            severity: 'critical',
+            category: 'wallet',
+            code: 'cashout_house_liquidity_unavailable',
+            title: 'House Wallet cannot retry a cashout',
+            message: 'A pending cashout cannot currently be retried because House Wallet lacks the required SOL plus its fee buffer.',
+            userId: record.userId,
+            mode: record.meta?.mode,
+            roomId: record.meta?.roomId,
+            gameSessionId: record.meta?.gameSessionId,
+            expectedUsd: record.amount,
+            actualUsd: 0,
+            differenceUsd: -(Number(record.amount) || 0),
+            context: { transactionId: String(record._id), payoutLamports, houseBalanceLamports: houseBalance },
+        });
+        return false;
+    }
+
+    const latest = await connection.getLatestBlockhash('confirmed');
+    const transaction = new solanaWeb3.Transaction({
+        feePayer: houseKeypair.publicKey,
+        recentBlockhash: latest.blockhash,
+    }).add(solanaWeb3.SystemProgram.transfer({
+        fromPubkey: houseKeypair.publicKey,
+        toPubkey: new solanaWeb3.PublicKey(user.depositAddress),
+        lamports: payoutLamports,
+    }));
+    transaction.sign(houseKeypair);
+    const previousSignature = record.meta?.signature;
+    const signature = bs58.encode(transaction.signature);
+    const stored = await Transaction.updateOne(
+        { _id: record._id, status: 'pending', 'meta.signature': previousSignature },
+        {
+            $set: {
+                'meta.signature': signature,
+                'meta.blockhash': latest.blockhash,
+                'meta.lastValidBlockHeight': latest.lastValidBlockHeight,
+                'meta.broadcastPreparedAt': new Date().toISOString(),
+                'meta.settlementError': null,
+            },
+            $inc: { 'meta.cashoutRetryCount': 1 },
+        },
+    );
+    if (!stored.modifiedCount) return false;
+    try {
+        const submitted = await connection.sendRawTransaction(transaction.serialize(), {
+            skipPreflight: false,
+            maxRetries: 3,
+        });
+        if (submitted !== signature) throw new Error('Retried cashout signature mismatch');
+        return true;
+    } catch (error) {
+        await Transaction.updateOne(
+            { _id: record._id, status: 'pending', 'meta.signature': signature },
+            { $set: { 'meta.settlementError': String(error.message || error).slice(0, 500) } },
+        ).catch(() => {});
+        await recordAdminIssue({
+            fingerprint: `cashout-retry-failed:${record._id}`,
+            severity: 'error',
+            category: 'solana',
+            code: 'cashout_retry_broadcast_failed',
+            title: 'Cashout retry failed',
+            message: String(error.message || error),
+            userId: record.userId,
+            mode: record.meta?.mode,
+            roomId: record.meta?.roomId,
+            gameSessionId: record.meta?.gameSessionId,
+            expectedUsd: record.amount,
+            actualUsd: 0,
+            differenceUsd: -(Number(record.amount) || 0),
+            context: { transactionId: String(record._id), signature },
+        });
+        return false;
+    }
 }
 
 async function submitTrackedCashout({
@@ -1575,8 +1781,70 @@ async function submitTrackedCashout({
         return { playerPayout, platformFee, signature: record.meta?.signature, processing: true };
     }
 
+    const expectedGrossUsd = Number(logMeta?.dollarBalance) || 0;
+    const expectedNetUsd = Number(logMeta?.requestedPlayerPayout ?? playerPayout) || 0;
+    const grossReconstructedUsd = expectedNetUsd + (Number(platformFee) || 0);
+    if (Math.abs(grossReconstructedUsd - expectedGrossUsd) > 0.00001) {
+        await recordAdminIssue({
+            fingerprint: `cashout-value-mismatch:${record._id}`,
+            severity: 'critical',
+            category: 'cashout',
+            code: 'cashout_value_mismatch',
+            title: 'Cashout calculation does not match in-game balance',
+            message: 'The gross in-game balance does not equal the calculated player payout plus the configured cashout fee.',
+            userId: user._id,
+            username: player.username,
+            roomId: room?.id,
+            gameSessionId: player.gameSessionId,
+            mode: player.mode,
+            expectedUsd: expectedGrossUsd,
+            actualUsd: grossReconstructedUsd,
+            differenceUsd: grossReconstructedUsd - expectedGrossUsd,
+            context: { transactionId: String(record._id), platformFeeUsd: platformFee },
+        });
+    }
+    if ((Number(logMeta?.roomLedgerShortfallUsd) || 0) > 0.000001) {
+        await recordAdminIssue({
+            fingerprint: `cashout-ledger-shortfall:${record._id}`,
+            severity: 'critical',
+            category: 'economy',
+            code: 'cashout_room_ledger_shortfall',
+            title: 'In-game balance exceeded room funding',
+            message: 'The player requested more value than remained in the funded room ledger. The cashout was capped to conserved room value.',
+            userId: user._id,
+            username: player.username,
+            roomId: room?.id,
+            gameSessionId: player.gameSessionId,
+            mode: player.mode,
+            expectedUsd: Number(logMeta.requestedDollarBalance) || 0,
+            actualUsd: Number(logMeta.dollarBalance) || 0,
+            differenceUsd: -(Number(logMeta.roomLedgerShortfallUsd) || 0),
+            context: { transactionId: String(record._id) },
+        });
+    }
+    if (logMeta?.liquidityAdjusted) {
+        await recordAdminIssue({
+            fingerprint: `cashout-liquidity-adjusted:${record._id}`,
+            severity: 'critical',
+            category: 'wallet',
+            code: 'cashout_liquidity_adjusted',
+            title: 'Cashout was reduced by the liquidity cap',
+            message: 'House Wallet could not cover the full calculated payout, so the existing liquidity cap reduced the transfer.',
+            userId: user._id,
+            username: player.username,
+            roomId: room?.id,
+            gameSessionId: player.gameSessionId,
+            mode: player.mode,
+            expectedUsd: Number(logMeta.requestedPlayerPayout) || 0,
+            actualUsd: playerPayout,
+            differenceUsd: -(Number(logMeta.liquidityShortfallUsd) || 0),
+            context: { transactionId: String(record._id), payoutLamports: Number(logMeta.payoutLamports) || 0 },
+        });
+    }
+
     detachPlayer();
     commitReservation?.();
+    room.sessionPlayerCashoutUsd = (Number(room.sessionPlayerCashoutUsd) || 0) + playerPayout;
     await persistCashoutPlaytime(user, player, context);
     emitPlayerAccountEvent(player, player.id, user._id, 'cashOutProcessing', {
         gameSessionId: player.gameSessionId || null,
@@ -1595,20 +1863,53 @@ async function submitTrackedCashout({
             lastValidBlockHeight: latest.lastValidBlockHeight,
         }, 'confirmed');
         if (confirmation.value.err) {
-            return {
-                ...(await settleTrackedCashoutToAccount(
-                    record,
-                    `On-chain cashout failed: ${JSON.stringify(confirmation.value.err)}`,
-                )),
-                platformFee,
+            record.meta = {
+                ...(record.meta || {}),
+                settlementError: `On-chain cashout failed: ${JSON.stringify(confirmation.value.err)}`,
             };
+            await record.save();
+            await recordAdminIssue({
+                fingerprint: `cashout-chain-failed:${record._id}`,
+                severity: 'error',
+                category: 'solana',
+                code: 'cashout_chain_failed',
+                title: 'Cashout transaction failed on-chain',
+                message: record.meta.settlementError,
+                userId: user._id,
+                username: player.username,
+                roomId: room?.id,
+                gameSessionId: player.gameSessionId,
+                mode: player.mode,
+                expectedUsd: playerPayout,
+                actualUsd: 0,
+                differenceUsd: -playerPayout,
+                context: { transactionId: String(record._id), signature },
+            });
+            return { playerPayout, platformFee, signature, processing: true };
         }
         return { ...(await confirmTrackedCashout(record)), platformFee };
     } catch (error) {
         // The signed transaction may have reached a validator even when this
         // RPC call failed. Keep it pending; the reconciler will confirm it or
-        // move the full USD amount to Rewards after blockhash expiry.
+        // retry the same House Wallet liability after blockhash expiry.
         console.warn(`[Cashout Settlement] ${context} awaiting reconciliation:`, error.message);
+        await recordAdminIssue({
+            fingerprint: `cashout-pending:${record._id}`,
+            severity: 'warning',
+            category: 'cashout',
+            code: 'cashout_awaiting_reconciliation',
+            title: 'Cashout is awaiting reconciliation',
+            message: String(error.message || error),
+            userId: user._id,
+            username: player.username,
+            roomId: room?.id,
+            gameSessionId: player.gameSessionId,
+            mode: player.mode,
+            expectedUsd: playerPayout,
+            actualUsd: 0,
+            differenceUsd: -playerPayout,
+            context: { transactionId: String(record._id), signature },
+        });
         return { playerPayout, platformFee, signature, processing: true };
     }
 }
@@ -1623,7 +1924,7 @@ async function reconcileTrackedCashouts() {
     for (const record of records) {
         try {
             // The live cashout path already owns this queue. Reconciliation
-            // enters the same queue so it cannot credit Rewards at the same
+            // enters the same queue so it cannot prepare a retry at the same
             // instant that a late confirmation is being committed.
             await houseWalletOperations.run(async () => {
                 const current = await Transaction.findOne({ _id: record._id, status: 'pending' });
@@ -1640,8 +1941,24 @@ async function reconcileTrackedCashouts() {
                     updatedAt: current.meta.broadcastPreparedAt || current.createdAt,
                 });
                 if (state === 'confirmed') await confirmTrackedCashout(current);
-                else if (['failed', 'expired'].includes(state)) {
-                    await settleTrackedCashoutToAccount(current, `Cashout transaction ${state}`);
+                else if (['failed', 'expired'].includes(state)) await retryTrackedCashout(current);
+                else if (Date.now() - new Date(current.createdAt).getTime() >= 120_000) {
+                    await recordAdminIssue({
+                        fingerprint: `cashout-pending:${current._id}`,
+                        severity: 'warning',
+                        category: 'cashout',
+                        code: 'cashout_stuck_pending',
+                        title: 'Cashout has been pending for over two minutes',
+                        message: 'The settlement is still waiting for a definitive Solana result. It remains protected from House Wallet sweeps.',
+                        userId: current.userId,
+                        mode: current.meta?.mode,
+                        roomId: current.meta?.roomId,
+                        gameSessionId: current.meta?.gameSessionId,
+                        expectedUsd: current.amount,
+                        actualUsd: 0,
+                        differenceUsd: -(Number(current.amount) || 0),
+                        context: { transactionId: String(current._id), signature: current.meta?.signature },
+                    });
                 }
             });
         } catch (error) {
@@ -2443,6 +2760,9 @@ function resetRoomEntities(room) {
     room.fundedEntryUsd = 0;
     room.reservedCashoutUsd = 0;
     room.paidCashoutUsd = 0;
+    room.botCashoutCount = 0;
+    room.botCashoutUsd = 0;
+    room.sessionPlayerCashoutUsd = 0;
     resetFreeTicketBotTargets(room);
 }
 
@@ -2685,9 +3005,11 @@ async function performGlobalArenaReset({ scheduled = false } = {}) {
             room.players = [];
             room.slitherFood = [];
             room.competitiveSpectators = [];
+            room.sessionPlayerCashoutUsd = 0;
         }
         for (const room of survivRooms) {
             resetSurvivRoomRuntime(room);
+            room.sessionPlayerCashoutUsd = 0;
         }
 
         GLOBAL_ARENA_START = Date.now();
@@ -5703,6 +6025,70 @@ app.put('/api/admin/pregame/display-settings', authenticateAdmin, async (req, re
     }
 });
 
+app.get('/api/admin/issues', authenticateAdmin, async (req, res) => {
+    try {
+        const query = {};
+        const status = String(req.query.status || 'open');
+        if (['open', 'resolved'].includes(status)) query.status = status;
+        else if (status !== 'all') return res.status(400).json({ message: 'Invalid issue status.' });
+        if (req.query.severity) {
+            if (!['critical', 'error', 'warning'].includes(String(req.query.severity))) return res.status(400).json({ message: 'Invalid issue severity.' });
+            query.severity = String(req.query.severity);
+        }
+        if (req.query.category) {
+            if (!['cashout', 'economy', 'wallet', 'solana', 'system'].includes(String(req.query.category))) return res.status(400).json({ message: 'Invalid issue category.' });
+            query.category = String(req.query.category);
+        }
+        const limit = Math.min(300, Math.max(1, Number.parseInt(req.query.limit, 10) || 150));
+        const [issues, openCounts] = await Promise.all([
+            AdminIssue.find(query).sort({ status: 1, severity: 1, lastSeenAt: -1 }).limit(limit).lean(),
+            AdminIssue.aggregate([
+                { $match: { status: 'open' } },
+                { $group: { _id: '$severity', count: { $sum: 1 } } },
+            ]),
+        ]);
+        const summary = { totalOpen: 0, critical: 0, error: 0, warning: 0 };
+        for (const row of openCounts) {
+            if (Object.hasOwn(summary, row._id)) summary[row._id] = row.count;
+            summary.totalOpen += row.count;
+        }
+        return res.json({ issues, summary });
+    } catch (err) {
+        console.error('Admin issues error:', err);
+        return res.status(500).json({ message: 'Could not load admin issues.' });
+    }
+});
+
+app.patch('/api/admin/issues/:issueId', authenticateAdmin, async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.issueId)) return res.status(400).json({ message: 'Invalid issue id.' });
+        const status = String(req.body?.status || '');
+        if (!['open', 'resolved'].includes(status)) return res.status(400).json({ message: 'Invalid issue status.' });
+        const current = await AdminIssue.findById(req.params.issueId).lean();
+        if (!current) return res.status(404).json({ message: 'Issue not found.' });
+        let issue;
+        if (status === 'resolved') {
+            issue = await AdminIssue.findByIdAndUpdate(
+                current._id,
+                { $set: { status: 'resolved', resolvedAt: new Date() }, $unset: { activeKey: 1 } },
+                { new: true },
+            ).lean();
+        } else {
+            const duplicate = await AdminIssue.findOne({ activeKey: current.fingerprint, _id: { $ne: current._id } }).lean();
+            if (duplicate) return res.status(409).json({ message: 'This issue has already occurred again and is open.' });
+            issue = await AdminIssue.findByIdAndUpdate(
+                current._id,
+                { $set: { status: 'open', resolvedAt: null, activeKey: current.fingerprint, lastSeenAt: new Date() } },
+                { new: true },
+            ).lean();
+        }
+        return res.json({ issue });
+    } catch (err) {
+        console.error('Update admin issue error:', err);
+        return res.status(500).json({ message: 'Could not update the issue.' });
+    }
+});
+
 app.get('/api/admin/bug-reports', authenticateAdmin, async (req, res) => {
     try {
         const reports = await BugReport.find({})
@@ -7670,6 +8056,193 @@ app.get('/api/admin/dashboard/wallets', authenticateAdmin, async (req, res) => {
     }
 });
 
+function roundLiveUsd(value) {
+    return Number((Math.max(0, Number(value) || 0)).toFixed(6));
+}
+
+function liveEntityBalance(entity) {
+    return roundLiveUsd(entity?.dollarBalance ?? entity?.balance ?? 0);
+}
+
+function sumLiveValues(items, getter) {
+    return roundLiveUsd((items || []).reduce((sum, item) => sum + (Number(getter(item)) || 0), 0));
+}
+
+app.get('/api/admin/dashboard/main-house-live', authenticateAdmin, async (req, res) => {
+    try {
+        let onChainBalanceSol = null;
+        let onChainError = null;
+        if (HOUSE_WALLET_ADDRESS) {
+            try {
+                const lamports = await connection.getBalance(new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS));
+                onChainBalanceSol = lamports / solanaWeb3.LAMPORTS_PER_SOL;
+            } catch (error) {
+                onChainError = error.message;
+            }
+        }
+
+        const paidArenaRooms = rooms.filter(room => (
+            !room.isFreeTicketRoom
+            && !room.isPersonalFreePlay
+            && !room.isTournament
+            && !room.isSandbox
+        ));
+        const roomSnapshots = paidArenaRooms.map(room => {
+            const players = (room.players || []).filter(player => !player.isBot).map(player => ({
+                id: player.mongoId?.toString() || player.id,
+                username: player.username || 'Unknown',
+                mode: player.mode === 'slither' ? 'Slither' : 'Agar',
+                balanceUsd: liveEntityBalance(player),
+                disconnected: !!player.disconnected,
+                cashingOut: !!player.isCashingOut || !!player.cashoutSettling,
+            })).sort((a, b) => b.balanceUsd - a.balanceUsd);
+            const bots = [...(room.bots || []), ...(room.slitherBots || [])];
+            const mapFoodUsd = roundLiveUsd(
+                sumLiveValues(room.food, food => food.dollarValue ?? food.balance)
+                + sumLiveValues(room.slitherFood, food => food.dollarValue ?? food.balance)
+                + sumLiveValues(room.ejected, food => food.dollarValue ?? food.balance),
+            );
+            return {
+                id: room.id,
+                label: `$${room.entryFeeUsd} shared Agar / Slither`,
+                entryFeeUsd: room.entryFeeUsd,
+                players,
+                playerBalanceUsd: sumLiveValues(players, player => player.balanceUsd),
+                activeBotCount: bots.length,
+                activeBotBalanceUsd: sumLiveValues(bots, liveEntityBalance),
+                mapFoodUsd,
+                unspawnedFoodUsd: roundLiveUsd(room.foodPoolBalance),
+                unspawnedBotBudgetUsd: roundLiveUsd(room.aiBudgetBalance),
+                ownerAccruedUsd: roundLiveUsd(room.ownerBalance),
+                reservedCashoutUsd: roundLiveUsd(room.reservedCashoutUsd),
+                playerCashoutsUsd: roundLiveUsd(room.sessionPlayerCashoutUsd),
+                botCashoutCount: Number(room.botCashoutCount) || 0,
+                botCashoutsUsd: roundLiveUsd(room.botCashoutUsd),
+            };
+        });
+
+        const survivSnapshots = survivRooms
+            .filter(room => !room.isPersonalFreePlay && !room.isSandbox)
+            .map(room => {
+                const players = (room.players || []).filter(player => !player.personalFreePlay).map(player => ({
+                    id: player.mongoId?.toString() || player.id,
+                    username: player.username || 'Unknown',
+                    mode: 'Surviv',
+                    balanceUsd: liveEntityBalance(player),
+                    disconnected: !!player.disconnected,
+                    cashingOut: !!player.isCashingOut || !!player.cashoutSettling,
+                })).sort((a, b) => b.balanceUsd - a.balanceUsd);
+                const moneyLoot = (room.loot || []).filter(item => item.type === 'money');
+                return {
+                    id: room.id,
+                    label: `$${room.entryFeeUsd} Surviv`,
+                    entryFeeUsd: room.entryFeeUsd,
+                    players,
+                    playerBalanceUsd: sumLiveValues(players, player => player.balanceUsd),
+                    activeBotCount: (room.bots || []).length,
+                    activeBotBalanceUsd: sumLiveValues(room.bots, liveEntityBalance),
+                    mapFoodUsd: sumLiveValues(moneyLoot, item => item.dollarValue ?? item.amount),
+                    unspawnedFoodUsd: roundLiveUsd(room.lootPoolBalance),
+                    unspawnedBotBudgetUsd: 0,
+                    ownerAccruedUsd: 0,
+                    reservedCashoutUsd: 0,
+                    playerCashoutsUsd: roundLiveUsd(room.sessionPlayerCashoutUsd),
+                    botCashoutCount: 0,
+                    botCashoutsUsd: 0,
+                };
+            });
+
+        const competitiveSnapshots = competitiveSlitherRooms
+            .filter(room => !room.isPersonalFreePlay && !room.isSandbox)
+            .map(room => {
+                const humans = (room.players || []).filter(player => !!player.mongoId && !player.isBot);
+                const bots = (room.players || []).filter(player => !player.mongoId || player.isBot);
+                const players = humans.map(player => ({
+                    id: player.mongoId?.toString() || player.id,
+                    username: player.username || 'Unknown',
+                    mode: 'Slither Arena',
+                    balanceUsd: liveEntityBalance(player),
+                    disconnected: !!player.disconnected,
+                    cashingOut: !!player.isCashingOut || !!player.cashoutSettling,
+                })).sort((a, b) => b.balanceUsd - a.balanceUsd);
+                return {
+                    id: room.id,
+                    label: `$${room.entryFeeUsd} Slither Arena`,
+                    entryFeeUsd: room.entryFeeUsd,
+                    players,
+                    playerBalanceUsd: sumLiveValues(players, player => player.balanceUsd),
+                    activeBotCount: bots.length,
+                    activeBotBalanceUsd: sumLiveValues(bots, liveEntityBalance),
+                    mapFoodUsd: sumLiveValues(room.slitherFood, food => food.dollarValue ?? food.balance),
+                    unspawnedFoodUsd: 0,
+                    unspawnedBotBudgetUsd: 0,
+                    ownerAccruedUsd: 0,
+                    reservedCashoutUsd: 0,
+                    playerCashoutsUsd: roundLiveUsd(room.sessionPlayerCashoutUsd),
+                    botCashoutCount: 0,
+                    botCashoutsUsd: 0,
+                };
+            });
+
+        const allRooms = [...roomSnapshots, ...survivSnapshots, ...competitiveSnapshots];
+        const totals = allRooms.reduce((result, room) => {
+            result.playerBalanceUsd += room.playerBalanceUsd;
+            result.activeBotBalanceUsd += room.activeBotBalanceUsd;
+            result.mapFoodUsd += room.mapFoodUsd;
+            result.unspawnedFoodUsd += room.unspawnedFoodUsd;
+            result.unspawnedBotBudgetUsd += room.unspawnedBotBudgetUsd;
+            result.ownerAccruedUsd += room.ownerAccruedUsd;
+            result.reservedCashoutUsd += room.reservedCashoutUsd;
+            result.playerCashoutsUsd += room.playerCashoutsUsd;
+            result.botCashoutsUsd += room.botCashoutsUsd;
+            result.activePlayers += room.players.length;
+            result.activeBots += room.activeBotCount;
+            result.botCashoutCount += room.botCashoutCount;
+            return result;
+        }, {
+            playerBalanceUsd: 0,
+            activeBotBalanceUsd: 0,
+            mapFoodUsd: 0,
+            unspawnedFoodUsd: 0,
+            unspawnedBotBudgetUsd: 0,
+            ownerAccruedUsd: 0,
+            reservedCashoutUsd: 0,
+            playerCashoutsUsd: 0,
+            botCashoutsUsd: 0,
+            activePlayers: 0,
+            activeBots: 0,
+            botCashoutCount: 0,
+        });
+        for (const key of Object.keys(totals)) {
+            if (key.endsWith('Usd')) totals[key] = roundLiveUsd(totals[key]);
+        }
+        totals.currentTrackedUsd = roundLiveUsd(
+            totals.playerBalanceUsd
+            + totals.activeBotBalanceUsd
+            + totals.mapFoodUsd
+            + totals.unspawnedFoodUsd
+            + totals.unspawnedBotBudgetUsd
+            + totals.ownerAccruedUsd,
+        );
+
+        return res.json({
+            wallet: {
+                address: HOUSE_WALLET_ADDRESS || null,
+                balanceSol: onChainBalanceSol,
+                balanceUsd: onChainBalanceSol == null ? null : roundLiveUsd(onChainBalanceSol * SOL_PRICE_USD),
+                error: onChainError,
+            },
+            sessionStartedAt: GLOBAL_ARENA_START,
+            serverTime: Date.now(),
+            totals,
+            rooms: allRooms,
+        });
+    } catch (error) {
+        console.error('Admin main-house live error:', error);
+        return res.status(500).json({ message: 'Could not load the live main-house session.' });
+    }
+});
+
 app.get('/api/admin/dashboard/sweeps', authenticateAdmin, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
@@ -9580,8 +10153,8 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 // Radius beräknas via `util.massToRadius` (sqrt-baserad) för konsistens med klient och Agar.io
 
 function agarFoodDollarValue(f) {
-    if (f.dollarValue != null && f.dollarValue > 0) return f.dollarValue;
-    return f.balance;
+    if (f.dollarValue != null) return Math.max(0, Number(f.dollarValue) || 0);
+    return Math.max(0, Number(f.balance) || 0);
 }
 
 function playerMassStart(player) {
@@ -9713,6 +10286,11 @@ function trimNormalAgarFood(room, targetCount) {
         room.foodPoolBalance += agarFoodDollarValue(removed);
     }
     room.food = normal.concat(golden);
+}
+
+function clearAgarFood(room) {
+    for (const food of room.food) room.foodPoolBalance += agarFoodDollarValue(food);
+    room.food.length = 0;
 }
 
 /** One high-value blob per human join — value already deducted from food allocation. */
@@ -9921,7 +10499,8 @@ function trimAgarBots(room, targetCount) {
         if (index === -1) break; // Only admin-spawned bots left
         const [removed] = room.bots.splice(index, 1);
         if (!removed?.freeTicketRewardFunded) {
-            room.aiBudgetBalance += removed?.dollarBalance ?? removed?.botStake ?? removed?.cells?.[0]?.balance ?? stake;
+            const removedValue = removed?.dollarBalance ?? removed?.botStake ?? removed?.cells?.[0]?.balance ?? stake;
+            room.ownerBalance = (Number(room.ownerBalance) || 0) + Math.max(0, Number(removedValue) || 0);
         }
     }
 }
@@ -11859,14 +12438,16 @@ io.on('connection', (socket) => {
                 const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
                 const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
                 
-                // Deduct the ejected mass value directly from the player's dollar balance, scaled by the arena tier factor s
+                const requestedDollarValue = c.ejectMass * s;
+                const valueSplit = allocateAgarEjectionValue({
+                    availableUsd: p.dollarBalance,
+                    requestedUsd: requestedDollarValue,
+                    retainedRatio: c.ejectMass > 0 ? c.ejectMassGain / c.ejectMass : 0,
+                });
                 if (p.dollarBalance != null) {
-                    p.dollarBalance = Math.max(0, p.dollarBalance - (c.ejectMass * s));
+                    p.dollarBalance = Math.max(0, p.dollarBalance - valueSplit.debitedUsd);
                 }
-                
-                // Recycle the spread (ejectMass − ejectMassGain) from player dollars into the food pool
-                const spread = Math.max(0, (c.ejectMass - c.ejectMassGain) * s);
-                room.foodPoolBalance += spread;
+                room.foodPoolBalance += valueSplit.recycledUsd;
 
                 room.ejected.push({
                     id: Math.random().toString(36).substr(2, 9),
@@ -11878,7 +12459,7 @@ io.on('connection', (socket) => {
                     hue: Math.floor(Math.random() * 360),
                     color: p.color,
                     balance: c.ejectMassGain,
-                    dollarValue: c.ejectMassGain * s
+                    dollarValue: valueSplit.ejectedUsd
                 });
             }
         });
@@ -12436,7 +13017,8 @@ function processRoom(room) {
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
 
-    // IDLE ROOM CLEANUP (Despawn bots after 10 min of no human players, reclaim money to food pool)
+    // IDLE ROOM CLEANUP: paid bot value becomes owner profit. Only unused,
+    // never-spawned AI budget is returned to food.
     const activeHumans = agarHumans + slitherHumans;
     if (activeHumans > 0) {
         room.lastHumanTime = Date.now();
@@ -12452,17 +13034,18 @@ function processRoom(room) {
             );
             if (botsCount > 0 || room.aiBudgetBalance > 0 || hasFreeTicketBotTargets) {
                 console.log(`⏳ Room ${room.id} has been empty of humans for 10 minutes. Despawning bots and reclaiming balances.`);
-                let totalReclaimed = room.isFreeTicketRoom ? 0 : room.aiBudgetBalance;
+                const unusedAiBudget = room.isFreeTicketRoom ? 0 : Math.max(0, Number(room.aiBudgetBalance) || 0);
+                let removedBotValue = 0;
 
                 room.bots.forEach(b => {
                     if (!b.freeTicketRewardFunded) {
-                        totalReclaimed += b.dollarBalance ?? b.botStake ?? b.balance ?? 0;
+                        removedBotValue += b.dollarBalance ?? b.botStake ?? b.balance ?? 0;
                     }
                 });
 
                 room.slitherBots.forEach(b => {
                     if (!b.freeTicketRewardFunded) {
-                        totalReclaimed += b.dollarBalance ?? b.botStake ?? 0;
+                        removedBotValue += b.dollarBalance ?? b.botStake ?? 0;
                     }
                 });
 
@@ -12473,8 +13056,9 @@ function processRoom(room) {
                 room.savedSlitherTarget = 0;
                 resetFreeTicketBotTargets(room);
 
-                room.foodPoolBalance += totalReclaimed;
-                console.log(`💰 Reclaimed $${totalReclaimed.toFixed(2)} from idle room bots/budget to foodPool.`);
+                room.foodPoolBalance += unusedAiBudget;
+                room.ownerBalance = (Number(room.ownerBalance) || 0) + removedBotValue;
+                console.log(`💰 Idle cleanup booked $${removedBotValue.toFixed(2)} of bot value as owner profit and returned $${unusedAiBudget.toFixed(2)} of unused AI budget to food.`);
             }
         }
     }
@@ -12484,6 +13068,7 @@ function processRoom(room) {
     const roomViewerCount = activeHumans
         + (room.spectators?.length || 0)
         + (room.agarSpectators?.length || 0);
+    maybeLogNormalRoomValueInvariant(room);
     if (roomViewerCount === 0) return;
 
     // DYNAMIC BOT SCALING (mode-specific, continuously maintained)
@@ -12559,7 +13144,7 @@ function processRoom(room) {
             NORMAL_AGAR_MAX_FOOD,
         );
         if (agarInArena <= 0) {
-            if ((room.agarSpectators?.length || 0) === 0) room.food.length = 0;
+            if ((room.agarSpectators?.length || 0) === 0) clearAgarFood(room);
         } else {
             const now = Date.now();
             if (!room._lastAgarFoodSync) room._lastAgarFoodSync = 0;
@@ -12619,7 +13204,8 @@ function processRoom(room) {
                 );
             const botMax = Math.min(getEconomy(room.entryFeeUsd).botMaxBalance, fundedRoomRemaining);
             if (botWealth > botMax) {
-                room.foodPoolBalance += botWealth;
+                if (player.freeTicketRewardFunded) room.foodPoolBalance += botWealth;
+                else room.ownerBalance = (Number(room.ownerBalance) || 0) + botWealth;
                 room.bots = room.bots.filter(b => b.id !== player.id);
                 const currentHumans = effectiveHumanCountForBots(room, 'agar');
                 const autoBotsCount = room.bots.filter(b => !b.adminSpawned).length;
@@ -12648,27 +13234,10 @@ function processRoom(room) {
                         player.cashOutEndTime = 0;
                         player.cashOutRetryAt = Date.now() + BOT_CASHOUT_RETRY_MS;
                     } else if (Date.now() >= player.cashOutEndTime) {
-                        const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
-                        const botStart = getEconomy(entryFee).botStartBalance;
-                        const remaining = Math.max(0, botWealth - botStart);
-
-                        // Resten delas 50/50 till owner och food pool
-                        room.ownerBalance = (room.ownerBalance || 0) + remaining * 0.5;
-                        room.foodPoolBalance += remaining * 0.5;
-
-                        // 1 bot går till AI budget (som spawnas efter 3 sekunder) endast om det finns riktiga spelare
-                        const currentHumans = effectiveHumanCountForBots(room, 'agar');
-                        if (currentHumans > 0) {
-                            room.aiBudgetBalance += botStart;
-                            room.pendingBotSpawns = (room.pendingBotSpawns || 0) + 1;
-                            setTimeout(() => {
-                                room.pendingBotSpawns = Math.max(0, (room.pendingBotSpawns || 0) - 1);
-                            }, 3000);
-                        } else {
-                            room.ownerBalance = (room.ownerBalance || 0) + botStart;
-                        }
-
-                        console.log(`🤖 Agar Bot ${player.username} successfully cashed out $${botWealth.toFixed(2)}. remaining: $${remaining.toFixed(2)} (50/50 split), botStart: $${botStart.toFixed(2)} (delayed spawn: ${currentHumans > 0})`);
+                        room.ownerBalance = (Number(room.ownerBalance) || 0) + botWealth;
+                        console.log(`🤖 Agar Bot ${player.username} cashed out $${botWealth.toFixed(2)} to owner profit.`);
+                        room.botCashoutCount = (Number(room.botCashoutCount) || 0) + 1;
+                        room.botCashoutUsd = (Number(room.botCashoutUsd) || 0) + botWealth;
                         room.bots = room.bots.filter(b => b.id !== player.id);
                         return;
                     }
@@ -13204,6 +13773,52 @@ function processRoom(room) {
     });
 }
 
+function maybeLogNormalRoomValueInvariant(room, now = Date.now()) {
+    if (!room
+        || DEV_FREE_PLAY
+        || room.isFreeTicketRoom
+        || room.isPersonalFreePlay
+        || room.isSandbox
+        || room.isTournament
+        || room.isBattleRoyale) return;
+    if (now - (room._lastValueInvariantCheckAt || 0) < 2_000) return;
+    room._lastValueInvariantCheckAt = now;
+
+    const snapshot = calculateNormalRoomValue(room);
+    const toleranceUsd = Math.max(0.0001, snapshot.fundedEntryUsd * 1e-7);
+    const fingerprint = `economy-invariant:${room.id}`;
+    if (snapshot.excessUsd <= toleranceUsd) {
+        if (room._economyInvariantIssueOpen) {
+            room._economyInvariantIssueOpen = false;
+            void resolveAdminIssue(fingerprint);
+        }
+        return;
+    }
+    if (now - (room._lastValueInvariantCriticalAt || 0) < 30_000) return;
+    room._lastValueInvariantCriticalAt = now;
+    room._economyInvariantIssueOpen = true;
+    console.error(
+        `[CRITICAL ECONOMY INVARIANT] ${room.id} contains $${snapshot.accountedUsd.toFixed(6)} `
+        + `against $${snapshot.fundedEntryUsd.toFixed(6)} of paid entry funding `
+        + `(excess $${snapshot.excessUsd.toFixed(6)}).`,
+        snapshot,
+    );
+    void recordAdminIssue({
+        fingerprint,
+        severity: 'critical',
+        category: 'economy',
+        code: 'live_value_exceeds_funding',
+        title: 'Live game value exceeds paid funding',
+        message: `Room ${room.id} contains $${snapshot.accountedUsd.toFixed(6)} against $${snapshot.fundedEntryUsd.toFixed(6)} of paid entry funding.`,
+        roomId: room.id,
+        mode: room.mode,
+        expectedUsd: snapshot.fundedEntryUsd,
+        actualUsd: snapshot.accountedUsd,
+        differenceUsd: snapshot.excessUsd,
+        context: snapshot,
+    });
+}
+
 
 const PORT = process.env.PORT || 5000;
 
@@ -13211,6 +13826,16 @@ const PORT = process.env.PORT || 5000;
 app.use((err, req, res, next) => {
     applyCorsHeaders(req, res);
     console.error('Unhandled error:', err);
+    void recordAdminIssue({
+        fingerprint: `unhandled-http:${req.method}:${req.route?.path || req.path || 'unknown'}`,
+        severity: 'error',
+        category: 'system',
+        code: 'unhandled_http_error',
+        title: 'Unhandled backend request error',
+        message: String(err?.message || err || 'Unknown backend error'),
+        userId: req.user?.id || null,
+        context: { method: req.method, path: req.route?.path || req.path || '' },
+    });
     if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
 });
 

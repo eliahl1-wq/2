@@ -96,8 +96,11 @@ function scaleAgarBotDistance(agarDistance) {
 }
 
 function slitherFoodDollarValue(f) {
-    if (f.dollarValue != null && f.dollarValue > 0) return f.dollarValue;
-    return f.balance;
+    // Explicit zero is real: boost can create visual-mass pellets after the
+    // snake's USD balance reaches its floor. Falling back to mass here minted
+    // USD when those pellets were trimmed or cleared.
+    if (f.dollarValue != null) return Math.max(0, Number(f.dollarValue) || 0);
+    return Math.max(0, Number(f.balance) || 0);
 }
 
 function getSlitherFoodValue(room) {
@@ -444,14 +447,18 @@ export function addSlitherBots(room, n, botStake = SLITHER.botStartBalance) {
     }
 }
 
-/** Remove excess bots from the front and return their stake to the AI budget (matches agar economy). */
+/** Remove excess paid bots and book their complete current value as owner profit. */
 export function trimSlitherBots(room, targetCount) {
     while (room.slitherBots.length > targetCount) {
         const index = room.slitherBots.findIndex(b => !b.adminSpawned);
         if (index === -1) break; // Only admin-spawned bots left
         const [removed] = room.slitherBots.splice(index, 1);
         if (!removed?.freeTicketRewardFunded) {
-            room.aiBudgetBalance += removed?.botStake ?? SLITHER.botStartBalance;
+            const removedValue = removed?.dollarBalance
+                ?? removed?.botStake
+                ?? removed?.balance
+                ?? SLITHER.botStartBalance;
+            room.ownerBalance = (Number(room.ownerBalance) || 0) + Math.max(0, Number(removedValue) || 0);
         }
     }
 }
@@ -2365,7 +2372,7 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
                 const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
                 const botWealth = snake.dollarBalance ?? snake.balance;
                 if (botWealth > botMax) {
-                    toRemove.push({ snake, isHuman, killer: null, respawnBot: true, returnToPool: true });
+                    toRemove.push({ snake, isHuman, killer: null, returnToPool: false, botRemovedForProfit: true });
                     continue;
                 }
 
@@ -2464,30 +2471,15 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         }
     }
 
-    for (const { snake, isHuman, killer, respawnBot, returnToPool = true, botCashedOut } of toRemove) {
+    for (const { snake, isHuman, killer, respawnBot, returnToPool = true, botCashedOut, botRemovedForProfit } of toRemove) {
         const lostDollars = eliminateSnake(room, snake, killer, io, User, isHuman, isBR ? false : returnToPool, Transaction);
-        if (botCashedOut) {
-            const entryFee = room.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
-            const botStart = getEconomy(entryFee).botStartBalance;
-            const remaining = Math.max(0, lostDollars - botStart);
-
-            // Resten delas 50/50 till owner och food pool
-            room.ownerBalance = (room.ownerBalance || 0) + remaining * 0.5;
-            room.foodPoolBalance += remaining * 0.5;
-
-            // 1 bot går till AI budget (som spawnas efter 3 sekunder) endast om det finns riktiga spelare
-            const humansInArena = room.players.filter(p => p.mode === 'slither').length;
-            if (humansInArena > 0) {
-                room.aiBudgetBalance += botStart;
-                room.pendingSlitherBotSpawns = (room.pendingSlitherBotSpawns || 0) + 1;
-                setTimeout(() => {
-                    room.pendingSlitherBotSpawns = Math.max(0, (room.pendingSlitherBotSpawns || 0) - 1);
-                }, 3000);
-            } else {
-                room.ownerBalance = (room.ownerBalance || 0) + botStart;
+        if (botCashedOut || botRemovedForProfit) {
+            room.ownerBalance = (Number(room.ownerBalance) || 0) + lostDollars;
+            console.log(`🤖 Slither Bot ${snake.username} ${botCashedOut ? 'cashed out' : 'was removed'}: $${lostDollars.toFixed(2)} to owner profit.`);
+            if (botCashedOut) {
+                room.botCashoutCount = (Number(room.botCashoutCount) || 0) + 1;
+                room.botCashoutUsd = (Number(room.botCashoutUsd) || 0) + lostDollars;
             }
-
-            console.log(`🤖 Slither Bot ${snake.username} successfully cashed out $${lostDollars.toFixed(2)}. remaining: $${remaining.toFixed(2)} (50/50 split), botStart: $${botStart.toFixed(2)} (delayed spawn: ${humansInArena > 0})`);
         } else if (!isBR && respawnBot) {
             const humansInArena = room.players.filter(p => p.mode === 'slither').length;
             const effectiveHumans = humansInArena > 0 ? humansInArena : (room.slitherBots.length > 0 ? 1 : 0);

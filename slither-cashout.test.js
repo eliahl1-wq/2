@@ -6,6 +6,8 @@ import {
     processCompetitiveSlitherRoom,
     runSlitherBotAI,
     runCompetitiveSlitherBotAI,
+    trimSlitherBots,
+    syncSlitherFood,
     SLITHER,
 } from './slither-engine.js';
 
@@ -125,4 +127,64 @@ test('Slither cashout does not grant immunity from the arena boundary', () => {
     const room = makeRoom(snake);
     tick(room, snake.mode);
     assert.equal(room.players.length, 0);
+});
+
+test('normal Slither boost recycles exactly the value removed from the snake', () => {
+    const snake = makeSnake('slither', false, { boost: true });
+    const room = { ...makeRoom(snake), isSandbox: false };
+    const initialUsd = snake.dollarBalance;
+    for (let i = 0; i < 80; i++) {
+        snake.boost = true;
+        tick(room, 'slither');
+        const liveUsd = snake.dollarBalance
+            + room.foodPoolBalance
+            + room.slitherFood.reduce((sum, food) => sum + (food.dollarValue || 0), 0);
+        assert.ok(Math.abs(liveUsd - initialUsd) < 1e-9, `tick ${i} changed funded value`);
+    }
+});
+
+test('trimming a Slither bot books its full current value as owner profit', () => {
+    const room = {
+        slitherBots: [{ id: 'grown', dollarBalance: 1.75, botStake: 1, adminSpawned: false }],
+        aiBudgetBalance: 0,
+        ownerBalance: 0,
+    };
+    trimSlitherBots(room, 0);
+    assert.equal(room.slitherBots.length, 0);
+    assert.equal(room.aiBudgetBalance, 0);
+    assert.equal(room.ownerBalance, 1.75);
+});
+
+test('normal Slither bot cashout books the full bot value as owner profit', (t) => {
+    t.mock.method(Date, 'now', () => 100000);
+    const previousFreePlay = process.env.DEV_FREE_PLAY;
+    process.env.DEV_FREE_PLAY = 'false';
+    t.after(() => {
+        if (previousFreePlay === undefined) delete process.env.DEV_FREE_PLAY;
+        else process.env.DEV_FREE_PLAY = previousFreePlay;
+    });
+    const snake = makeSnake('slither', true, {
+        dollarBalance: 1.75,
+        isCashingOut: true,
+        cashoutHoldActive: true,
+        cashOutEndTime: 99999,
+    });
+    const room = { ...makeRoom(snake), isSandbox: false, ownerBalance: 0 };
+    tick(room, 'slither');
+    assert.equal(room.slitherBots.length, 0);
+    assert.equal(room.foodPoolBalance, 0);
+    assert.equal(room.aiBudgetBalance, 0);
+    assert.equal(room.ownerBalance, 1.75);
+});
+
+test('clearing zero-dollar boost food never converts visual mass into USD', () => {
+    const room = {
+        players: [],
+        spectators: [],
+        slitherFood: [{ id: 'visual-only', balance: 0.02, dollarValue: 0 }],
+        foodPoolBalance: 1,
+    };
+    syncSlitherFood(room, 0.02, 1, 0);
+    assert.equal(room.slitherFood.length, 0);
+    assert.equal(room.foodPoolBalance, 1);
 });
