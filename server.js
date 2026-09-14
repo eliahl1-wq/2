@@ -5966,18 +5966,39 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
         }).filter(owner => owner.totalRewardsUsd > 0 || owner.freeTicket.available || owner.freeTicket.used || owner.starterChallenge.status !== 'not-started')
             .sort((a, b) => b.rewardWalletUsd - a.rewardWalletUsd || b.totalRewardsUsd - a.totalRewardsUsd);
 
-        const rewardTxs = await Transaction.find({
-            $or: [
-                { 'meta.event': { $in: ['sponsored_rewards_claim', 'tournament_reward', 'tournament_reward_claim', 'free_ticket_join'] } },
-                { 'meta.freeTicketChallengeApplied': true },
-                { 'meta.challengeProgressApplied': true },
-                { 'meta.starterRewardCompleted': true },
-                { 'meta.permanentRewardApplied': true },
-                { 'meta.isFreeTicketPlay': true },
-                { 'meta.isRentExemptFallback': true },
-                { 'meta.action': 'reset_unfinished_rewards' },
-            ],
-        }).sort({ createdAt: -1 }).limit(400).lean();
+        const walletEventNames = [
+            'reward_pool_contribution',
+            'reward_pool_correction',
+            'reward_pool_sweep',
+            'sponsored_rewards_claim',
+            'affiliate_payout',
+            'reward_owner_surplus_sweep',
+            'reward_pool_factory_reset',
+            'admin_reward_adjustment',
+        ];
+        const [rewardTxs, recentClaims, walletTxs] = await Promise.all([
+            Transaction.find({
+                $or: [
+                    { 'meta.event': { $in: ['sponsored_rewards_claim', 'tournament_reward', 'tournament_reward_claim', 'free_ticket_join'] } },
+                    { 'meta.freeTicketChallengeApplied': true },
+                    { 'meta.challengeProgressApplied': true },
+                    { 'meta.starterRewardCompleted': true },
+                    { 'meta.permanentRewardApplied': true },
+                    { 'meta.isFreeTicketPlay': true },
+                    { 'meta.isRentExemptFallback': true },
+                    { 'meta.action': 'reset_unfinished_rewards' },
+                ],
+            }).sort({ createdAt: -1 }).limit(120).lean(),
+            RewardClaim.find({})
+                .sort({ updatedAt: -1 })
+                .limit(30)
+                .populate('userId', 'username email')
+                .lean(),
+            Transaction.find({ 'meta.event': { $in: walletEventNames } })
+                .sort({ createdAt: -1 })
+                .limit(80)
+                .lean(),
+        ]);
         const userMap = Object.fromEntries(users.map(user => [user._id.toString(), user]));
         const activity = [];
         const pushActivity = (tx, kind, title, amountUsd, details, wallet = 'reward') => {
@@ -6043,7 +6064,88 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
         totals.rewardWalletLiabilityUsd = Number((totals.rewardWalletLiabilityUsd + affiliateLiabilityUsd).toFixed(6));
         totals.pendingHouseUsd = Number((Math.max(0, Number(rewardPoolState?.pendingHouseUsd) || 0)).toFixed(6));
 
-        return res.json({ totals, owners, activity: activity.slice(0, 250) });
+        const claims = recentClaims.map(claim => ({
+            id: claim._id,
+            username: claim.userId?.username || claim.userId?.email || 'Unknown',
+            userId: claim.userId?._id || null,
+            amountUsd: Number((Number(claim.amountUsd) || 0).toFixed(6)),
+            sponsoredAmountUsd: Number((Number(claim.sponsoredAmountUsd) || 0).toFixed(6)),
+            permanentAmountUsd: Number((Number(claim.permanentAmountUsd) || 0).toFixed(6)),
+            retainedAmountUsd: Number((Number(claim.rentFallbackAmountUsd) || 0).toFixed(6)),
+            solAmount: claim.solAmount == null ? null : Number(claim.solAmount),
+            status: claim.status,
+            signature: claim.signature || null,
+            error: claim.error || null,
+            createdAt: claim.createdAt,
+            updatedAt: claim.updatedAt,
+        }));
+
+        const walletActivity = walletTxs.map(tx => {
+            const meta = tx.meta || {};
+            const event = meta.event;
+            const user = userMap[tx.userId?.toString()];
+            let direction = 'accounting';
+            let title = meta.reason || event;
+            let details = 'Reward accounting updated';
+            let amountUsd = 0;
+            if (event === 'reward_pool_sweep') {
+                direction = 'in';
+                title = 'Received from house wallet';
+                amountUsd = Number(meta.amountUsd) || txAmountUsd(tx);
+                details = `${Number(meta.solAmount || tx.amount || 0).toFixed(6)} SOL transferred into the reward wallet`;
+            } else if (event === 'sponsored_rewards_claim') {
+                direction = 'out';
+                title = 'Player reward paid';
+                amountUsd = Number(meta.amountUsd) || txAmountUsd(tx);
+                details = `${user?.username || 'Unknown'} · starter $${Number(meta.starterAmountUsd || 0).toFixed(2)} · permanent $${Number(meta.permanentAmountUsd || 0).toFixed(2)} · retained $${Number(meta.retainedWinningsAmountUsd || 0).toFixed(2)}`;
+            } else if (event === 'affiliate_payout') {
+                direction = 'out';
+                title = 'Affiliate reward paid';
+                amountUsd = txAmountUsd(tx);
+                details = `${user?.username || 'Unknown'} · paid to affiliate wallet`;
+            } else if (event === 'reward_owner_surplus_sweep') {
+                direction = 'out';
+                title = 'Safe surplus withdrawn';
+                amountUsd = Number(meta.amountUsd) || txAmountUsd(tx);
+                details = 'Reward wallet → owner vault';
+            } else if (event === 'reward_pool_factory_reset') {
+                direction = 'out';
+                title = 'Reward pool reset withdrawal';
+                amountUsd = Number(meta.amountUsd) || txAmountUsd(tx);
+                details = `Reward wallet → owner vault · $${Number(meta.retainedBufferUsd || 0).toFixed(2)} retained as buffer`;
+            } else if (event === 'reward_pool_contribution') {
+                title = 'Game fee reserved for rewards';
+                amountUsd = Number(meta.contributionUsd) || 0;
+                details = `${user?.username || 'Unknown'} · ${meta.mode || 'game'} · waits in house until settlement`;
+            } else if (event === 'reward_pool_correction') {
+                title = 'Pending reward reserve corrected';
+                amountUsd = Number(meta.correctionUsd) || 0;
+                details = meta.reason || 'Accounting correction';
+            } else if (event === 'admin_reward_adjustment') {
+                title = 'Admin changed reward balances';
+                details = user?.username || 'Admin adjustment';
+            }
+            return {
+                id: tx._id,
+                event,
+                direction,
+                title,
+                details,
+                amountUsd: Number((Number(amountUsd) || 0).toFixed(6)),
+                solAmount: meta.solAmount == null ? null : Number(meta.solAmount),
+                status: tx.status,
+                signature: meta.signature || null,
+                createdAt: tx.createdAt,
+            };
+        });
+
+        return res.json({
+            totals,
+            owners,
+            activity: activity.slice(0, 40),
+            claims,
+            walletActivity,
+        });
     } catch (err) {
         console.error('Admin rewards dashboard error:', err);
         return res.status(500).json({ message: 'Could not load reward ownership.' });
