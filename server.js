@@ -9601,8 +9601,14 @@ app.post('/api/admin/force-cashout', authenticateAdmin, async (req, res) => {
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/agario_db";
 
-mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
-    .then(async () => {
+let databaseStartupPromise = null;
+
+async function initializeDatabaseBackedSystems() {
+    if (serverReady) return;
+    if (databaseStartupPromise) return databaseStartupPromise;
+
+    databaseStartupPromise = (async () => {
+        console.log('[Startup] Initializing database-backed systems...');
         const permanentRewardMigration = await User.updateMany(
             { permanentRewardModelVersion: { $ne: 4 } },
             { $set: {
@@ -9624,11 +9630,40 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
         serverReady = true;
         emitReleaseState();
         console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Permanent reward migration: ${permanentRewardMigration.modifiedCount}. Shared-wallet blocks restored: ${restoredSharedWalletBlocks}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
-    })
+    })();
+
+    try {
+        await databaseStartupPromise;
+    } catch (err) {
+        serverReady = false;
+        console.error('[Startup] Database-backed initialization failed:', err);
+        throw err;
+    } finally {
+        databaseStartupPromise = null;
+    }
+}
+
+function retryDatabaseStartupAfterConnection() {
+    if (mongoose.connection.readyState !== 1 || serverReady || databaseStartupPromise) return;
+    void initializeDatabaseBackedSystems().catch(() => {
+        // A later `connected` event or the retry timer below gets another
+        // chance. Readiness stays closed until the complete sequence succeeds.
+    });
+}
+
+mongoose.connection.on('connected', retryDatabaseStartupAfterConnection);
+
+mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15_000 })
+    .then(retryDatabaseStartupAfterConnection)
     .catch(err => {
         serverReady = false;
-        console.error("Kunde inte ansluta:", err);
+        console.error('Kunde inte ansluta till MongoDB initialt; väntar på automatisk återanslutning:', err);
     });
+
+// Mongoose can reconnect after the initial connect promise has rejected. The
+// old startup path never ran again in that case, leaving `/ready` at 503
+// forever even though `database` had recovered to true.
+setInterval(retryDatabaseStartupAfterConnection, 5_000).unref();
 
 setInterval(() => {
     if (mongoose.connection.readyState !== 1) return;
