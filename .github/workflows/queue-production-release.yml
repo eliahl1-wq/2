@@ -1,0 +1,29 @@
+name: Queue production release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Register commit for the next scheduled arena reset
+        env:
+          RELEASE_QUEUE_URL: ${{ secrets.RELEASE_QUEUE_URL }}
+          RELEASE_QUEUE_SECRET: ${{ secrets.RELEASE_QUEUE_SECRET }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          test -n "$RELEASE_QUEUE_URL"
+          test -n "$RELEASE_QUEUE_SECRET"
+          jq -n --arg sha "$RELEASE_SHA" '{commitSha: $sha}' > release.json
+          curl --fail-with-body --silent --show-error \
+            --retry 20 --retry-all-errors --retry-delay 15 --retry-max-time 900 \
+            --request POST "$RELEASE_QUEUE_URL/api/internal/releases/pending" \
+            --header "Authorization: Bearer $RELEASE_QUEUE_SECRET" \
+            --header "Content-Type: application/json" \
+            --data-binary @release.json

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateRoomCashoutReservation } from './cashout-accounting.js';
 
-test('room audit never silently reduces the HUD cashout amount', () => {
+test('room settlement cannot pay more than the funded reset-cycle pool', () => {
     const reservation = calculateRoomCashoutReservation({
         requestedUsd: 7,
         fundedUsd: 10,
@@ -11,8 +11,9 @@ test('room audit never silently reduces the HUD cashout amount', () => {
     });
     assert.equal(reservation.requestedUsd, 7);
     assert.equal(reservation.availableUsd, 2);
+    assert.equal(reservation.payableUsd, 2);
     assert.equal(reservation.ledgerShortfallUsd, 5);
-    assert.equal(reservation.nextReservedUsd, 8);
+    assert.equal(reservation.nextReservedUsd, 3);
 });
 
 test('room audit reports no shortfall when the full amount is funded', () => {
@@ -24,5 +25,6 @@ test('room audit reports no shortfall when the full amount is funded', () => {
     });
     assert.equal(reservation.requestedUsd, 6.5);
     assert.equal(reservation.availableUsd, 13);
+    assert.equal(reservation.payableUsd, 6.5);
     assert.equal(reservation.ledgerShortfallUsd, 0);
 });

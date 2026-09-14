@@ -130,8 +130,9 @@ export async function addRewardFundingUsd(amountUsd, { ownerSurplusUsd = 0 } = {
     return cachedPendingHouseUsd;
 }
 
-export async function addRewardFundingUsdOnce(amountUsd, fundingKey) {
+export async function addRewardFundingUsdOnce(amountUsd, fundingKey, { ownerSurplusUsd = 0 } = {}) {
     const amount = Math.max(0, Number(amountUsd) || 0);
+    const surplus = Math.min(amount, Math.max(0, Number(ownerSurplusUsd) || 0));
     const key = String(fundingKey || '').trim();
     if (!amount || !key) return { applied: false, pendingHouseUsd: cachedPendingHouseUsd };
     let state;
@@ -139,7 +140,11 @@ export async function addRewardFundingUsdOnce(amountUsd, fundingKey) {
         state = await RewardPoolState.findOneAndUpdate(
             { key: 'global', fundingKeys: { $ne: key } },
             {
-                $inc: { pendingHouseUsd: amount, totalFundedUsd: amount },
+                $inc: {
+                    pendingHouseUsd: amount,
+                    totalFundedUsd: amount,
+                    ownerSurplusUsd: surplus,
+                },
                 $addToSet: { fundingKeys: key },
             },
             { upsert: true, new: true },

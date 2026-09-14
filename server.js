@@ -19,6 +19,14 @@ import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
 import { createTokenLaunchService } from './token-launch-service.js';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { PUBLIC_FREE_PLAY_ROOM_OWNER, getPublicFreePlayEntryFee } from './public-free-mode.js';
+import { REPORTED_TRANSACTION_MATCH, isFreePlayTransaction } from './reporting-filters.js';
+import {
+    RELEASE_PHASES,
+    createRailwayDeployer,
+    currentReleaseSha,
+    normalizeCommitSha,
+    secretsMatch,
+} from './release-coordinator.js';
 import {
     SLITHER,
     COMPETITIVE_SLITHER,
@@ -116,11 +124,10 @@ import {
     TournamentRewardClaim,
     TOURNAMENT_DURATION_MS,
     TOURNAMENT_ENDED_VISIBLE_MS,
-    TOURNAMENT_ENTRY_FEE_USD,
-    TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD,
-    TOURNAMENT_MAX_ATTEMPTS,
     calculateTournamentPrizes,
+    getTournamentFormat,
     serializeTournament,
+    tournamentSettings,
 } from './tournament-system.js';
 import { calculateAffordableSolanaPayout, calculateCashoutMoney, microsToUsd, usdToMicros } from './affiliate-money.js';
 import {
@@ -173,6 +180,7 @@ import {
 import { getAgarBotCellCenter, planAgarBotEscapeSplit, planAgarBotSplit } from './agar-bot-ai.js';
 import { createSerialOperationQueue } from './serial-operation-queue.js';
 import { calculateRoomCashoutReservation } from './cashout-accounting.js';
+import { calculateReferredCashoutFeeRouting } from './affiliate-fee-routing.js';
 import {
     DEFAULT_MISSING_BROADCAST_TIMEOUT_MS,
     shouldReleaseMissingBroadcastClaim,
@@ -537,6 +545,21 @@ const SiteDisplaySettingsSchema = new mongoose.Schema({
 
 const SiteDisplaySettings = mongoose.model('SiteDisplaySettings', SiteDisplaySettingsSchema);
 
+const ScheduledReleaseSchema = new mongoose.Schema({
+    key: { type: String, required: true, unique: true, default: 'production' },
+    pendingSha: { type: String, default: null },
+    pendingAt: { type: Date, default: null },
+    deployingSha: { type: String, default: null },
+    deployedSha: { type: String, default: null },
+    deploymentId: { type: String, default: null },
+    phase: { type: String, enum: Object.values(RELEASE_PHASES), default: RELEASE_PHASES.IDLE },
+    maintenanceStartedAt: { type: Date, default: null },
+    maintenanceDeadlineAt: { type: Date, default: null },
+    lastError: { type: String, default: null },
+}, { timestamps: true });
+
+const ScheduledRelease = mongoose.model('ScheduledRelease', ScheduledReleaseSchema);
+
 const BugReportSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     username: { type: String, required: true, trim: true, maxlength: 80 },
@@ -800,13 +823,43 @@ TransactionSchema.post('save', async function applyPermanentCashoutRewardHook(do
 TransactionSchema.post('save', async function createAffiliateCommissionHook(doc) {
     try {
         const result = await createAffiliateCommissionForCashout(doc);
-        if (result.created && result.commission) {
+        if (result.commission && result.commission.status !== 'reversed') {
+            // Referred cashouts are fully moved to the Reward Wallet. The
+            // permanent-reward hook above already reserved 55% of the fee, so
+            // only reserve the remainder here. Affiliate liabilities and the
+            // player's permanent reward stay protected; everything left over
+            // is explicitly tracked as owner surplus.
+            const freshCashout = await mongoose.model('Transaction').findById(doc._id).select('meta').lean();
+            const routing = calculateReferredCashoutFeeRouting({
+                platformFeeUsdMicros: result.commission.platformFeeUsdMicros,
+                affiliateCommissionUsdMicros: result.commission.commissionUsdMicros,
+                permanentPoolFundingUsdMicros: usdToMicros(freshCashout?.meta?.permanentPoolFundingUsd),
+                permanentRewardContributionUsdMicros: usdToMicros(freshCashout?.meta?.permanentRewardContributionUsd),
+                permanentOwnerSurplusUsdMicros: usdToMicros(freshCashout?.meta?.permanentOwnerSurplusUsd),
+            });
+            const platformFeeUsd = microsToUsd(routing.platformFeeUsdMicros);
+            const affiliateCommissionUsd = microsToUsd(routing.affiliateCommissionUsdMicros);
+            const additionalFundingUsd = microsToUsd(routing.additionalFundingUsdMicros);
+            const totalOwnerSurplusUsd = microsToUsd(routing.totalOwnerSurplusUsdMicros);
+            const additionalOwnerSurplusUsd = microsToUsd(routing.additionalOwnerSurplusUsdMicros);
+            const funding = await addRewardFundingUsdOnce(
+                additionalFundingUsd,
+                `referred-cashout-fee:${doc._id}`,
+                { ownerSurplusUsd: additionalOwnerSurplusUsd },
+            );
             await mongoose.model('Transaction').updateOne(
                 { _id: doc._id },
                 {
                     $set: {
                         'meta.affiliateCommissionId': result.commission._id,
-                        'meta.affiliateCommissionCreatedAt': new Date().toISOString(),
+                        ...(result.created ? { 'meta.affiliateCommissionCreatedAt': new Date().toISOString() } : {}),
+                        'meta.referredFeeRoutedToRewardWallet': true,
+                        'meta.referredFeeRoutedAt': new Date().toISOString(),
+                        'meta.referredFeeUsd': platformFeeUsd,
+                        'meta.referredFeeAdditionalFundingUsd': additionalFundingUsd,
+                        'meta.referredFeeAffiliateLiabilityUsd': affiliateCommissionUsd,
+                        'meta.referredFeeOwnerSurplusUsd': totalOwnerSurplusUsd,
+                        'meta.referredFeeFundingApplied': funding.applied,
                     },
                 },
             );
@@ -922,9 +975,214 @@ function isUserJoining(userId) {
 let rewardPoolAdminResetting = false;
 let affiliatePoolAdminResetting = false;
 let newGameJoinsLocked = false;
+let releaseMaintenanceActive = false;
+let releasePhase = RELEASE_PHASES.IDLE;
+let serverReady = false;
+let releaseStateLoaded = false;
+let gameSystemsInitialized = false;
+let releaseFailureTimer = null;
+const RELEASE_MAINTENANCE_TIMEOUT_MS = Math.max(
+    5 * 60_000,
+    Number(process.env.RELEASE_MAINTENANCE_TIMEOUT_MS || 20 * 60_000),
+);
+
+function publicReleaseState(extra = {}) {
+    return {
+        updating: releaseMaintenanceActive,
+        phase: releasePhase,
+        ...extra,
+    };
+}
+
+function emitReleaseState(extra = {}) {
+    io.emit('serverUpdateState', publicReleaseState(extra));
+    io.emit('gameJoinLockChanged', {
+        locked: isNewGameJoinLocked(),
+        reason: releaseMaintenanceActive ? 'server_update' : (newGameJoinsLocked ? 'admin' : null),
+    });
+}
 
 function isNewGameJoinLocked() {
-    return newGameJoinsLocked;
+    return newGameJoinsLocked || releaseMaintenanceActive || !serverReady;
+}
+
+const deployRailwayCommit = createRailwayDeployer({
+    fetchImpl: fetch,
+    token: process.env.RAILWAY_API_TOKEN,
+    projectToken: process.env.RAILWAY_PROJECT_TOKEN,
+    serviceId: process.env.RAILWAY_SERVICE_ID,
+    environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
+});
+
+async function loadReleaseStateOnStartup() {
+    const release = await ScheduledRelease.findOne({ key: 'production' }).lean();
+    const runningSha = currentReleaseSha();
+    const deployingSha = normalizeCommitSha(release?.deployingSha);
+    const deadlineExpired = release?.maintenanceDeadlineAt
+        && new Date(release.maintenanceDeadlineAt).getTime() <= Date.now();
+
+    if (release && deployingSha && runningSha === deployingSha) {
+        const nextPhase = release.pendingSha ? RELEASE_PHASES.PENDING : RELEASE_PHASES.IDLE;
+        await ScheduledRelease.updateOne({ key: 'production', deployingSha }, { $set: {
+            deployedSha: deployingSha,
+            deployingSha: null,
+            deploymentId: null,
+            phase: nextPhase,
+            maintenanceStartedAt: null,
+            maintenanceDeadlineAt: null,
+            lastError: null,
+        } });
+        releasePhase = nextPhase;
+    } else if (release && [RELEASE_PHASES.RESETTING, RELEASE_PHASES.DEPLOYING].includes(release.phase)) {
+        if (deadlineExpired) {
+            await ScheduledRelease.updateOne({ key: 'production' }, { $set: {
+                pendingSha: release.pendingSha || deployingSha,
+                deployingSha: null,
+                deploymentId: null,
+                phase: RELEASE_PHASES.PENDING,
+                maintenanceStartedAt: null,
+                maintenanceDeadlineAt: null,
+                lastError: 'Previous deployment did not become ready before its maintenance deadline.',
+            } });
+            releasePhase = RELEASE_PHASES.PENDING;
+        } else {
+            releaseMaintenanceActive = true;
+            releasePhase = release.phase;
+            const remainingMs = Math.max(
+                1_000,
+                new Date(release.maintenanceDeadlineAt).getTime() - Date.now(),
+            );
+            armReleaseFailureRecovery(
+                deployingSha || normalizeCommitSha(release.pendingSha),
+                remainingMs,
+                'Recovered deployment did not become ready before its maintenance deadline.',
+            );
+        }
+    } else {
+        releasePhase = release?.phase || RELEASE_PHASES.IDLE;
+    }
+    releaseStateLoaded = true;
+}
+
+async function beginScheduledReleaseReset() {
+    if (mongoose.connection.readyState !== 1) return null;
+    const pending = await ScheduledRelease.findOneAndUpdate(
+        { key: 'production', phase: RELEASE_PHASES.PENDING, pendingSha: { $type: 'string' } },
+        { $set: {
+            phase: RELEASE_PHASES.RESETTING,
+            maintenanceStartedAt: new Date(),
+            maintenanceDeadlineAt: new Date(Date.now() + RELEASE_MAINTENANCE_TIMEOUT_MS),
+            lastError: null,
+        } },
+        { new: true },
+    ).lean();
+    const sha = normalizeCommitSha(pending?.pendingSha);
+    if (!sha) {
+        if (pending) {
+            await ScheduledRelease.updateOne({ _id: pending._id }, { $set: {
+                pendingSha: null,
+                phase: RELEASE_PHASES.FAILED,
+                maintenanceStartedAt: null,
+                maintenanceDeadlineAt: null,
+                lastError: 'Pending release contained an invalid commit SHA.',
+            } });
+            releasePhase = RELEASE_PHASES.FAILED;
+        }
+        return null;
+    }
+    releaseMaintenanceActive = true;
+    releasePhase = RELEASE_PHASES.RESETTING;
+    emitReleaseState({ phase: RELEASE_PHASES.RESETTING });
+    return sha;
+}
+
+async function releaseScheduledMaintenance(commitSha, error) {
+    const current = await ScheduledRelease.findOne({ key: 'production' }).lean();
+    const retrySha = normalizeCommitSha(current?.pendingSha) || normalizeCommitSha(commitSha)
+        || normalizeCommitSha(current?.deployingSha);
+    await ScheduledRelease.updateOne({ key: 'production' }, { $set: {
+        pendingSha: retrySha,
+        pendingAt: retrySha ? new Date() : null,
+        deployingSha: null,
+        deploymentId: null,
+        phase: retrySha ? RELEASE_PHASES.PENDING : RELEASE_PHASES.FAILED,
+        maintenanceStartedAt: null,
+        maintenanceDeadlineAt: null,
+        lastError: String(error?.message || error || 'Scheduled deployment failed').slice(0, 1000),
+    } }, { upsert: true });
+    releaseMaintenanceActive = false;
+    releasePhase = retrySha ? RELEASE_PHASES.PENDING : RELEASE_PHASES.FAILED;
+    emitReleaseState({ phase: retrySha ? RELEASE_PHASES.PENDING : RELEASE_PHASES.FAILED });
+}
+
+function armReleaseFailureRecovery(
+    commitSha,
+    delayMs = RELEASE_MAINTENANCE_TIMEOUT_MS,
+    reason = 'Railway deployment readiness timed out; release was queued for the next reset.',
+) {
+    clearTimeout(releaseFailureTimer);
+    releaseFailureTimer = setTimeout(async () => {
+        if (!releaseMaintenanceActive) return;
+        try {
+            await releaseScheduledMaintenance(
+                commitSha,
+                reason,
+            );
+        } catch (error) {
+            console.error('[Release] Timeout recovery failed; retrying:', error.message);
+            armReleaseFailureRecovery(commitSha, 30_000, reason);
+        }
+    }, delayMs);
+    releaseFailureTimer.unref?.();
+}
+
+async function triggerScheduledRailwayDeploy(commitSha) {
+    const runningSha = currentReleaseSha();
+    if (runningSha && runningSha === commitSha) {
+        await ScheduledRelease.updateOne({ key: 'production' }, { $set: {
+            pendingSha: null,
+            deployingSha: null,
+            deployedSha: commitSha,
+            phase: RELEASE_PHASES.IDLE,
+            maintenanceStartedAt: null,
+            maintenanceDeadlineAt: null,
+            lastError: null,
+        } });
+        releaseMaintenanceActive = false;
+        releasePhase = RELEASE_PHASES.IDLE;
+        emitReleaseState();
+        return { skipped: true, reason: 'already_running' };
+    }
+
+    try {
+        const claimed = await ScheduledRelease.findOneAndUpdate(
+            { key: 'production', pendingSha: commitSha, phase: RELEASE_PHASES.RESETTING },
+            { $set: {
+                pendingSha: null,
+                deployingSha: commitSha,
+                phase: RELEASE_PHASES.DEPLOYING,
+                maintenanceDeadlineAt: new Date(Date.now() + RELEASE_MAINTENANCE_TIMEOUT_MS),
+            } },
+            { new: true },
+        ).lean();
+        if (!claimed) throw new Error('Pending release changed before deployment could be claimed');
+
+        emitReleaseState({ phase: RELEASE_PHASES.DEPLOYING });
+        releasePhase = RELEASE_PHASES.DEPLOYING;
+        const deployment = await deployRailwayCommit(commitSha);
+        await ScheduledRelease.updateOne(
+            { key: 'production', deployingSha: commitSha },
+            { $set: { deploymentId: deployment.deploymentId } },
+        );
+
+        armReleaseFailureRecovery(commitSha);
+        console.log(`[Release] Railway deployment ${deployment.deploymentId} started for ${commitSha}.`);
+        return deployment;
+    } catch (error) {
+        console.error('[Release] Deployment trigger failed:', error.message);
+        await releaseScheduledMaintenance(commitSha, error);
+        return { failed: true, error: error.message };
+    }
 }
 
 let GLOBAL_ARENA_START = Date.now();
@@ -968,11 +1226,17 @@ const rooms = [
 const tournamentRooms = new Map();
 
 function createTournamentArenaRoom(tournament) {
-    const room = createArenaRoom(TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD);
+    const settings = tournamentSettings(tournament);
+    const room = createArenaRoom(settings.gameplayEntryFeeUsd);
     room.id = `tournament-${tournament._id}`;
     room.isTournament = true;
     room.tournamentId = tournament._id.toString();
     room.tournamentName = tournament.name;
+    room.tournamentType = settings.tournamentType;
+    room.tournamentGameMode = settings.gameMode;
+    room.tournamentEntryFeeUsd = settings.entryFeeUsd;
+    room.tournamentMaxAttempts = settings.maxAttempts;
+    room.tournamentStartBalanceUsd = settings.gameplayStartBalanceUsd;
     room.startTime = new Date(tournament.startedAt || tournament.startAt).getTime();
     room.endTime = new Date(tournament.endAt).getTime();
     // Score food and bots are intentionally virtual. Tournament entry fees never
@@ -1137,6 +1401,9 @@ const processingCashouts = new Set(); // mongoId strings
 // account. Serialize those mutations so concurrent users cannot all budget
 // against one stale house-wallet balance.
 const houseWalletOperations = createSerialOperationQueue();
+// Every outgoing transfer from the shared Reward Wallet must use one queue.
+// Affiliate payouts now share this wallet with player reward claims.
+const rewardWalletOperations = createSerialOperationQueue();
 
 function accountSocketRoom(userId) {
     return userId ? `account:${String(userId)}` : null;
@@ -1206,39 +1473,38 @@ async function emitPersistedCashoutResult(record, payload) {
     });
 }
 
-async function settleTrackedCashoutToRewards(record, reason) {
+async function settleTrackedCashoutToAccount(record, reason) {
     const amountUsd = Math.max(0, Number(record.amount) || 0);
+    const solAmount = Math.max(0, Number(record.meta?.solAmount) || 0);
     const credited = await User.updateOne(
         {
             _id: record.userId,
             retainedCashoutSettlementIds: { $ne: record._id },
         },
         {
-            $inc: { rentFallbackBalanceUsd: amountUsd },
+            $inc: { balance: solAmount },
             $addToSet: { retainedCashoutSettlementIds: record._id },
         },
     );
-    await addRewardFundingUsdOnce(amountUsd, `cashout-fallback:${record._id}`);
-
     record.status = 'confirmed';
     record.meta = {
         ...(record.meta || {}),
         attemptedSignature: record.meta?.signature || null,
-        signature: 'house_liquidity_fallback',
+        signature: 'house_cashout_account_credit',
         paidOnChainUsd: 0,
-        retainedWinningsAmountUsd: amountUsd,
-        retainedForClaim: true,
-        isLiquidityFallback: true,
+        accountCreditSol: solAmount,
+        accountCreditUsd: amountUsd,
+        retainedForAccountWithdrawal: true,
         settlementError: String(reason || 'On-chain settlement unavailable').slice(0, 500),
         fallbackCreditedNow: credited.modifiedCount === 1,
     };
     await record.save();
     await emitPersistedCashoutResult(record, {
         amount: amountUsd,
-        signature: 'house_liquidity_fallback',
-        retainedForClaim: true,
+        signature: 'house_cashout_account_credit',
+        retainedForAccountWithdrawal: true,
     });
-    return { playerPayout: amountUsd, signature: 'house_liquidity_fallback', retainedForClaim: true };
+    return { playerPayout: amountUsd, signature: 'house_cashout_account_credit', retainedForAccountWithdrawal: true };
 }
 
 async function confirmTrackedCashout(record) {
@@ -1330,7 +1596,7 @@ async function submitTrackedCashout({
         }, 'confirmed');
         if (confirmation.value.err) {
             return {
-                ...(await settleTrackedCashoutToRewards(
+                ...(await settleTrackedCashoutToAccount(
                     record,
                     `On-chain cashout failed: ${JSON.stringify(confirmation.value.err)}`,
                 )),
@@ -1375,71 +1641,13 @@ async function reconcileTrackedCashouts() {
                 });
                 if (state === 'confirmed') await confirmTrackedCashout(current);
                 else if (['failed', 'expired'].includes(state)) {
-                    await settleTrackedCashoutToRewards(current, `Cashout transaction ${state}`);
+                    await settleTrackedCashoutToAccount(current, `Cashout transaction ${state}`);
                 }
             });
         } catch (error) {
             console.error('[Cashout Settlement] Reconciliation failed:', record._id, error.message);
         }
     }
-}
-
-async function retainCashoutForLater({
-    player,
-    room,
-    user,
-    requestedPlayerPayout,
-    platformFee,
-    logMeta,
-    keepSpectator,
-}) {
-    const mongoId = player.mongoId?.toString();
-    const playerId = player.id;
-    const playtimeDelta = player.personalFreePlay ? 0 : Math.max(0, Date.now() - player.startTime);
-    const update = await User.updateOne(
-        { _id: user._id },
-        {
-            $inc: {
-                rentFallbackBalanceUsd: requestedPlayerPayout,
-                ...(playtimeDelta > 0 ? { playtime: playtimeDelta } : {}),
-            },
-        },
-    );
-    if (update.matchedCount !== 1) throw new Error('Could not retain the cashout on the player account');
-
-    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-    keepSpectator?.(room, player);
-
-    await addRewardFundingUsd(requestedPlayerPayout).catch(error => {
-        console.error('[Cashout Fallback] Reward funding accounting failed:', error.message);
-    });
-    await Transaction.create({
-        userId: user._id,
-        type: 'withdraw',
-        amount: requestedPlayerPayout,
-        meta: {
-            ...logMeta,
-            playerPayout: requestedPlayerPayout,
-            paidOnChainUsd: 0,
-            retainedWinningsAmountUsd: requestedPlayerPayout,
-            isLiquidityFallback: true,
-            signature: 'house_liquidity_fallback',
-        },
-        excludedFromReports: !!player.personalFreePlay,
-        status: 'confirmed',
-    }).catch(error => console.error('[Cashout Fallback] Audit transaction failed:', error.message));
-
-    emitCashoutSuccess(player, playerId, mongoId, {
-        amount: requestedPlayerPayout,
-        signature: 'house_liquidity_fallback',
-        retainedForClaim: true,
-    });
-    return {
-        playerPayout: requestedPlayerPayout,
-        platformFee,
-        signature: 'house_liquidity_fallback',
-        retainedForClaim: true,
-    };
 }
 
 function keepAgarSpectator(room, player) {
@@ -1502,10 +1710,7 @@ async function executeTournamentCashout(player, room) {
 
     const participant = tournament.participants.find(p => p.userId.toString() === mongoId);
     room.players = room.players.filter(p => p !== player);
-    if (!room.spectators) room.spectators = [];
-    const head = player.segments?.[0];
-    room.spectators = room.spectators.filter(s => s.id !== playerId);
-    room.spectators.push({ id: playerId, x: head?.x ?? 0, y: head?.y ?? 0 });
+    keepArenaCashoutSpectator(room, player);
 
     await Promise.all([
         User.findByIdAndUpdate(player.mongoId, { $inc: { playtime: Date.now() - player.startTime } }),
@@ -1546,12 +1751,12 @@ function reserveArenaCashout(room, player, requestedUsd) {
         reservedUsd: room.reservedCashoutUsd,
         paidUsd: room.paidCashoutUsd,
     });
-    const amount = reservation.requestedUsd;
+    const amount = reservation.payableUsd;
     if (reservation.ledgerShortfallUsd > 1e-9) {
         console.error(
-            `ECONOMY INVARIANT: ${room.id} requested $${amount.toFixed(6)} cashout `
+            `ECONOMY CAP: ${room.id} requested $${reservation.requestedUsd.toFixed(6)} cashout `
             + `with only $${reservation.availableUsd.toFixed(6)} in the room ledger. `
-            + 'The HUD amount was preserved and the shared wallet check remains authoritative.',
+            + `$${reservation.ledgerShortfallUsd.toFixed(6)} was converted to a liquidity fee.`,
         );
     }
     if (amount <= 1e-9) throw new Error('No funded arena value available for cashout');
@@ -1588,6 +1793,12 @@ function applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidi
     logMeta.liquidityAdjusted = liquidity.liquidityAdjusted;
     logMeta.liquidityShortfallUsd = liquidity.shortfallUsd;
     logMeta.liquidityShortfallUsdMicros = liquidity.shortfallUsdMicros;
+    const basePlatformFeeUsd = Number(logMeta.basePlatformFeeUsd ?? logMeta.platformFee) || 0;
+    const existingLiquidityFeeUsd = Number(logMeta.liquidityFeeUsd) || 0;
+    logMeta.basePlatformFeeUsd = basePlatformFeeUsd;
+    logMeta.liquidityFeeUsd = existingLiquidityFeeUsd + liquidity.shortfallUsd;
+    logMeta.platformFee = basePlatformFeeUsd + logMeta.liquidityFeeUsd;
+    logMeta.totalCashoutFeeUsd = logMeta.platformFee;
     logMeta.cashoutFeeBufferLamports = liquidity.feeBufferLamports;
 }
 
@@ -1686,10 +1897,7 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
         cashoutSolPriceUsd = await getSettlementSolPrice();
     } catch (priceError) {
         logMeta.priceError = priceError.message;
-        return retainCashoutForLater({
-            player, room, user, requestedPlayerPayout, platformFee, logMeta,
-            keepSpectator: keepCompetitiveCashoutSpectator,
-        });
+        throw new Error('Cashout price is temporarily unavailable; the game balance was not removed');
     }
     logMeta.solPriceUsd = cashoutSolPriceUsd;
     logMeta.solPriceSource = SOL_PRICE_SOURCE;
@@ -1711,15 +1919,6 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
     applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
     if (liquidity.liquidityAdjusted) {
         console.warn(`[Cashout Liquidity] Competitive payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
-        return retainCashoutForLater({
-            player,
-            room,
-            user,
-            requestedPlayerPayout,
-            platformFee,
-            logMeta,
-            keepSpectator: keepCompetitiveCashoutSpectator,
-        });
     }
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
@@ -1731,10 +1930,7 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
 
     if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
         logMeta.isRentExemptFallback = true;
-        return retainCashoutForLater({
-            player, room, user, requestedPlayerPayout, platformFee, logMeta,
-            keepSpectator: keepCompetitiveCashoutSpectator,
-        });
+        throw new Error('Cashout is too small to activate the destination account; the game balance was not removed');
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1846,9 +2042,7 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
         cashoutSolPriceUsd = await getSettlementSolPrice();
     } catch (priceError) {
         logMeta.priceError = priceError.message;
-        return retainCashoutForLater({
-            player, room, user, requestedPlayerPayout, platformFee, logMeta,
-        });
+        throw new Error('Cashout price is temporarily unavailable; the game balance was not removed');
     }
     logMeta.solPriceUsd = cashoutSolPriceUsd;
     logMeta.solPriceSource = SOL_PRICE_SOURCE;
@@ -1870,14 +2064,6 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
     applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
     if (liquidity.liquidityAdjusted) {
         console.warn(`[Cashout Liquidity] Surviv payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
-        return retainCashoutForLater({
-            player,
-            room,
-            user,
-            requestedPlayerPayout,
-            platformFee,
-            logMeta,
-        });
     }
     // Cashout fees stay in the house wallet and are batched into the normal reset sweep.
     // Sending one tiny owner transfer per cashout wastes fees and can violate rent minimums.
@@ -1889,9 +2075,7 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
 
     if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
         logMeta.isRentExemptFallback = true;
-        return retainCashoutForLater({
-            player, room, user, requestedPlayerPayout, platformFee, logMeta,
-        });
+        throw new Error('Cashout is too small to activate the destination account; the game balance was not removed');
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1972,6 +2156,12 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
         gameSessionId: player.gameSessionId || null,
         timestamp: new Date().toISOString(),
     };
+    if (logMeta.roomLedgerShortfallUsd > 0) {
+        logMeta.basePlatformFeeUsd = platformFee;
+        logMeta.liquidityFeeUsd = logMeta.roomLedgerShortfallUsd;
+        logMeta.platformFee = platformFee + logMeta.roomLedgerShortfallUsd;
+        logMeta.totalCashoutFeeUsd = logMeta.platformFee;
+    }
 
 
     if (player.isFreeTicketPlay) {
@@ -2035,12 +2225,7 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
         cashoutSolPriceUsd = await getSettlementSolPrice();
     } catch (priceError) {
         logMeta.priceError = priceError.message;
-        const retained = await retainCashoutForLater({
-            player, room, user, requestedPlayerPayout, platformFee, logMeta,
-            keepSpectator: keepArenaCashoutSpectator,
-        });
-        commitArenaCashoutReservation(room, player);
-        return retained;
+        throw new Error('Cashout price is temporarily unavailable; the game balance was not removed');
     }
     logMeta.solPriceUsd = cashoutSolPriceUsd;
     logMeta.solPriceSource = SOL_PRICE_SOURCE;
@@ -2062,17 +2247,6 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
     applyCashoutLiquidityAdjustment(logMeta, requestedPlayerPayout, liquidity);
     if (liquidity.liquidityAdjusted) {
         console.warn(`[Cashout Liquidity] Arena payout reduced from $${requestedPlayerPayout.toFixed(6)} to $${playerPayout.toFixed(6)} (${liquidity.shortfallUsd.toFixed(6)} shortfall).`);
-        const retained = await retainCashoutForLater({
-            player,
-            room,
-            user,
-            requestedPlayerPayout,
-            platformFee,
-            logMeta,
-            keepSpectator: keepArenaCashoutSpectator,
-        });
-        commitArenaCashoutReservation(room, player);
-        return retained;
     }
     // Cashout fees remain in house and are sent in the batched reset sweep.
     const canTransferOwnerFee = false;
@@ -2083,12 +2257,7 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
 
     if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
         logMeta.isRentExemptFallback = true;
-        const retained = await retainCashoutForLater({
-            player, room, user, requestedPlayerPayout, platformFee, logMeta,
-            keepSpectator: keepArenaCashoutSpectator,
-        });
-        commitArenaCashoutReservation(room, player);
-        return retained;
+        throw new Error('Cashout is too small to activate the destination account; the game balance was not removed');
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -2335,26 +2504,16 @@ async function sweepHouseWalletOnResetUnlocked() {
     }
     
     const reservedRewardSweepLamports = rewardSweepLamports;
-    const affiliateLiabilityUsdMicros = await getOutstandingAffiliateLiabilityUsdMicros();
-    // Round liabilities upward: one lamport too much retained is harmless,
-    // while rounding down can make the final affiliate payout unpayable.
-    const requestedAffiliateReserveLamports = Math.ceil(
-        (microsToUsd(affiliateLiabilityUsdMicros) / solPrice) * solanaWeb3.LAMPORTS_PER_SOL
-    );
-    const affiliateReserveLamports = Math.min(
-        Math.max(0, totalSweepLamports - reservedRewardSweepLamports),
-        Math.max(0, requestedAffiliateReserveLamports),
-    );
-    if (affiliateReserveLamports > 0) {
-        console.log(`Affiliate liability reserved in house wallet: ${affiliateReserveLamports / solanaWeb3.LAMPORTS_PER_SOL} SOL`);
-    }
     if (rewardSweepLamports > 0
         && !await canReceiveSystemTransfer(REWARD_WALLET_ADDRESS, rewardSweepLamports)) {
         console.log('Reward sweep deferred until it can satisfy the destination rent minimum.');
         rewardSweepLamports = 0;
     }
 
-    let ownerSweepLamports = totalSweepLamports - reservedRewardSweepLamports - affiliateReserveLamports;
+    // Affiliate liabilities are included in getRewardWalletLiabilityUsd(), so
+    // referred-user fees are swept to Reward Wallet instead of being stranded
+    // as an invisible reserve in House Wallet.
+    let ownerSweepLamports = totalSweepLamports - reservedRewardSweepLamports;
     if (ownerSweepLamports > 0
         && !await canReceiveSystemTransfer(OWNER_VAULT_ADDRESS, ownerSweepLamports)) {
         console.log('Owner sweep deferred until it can satisfy the destination rent minimum.');
@@ -2432,22 +2591,42 @@ async function sweepHouseWalletOnResetUnlocked() {
     }
 }
 
-async function performGlobalArenaReset() {
+async function waitForBattleRoyaleReleaseDrain(maxWaitMs = 8 * 60_000) {
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+        const activeMatches = getActiveBRMatchesRaw().filter(room => room.status !== 'ended').length;
+        const queuedPlayers = getBRServerStatus().queuedPlayers;
+        if (activeMatches === 0 && queuedPlayers === 0) return true;
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+    }
+    return false;
+}
+
+async function performGlobalArenaReset({ scheduled = false } = {}) {
     if (globalArenaResetting) return { success: false, alreadyRunning: true };
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
     for (const room of competitiveSlitherRooms) room.isResetting = true;
     for (const room of survivRooms) room.isResetting = true;
 
-    console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers — BR matches unaffected)');
-    await Transaction.create({
-        type: 'game',
-        amount: 0,
-        meta: { event: 'reset_start', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
-        status: 'confirmed',
-    });
+    let scheduledReleaseSha = null;
+    if (scheduled) {
+        try {
+            scheduledReleaseSha = await beginScheduledReleaseReset();
+        } catch (error) {
+            console.error('[Release] Could not inspect the pending release before reset:', error.message);
+        }
+    }
 
     try {
+        console.log('🚨 GLOBAL ARENA RESET STARTED (all stake tiers — BR matches unaffected)');
+        await Transaction.create({
+            type: 'game',
+            amount: 0,
+            meta: { event: 'reset_start', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
+            status: 'confirmed',
+        });
+
         let allCashoutsSettled = true;
         for (const room of rooms) {
             const settled = await cashOutRoomPlayers(room);
@@ -2474,6 +2653,9 @@ async function performGlobalArenaReset() {
             for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
                 room.startTime = GLOBAL_ARENA_START;
             }
+            if (scheduledReleaseSha) {
+                await releaseScheduledMaintenance(scheduledReleaseSha, 'Arena reset deferred because cashouts were unsettled.');
+            }
             return { success: false, deferred: true, reason: 'unsettled_cashouts' };
         }
 
@@ -2489,6 +2671,9 @@ async function performGlobalArenaReset() {
             GLOBAL_ARENA_START = Date.now() - c.roomDuration + 30_000;
             for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
                 room.startTime = GLOBAL_ARENA_START;
+            }
+            if (scheduledReleaseSha) {
+                await releaseScheduledMaintenance(scheduledReleaseSha, 'Arena reset deferred because the wallet sweep failed.');
             }
             return { success: false, deferred: true, reason: 'pool_sweep_failed' };
         }
@@ -2523,7 +2708,37 @@ async function performGlobalArenaReset() {
             meta: { event: 'reset_complete', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
             status: 'confirmed',
         });
+        if (scheduledReleaseSha) {
+            const activeTournamentSession = [...tournamentRooms.values()].some(room =>
+                room.players.some(player => !player.isBot && !player.disconnected),
+            );
+            if (activeTournamentSession) {
+                await releaseScheduledMaintenance(
+                    scheduledReleaseSha,
+                    'Deployment deferred because an in-memory tournament session is still active.',
+                );
+            } else if (!await waitForBattleRoyaleReleaseDrain()) {
+                await releaseScheduledMaintenance(
+                    scheduledReleaseSha,
+                    'Deployment deferred because Battle Royale sessions did not drain safely.',
+                );
+            } else {
+                await triggerScheduledRailwayDeploy(scheduledReleaseSha);
+            }
+        }
         return { success: true };
+    } catch (error) {
+        if (scheduledReleaseSha && releaseMaintenanceActive) {
+            await releaseScheduledMaintenance(scheduledReleaseSha, error).catch(recoveryError => {
+                console.error('[Release] Reset failure recovery failed:', recoveryError.message);
+                armReleaseFailureRecovery(
+                    scheduledReleaseSha,
+                    30_000,
+                    'Reset failure recovery was delayed by a database error; release was requeued.',
+                );
+            });
+        }
+        throw error;
     } finally {
         for (const room of rooms) room.isResetting = false;
         for (const room of competitiveSlitherRooms) room.isResetting = false;
@@ -2975,6 +3190,73 @@ app.get('/api/health', (req, res) => {
     res.json({ ok: true, ts: Date.now() });
 });
 
+function sendReadiness(req, res) {
+    applyCorsHeaders(req, res);
+    const dependencies = {
+        database: mongoose.connection.readyState === 1,
+        startupTasks: serverReady,
+        gameSystems: gameSystemsInitialized,
+        releaseState: releaseStateLoaded,
+        joins: !releaseMaintenanceActive,
+    };
+    const ready = Object.values(dependencies).every(Boolean);
+    res.status(ready ? 200 : 503).json({
+        ready,
+        status: ready ? 'ready' : 'updating',
+        dependencies,
+        release: publicReleaseState(),
+        version: currentReleaseSha(),
+        ts: Date.now(),
+    });
+}
+
+// Railway and the frontend both use the same dependency-aware readiness gate.
+app.get('/ready', sendReadiness);
+app.get('/api/ready', sendReadiness);
+
+app.post('/api/internal/releases/pending', async (req, res) => {
+    const expectedSecret = process.env.RELEASE_QUEUE_SECRET;
+    const suppliedSecret = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!secretsMatch(suppliedSecret, expectedSecret)) {
+        return res.status(expectedSecret ? 403 : 503).json({ error: 'Release queue is not available' });
+    }
+
+    const commitSha = normalizeCommitSha(req.body?.commitSha);
+    if (!commitSha) return res.status(400).json({ error: 'A full 40-character commitSha is required' });
+
+    try {
+        const runningSha = currentReleaseSha();
+        const current = await ScheduledRelease.findOne({ key: 'production' }).lean();
+        if (commitSha === runningSha || (
+            commitSha === normalizeCommitSha(current?.deployedSha)
+            && !current?.pendingSha
+            && !current?.deployingSha
+        )) {
+            return res.json({ accepted: false, reason: 'already_deployed', commitSha });
+        }
+        if (commitSha === normalizeCommitSha(current?.pendingSha)) {
+            return res.json({ accepted: false, reason: 'already_pending', commitSha });
+        }
+
+        const deploying = [RELEASE_PHASES.RESETTING, RELEASE_PHASES.DEPLOYING].includes(current?.phase);
+        await ScheduledRelease.findOneAndUpdate(
+            { key: 'production' },
+            { $set: {
+                pendingSha: commitSha,
+                pendingAt: new Date(),
+                ...(!deploying ? { phase: RELEASE_PHASES.PENDING, lastError: null } : {}),
+            } },
+            { upsert: true, setDefaultsOnInsert: true },
+        );
+        if (!deploying) releasePhase = RELEASE_PHASES.PENDING;
+        console.log(`[Release] Queued ${commitSha} for the next scheduled arena reset.`);
+        return res.status(202).json({ accepted: true, commitSha, deployAt: 'next_scheduled_reset' });
+    } catch (error) {
+        console.error('[Release] Queue update failed:', error.message);
+        return res.status(500).json({ error: 'Could not queue release' });
+    }
+});
+
 // Hälso-check för att se om servern är vaken
 app.get('/', (req, res) => {
     console.log("Health check requested at " + new Date().toISOString());
@@ -3378,18 +3660,18 @@ app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, asy
             return res.json({ payout });
         }
         if (action !== 'approve') return res.status(400).json({ message: 'Action must be approve or reject' });
-        if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
-            return res.status(503).json({ message: 'House wallet is not configured; payout was not started' });
+        if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET) {
+            return res.status(503).json({ message: 'Reward wallet is not configured; payout was not started' });
         }
 
         payout = await beginAffiliatePayout(req.params.payoutId, req.adminUser._id);
         if (payout.status === 'completed') return res.json({ payout });
 
-        const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
-            Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
+        const rewardKeypair = solanaWeb3.Keypair.fromSecretKey(
+            Uint8Array.from(Buffer.from(REWARD_WALLET_SECRET, 'hex'))
         );
-        if (houseKeypair.publicKey.toBase58() !== HOUSE_WALLET_ADDRESS) {
-            throw new Error('House wallet address does not match configured secret');
+        if (rewardKeypair.publicKey.toBase58() !== REWARD_WALLET_ADDRESS) {
+            throw new Error('Reward wallet address does not match configured secret');
         }
         const payoutSolPriceUsd = payout.signature && payout.solPriceUsd
             ? payout.solPriceUsd
@@ -3401,7 +3683,7 @@ app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, asy
             );
         if (lamports <= 0) return res.status(400).json({ message: 'Payout rounds to zero lamports' });
 
-        const payment = await houseWalletOperations.run(async () => {
+        const payment = await rewardWalletOperations.run(async () => {
             let signature = payout.signature;
             let latest = payout.blockhash && payout.lastValidBlockHeight
                 ? { blockhash: payout.blockhash, lastValidBlockHeight: payout.lastValidBlockHeight }
@@ -3434,13 +3716,16 @@ app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, asy
                 throw error;
             }
 
-            const [houseBalance, rentMinimum] = await Promise.all([
-                connection.getBalance(houseKeypair.publicKey),
+            // If the room reset has not swept the newly reserved fee yet, move
+            // only protected liquidity from House Wallet before paying.
+            await ensureRewardWalletLiquidity(lamports, payoutSolPriceUsd);
+            const [rewardBalance, rentMinimum] = await Promise.all([
+                connection.getBalance(rewardKeypair.publicKey),
                 getSystemAccountRentLamports(),
             ]);
             const feeBuffer = 20_000;
-            if (houseBalance < lamports + feeBuffer) {
-                const error = new Error('House wallet lacks affiliate payout liquidity; no transfer was sent');
+            if (rewardBalance < lamports + feeBuffer) {
+                const error = new Error('Reward wallet lacks affiliate payout liquidity; add SOL to the Reward Wallet and retry');
                 error.status = 409;
                 throw error;
             }
@@ -3454,14 +3739,14 @@ app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, asy
 
             latest = await connection.getLatestBlockhash('confirmed');
             const transaction = new solanaWeb3.Transaction({
-                feePayer: houseKeypair.publicKey,
+                feePayer: rewardKeypair.publicKey,
                 recentBlockhash: latest.blockhash,
             }).add(solanaWeb3.SystemProgram.transfer({
-                fromPubkey: houseKeypair.publicKey,
+                fromPubkey: rewardKeypair.publicKey,
                 toPubkey: destination,
                 lamports,
             }));
-            transaction.sign(houseKeypair);
+            transaction.sign(rewardKeypair);
             signature = bs58.encode(transaction.signature);
             preparedSignature = signature;
             const stored = await AffiliatePayout.updateOne(
@@ -3575,14 +3860,16 @@ async function settleTournament(tournamentId) {
 
     const room = getTournamentRoom(tournament._id);
     if (room) {
-        for (const player of room.players) {
-            if (!player.isBot && player.id) {
-                io.to(player.id).emit('tournamentEnded', {
-
-                    tournamentId: tournament._id.toString(),
-                    name: tournament.name,
-                });
-            }
+        const tournamentSocketIds = new Set([
+            ...room.players.filter(player => !player.isBot).map(player => player.id),
+            ...(room.spectators || []).map(spectator => spectator.id),
+            ...(room.agarSpectators || []).map(spectator => spectator.id),
+        ].filter(Boolean));
+        for (const socketId of tournamentSocketIds) {
+            io.to(socketId).emit('tournamentEnded', {
+                tournamentId: tournament._id.toString(),
+                name: tournament.name,
+            });
         }
         room.players = [];
         room.bots = [];
@@ -3719,7 +4006,10 @@ app.get('/api/admin/tournaments', authenticateAdmin, async (req, res) => {
 
 app.post('/api/admin/tournaments', authenticateAdmin, async (req, res) => {
     try {
-        const name = String(req.body?.name || '').trim();
+        const requestedType = String(req.body?.tournamentType || 'balance-grab');
+        const format = getTournamentFormat(requestedType);
+        if (format.id !== requestedType) return res.status(400).json({ error: 'Unknown tournament type' });
+        const name = String(req.body?.name || format.name).trim();
         const startAt = new Date(req.body?.startAt);
         if (name.length < 3 || name.length > 60) return res.status(400).json({ error: 'Name must be 3-60 characters' });
         if (Number.isNaN(startAt.getTime())) return res.status(400).json({ error: 'Choose a valid start time' });
@@ -3727,6 +4017,13 @@ app.post('/api/admin/tournaments', authenticateAdmin, async (req, res) => {
 
         const tournament = await Tournament.create({
             name,
+            tournamentType: format.id,
+            gameMode: format.gameMode,
+            entryFeeUsd: format.entryFeeUsd,
+            maxAttempts: format.maxAttempts,
+            gameplayEntryFeeUsd: format.gameplayEntryFeeUsd,
+            gameplayStartBalanceUsd: format.gameplayStartBalanceUsd,
+            imageUrl: format.imageUrl,
             startAt,
             endAt: new Date(startAt.getTime() + TOURNAMENT_DURATION_MS),
             createdBy: req.user.id,
@@ -3991,6 +4288,7 @@ async function logAffiliatePayoutTransaction(payout) {
                 event: 'affiliate_payout',
                 reason: 'Affiliate Commission Payout',
                 destination: payout.destinationWallet,
+                from: REWARD_WALLET_ADDRESS,
                 signature: payout.signature,
                 payoutId: payout._id,
                 solAmount: payout.solAmount,
@@ -4395,14 +4693,10 @@ async function ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd
     const activeNormalHumans = [...rooms, ...competitiveSlitherRooms, ...survivRooms]
         .reduce((total, room) => total + room.players.filter(player => !player.isBot).length, 0);
     if (activeNormalHumans === 0 && joiningUsers.size === 0) {
-        const affiliateReserveLamports = Math.ceil(
-            (microsToUsd(await getOutstandingAffiliateLiabilityUsdMicros()) / price)
-            * solanaWeb3.LAMPORTS_PER_SOL,
-        );
         const operatingBufferLamports = Math.ceil((1 / price) * solanaWeb3.LAMPORTS_PER_SOL);
         safelyAvailableLamports = Math.max(
             pendingRewardLamports,
-            houseBalance - affiliateReserveLamports - operatingBufferLamports - feeBuffer,
+            houseBalance - operatingBufferLamports - feeBuffer,
         );
     }
     if (shortfall > safelyAvailableLamports) {
@@ -4426,19 +4720,23 @@ async function ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd
 
 
 async function getRewardWalletLiabilityUsd() {
-    const users = await User.find({}).select([
+    const [users, affiliateLiabilityUsdMicros] = await Promise.all([
+        User.find({}).select([
         'sponsoredRewardsBalance', 'fundedRewardsUsd',
         'sponsoredRewardsCompleted', 'sponsoredRewardsUnlocked',
         'permanentRewardsBalanceUsdMicros', 'permanentRewardProgressEarnedUsdMicros',
         'rentFallbackBalanceUsd', 'rewardClaimReservedUsd',
-    ].join(' ')).lean();
-    return users.reduce((total, user) => Math.max(0,
+        ].join(' ')).lean(),
+        getOutstandingAffiliateLiabilityUsdMicros(),
+    ]);
+    const playerLiabilityUsd = users.reduce((total, user) => Math.max(0,
         total
         + getStarterRewardLiabilityUsd(user)
         + ((Number(user.permanentRewardsBalanceUsdMicros) || 0) / 1_000_000)
         + permanentProgressReserveUsd(user.permanentRewardProgressEarnedUsdMicros)
         + (Number(user.rentFallbackBalanceUsd) || 0)
         + (Number(user.rewardClaimReservedUsd) || 0)), 0);
+    return playerLiabilityUsd + microsToUsd(affiliateLiabilityUsdMicros);
 }
 
 
@@ -5031,7 +5329,7 @@ app.post('/api/entry-pay', authenticateToken, (_req, res) => {
 
 // --- ADMIN DASHBOARD ---
 /** Transactions / users hidden from admin stats (not deleted). */
-const TX_REPORTED = { excludedFromReports: { $ne: true } };
+const TX_REPORTED = REPORTED_TRANSACTION_MATCH;
 const USER_REPORTED = { excludedFromReports: { $ne: true } };
 
 async function fetchExcludedUserIds() {
@@ -5325,7 +5623,8 @@ app.get('/api/pregame/display-settings', async (req, res) => {
         const settings = await SiteDisplaySettings.findOne({ key: 'pregame' }).lean();
         res.json({
             playingOffsets: normalizePregamePlayingOffsets(settings?.pregamePlayingOffsets),
-            newGameJoinsLocked: !!settings?.newGameJoinsLocked,
+            newGameJoinsLocked: isNewGameJoinLocked(),
+            serverUpdate: publicReleaseState(),
         });
     } catch (err) {
         console.error('Pregame display settings error:', err);
@@ -5349,7 +5648,10 @@ app.put('/api/admin/runtime/join-lock', authenticateAdmin, async (req, res) => {
             { new: true, upsert: true, setDefaultsOnInsert: true },
         ).lean();
         newGameJoinsLocked = !!settings.newGameJoinsLocked;
-        io.emit('gameJoinLockChanged', { locked: newGameJoinsLocked });
+        io.emit('gameJoinLockChanged', {
+            locked: isNewGameJoinLocked(),
+            reason: releaseMaintenanceActive ? 'server_update' : (newGameJoinsLocked ? 'admin' : null),
+        });
         await Transaction.create({
             userId: req.user.id,
             type: 'game',
@@ -5735,6 +6037,10 @@ app.get('/api/admin/dashboard/rewards', authenticateAdmin, async (req, res) => {
         for (const key of Object.keys(totals)) {
             if (key.endsWith('Usd')) totals[key] = Number(totals[key].toFixed(6));
         }
+        const affiliateLiabilityUsd = microsToUsd(await getOutstandingAffiliateLiabilityUsdMicros());
+        totals.affiliateUsd = Number(affiliateLiabilityUsd.toFixed(6));
+        totals.playerRewardWalletLiabilityUsd = totals.rewardWalletLiabilityUsd;
+        totals.rewardWalletLiabilityUsd = Number((totals.rewardWalletLiabilityUsd + affiliateLiabilityUsd).toFixed(6));
         totals.pendingHouseUsd = Number((Math.max(0, Number(rewardPoolState?.pendingHouseUsd) || 0)).toFixed(6));
 
         return res.json({ totals, owners, activity: activity.slice(0, 250) });
@@ -7864,7 +8170,10 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
         msUntilReset: resetting ? 0 : msUntilReset,
         msElapsed: now - GLOBAL_ARENA_START,
         isResetting: resetting,
-        newGameJoinsLocked,
+        newGameJoinsLocked: isNewGameJoinLocked(),
+        manualJoinLock: newGameJoinsLocked,
+        serverReady,
+        release: publicReleaseState(),
         devFreePlay: DEV_FREE_PLAY,
         sweepScope: 'main_house_wallet_only',
         brUntouchedOnArenaReset: true,
@@ -8635,9 +8944,15 @@ mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
         const restoredSharedWalletBlocks = await restoreAutomaticSharedWalletBlocks();
         await releaseMatureAffiliateCommissions();
         const reconciliation = await reconcileAffiliateCommissions(Transaction);
+        await loadReleaseStateOnStartup();
+        serverReady = true;
+        emitReleaseState();
         console.log(`Ansluten till databasen, reward-poolen och affiliate-tiers återställda! Permanent reward migration: ${permanentRewardMigration.modifiedCount}. Shared-wallet blocks restored: ${restoredSharedWalletBlocks}. Affiliate reconciliation: ${reconciliation.created}/${reconciliation.scanned} skapade.`);
     })
-    .catch(err => console.error("Kunde inte ansluta:", err));
+    .catch(err => {
+        serverReady = false;
+        console.error("Kunde inte ansluta:", err);
+    });
 
 setInterval(() => {
     if (mongoose.connection.readyState !== 1) return;
@@ -9029,9 +9344,12 @@ async function buildLeaderboardRankings({ since = null } = {}) {
         ...buildGameCashoutTxFilter(),
         ...(since ? { createdAt: { $gte: since } } : {}),
     });
-    const txs = await Transaction.find(match).select('userId amount currency meta').lean();
+    const txs = await Transaction.find(match).select('userId amount currency meta excludedFromReports').lean();
     const totalsByUser = {};
     for (const tx of txs) {
+        // Defense in depth for legacy rows: simulated/free-play results must
+        // never alter an account's public leaderboard position.
+        if (isFreePlayTransaction(tx)) continue;
         const uid = tx.userId?.toString();
         if (!uid) continue;
         totalsByUser[uid] = (totalsByUser[uid] || 0) + txAmountUsd(tx);
@@ -9177,6 +9495,62 @@ function playerTotalMass(player) {
     return player.cells.reduce((sum, cell) => sum + (Number(cell?.balance) || 0), 0);
 }
 
+function createAgarPlayer(id, mongoId, username, skinColor, room, startMass, startDollars) {
+    const spawnX = Math.random() * c.worldWidth;
+    const spawnY = Math.random() * c.worldHeight;
+    let color;
+    if (skinColor === 'random') {
+        color = { fill: 'rainbow', border: 'rainbow' };
+    } else if (isFlagSkinColor(skinColor) || skinColor === 'prism') {
+        color = { fill: skinColor, border: '#16161d' };
+    } else {
+        const requestedColor = skinColor === 'random_color' ? util.randomColor() : skinColor;
+        const match = typeof requestedColor === 'string'
+            ? /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(requestedColor)
+            : null;
+        if (match) {
+            const r = Math.max(0, parseInt(match[1], 16) - 32);
+            const g = Math.max(0, parseInt(match[2], 16) - 32);
+            const b = Math.max(0, parseInt(match[3], 16) - 32);
+            color = {
+                fill: requestedColor,
+                border: '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1),
+            };
+        } else {
+            color = util.randomColor();
+        }
+    }
+
+    return {
+        id,
+        mongoId,
+        username,
+        mode: 'agar',
+        entryFeeUsd: room.entryFeeUsd,
+        kills: 0,
+        balance: startDollars,
+        dollarBalance: startDollars,
+        startTime: Date.now(),
+        color,
+        x: spawnX,
+        y: spawnY,
+        mouseX: 220,
+        mouseY: 0,
+        screenWidth: 1920,
+        screenHeight: 1080,
+        cells: [{
+            id: Math.random().toString(36).substr(2, 9),
+            x: spawnX,
+            y: spawnY,
+            balance: startMass,
+            radius: calculateCellRadius(startMass, startMass, 1, startMass),
+            vx: 0,
+            vy: 0,
+            lastSplit: Date.now(),
+        }],
+    };
+}
+
 function applyAgarFoodPickup(cell, food, player, room) {
     const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
     let massGain = food.balance;
@@ -9278,6 +9652,9 @@ function getModeFoodBudgets(room, agarActive, slitherActive) {
     if (room.isTournament) {
         // Match the amount of score-food a normal $10 join creates, without
         // treating any pellet or bot balance as a real wallet liability.
+        if (room.tournamentGameMode === 'agar') {
+            return { agar: Math.max(80, agarActive * 80), slither: 0 };
+        }
         return { agar: 0, slither: Math.max(80, slitherActive * 80) };
     }
     const total = agarActive + slitherActive;
@@ -9878,23 +10255,36 @@ io.on('connection', (socket) => {
             let user = await User.findById(decoded.id);
             if (!user) throw new Error('User not found');
             user = await ensureUserDepositWallet(user);
-            let tournamentSkinColor = typeof skinColor === 'string' && (skinColor === 'random' || isFlagSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))
+            let tournament = await Tournament.findById(tournamentId);
+            const now = Date.now();
+            if (!tournament || tournament.status !== 'live' || new Date(tournament.endAt).getTime() <= now) {
+                throw new Error('This tournament is not live');
+            }
+            const settings = tournamentSettings(tournament);
+            const tournamentMode = settings.gameMode;
+            let tournamentSkinColor = typeof skinColor === 'string' && (
+                skinColor === 'random'
+                || skinColor === 'random_color'
+                || isFlagSkinColor(skinColor)
+                || (tournamentMode === 'slither' && isSpecialSlitherSkinColor(skinColor))
+                || /^#[0-9a-fA-F]{6}$/.test(skinColor)
+            )
                 ? skinColor
-                : util.randomSlitherColor();
+                : tournamentMode === 'slither' ? util.randomSlitherColor() : util.randomColor();
             const wantsRainbow = skinId === 'rainbow' || tournamentSkinColor === 'random';
-            if (wantsRainbow && !await hasSkinAccess(user, 'slither', 'rainbow')) {
-                throw new Error('Rainbow for Slither must be purchased in the AGAR shop first.');
+            if (wantsRainbow && !await hasSkinAccess(user, tournamentMode, 'rainbow')) {
+                throw new Error(`Rainbow for ${tournamentMode === 'slither' ? 'Slither' : 'Agar'} must be purchased in the AGAR shop first.`);
             }
             const wantsFlags = skinId === 'flags' || isFlagSkinColor(tournamentSkinColor);
-            if (wantsFlags && !await hasSkinAccess(user, 'slither', 'flags')) {
+            if (wantsFlags && !await hasSkinAccess(user, tournamentMode, 'flags')) {
                 throw new Error('Flag Pack must be purchased in the AGAR shop first.');
             }
             const tournamentSpecialSkinId = getSpecialSlitherSkinId(skinId) || getSpecialSlitherSkinId(tournamentSkinColor);
-            if (tournamentSpecialSkinId && !await hasSkinAccess(user, 'slither', tournamentSpecialSkinId)) {
+            if (tournamentSpecialSkinId && (tournamentMode !== 'slither' || !await hasSkinAccess(user, 'slither', tournamentSpecialSkinId))) {
                 throw new Error((tournamentSpecialSkinId === 'aurora' ? 'Aurora Veil' : 'Solar Eclipse') + ' must be purchased in the AGAR shop first.');
             }
             if (tournamentSpecialSkinId) tournamentSkinColor = tournamentSpecialSkinId;
-            tournamentSkinColor = await resolveSignatureSkin({ mode: 'slither', skinId, skinColor, hasAccess: (gameMode, id) => hasSkinAccess(user, gameMode, id) }) || tournamentSkinColor;
+            tournamentSkinColor = await resolveSignatureSkin({ mode: tournamentMode, skinId, skinColor, hasAccess: (gameMode, id) => hasSkinAccess(user, gameMode, id) }) || tournamentSkinColor;
             userKey = `tournament:${tournamentId}:${user._id}`;
             if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
             joiningUsers.add(userKey);
@@ -9904,11 +10294,6 @@ io.on('connection', (socket) => {
                 throw new Error('Another wallet operation is already processing for this account.');
             }
 
-            let tournament = await Tournament.findById(tournamentId);
-            const now = Date.now();
-            if (!tournament || tournament.status !== 'live' || new Date(tournament.endAt).getTime() <= now) {
-                throw new Error('This tournament is not live');
-            }
             let room = getTournamentRoom(tournament._id);
             if (!room) room = createTournamentArenaRoom(tournament);
 
@@ -9923,18 +10308,18 @@ io.on('connection', (socket) => {
                 socket.roomId = room.id;
                 const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
                 socket.emit('welcome', existingPlayer, {
-                    width: SLITHER.worldHalf * 2,
-                    height: SLITHER.worldHalf * 2,
-                    mode: 'slither',
+                    width: tournamentMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
+                    height: tournamentMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
+                    mode: tournamentMode,
                     rejoin: true,
-                    entryFeeUsd: TOURNAMENT_ENTRY_FEE_USD,
+                    entryFeeUsd: settings.entryFeeUsd,
                     solPrice: SOL_PRICE_USD,
                     tournament: true,
                     tournamentId: tournament._id.toString(),
                     tournamentName: tournament.name,
                     tournamentBalanceUsd: participant?.tournamentBalanceUsd || 0,
                     attemptsUsed: participant?.entries || 0,
-                    maxAttempts: TOURNAMENT_MAX_ATTEMPTS,
+                    maxAttempts: settings.maxAttempts,
                     tournamentEndAt: tournament.endAt,
                 });
                 return;
@@ -9947,14 +10332,14 @@ io.on('connection', (socket) => {
             const activeGame = findPlayerInArena(user._id);
             if (activeGame) throw new Error('Finish or leave your active game before entering the tournament');
             const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
-            if ((participant?.entries || 0) >= TOURNAMENT_MAX_ATTEMPTS) {
-                throw new Error(`You have used all ${TOURNAMENT_MAX_ATTEMPTS} tournament attempts`);
+            if ((participant?.entries || 0) >= settings.maxAttempts) {
+                throw new Error(`You have used all ${settings.maxAttempts} tournament attempts`);
             }
 
             const tournamentEntrySolPriceUsd = DEV_FREE_PLAY
                 ? SOL_PRICE_USD
                 : await getSettlementSolPrice();
-            const feeLamports = Math.round((TOURNAMENT_ENTRY_FEE_USD / tournamentEntrySolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
+            const feeLamports = Math.round((settings.entryFeeUsd / tournamentEntrySolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
             if (!DEV_FREE_PLAY) {
                 if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET) throw new Error('Tournament wallet not configured');
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
@@ -9971,7 +10356,7 @@ io.on('connection', (socket) => {
                 }
                 const requiredLamports = feeLamports + 15_000 + await getSystemAccountRentLamports();
                 if (currentLamports < requiredLamports) {
-                    throw new Error('Insufficient SOL for the $1 tournament entry plus the Solana account reserve');
+                    throw new Error(`Insufficient SOL for the $${settings.entryFeeUsd} tournament entry plus the Solana account reserve`);
                 }
                 const userKeypair = solanaWeb3.Keypair.fromSecretKey(
                     decryptWalletSecret(user.depositSecret),
@@ -10009,14 +10394,14 @@ io.on('connection', (socket) => {
                     console.warn('[tournament join] post-payment balance sync failed:', syncErr.message);
                 }
             } else {
-                const feeSol = TOURNAMENT_ENTRY_FEE_USD / tournamentEntrySolPriceUsd;
+                const feeSol = settings.entryFeeUsd / tournamentEntrySolPriceUsd;
                 user.balance = Math.max(0, user.balance - feeSol);
                 await user.save();
             }
 
             const commonUpdate = {
                 $inc: {
-                    totalEntryFeesUsd: TOURNAMENT_ENTRY_FEE_USD,
+                    totalEntryFeesUsd: settings.entryFeeUsd,
                     totalCollectedLamports: feeLamports,
                     totalAttempts: 1,
                 },
@@ -10026,7 +10411,7 @@ io.on('connection', (socket) => {
                     _id: tournament._id,
                     status: 'live',
                     endAt: { $gt: new Date() },
-                    participants: { $elemMatch: { userId: user._id, entries: { $lt: TOURNAMENT_MAX_ATTEMPTS } } },
+                    participants: { $elemMatch: { userId: user._id, entries: { $lt: settings.maxAttempts } } },
                 },
                 { ...commonUpdate, $inc: { ...commonUpdate.$inc, 'participants.$.entries': 1 } },
                 { new: true },
@@ -10049,23 +10434,33 @@ io.on('connection', (socket) => {
             if (!tournament) {
                 await refundTournamentJoin(paidJoin, 'tournament_entry_rejected');
                 paidJoin = null;
-                throw new Error(`Tournament entry closed or all ${TOURNAMENT_MAX_ATTEMPTS} attempts have been used`);
+                throw new Error(`Tournament entry closed or all ${settings.maxAttempts} attempts have been used`);
             }
             entryRecorded = true;
 
-            const economy = getEconomy(TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD);
-            const player = createSlitherPlayer(
-                socket.id,
-                user._id,
-                username || user.username,
-                tournamentSkinColor,
-                room,
-                economy.massStartBalance,
-                TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD * 0.10,
-            );
+            const economy = getEconomy(settings.gameplayEntryFeeUsd);
+            const player = tournamentMode === 'slither'
+                ? createSlitherPlayer(
+                    socket.id,
+                    user._id,
+                    username || user.username,
+                    tournamentSkinColor,
+                    room,
+                    economy.massStartBalance,
+                    settings.gameplayStartBalanceUsd,
+                )
+                : createAgarPlayer(
+                    socket.id,
+                    user._id,
+                    username || user.username,
+                    tournamentSkinColor,
+                    room,
+                    economy.massStartBalance,
+                    settings.gameplayStartBalanceUsd,
+                );
             player.isTournament = true;
             player.tournamentId = tournament._id.toString();
-            player.tournamentEntryFeeUsd = TOURNAMENT_ENTRY_FEE_USD;
+            player.tournamentEntryFeeUsd = settings.entryFeeUsd;
             player.tournamentAttempt = tournament.participants.find(p => p.userId.toString() === user._id.toString())?.entries || 1;
             room.players.push(player);
             socket.roomId = room.id;
@@ -10080,7 +10475,8 @@ io.on('connection', (socket) => {
                     reason: 'Tournament Entry',
                     tournamentId: tournament._id.toString(),
                     tournamentName: tournament.name,
-                    entryFeeUsd: TOURNAMENT_ENTRY_FEE_USD,
+                    entryFeeUsd: settings.entryFeeUsd,
+                    gameMode: tournamentMode,
                     lamports: feeLamports,
                     attempt: player.tournamentAttempt,
                     signature: paidJoin?.signature || 'simulated_tournament_entry',
@@ -10092,18 +10488,18 @@ io.on('connection', (socket) => {
 
             const latestParticipant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
             socket.emit('welcome', player, {
-                width: SLITHER.worldHalf * 2,
-                height: SLITHER.worldHalf * 2,
-                mode: 'slither',
+                width: tournamentMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
+                height: tournamentMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
+                mode: tournamentMode,
                 rejoin: false,
-                entryFeeUsd: TOURNAMENT_ENTRY_FEE_USD,
+                entryFeeUsd: settings.entryFeeUsd,
                 solPrice: SOL_PRICE_USD,
                 tournament: true,
                 tournamentId: tournament._id.toString(),
                 tournamentName: tournament.name,
                 tournamentBalanceUsd: latestParticipant?.tournamentBalanceUsd || 0,
                 attemptsUsed: latestParticipant?.entries || 1,
-                maxAttempts: TOURNAMENT_MAX_ATTEMPTS,
+                maxAttempts: settings.maxAttempts,
                 tournamentEndAt: tournament.endAt,
             });
         } catch (err) {
@@ -10981,69 +11377,15 @@ io.on('connection', (socket) => {
                     newPlayer.isFreeTicketPlay = true;
                 }
             } else {
-                const spawnX = Math.random() * c.worldWidth;
-                const spawnY = Math.random() * c.worldHeight;
-                newPlayer = {
-                    id: socket.id,
-                    mongoId: user._id,
-                    username: username || user.username,
-                    mode: 'agar',
-                    entryFeeUsd: room.entryFeeUsd,
-                    kills: 0,
-                    balance: startDollars,
-                    dollarBalance: startDollars,
-                    startTime: Date.now(),
-                    color: (() => {
-                        if (validatedSkinColor === 'random') {
-                            return { fill: 'rainbow', border: 'rainbow' };
-                        }
-                        if (isFlagSkinColor(validatedSkinColor) || validatedSkinColor === 'prism') {
-                            return { fill: validatedSkinColor, border: '#16161d' };
-                        }
-                        if (validatedSkinColor === 'random_color') {
-                            const randColor = util.randomColor();
-                            const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(randColor);
-                            if (c) {
-                                const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;
-                                const g = (parseInt(c[2], 16) - 32) > 0 ? (parseInt(c[2], 16) - 32) : 0;
-                                const b = (parseInt(c[3], 16) - 32) > 0 ? (parseInt(c[3], 16) - 32) : 0;
-                                return {
-                                    fill: randColor,
-                                    border: '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)
-                                };
-                            }
-                        }
-                        if (validatedSkinColor) {
-                            const c = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(validatedSkinColor);
-                            if (c) {
-                                const r = (parseInt(c[1], 16) - 32) > 0 ? (parseInt(c[1], 16) - 32) : 0;
-                                const g = (parseInt(c[2], 16) - 32) > 0 ? (parseInt(c[2], 16) - 32) : 0;
-                                const b = (parseInt(c[3], 16) - 32) > 0 ? (parseInt(c[3], 16) - 32) : 0;
-                                return {
-                                    fill: validatedSkinColor,
-                                    border: '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)
-                                };
-                            }
-                        }
-                        return util.randomColor();
-                    })(),
-                    x: spawnX,
-                    y: spawnY,
-                    mouseX: 220,
-                    mouseY: 0,
-                    screenWidth: 1920,
-                    screenHeight: 1080,
-                    cells: [{
-                        id: Math.random().toString(36).substr(2, 9),
-                        x: spawnX,
-                        y: spawnY,
-                        balance: startMass,
-                        radius: calculateCellRadius(startMass, startMass, 1, startMass),
-                        vx: 0,
-                        vy: 0,
-                        lastSplit: Date.now()
-                    }]
-                };
+                newPlayer = createAgarPlayer(
+                    socket.id,
+                    user._id,
+                    username || user.username,
+                    validatedSkinColor,
+                    room,
+                    startMass,
+                    startDollars,
+                );
                 if (switchedDollarBalance != null) {
                     newPlayer.dollarBalance = switchedDollarBalance;
                     newPlayer.balance = switchedDollarBalance;
@@ -11921,6 +12263,7 @@ function getBattleRoyaleDeps() {
 }
 
 setupBattleRoyale(io, getBattleRoyaleDeps());
+gameSystemsInitialized = true;
 
 
 setInterval(() => {
@@ -11935,10 +12278,17 @@ setInterval(() => {
     try {
         const age = Date.now() - GLOBAL_ARENA_START;
         if (age > c.roomDuration && !isArenaResetting()) {
-            performGlobalArenaReset();
+            performGlobalArenaReset({ scheduled: true }).catch(error => {
+                console.error('[Arena Reset] Scheduled reset failed:', error.message);
+            });
             return;
         }
-        if (isArenaResetting()) return;
+        if (isArenaResetting()) {
+            // BR is intentionally outside the arena reset. Keep existing paid
+            // matches advancing while a scheduled release waits for them to drain.
+            processBattleRoyaleMatches(io, getBattleRoyaleDeps());
+            return;
+        }
 
         rooms.forEach(room => {
             try {
@@ -12122,7 +12472,9 @@ function processRoom(room) {
             }
         }
         const baseDensity = foodDensityForRoom(room);
-        const slitherDensity = room.isTournament ? baseDensity * 4.5 : baseDensity;
+        const slitherDensity = room.isTournament && room.tournamentGameMode === 'slither'
+            ? baseDensity * 4.5
+            : baseDensity;
         syncSlitherFood(room, pelletValue, foodBudgets.slither, slitherInArena, slitherDensity);
 
         if (room.viruses.length < c.virusCount) addViruses(room, c.virusCount - room.viruses.length);
@@ -12155,7 +12507,15 @@ function processRoom(room) {
             // SJÄLVSANERING: Despawn om botten blir för stor (dollar, not mass)
             const totalBotMass = playerTotalMass(player);
             const botWealth = player.dollarBalance ?? player.balance ?? 0;
-            const botMax = getEconomy(room.entryFeeUsd).botMaxBalance;
+            const fundedRoomRemaining = room.isPersonalFreePlay || room.isFreeTicketRoom || room.isTournament
+                ? Number.POSITIVE_INFINITY
+                : Math.max(
+                    0,
+                    (Number(room.fundedEntryUsd) || 0)
+                    - (Number(room.paidCashoutUsd) || 0)
+                    - (Number(room.reservedCashoutUsd) || 0),
+                );
+            const botMax = Math.min(getEconomy(room.entryFeeUsd).botMaxBalance, fundedRoomRemaining);
             if (botWealth > botMax) {
                 room.foodPoolBalance += botWealth;
                 room.bots = room.bots.filter(b => b.id !== player.id);
@@ -12542,13 +12902,17 @@ function processRoom(room) {
                                             type: 'game',
                                             amount: balanceAtDeath,
                                             meta: {
-                                                reason: 'Arena Death',
+                                                reason: victim.isTournament ? 'Tournament Death' : 'Arena Death',
                                                 event: 'death',
                                                 mode: victim.mode || 'agar',
-                                                entryFeeUsd: victim.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
+                                                entryFeeUsd: victim.tournamentEntryFeeUsd ?? victim.entryFeeUsd ?? DEFAULT_ENTRY_FEE,
                                                 inGameBalanceUsd: balanceAtDeath,
                                                 isFreeTicketPlay: !!victim.isFreeTicketPlay,
                                                 gameSessionId: victim.gameSessionId || null,
+                                                ...(victim.isTournament ? {
+                                                    tournamentId: victim.tournamentId,
+                                                    attempt: victim.tournamentAttempt,
+                                                } : {}),
                                                 ...(victim.personalFreePlay ? { simulated: true } : {}),
                                             },
                                             excludedFromReports: !!victim.personalFreePlay,
@@ -12583,12 +12947,10 @@ function processRoom(room) {
             totalWeight += weight;
         });
 
-        // HUD / cashout balance is dollars; cell.balance is mass. Coupled directly via tier scale factor.
-        const s = player.isBot
-            ? (player.botStake ?? player.dollarBalance ?? c.botStartBalance)
-            : playerDollarStart(player);
-
-        player.dollarBalance = playerTotalMass(player) * s;
+        // Visual mass and funded dollars are deliberately separate ledgers.
+        // Food/collisions/ejection update dollarBalance at the moment value is
+        // transferred; deriving it again from mass here duplicated food value.
+        player.dollarBalance = Math.max(0, Number(player.dollarBalance) || 0);
         player.balance = player.dollarBalance;
 
         if (player.cells.length > 0) {

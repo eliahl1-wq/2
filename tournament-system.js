@@ -7,6 +7,52 @@ export const TOURNAMENT_MAX_ATTEMPTS = 3;
 export const TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD = 10;
 export const TOURNAMENT_PRIZE_SPLITS = [0.60, 0.30, 0.10];
 
+export const TOURNAMENT_FORMATS = Object.freeze({
+    'balance-grab': Object.freeze({
+        id: 'balance-grab',
+        name: 'Balance Grab',
+        gameMode: 'slither',
+        entryFeeUsd: 1,
+        maxAttempts: 3,
+        gameplayEntryFeeUsd: TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD,
+        gameplayStartBalanceUsd: 1,
+        imageUrl: '/normal slither.png',
+    }),
+    'mass-grab': Object.freeze({
+        id: 'mass-grab',
+        name: 'Mass Grab',
+        gameMode: 'agar',
+        entryFeeUsd: 2,
+        maxAttempts: 1,
+        gameplayEntryFeeUsd: TOURNAMENT_GAMEPLAY_ENTRY_FEE_USD,
+        gameplayStartBalanceUsd: 2,
+        imageUrl: '/mass-grab.png',
+    }),
+});
+
+export function getTournamentFormat(formatId = 'balance-grab') {
+    return TOURNAMENT_FORMATS[formatId] || TOURNAMENT_FORMATS['balance-grab'];
+}
+
+export function tournamentSettings(value = {}) {
+    const inferredFormat = value.tournamentType
+        || (value.gameMode === 'agar' ? 'mass-grab' : 'balance-grab');
+    const format = getTournamentFormat(inferredFormat);
+    return {
+        tournamentType: format.id,
+        gameMode: format.gameMode,
+        entryFeeUsd: Number(value.entryFeeUsd) > 0 ? Number(value.entryFeeUsd) : format.entryFeeUsd,
+        maxAttempts: Math.max(1, Math.min(10, Math.floor(Number(value.maxAttempts) || format.maxAttempts))),
+        gameplayEntryFeeUsd: Number(value.gameplayEntryFeeUsd) > 0
+            ? Number(value.gameplayEntryFeeUsd)
+            : format.gameplayEntryFeeUsd,
+        gameplayStartBalanceUsd: Number(value.gameplayStartBalanceUsd) > 0
+            ? Number(value.gameplayStartBalanceUsd)
+            : format.gameplayStartBalanceUsd,
+        imageUrl: String(value.imageUrl || format.imageUrl),
+    };
+}
+
 const ParticipantSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     username: { type: String, required: true },
@@ -21,7 +67,12 @@ const ParticipantSchema = new mongoose.Schema({
 
 const TournamentSchema = new mongoose.Schema({
     name: { type: String, required: true, trim: true, maxlength: 60 },
-    gameMode: { type: String, default: 'slither', enum: ['slither'] },
+    tournamentType: { type: String, default: 'balance-grab', enum: Object.keys(TOURNAMENT_FORMATS) },
+    gameMode: {
+        type: String,
+        default() { return getTournamentFormat(this.tournamentType).gameMode; },
+        enum: ['agar', 'slither'],
+    },
     status: {
         type: String,
         enum: ['scheduled', 'live', 'settling', 'ended', 'cancelled'],
@@ -34,8 +85,26 @@ const TournamentSchema = new mongoose.Schema({
     endedAt: { type: Date, default: null },
     displayUntil: { type: Date, default: null },
     durationMinutes: { type: Number, default: 30 },
-    entryFeeUsd: { type: Number, default: TOURNAMENT_ENTRY_FEE_USD },
-    maxAttempts: { type: Number, default: TOURNAMENT_MAX_ATTEMPTS },
+    entryFeeUsd: {
+        type: Number,
+        default() { return getTournamentFormat(this.tournamentType).entryFeeUsd; },
+    },
+    maxAttempts: {
+        type: Number,
+        default() { return getTournamentFormat(this.tournamentType).maxAttempts; },
+    },
+    gameplayEntryFeeUsd: {
+        type: Number,
+        default() { return getTournamentFormat(this.tournamentType).gameplayEntryFeeUsd; },
+    },
+    gameplayStartBalanceUsd: {
+        type: Number,
+        default() { return getTournamentFormat(this.tournamentType).gameplayStartBalanceUsd; },
+    },
+    imageUrl: {
+        type: String,
+        default() { return getTournamentFormat(this.tournamentType).imageUrl; },
+    },
     prizeSplits: { type: [Number], default: TOURNAMENT_PRIZE_SPLITS },
     totalEntryFeesUsd: { type: Number, default: 0, min: 0 },
     totalCollectedLamports: { type: Number, default: 0, min: 0 },
@@ -130,15 +199,14 @@ export function serializeTournament(doc, userId = null) {
         ? participants.find(p => p.userId?.toString() === key)
         : null;
 
-    const maxAttempts = Math.min(
-        Number(value.maxAttempts) || TOURNAMENT_MAX_ATTEMPTS,
-        TOURNAMENT_MAX_ATTEMPTS,
-    );
+    const settings = tournamentSettings(value);
+    const maxAttempts = settings.maxAttempts;
 
     return {
         id: value._id?.toString(),
         name: value.name,
-        gameMode: value.gameMode,
+        tournamentType: settings.tournamentType,
+        gameMode: settings.gameMode,
         status: value.status,
         startAt: value.startAt,
         endAt: value.endAt,
@@ -146,8 +214,11 @@ export function serializeTournament(doc, userId = null) {
         endedAt: value.endedAt,
         displayUntil: value.displayUntil,
         durationMinutes: value.durationMinutes,
-        entryFeeUsd: value.entryFeeUsd,
+        entryFeeUsd: settings.entryFeeUsd,
         maxAttempts,
+        gameplayEntryFeeUsd: settings.gameplayEntryFeeUsd,
+        gameplayStartBalanceUsd: settings.gameplayStartBalanceUsd,
+        imageUrl: settings.imageUrl,
         prizeSplits: value.prizeSplits,
         prizePotUsd: Number(((value.totalEntryFeesUsd || 0) * 0.92).toFixed(2)),
         totalAttempts: value.totalAttempts || 0,
