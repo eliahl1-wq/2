@@ -6,6 +6,7 @@ import {
     getCompetitiveEconomy,
     getEconomy,
     getJoinPoolSplit,
+    getAdminNormalEntryFunding,
     getRewardPoolSplit,
     getSurvivEconomy,
     NORMAL_ENTRY_OWNER_CUT_PCT,
@@ -58,6 +59,19 @@ test('Normal Agar and Slither use 20% starting dollars without changing starting
         assert.equal(eco.playerStartBalance, entryFeeUsd * 0.20);
         assert.equal(eco.botStartBalance, eco.playerStartBalance);
         assert.equal(eco.massStartBalance, 1.0);
+    }
+});
+
+test('admin public Normal entry funds only its starting balance', () => {
+    for (const entryFeeUsd of ALLOWED_ENTRY_FEES) {
+        const funding = getAdminNormalEntryFunding(entryFeeUsd);
+        assert.equal(funding.paidEntryUsd, entryFeeUsd * 0.20);
+        assert.equal(funding.playerStartBalance, funding.paidEntryUsd);
+        assert.equal(funding.food, 0);
+        assert.equal(funding.ai, 0);
+        assert.equal(funding.rewardPoolContribution, 0);
+        assert.equal(funding.ownerVaultContribution, 0);
+        assert.equal(funding.goldenBlobValue, 0);
     }
 });
 

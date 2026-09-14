@@ -67,6 +67,7 @@ import {
     getSurvivEconomy,
     getSurvivJoinLootFunding,
     getJoinPoolSplit,
+    getAdminNormalEntryFunding,
     getRewardPoolSplit,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
@@ -11669,6 +11670,12 @@ io.on('connection', (socket) => {
 
             const existing = findPlayerInArena(userKey);
             const isFreeTicketPlay = !sessionFreePlay && (!!useFreeTicket || !!(existing && existing.room.isFreeTicketRoom));
+            const adminStartingBalanceOnly = isAdminAccount
+                && !sessionFreePlay
+                && !isFreeTicketPlay;
+            const adminEntryFunding = adminStartingBalanceOnly
+                ? getAdminNormalEntryFunding(entryFeeUsd)
+                : null;
 
             if (!existing && isNewGameJoinLocked()) {
                 socket.emit('error', 'New game entries are temporarily locked while active matches finish.');
@@ -11764,7 +11771,8 @@ io.on('connection', (socket) => {
             const entrySolPriceUsd = (!switchingNormalMode && !freePlay && !isFreeTicketPlay)
                 ? await getSettlementSolPrice()
                 : SOL_PRICE_USD;
-            const entryFeeInSol = entryFeeUsd / entrySolPriceUsd;
+            const paidEntryUsd = adminEntryFunding?.paidEntryUsd ?? entryFeeUsd;
+            const entryFeeInSol = paidEntryUsd / entrySolPriceUsd;
 
             if (!switchingNormalMode && !freePlay && !isFreeTicketPlay) {
                 // 1. Kontrollera on-chain balans direkt innan start
@@ -11774,7 +11782,7 @@ io.on('connection', (socket) => {
 
                 const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
                 if (currentLamports < requiredLamports) {
-                    socket.emit('error', `Insufficient SOL for $${entryFeeUsd} entry plus the Solana account reserve. Deposit a little extra SOL and try again.`);
+                    socket.emit('error', `Insufficient SOL for $${paidEntryUsd.toFixed(2)}${adminStartingBalanceOnly ? ' admin starting balance' : ` entry`} plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                     return;
                 }
 
@@ -11801,7 +11809,7 @@ io.on('connection', (socket) => {
                         { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                     );
                     pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
-                    console.log(`🎟️ Arena Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
+                    console.log(`🎟️ Arena Entry: ${user.username} paid $${paidEntryUsd.toFixed(2)}${adminStartingBalanceOnly ? ' (admin starting balance only)' : ''}. Sig: ${sig}`);
                 } catch (txErr) {
                     await logSolanaTransactionError('Join transaction failed:', txErr);
                     socket.emit('error', 'Blockchain transfer failed. Please try again.');
@@ -11858,8 +11866,10 @@ io.on('connection', (socket) => {
                             event: 'join',
                             roomId: room.id,
                             entryFeeUsd,
+                            paidEntryUsd,
                             mode: mode === 'slither' ? 'slither' : 'agar',
                             gameSessionId,
+                            ...(adminStartingBalanceOnly ? { adminStartingBalanceOnly: true } : {}),
                             ...(freePlay ? { simulated: true } : {}),
                         },
                         excludedFromReports: sessionFreePlay,
@@ -11873,11 +11883,17 @@ io.on('connection', (socket) => {
             // starter reward. Recurring rewards now come from confirmed
             // cashout fees, never from the player's entry value.
             const modeHumansAfterJoin = countHumansInMode(room, gameMode) + 1;
-            const goldenBlobValue = getGoldenBlobValue(entryFeeUsd);
+            const goldenBlobValue = adminEntryFunding?.goldenBlobValue ?? getGoldenBlobValue(entryFeeUsd);
             let foodAlloc, aiAlloc, rewardContribution = 0, ownerContribution = 0;
             let starterFundingUsd = 0;
 
-            if (!freePlay && !isFreeTicketPlay) {
+            if (adminStartingBalanceOnly) {
+                // Admin funds only the value placed on their own character in
+                // the shared paid room. No food, bot, reward, or owner entry
+                // allocation is created from this reduced payment.
+                foodAlloc = adminEntryFunding.food;
+                aiAlloc = adminEntryFunding.ai;
+            } else if (!freePlay && !isFreeTicketPlay) {
                 const remainingToFund = !user.rewardsDisabled && !user.sponsoredRewardsCompleted
                     ? Math.max(0, (user.sponsoredRewardsBalance || 0) - (user.fundedRewardsUsd || 0))
                     : 0;
@@ -11942,7 +11958,7 @@ io.on('connection', (socket) => {
                     room.aiBudgetBalance += aiToAdd;
                     room.foodPoolBalance += foodToPool + (aiAlloc - aiToAdd);
                 }
-                room.fundedEntryUsd += entryFeeUsd;
+                room.fundedEntryUsd += paidEntryUsd;
 
                 // Reward pool / owner vault contributions
                 if (rewardContribution > 0) {
@@ -12077,6 +12093,7 @@ io.on('connection', (socket) => {
             }
 
             newPlayer.gameSessionId = gameSessionId;
+            newPlayer.adminStartingBalanceOnly = adminStartingBalanceOnly;
 
             // Race guard: another join may have completed while we awaited payment
             const raced = room.players.find(p => p.mongoId?.toString() === userKey);

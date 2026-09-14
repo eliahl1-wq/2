@@ -107,6 +107,20 @@ export function getJoinPoolSplit(entryFeeUsd, activeHumansAfterJoin) {
     return { food: distributable - ai - ownerVaultContribution, ai, ownerVaultContribution };
 }
 
+/** Admin-only funding for joining a public Normal room with just the playable starting value. */
+export function getAdminNormalEntryFunding(entryFeeUsd) {
+    const playerStartBalance = getEconomy(entryFeeUsd).playerStartBalance;
+    return {
+        paidEntryUsd: playerStartBalance,
+        playerStartBalance,
+        food: 0,
+        ai: 0,
+        rewardPoolContribution: 0,
+        ownerVaultContribution: 0,
+        goldenBlobValue: 0,
+    };
+}
+
 /**
  * Modified entry split only while a user's one-time starter reward is being funded.
  * Allocations (of entry fee):
