@@ -1,6 +1,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { allocateAgarEjectionValue, calculateNormalRoomValue } from './game-value-accounting.js';
+import {
+    agarEconomicVisualMass,
+    allocateAgarEjectionValue,
+    calculateNormalRoomValue,
+    canAgarCellEat,
+    proportionalAgarCellUsd,
+} from './game-value-accounting.js';
+
+test('Agar cell size and eat power follow proportional USD instead of mismatched raw mass', () => {
+    const largerRawMassButLowerUsd = proportionalAgarCellUsd({
+        playerUsd: 1.8,
+        cellMass: 1.4,
+        totalMass: 1.4,
+    });
+    const smallerRawMassButHigherUsd = proportionalAgarCellUsd({
+        playerUsd: 2,
+        cellMass: 1,
+        totalMass: 1,
+    });
+
+    assert.equal(largerRawMassButLowerUsd, 1.8);
+    assert.equal(smallerRawMassButHigherUsd, 2);
+    assert.equal(canAgarCellEat({
+        eaterCellUsd: largerRawMassButLowerUsd,
+        victimCellUsd: smallerRawMassButHigherUsd,
+    }), false);
+    assert.equal(agarEconomicVisualMass({ cellUsd: 2, startingUsd: 2, startingMass: 1 }), 1);
+    assert.equal(agarEconomicVisualMass({ cellUsd: 4, startingUsd: 2, startingMass: 1 }), 2);
+});
 
 test('Agar ejection cannot create USD when the player has less than the requested value', () => {
     assert.deepEqual(allocateAgarEjectionValue({

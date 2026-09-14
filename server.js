@@ -182,7 +182,13 @@ import { getAgarBotCellCenter, planAgarBotEscapeSplit, planAgarBotSplit } from '
 import { createSerialOperationQueue } from './serial-operation-queue.js';
 import { calculateRoomCashoutReservation } from './cashout-accounting.js';
 import { calculateReferredCashoutFeeRouting } from './affiliate-fee-routing.js';
-import { allocateAgarEjectionValue, calculateNormalRoomValue } from './game-value-accounting.js';
+import {
+    agarEconomicVisualMass,
+    allocateAgarEjectionValue,
+    calculateNormalRoomValue,
+    canAgarCellEat,
+    proportionalAgarCellUsd,
+} from './game-value-accounting.js';
 import {
     DEFAULT_MISSING_BROADCAST_TIMEOUT_MS,
     shouldReleaseMissingBroadcastClaim,
@@ -10216,6 +10222,29 @@ function playerTotalMass(player) {
     return player.cells.reduce((sum, cell) => sum + (Number(cell?.balance) || 0), 0);
 }
 
+function agarCellDollarValue(player, cell) {
+    return proportionalAgarCellUsd({
+        playerUsd: player?.dollarBalance ?? player?.balance,
+        cellMass: cell?.balance,
+        totalMass: playerTotalMass(player),
+    });
+}
+
+function calculateAgarPlayerCellRadius(player, cell) {
+    const massStart = playerMassStart(player);
+    const economicMass = agarEconomicVisualMass({
+        cellUsd: agarCellDollarValue(player, cell),
+        startingUsd: playerDollarStart(player),
+        startingMass: massStart,
+    });
+    return calculateCellRadius(
+        economicMass || Math.max(0, Number(cell?.balance) || 0),
+        economicMass,
+        Math.max(1, player?.cells?.length || 1),
+        massStart,
+    );
+}
+
 function createAgarPlayer(id, mongoId, username, skinColor, room, startMass, startDollars) {
     const spawnX = Math.random() * c.worldWidth;
     const spawnY = Math.random() * c.worldHeight;
@@ -10507,6 +10536,7 @@ function addBots(room, n, botStake = null) {
         room.bots.push({
             id: id,
             username: ' ',
+            entryFeeUsd: room.entryFeeUsd,
             balance: botCost,
             dollarBalance: botCost,
             botStake: botCost,
@@ -10594,7 +10624,6 @@ function ensureAgarMovementInput(player) {
 function splitAgarCells(player, angle, now = Date.now(), options = {}) {
     if (!player?.cells?.length || player.cells.length >= c.maxCells) return 0;
 
-    const totalMass = playerTotalMass(player);
     const massStart = playerMassStart(player);
     const availableSlots = Math.min(
         c.maxCells - player.cells.length,
@@ -10627,9 +10656,8 @@ function splitAgarCells(player, angle, now = Date.now(), options = {}) {
     if (newCells.length === 0) return 0;
 
     player.cells.push(...newCells);
-    const finalCellCount = player.cells.length;
     player.cells.forEach(cell => {
-        cell.radius = calculateCellRadius(cell.balance, totalMass, finalCellCount, massStart);
+        cell.radius = calculateAgarPlayerCellRadius(player, cell);
     });
     return newCells.length;
 }
@@ -10713,10 +10741,8 @@ function resolveAgarOwnCells(player, now, massStart) {
 
     if (mergedIds.size === 0) return;
     player.cells = cells.filter(cell => !mergedIds.has(cell.id));
-    const totalMass = playerTotalMass(player);
-    const cellCount = player.cells.length;
     player.cells.forEach(cell => {
-        cell.radius = calculateCellRadius(cell.balance, totalMass, cellCount, massStart);
+        cell.radius = calculateAgarPlayerCellRadius(player, cell);
     });
 }
 function calculateCellRadius(cellMass, playerTotalMass, cellCount, massStart = c.playerStartBalance) {
@@ -11252,6 +11278,7 @@ io.on('connection', (socket) => {
         let pendingTicketUserId = null;
         let pendingTicketTransactionId = null;
         let pendingJoinEconomy = null;
+        const reportJoinProgress = (message) => socket.emit('joinProgress', { message });
         try {
             if (mode === 'br-agar' || mode === 'br-slither' || mode === 'br-surviv') {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
@@ -11262,6 +11289,7 @@ io.on('connection', (socket) => {
                 validatedSkinColor = skinColor;
             }
             const decoded = await verifyAccountToken(token);
+            reportJoinProgress('Checking your account…');
             let user = await User.findById(decoded.id);
             if (!user) {
                 socket.emit('error', 'Account not found — please log in again.');
@@ -11296,6 +11324,7 @@ io.on('connection', (socket) => {
                 return;
             }
             user = await ensureUserDepositWallet(user);
+            reportJoinProgress('Preparing your arena entry…');
             const personalFreePlayContext = await getPersonalFreePlayContext(user);
             const personalFreePlay = personalFreePlayContext.enabled;
             const publicFreePlay = publicFreeMode === true;
@@ -11390,15 +11419,20 @@ io.on('connection', (socket) => {
                 const entryFeeInSol = entryFeeUsd / entrySolPriceUsd;
 
                 if (!freePlay) {
+                    reportJoinProgress('Checking your SOL balance…');
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                    const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
+                    const [currentLamports, rentLamports] = await Promise.all([
+                        connection.getBalance(userPubKey),
+                        getSystemAccountRentLamports(),
+                    ]);
+                    const requiredLamports = feeLamports + 15000 + rentLamports;
                     if (currentLamports < requiredLamports) {
                         socket.emit('error', `Insufficient SOL for $${entryFeeUsd} entry plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                         return;
                     }
                     try {
+                        reportJoinProgress('Confirming your entry on Solana…');
                         const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
@@ -11420,6 +11454,7 @@ io.on('connection', (socket) => {
                             { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                         );
                         pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
+                        reportJoinProgress('Preparing the Slither arena…');
                         console.log(`🎟️ Competitive Slither Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
                         await logSolanaTransactionError('Competitive join transaction failed:', txErr);
@@ -11568,15 +11603,20 @@ io.on('connection', (socket) => {
                 const entryFeeInSol = entryFeeUsd / entrySolPriceUsd;
 
                 if (!freePlay && !useAdminFreeSurvivEntry) {
+                    reportJoinProgress('Checking your SOL balance…');
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                    const currentLamports = await connection.getBalance(userPubKey);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
+                    const [currentLamports, rentLamports] = await Promise.all([
+                        connection.getBalance(userPubKey),
+                        getSystemAccountRentLamports(),
+                    ]);
+                    const requiredLamports = feeLamports + 15000 + rentLamports;
                     if (currentLamports < requiredLamports) {
                         socket.emit('error', `Insufficient SOL for $${entryFeeUsd} entry plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                         return;
                     }
                     try {
+                        reportJoinProgress('Confirming your entry on Solana…');
                         const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                         const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
@@ -11598,6 +11638,7 @@ io.on('connection', (socket) => {
                             { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                         );
                         pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
+                        reportJoinProgress('Preparing the Surviv arena…');
                         console.log(`🎟️ Surviv Entry: ${user.username} paid $${entryFeeUsd}. Sig: ${sig}`);
                     } catch (txErr) {
                         await logSolanaTransactionError('Surviv join transaction failed:', txErr);
@@ -11821,11 +11862,15 @@ io.on('connection', (socket) => {
 
             if (!switchingNormalMode && !freePlay && !isFreeTicketPlay) {
                 // 1. Kontrollera on-chain balans direkt innan start
+                reportJoinProgress('Checking your SOL balance…');
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
-                const currentLamports = await connection.getBalance(userPubKey);
                 const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
 
-                const requiredLamports = feeLamports + 15000 + await getSystemAccountRentLamports();
+                const [currentLamports, rentLamports] = await Promise.all([
+                    connection.getBalance(userPubKey),
+                    getSystemAccountRentLamports(),
+                ]);
+                const requiredLamports = feeLamports + 15000 + rentLamports;
                 if (currentLamports < requiredLamports) {
                     socket.emit('error', `Insufficient SOL for $${paidEntryUsd.toFixed(2)}${adminStartingBalanceOnly ? ' admin starting balance' : ` entry`} plus the Solana account reserve. Deposit a little extra SOL and try again.`);
                     return;
@@ -11833,6 +11878,7 @@ io.on('connection', (socket) => {
 
                 // 2. Utför on-chain transfer: Deposit Address -> House Wallet
                 try {
+                    reportJoinProgress('Confirming your entry on Solana…');
                     const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                     const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
                     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
@@ -11854,6 +11900,7 @@ io.on('connection', (socket) => {
                         { commitment: 'confirmed', maxRetries: 3, lastValidBlockHeight }
                     );
                     pendingPaidJoin = { userId: user._id, destination: user.depositAddress, lamports: feeLamports, signature: sig };
+                    reportJoinProgress(`Preparing the ${gameMode === 'slither' ? 'Slither' : 'Agar'} arena…`);
                     console.log(`🎟️ Arena Entry: ${user.username} paid $${paidEntryUsd.toFixed(2)}${adminStartingBalanceOnly ? ' (admin starting balance only)' : ''}. Sig: ${sig}`);
                 } catch (txErr) {
                     await logSolanaTransactionError('Join transaction failed:', txErr);
@@ -12489,18 +12536,20 @@ io.on('connection', (socket) => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p) return;
-        const s = playerDollarStart(p);
         p.cells.forEach(cell => {
             const massStart = playerMassStart(p);
             const totalMass = playerTotalMass(p);
             if (cell.balance >= massStart * 1.5) {
+                const requestedDollarValue = proportionalAgarCellUsd({
+                    playerUsd: p.dollarBalance,
+                    cellMass: c.ejectMass,
+                    totalMass,
+                });
                 cell.balance -= c.ejectMass;
-                cell.radius = calculateCellRadius(cell.balance, totalMass, p.cells.length, massStart);
                 const angle = Math.atan2(p.mouseY, p.mouseX);
                 const dirX = Number.isFinite(Math.cos(angle)) && (p.mouseX || p.mouseY) ? Math.cos(angle) : 1;
                 const dirY = Number.isFinite(Math.sin(angle)) && (p.mouseX || p.mouseY) ? Math.sin(angle) : 0;
                 
-                const requestedDollarValue = c.ejectMass * s;
                 const valueSplit = allocateAgarEjectionValue({
                     availableUsd: p.dollarBalance,
                     requestedUsd: requestedDollarValue,
@@ -12509,6 +12558,7 @@ io.on('connection', (socket) => {
                 if (p.dollarBalance != null) {
                     p.dollarBalance = Math.max(0, p.dollarBalance - valueSplit.debitedUsd);
                 }
+                cell.radius = calculateAgarPlayerCellRadius(p, cell);
                 room.foodPoolBalance += valueSplit.recycledUsd;
 
                 room.ejected.push({
@@ -13488,6 +13538,10 @@ function processRoom(room) {
         // 1. Beräkna rörelse för alla celler
         for (let i = 0; i < player.cells.length; i++) {
             const cell = player.cells[i];
+            // Radius and the HUD's per-cell balance use the same proportional
+            // USD source of truth. Recompute each tick so rejoins, mode
+            // switches, and legacy in-memory cells cannot retain stale size.
+            cell.radius = calculateAgarPlayerCellRadius(player, cell);
             
             // PHYSICS: Movement & Friction
             // Använder balans som bas för hastighet (normaliserad med faktor 50)
@@ -13540,12 +13594,7 @@ function processRoom(room) {
                         // already have consumed this exact blob.
                         if (!room.food.some(f => f.id === item.data.id)) continue;
                         applyAgarFoodPickup(cell, item.data, player, room);
-                        cell.radius = calculateCellRadius(
-                            cell.balance,
-                            playerTotalMass(player),
-                            player.cells.length,
-                            massStart,
-                        );
+                        cell.radius = calculateAgarPlayerCellRadius(player, cell);
                         room.food = room.food.filter(f => f.id !== item.data.id);
                     }
                 } else if (item.type === 'ejected') {
@@ -13558,12 +13607,7 @@ function processRoom(room) {
                         if (player.dollarBalance != null) {
                             player.dollarBalance = (player.dollarBalance || 0) + dollarGain;
                         }
-                        cell.radius = calculateCellRadius(
-                            cell.balance,
-                            playerTotalMass(player),
-                            player.cells.length,
-                            massStart,
-                        );
+                        cell.radius = calculateAgarPlayerCellRadius(player, cell);
                         room.ejected = room.ejected.filter(e => e.id !== item.data.id);
                     }
                 } else if (item.type === 'virus') {
@@ -13572,15 +13616,12 @@ function processRoom(room) {
                     if (Math.hypot(cell.x - item.data.x, cell.y - item.data.y) < r + virusRadius * 0.3 && cell.balance > massStart * 2) {
                         if (player.cells.length < c.maxCells) {
                             cell.balance /= 2;
-                            cell.radius = calculateCellRadius(
-                                cell.balance,
-                                playerTotalMass(player),
-                                player.cells.length,
-                                massStart,
-                            );
                             player.cells.push({
                                 id: Math.random().toString(36).substr(2, 9),
                                 x: cell.x, y: cell.y, balance: cell.balance, radius: cell.radius, vx: Math.random() * 40 - 20, vy: Math.random() * 40 - 20, lastSplit: Date.now()
+                            });
+                            player.cells.forEach(currentCell => {
+                                currentCell.radius = calculateAgarPlayerCellRadius(player, currentCell);
                             });
                             room.viruses = room.viruses.filter(v => v.id !== item.data.id);
                         }
@@ -13589,30 +13630,30 @@ function processRoom(room) {
                     const otherCell = item.cell;
                     if (otherCell.id === cell.id || cellsToDelete.has(otherCell.id)) continue;
                     const d = Math.hypot(cell.x - otherCell.x, cell.y - otherCell.y);
-                    const r2 = otherCell.radius;
 
                     if (item.socketId === player.id || item.botId === player.id) {
                         continue;
                     } else {
                         if (isSandbox && room.sandboxInvincible) continue;
-                        // EXTERNAL: Eat
-                        // Sänkt tröskel till 5% (1.05) och mer förlåtande avstånd (d < r för en mjukare känsla där man äter lättare)
-                        if (cell.balance > otherCell.balance * 1.05 && d < r) {
-                            const victim = room.players.find(p => p.id === item.socketId)
-                                || room.bots.find(b => b.id === item.botId);
+                        const victim = room.players.find(p => p.id === item.socketId)
+                            || room.bots.find(b => b.id === item.botId);
 
-                            // Reject stale quadtree cells already consumed by another eater.
-                            if (!victim?.cells?.some(c => c.id === otherCell.id)) continue;
+                        // Reject stale quadtree cells already consumed by another eater.
+                        if (!victim?.cells?.some(c => c.id === otherCell.id)) continue;
+
+                        // EXTERNAL: Eat
+                        // Compare the same proportional USD shown on each blob.
+                        // Raw mass can have a different USD ratio after food,
+                        // so using it here allowed a lower-balance blob to eat
+                        // a higher-balance one.
+                        const eaterCellUsd = agarCellDollarValue(player, cell);
+                        const victimCellUsd = agarCellDollarValue(victim, otherCell);
+                        if (canAgarCellEat({ eaterCellUsd, victimCellUsd }) && d < r) {
 
                             // EKONOMI: Absorberar 100% av cellmassan + proportionell dollar-andel
                             cell.balance += otherCell.balance;
                             transferAgarDollars(victim, player, otherCell.balance);
-                            cell.radius = calculateCellRadius(
-                                cell.balance,
-                                playerTotalMass(player),
-                                player.cells.length,
-                                massStart,
-                            );
+                            cell.radius = calculateAgarPlayerCellRadius(player, cell);
                             if (victim) {
                                 const willEliminate = !victim.isBot && victim.cells.length === 1 && victim.cells[0].id === otherCell.id;
                                 const balanceAtDeath = willEliminate
