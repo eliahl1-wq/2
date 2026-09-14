@@ -687,6 +687,9 @@ const TransactionSchema = new mongoose.Schema({
 TransactionSchema.index({ 'meta.cashoutSettlementKey': 1 }, { unique: true, sparse: true });
 TransactionSchema.index({ 'meta.refundSettlementKey': 1 }, { unique: true, sparse: true });
 TransactionSchema.index({ status: 1, 'meta.event': 1, createdAt: 1 });
+TransactionSchema.index({ userId: 1, createdAt: -1 });
+TransactionSchema.index({ type: 1, status: 1, 'meta.event': 1, userId: 1 });
+TransactionSchema.index({ createdAt: -1, userId: 1 });
 
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed' || doc.excludedFromReports || doc.meta?.simulated) return;
@@ -6760,31 +6763,37 @@ app.get('/api/admin/dashboard/active-users', authenticateAdmin, async (req, res)
     }
 });
 
-app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
-    try {
-        const showExcluded = req.query.showExcluded === 'true';
-        const sortKey = req.query.sort || 'balance_desc';
-        const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardProgressEarnedUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
-        const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
+const ADMIN_USER_STATS_CACHE_MS = 10_000;
+const adminUserStatsCache = new Map();
+
+async function getAdminUserStats(userIds, showExcluded) {
+    const cacheKey = showExcluded ? 'all' : 'reported';
+    const cached = adminUserStatsCache.get(cacheKey);
+    if (cached && (cached.pending || Date.now() - cached.createdAt < ADMIN_USER_STATS_CACHE_MS)) {
+        return cached.promise;
+    }
+
+    const promise = (async () => {
+        const userIdMatch = { $in: userIds };
+        const depositMatch = await reportedTxMatch({
+            type: 'deposit',
+            status: 'confirmed',
+            userId: userIdMatch,
+        });
         const realGameBaseMatch = {
             status: 'confirmed',
             excludedFromReports: { $ne: true },
             'meta.simulated': { $ne: true },
             'meta.isFreeTicketPlay': { $ne: true },
-            userId: { $ne: null },
+            userId: userIdMatch,
         };
         const numberFrom = (field, fallback = 0) => ({
             $convert: { input: { $ifNull: [field, fallback] }, to: 'double', onError: 0, onNull: 0 },
         });
-        const [depositTotals, latestActivity, gameSpendTotals, gameReturnTotals] = await Promise.all([
+        const [depositTotals, gameSpendTotals, gameReturnTotals] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: '$userId', totalDepositedSol: { $sum: '$amount' }, depositCount: { $sum: 1 } } },
-            ]),
-            Transaction.aggregate([
-                { $match: { userId: { $ne: null } } },
-                { $group: { _id: '$userId', lastActiveAt: { $max: '$createdAt' } } },
             ]),
             Transaction.aggregate([
                 { $match: { ...realGameBaseMatch, type: 'game', 'meta.event': { $in: ['join', 'br_join'] } } },
@@ -6801,10 +6810,36 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 },
             ]),
         ]);
-        const depositMap = Object.fromEntries(depositTotals.map(d => [d._id.toString(), d]));
-        const activityMap = Object.fromEntries(latestActivity.map(row => [row._id.toString(), row.lastActiveAt]));
-        const gameSpendMap = Object.fromEntries(gameSpendTotals.map(row => [row._id.toString(), row]));
-        const gameReturnMap = Object.fromEntries(gameReturnTotals.map(row => [row._id.toString(), row]));
+        return {
+            depositMap: Object.fromEntries(depositTotals.map(row => [row._id.toString(), row])),
+            gameSpendMap: Object.fromEntries(gameSpendTotals.map(row => [row._id.toString(), row])),
+            gameReturnMap: Object.fromEntries(gameReturnTotals.map(row => [row._id.toString(), row])),
+        };
+    })();
+
+    const cacheEntry = { createdAt: Date.now(), pending: true, promise };
+    adminUserStatsCache.set(cacheKey, cacheEntry);
+    promise.then(() => {
+        cacheEntry.pending = false;
+        cacheEntry.createdAt = Date.now();
+    }, () => {});
+    promise.catch(() => {
+        const current = adminUserStatsCache.get(cacheKey);
+        if (current?.promise === promise) adminUserStatsCache.delete(cacheKey);
+    });
+    return promise;
+}
+
+app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
+    try {
+        const showExcluded = req.query.showExcluded === 'true';
+        const sortKey = req.query.sort || 'balance_desc';
+        const userFilter = showExcluded ? {} : USER_REPORTED;
+        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardProgressEarnedUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const { depositMap, gameSpendMap, gameReturnMap } = await getAdminUserStats(
+            users.map(account => account._id),
+            showExcluded,
+        );
 
         const playingMap = new Map();
         const addPlaying = (player, mode, entryFeeUsd) => {
@@ -6856,7 +6891,6 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
             const online = onlineMap.get(userId) || null;
             const createdAt = objectIdCreatedAt(u._id);
             const lastActiveAt = new Date(Math.max(
-                new Date(activityMap[userId] || 0).getTime() || 0,
                 new Date(u.lastActiveAt || 0).getTime() || 0,
                 Number(online?.lastSeen || 0),
                 new Date(createdAt || 0).getTime() || 0,
