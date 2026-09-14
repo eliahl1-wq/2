@@ -62,6 +62,7 @@ import {
     getRewardPoolSplit,
     getGoldenBlobValue,
     wealthTaxDecayAmount,
+    cappedAmbientFoodTarget,
 } from './economy.js';
 import {
     SURVIV,
@@ -563,6 +564,7 @@ const TransactionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 TransactionSchema.index({ 'meta.cashoutSettlementKey': 1 }, { unique: true, sparse: true });
+TransactionSchema.index({ 'meta.refundSettlementKey': 1 }, { unique: true, sparse: true });
 TransactionSchema.index({ status: 1, 'meta.event': 1, createdAt: 1 });
 
 TransactionSchema.post('save', async function(doc) {
@@ -906,6 +908,12 @@ const c = {
 const BOT_CASHOUT_DURATION_MS = 3_000;
 const BOT_CASHOUT_RETRY_MS = 1_500;
 const CASHOUT_HOLD_MS = 3_000;
+// Ordinary Agar pellets only. Golden join blobs remain protected and consume
+// part of this total; trimmed dollars are returned to foodPoolBalance.
+const NORMAL_AGAR_MAX_FOOD = Math.max(
+    100,
+    Math.floor(Number(process.env.NORMAL_AGAR_MAX_FOOD || 500)),
+);
 const joiningUsers = new Set();
 function isUserJoining(userId) {
     const id = String(userId || '');
@@ -2279,10 +2287,10 @@ async function sweepHouseWalletOnResetUnlocked() {
 
     const pendingCashouts = await Transaction.countDocuments({
         status: 'pending',
-        'meta.settlementKind': 'game_cashout',
+        'meta.settlementKind': { $in: ['game_cashout', 'entry_refund'] },
     });
     if (pendingCashouts > 0) {
-        throw new Error(`House sweep blocked by ${pendingCashouts} unresolved game cashout(s)`);
+        throw new Error(`House sweep blocked by ${pendingCashouts} unresolved player settlement(s)`);
     }
 
     let solPrice;
@@ -4064,6 +4072,9 @@ async function reconcileAccountWithdrawalRecord(recordOrId) {
             { _id: record._id, status: 'pending' },
             { $set: { status: 'confirmed', 'meta.confirmedByReconciler': true } },
         );
+        if (record.meta?.walletOperationId && record.userId) {
+            await releaseWalletOperation(record.userId, record.meta.walletOperationId).catch(() => {});
+        }
         return 'confirmed';
     }
     if (!['failed', 'expired'].includes(state)) return 'pending';
@@ -4085,6 +4096,9 @@ async function reconcileAccountWithdrawalRecord(recordOrId) {
                 : `Withdrawal failed on-chain: ${JSON.stringify(snapshot.signatureStatus?.err)}`,
         } },
     );
+    if (record.meta?.walletOperationId && record.userId) {
+        await releaseWalletOperation(record.userId, record.meta.walletOperationId).catch(() => {});
+    }
     return state;
 }
 
@@ -4130,7 +4144,21 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
     let reservedSol = 0;
     let record = null;
     let signature = null;
+    const walletOperationId = `account_withdrawal:${randomBytes(16).toString('hex')}`;
+    let walletOperationLocked = false;
+    let keepWalletOperationLease = false;
     try {
+        walletOperationLocked = await acquireWalletOperation(
+            userId,
+            'account_withdrawal',
+            walletOperationId,
+            180_000,
+        );
+        if (!walletOperationLocked) {
+            const lockError = new Error('Another wallet operation is already processing for this account');
+            lockError.status = 409;
+            throw lockError;
+        }
         const withdrawalSolPriceUsd = await getSettlementSolPrice();
         const currentUser = await User.findById(userId).select('balance');
         if (!currentUser) {
@@ -4227,6 +4255,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
                 reservedSol,
                 lastValidBlockHeight: prepared.latestBlockhash.lastValidBlockHeight,
                 blockhash: prepared.latestBlockhash.blockhash,
+                walletOperationId,
                 ...(adminActorId ? { initiatedBy: 'admin', adminActorId: String(adminActorId) } : {}),
             },
             status: 'pending',
@@ -4301,6 +4330,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
                 };
             }
             if (state === 'pending') {
+                keepWalletOperationLease = true;
                 return {
                     success: false,
                     processing: true,
@@ -4312,6 +4342,9 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         }
         throw err;
     } finally {
+        if (walletOperationLocked && !keepWalletOperationLease) {
+            await releaseWalletOperation(userId, walletOperationId).catch(() => {});
+        }
         releaseCashoutLock(userId);
     }
 }
@@ -4504,6 +4537,7 @@ async function reconcileRewardClaims() {
 }
 setInterval(() => reconcileRewardClaims().catch(err => console.error('Claim reconciliation failed:', err.message)), 30_000);
 setInterval(() => reconcileTrackedCashouts().catch(err => console.error('Cashout reconciliation failed:', err.message)), 30_000);
+setInterval(() => reconcileTrackedEntryRefunds().catch(err => console.error('Entry-refund reconciliation failed:', err.message)), 30_000);
 setInterval(() => reconcilePendingAccountWithdrawals().catch(err => console.error('Withdrawal reconciliation failed:', err.message)), 30_000);
 setInterval(() => reconcileAffiliatePayouts().catch(err => console.error('Affiliate payout reconciliation failed:', err.message)), 30_000);
 setInterval(() => reconcileTournamentRewardClaims().catch(err => console.error('Tournament claim reconciliation failed:', err.message)), 30_000);
@@ -9628,35 +9662,165 @@ async function refundPaidJoin(pending, reason) {
 
 async function refundPaidJoinUnlocked(pending, reason) {
     if (!pending || DEV_FREE_PLAY) return;
+    const refundKey = `entry-refund:${String(pending.signature || '').trim()}`;
+    if (!pending.signature) throw new Error('Cannot safely identify the paid entry being refunded');
     try {
         const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
             Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
         );
-        const refundTx = new solanaWeb3.Transaction().add(
+        const existing = await Transaction.findOne({ 'meta.refundSettlementKey': refundKey });
+        if (existing?.status === 'confirmed') return true;
+        if (existing?.status === 'pending') return true;
+
+        const latest = await connection.getLatestBlockhash('confirmed');
+        const refundTx = new solanaWeb3.Transaction({
+            feePayer: houseKeypair.publicKey,
+            recentBlockhash: latest.blockhash,
+        }).add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: houseKeypair.publicKey,
                 toPubkey: new solanaWeb3.PublicKey(pending.destination),
                 lamports: pending.lamports,
             })
         );
-        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, refundTx, [houseKeypair]);
-        await Transaction.create({
+        refundTx.sign(houseKeypair);
+        const signature = bs58.encode(refundTx.signature);
+        const record = await Transaction.create({
             userId: pending.userId,
             type: 'withdraw',
             amount: pending.lamports / solanaWeb3.LAMPORTS_PER_SOL,
             currency: 'SOL',
-            meta: { event: 'entry_refund', reason, originalSignature: pending.signature, signature },
-            status: 'confirmed',
+            meta: {
+                event: 'entry_refund',
+                settlementKind: 'entry_refund',
+                refundSettlementKey: refundKey,
+                reason,
+                originalSignature: pending.signature,
+                signature,
+                destination: pending.destination,
+                lamports: pending.lamports,
+                blockhash: latest.blockhash,
+                lastValidBlockHeight: latest.lastValidBlockHeight,
+                broadcastPreparedAt: new Date().toISOString(),
+            },
+            status: 'pending',
         });
+        try {
+            const submitted = await connection.sendRawTransaction(refundTx.serialize(), {
+                skipPreflight: false,
+                maxRetries: 3,
+            });
+            if (submitted !== signature) throw new Error('Entry refund signature mismatch');
+            const confirmation = await connection.confirmTransaction({
+                signature,
+                blockhash: latest.blockhash,
+                lastValidBlockHeight: latest.lastValidBlockHeight,
+            }, 'confirmed');
+            if (confirmation.value.err) {
+                await Transaction.updateOne(
+                    { _id: record._id, status: 'pending' },
+                    { $set: { 'meta.lastFailure': JSON.stringify(confirmation.value.err) } },
+                );
+                return true;
+            }
+            await Transaction.updateOne({ _id: record._id, status: 'pending' }, { $set: { status: 'confirmed' } });
+            return true;
+        } catch (error) {
+            console.warn('[Entry Refund] Awaiting reconciliation:', error.message);
+            return true;
+        }
     } catch (err) {
         console.error('CRITICAL: automatic paid-entry refund failed:', err.message, pending);
-        await Transaction.create({
-            userId: pending.userId,
-            type: 'game',
-            amount: 0,
-            meta: { event: 'failure', reason: 'entry_refund_failed', error: err.message, originalSignature: pending.signature },
-            status: 'failed',
-        }).catch(() => {});
+        return false;
+    }
+}
+
+async function retryTrackedEntryRefund(record) {
+    const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
+        Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex')),
+    );
+    const destination = new solanaWeb3.PublicKey(record.meta.destination);
+    const lamports = Math.max(0, Math.floor(Number(record.meta.lamports) || 0));
+    if (!lamports) throw new Error('Tracked entry refund has no lamport amount');
+    const [balance, latest] = await Promise.all([
+        connection.getBalance(houseKeypair.publicKey),
+        connection.getLatestBlockhash('confirmed'),
+    ]);
+    if (balance < lamports + 15_000) {
+        throw new Error('House wallet needs funding before the tracked entry refund can retry');
+    }
+    const transaction = new solanaWeb3.Transaction({
+        feePayer: houseKeypair.publicKey,
+        recentBlockhash: latest.blockhash,
+    }).add(solanaWeb3.SystemProgram.transfer({
+        fromPubkey: houseKeypair.publicKey,
+        toPubkey: destination,
+        lamports,
+    }));
+    transaction.sign(houseKeypair);
+    const signature = bs58.encode(transaction.signature);
+    const claimed = await Transaction.updateOne(
+        { _id: record._id, status: 'pending', 'meta.signature': record.meta.signature },
+        { $set: {
+            'meta.signature': signature,
+            'meta.blockhash': latest.blockhash,
+            'meta.lastValidBlockHeight': latest.lastValidBlockHeight,
+            'meta.broadcastPreparedAt': new Date().toISOString(),
+            'meta.lastFailure': null,
+        }, $inc: { 'meta.retryCount': 1 } },
+    );
+    if (!claimed.modifiedCount) return;
+    const submitted = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: false,
+        maxRetries: 3,
+    });
+    if (submitted !== signature) throw new Error('Retried entry refund signature mismatch');
+    const confirmation = await connection.confirmTransaction({
+        signature,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+    }, 'confirmed');
+    if (!confirmation.value.err) {
+        await Transaction.updateOne(
+            { _id: record._id, status: 'pending', 'meta.signature': signature },
+            { $set: { status: 'confirmed', 'meta.confirmedByReconciler': true } },
+        );
+    }
+}
+
+async function reconcileTrackedEntryRefunds() {
+    if (mongoose.connection.readyState !== 1 || DEV_FREE_PLAY || !HOUSE_WALLET_SECRET) return;
+    const refunds = await Transaction.find({
+        status: 'pending',
+        'meta.settlementKind': 'entry_refund',
+        'meta.signature': { $ne: null },
+    }).sort({ createdAt: 1 }).limit(50);
+    for (const refund of refunds) {
+        await houseWalletOperations.run(async () => {
+            const current = await Transaction.findOne({ _id: refund._id, status: 'pending' });
+            if (!current) return;
+            const snapshot = await getSettlementChainSnapshot(
+                current.meta.signature,
+                current.meta.lastValidBlockHeight,
+            );
+            if (!snapshot.rpcChecked && snapshot.currentBlockHeight == null) return;
+            const state = classifySettlement({
+                signatureStatus: snapshot.signatureStatus,
+                currentBlockHeight: snapshot.currentBlockHeight,
+                lastValidBlockHeight: current.meta.lastValidBlockHeight,
+                updatedAt: current.meta.broadcastPreparedAt || current.createdAt,
+            });
+            if (state === 'confirmed') {
+                await Transaction.updateOne(
+                    { _id: current._id, status: 'pending' },
+                    { $set: { status: 'confirmed', 'meta.confirmedByReconciler': true } },
+                );
+            } else if (['failed', 'expired'].includes(state)) {
+                await retryTrackedEntryRefund(current);
+            }
+        }).catch(error => {
+            console.error('[Entry Refund] Reconciliation deferred:', refund._id, error.message);
+        });
     }
 }
 async function refundTournamentJoin(pending, reason) {
@@ -9705,6 +9869,8 @@ io.on('connection', (socket) => {
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor, skinId }) => {
         let userKey = null;
+        let walletOperationUserId = null;
+        let walletOperationId = null;
         let paidJoin = null;
         let entryRecorded = false;
         try {
@@ -9732,6 +9898,11 @@ io.on('connection', (socket) => {
             userKey = `tournament:${tournamentId}:${user._id}`;
             if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
             joiningUsers.add(userKey);
+            walletOperationUserId = user._id.toString();
+            walletOperationId = `tournament_entry:${randomBytes(16).toString('hex')}`;
+            if (!await acquireWalletOperation(user._id, 'tournament_entry', walletOperationId, 180_000)) {
+                throw new Error('Another wallet operation is already processing for this account.');
+            }
 
             let tournament = await Tournament.findById(tournamentId);
             const now = Date.now();
@@ -9940,6 +10111,9 @@ io.on('connection', (socket) => {
             if (entryRecorded) console.error('Tournament entry was recorded before a later join failure:', err);
             socket.emit('error', err.message || 'Unable to join tournament');
         } finally {
+            if (walletOperationUserId && walletOperationId) {
+                await releaseWalletOperation(walletOperationUserId, walletOperationId).catch(() => {});
+            }
             if (userKey) joiningUsers.delete(userKey);
         }
     });
@@ -9950,6 +10124,7 @@ io.on('connection', (socket) => {
             return;
         }
         let userKey = null;
+        let walletOperationId = null;
         let pendingPaidJoin = null;
         let pendingTicketUserId = null;
         let pendingTicketTransactionId = null;
@@ -10023,6 +10198,10 @@ io.on('connection', (socket) => {
             userKey = user._id.toString();
             if (joiningUsers.has(userKey)) return;
             joiningUsers.add(userKey);
+            walletOperationId = `game_entry:${randomBytes(16).toString('hex')}`;
+            if (!await acquireWalletOperation(user._id, 'game_entry', walletOperationId, 180_000)) {
+                throw new Error('Another wallet operation is already processing for this account.');
+            }
 
             // ── Competitive Slither ($1 / $2 / $5 separate pools) ──
             if (mode === 'competitive-slither') {
@@ -10996,6 +11175,9 @@ io.on('connection', (socket) => {
                 socket.emit('error', err.message || 'Failed to join game');
             }
         } finally {
+            if (walletOperationId && userKey) {
+                await releaseWalletOperation(userKey, walletOperationId).catch(() => {});
+            }
             if (userKey) joiningUsers.delete(userKey);
         }
     });
@@ -11731,6 +11913,8 @@ function getBattleRoyaleDeps() {
         connection,
         ensureUserDepositWallet,
         OWNER_VAULT_ADDRESS,
+        acquireWalletOperation,
+        releaseWalletOperation,
         hasSkinEntitlement: hasSkinAccess,
         isNewGameJoinLocked,
     };
@@ -11915,7 +12099,13 @@ function processRoom(room) {
 
         const pelletValue = foodBlobValueForRoom(room);
         const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
-        const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
+        const rawAgarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
+        const protectedAgarFoodCount = room.food.filter(food => food.golden).length;
+        const agarTargetFoodCount = cappedAmbientFoodTarget(
+            rawAgarTargetFoodCount,
+            protectedAgarFoodCount,
+            NORMAL_AGAR_MAX_FOOD,
+        );
         if (agarInArena <= 0) {
             if ((room.agarSpectators?.length || 0) === 0) room.food.length = 0;
         } else {

@@ -9,6 +9,7 @@ import {
     getRewardPoolSplit,
     getSurvivEconomy,
     NORMAL_ENTRY_OWNER_CUT_PCT,
+    cappedAmbientFoodTarget,
 } from './economy.js';
 
 const populations = [1, 2, 3, 7, 8, 30];
@@ -64,6 +65,12 @@ test('Normal food pellets have double value and growth so the target count is ha
     const eco = getEconomy(10);
     assert.equal(eco.foodBlobValue, 0.04);
     assert.equal(eco.massPerPellet, 0.04);
+});
+
+test('normal food caps preserve protected drops and leave excess value off-map', () => {
+    assert.equal(cappedAmbientFoodTarget(2_000, 25, 500), 475);
+    assert.equal(cappedAmbientFoodTarget(300, 25, 500), 300);
+    assert.equal(cappedAmbientFoodTarget(300, 600, 500), 0);
 });
 
 // --- Reward Pool Split tests ---

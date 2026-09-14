@@ -1,5 +1,11 @@
 import * as util from './utils.js';
-import { getEconomy, DEFAULT_ENTRY_FEE, wealthTaxDecayAmount, getCompetitiveEconomy } from './economy.js';
+import {
+    getEconomy,
+    DEFAULT_ENTRY_FEE,
+    wealthTaxDecayAmount,
+    getCompetitiveEconomy,
+    cappedAmbientFoodTarget,
+} from './economy.js';
 import {
     FREE_TICKET_MAX_BOTS_PER_MODE,
     getFreeTicketBotTarget,
@@ -2165,9 +2171,12 @@ function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = t
 
 const MAX_NETWORK_SEGMENTS = 120;
 const MAX_VISIBLE_FOOD = 800;
-// Keep twice as much ambient food available across the arena. The per-player
-// visibility cap stays unchanged so this does not double network/render cost.
-const MAX_SLITHER_FOOD_TOTAL = 1400;
+// Keep normal Slither lighter than before while retaining a larger cap than
+// Agar. Removed pellet value is returned to the room's food pool.
+const MAX_SLITHER_FOOD_TOTAL = Math.max(
+    200,
+    Math.floor(Number(process.env.NORMAL_SLITHER_MAX_FOOD || 1000)),
+);
 const TOURNAMENT_SLITHER_FOOD_TOTAL = 4000;
 const SLITHER_FOOD_SYNC_INTERVAL_MS = 375;
 const SLITHER_FOOD_REFILL_BATCH = 24;
@@ -2250,7 +2259,14 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
         else if (!f.deathDrop) normalCount++;
     }
     const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale, budget) - goldenValueOnMap);
-    const targetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
+    const rawTargetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
+    const maxFoodTotal = room.isTournament ? TOURNAMENT_SLITHER_FOOD_TOTAL : MAX_SLITHER_FOOD_TOTAL;
+    const protectedFoodCount = room.slitherFood.length - normalCount;
+    const targetFoodCount = cappedAmbientFoodTarget(
+        rawTargetFoodCount,
+        protectedFoodCount,
+        maxFoodTotal,
+    );
 
     const addThreshold = Math.floor(targetFoodCount * 0.94);
     const trimThreshold = Math.ceil(targetFoodCount * 1.12);
@@ -2268,7 +2284,7 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
     } else if (normalCount > trimThreshold) {
         trimSlitherFood(room, targetFoodCount);
     }
-    enforceSlitherFoodCap(room, room.isTournament ? TOURNAMENT_SLITHER_FOOD_TOTAL : MAX_SLITHER_FOOD_TOTAL);
+    enforceSlitherFoodCap(room, maxFoodTotal);
 }
 
 /**

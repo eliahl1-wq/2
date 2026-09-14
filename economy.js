@@ -16,6 +16,14 @@ export const NORMAL_CASHOUT_FEE_PCT = PLATFORM_CASHOUT_FEE_BPS / 10_000;
 /** Hidden owner cut taken from the food/loot allocation of every paid Normal entry. */
 export const NORMAL_ENTRY_OWNER_CUT_PCT = 0.05;
 
+/** Keep protected/high-value drops and cap only ordinary ambient food. */
+export function cappedAmbientFoodTarget(targetCount, protectedCount, maxTotal) {
+    const target = Math.max(0, Math.floor(Number(targetCount) || 0));
+    const protectedItems = Math.max(0, Math.floor(Number(protectedCount) || 0));
+    const cap = Math.max(0, Math.floor(Number(maxTotal) || 0));
+    return Math.min(target, Math.max(0, cap - protectedItems));
+}
+
 /** Baseline economy at $10 entry — all values scale linearly with entry fee. */
 const BASE = {
     // Normal Agar/Slither starts with 20% of the entry in cash value.

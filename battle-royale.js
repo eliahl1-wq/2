@@ -1414,6 +1414,8 @@ export function setupBattleRoyale(io, deps) {
     io.on('connection', (socket) => {
         socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId, publicFreeMode } = {}) => {
             let joiningId = null;
+            let walletOperationId = null;
+            let walletOperationLocked = false;
             try {
                 if (!['agar', 'slither', 'surviv'].includes(variant)) {
                     socket.emit('error', 'Invalid battle royale variant.');
@@ -1426,6 +1428,19 @@ export function setupBattleRoyale(io, deps) {
                 pendingQueueJoins.add(joiningId);
                 const user = await deps.User.findById(decoded.id);
                 if (!user) return;
+                if (typeof deps.acquireWalletOperation === 'function') {
+                    walletOperationId = `br_entry:${Date.now()}:${randId()}`;
+                    walletOperationLocked = await deps.acquireWalletOperation(
+                        user._id,
+                        'br_entry',
+                        walletOperationId,
+                        180_000,
+                    );
+                    if (!walletOperationLocked) {
+                        socket.emit('error', 'Another wallet operation is already processing for this account.');
+                        return;
+                    }
+                }
                 if (deps.isNewGameJoinLocked?.()) {
                     socket.emit('error', 'New game entries are temporarily locked while active matches finish.');
                     return;
@@ -1523,6 +1538,10 @@ export function setupBattleRoyale(io, deps) {
                 console.error('brJoinQueue failed:', err.message);
                 socket.emit('error', 'Failed to join battle royale queue.');
             } finally {
+                if (walletOperationLocked && walletOperationId && joiningId
+                    && typeof deps.releaseWalletOperation === 'function') {
+                    await deps.releaseWalletOperation(joiningId, walletOperationId).catch(() => {});
+                }
                 if (joiningId) pendingQueueJoins.delete(joiningId);
             }
         });
