@@ -19,6 +19,7 @@ import {
 } from './slither-engine.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import { getBRHouseWallet, isBRWalletConfigured, normalizeBREntryFee } from './br-wallets.js';
+import { splitCollectedLamports } from './solana-settlement-safety.js';
 
 export const BR = {
     entryFees: [5, 10],
@@ -404,7 +405,9 @@ function findQueueEntryBySocket(socketId) {
 async function refundBREntryFee(entry, variant, entryFeeUsd, deps, reason) {
     const { DEV_FREE_PLAY, SOL_PRICE_USD, connection, Transaction, ensureUserDepositWallet, User } = deps;
     const fee = normalizeBREntryFee(entryFeeUsd);
-    const entryFeeInSol = fee / SOL_PRICE_USD;
+    const entryFeeInSol = entry.paidLamports > 0
+        ? entry.paidLamports / solanaWeb3.LAMPORTS_PER_SOL
+        : fee / (entry.paymentSolPriceUsd || SOL_PRICE_USD);
 
     if (DEV_FREE_PLAY || entry.personalFreePlay) {
         await Transaction.create({
@@ -425,7 +428,9 @@ async function refundBREntryFee(entry, variant, entryFeeUsd, deps, reason) {
         if (!userWithWallet.depositAddress) return false;
 
         const brWallet = getBRHouseWallet(variant, fee);
-        const lamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
+        const lamports = entry.paidLamports > 0
+            ? Math.floor(entry.paidLamports)
+            : Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
         const brKeypair = solanaWeb3.Keypair.fromSecretKey(
             Uint8Array.from(Buffer.from(brWallet.secret, 'hex'))
         );
@@ -454,8 +459,11 @@ async function refundBREntryFee(entry, variant, entryFeeUsd, deps, reason) {
 
 async function refundAllBRPlayers(room, deps, reason) {
     for (const player of [...room.players]) {
+        const paidEntry = room.entryParticipants?.find(entry =>
+            entry.mongoId?.toString() === player.mongoId?.toString()
+        );
         await refundBREntryFee(
-            { mongoId: player.mongoId, username: player.username },
+            paidEntry || { mongoId: player.mongoId, username: player.username },
             room.variant,
             room.entryFeeUsd,
             deps,
@@ -707,8 +715,16 @@ async function sweepBROwnerCut(room, deps) {
 
     try {
         const brWallet = getBRHouseWallet(room.variant, room.entryFeeUsd);
-        const ownerCutSol = ownerCutUsd / SOL_PRICE_USD;
-        let lamports = Math.round(ownerCutSol * solanaWeb3.LAMPORTS_PER_SOL);
+        // Real matches reserve their split from the exact lamports collected at
+        // entry. Repricing a USD owner cut after the match could consume part of
+        // the winner's already-funded pot when SOL moves.
+        let lamports = Math.max(0, Math.floor(Number(room.ownerCutLamports) || 0));
+        if (!lamports) {
+            const livePrice = typeof deps.getSettlementSolPrice === 'function'
+                ? await deps.getSettlementSolPrice()
+                : SOL_PRICE_USD;
+            lamports = Math.round((ownerCutUsd / livePrice) * solanaWeb3.LAMPORTS_PER_SOL);
+        }
 
         const brPubKey = new solanaWeb3.PublicKey(brWallet.address);
         const walletLamports = await connection.getBalance(brPubKey);
@@ -734,7 +750,7 @@ async function sweepBROwnerCut(room, deps) {
 
         await Transaction.create({
             type: 'withdraw',
-            amount: solAmount * SOL_PRICE_USD,
+            amount: ownerCutUsd,
             currency: 'SOL',
             meta: {
                 event: 'br_owner_sweep',
@@ -747,6 +763,8 @@ async function sweepBROwnerCut(room, deps) {
                 entryFeeUsd: room.entryFeeUsd,
                 playerCount: room.playerCount,
                 ownerCutPct: BR.houseFeePct,
+                collectedLamports: room.collectedLamports || null,
+                reservedOwnerCutLamports: room.ownerCutLamports || null,
                 reason: 'BR Owner Cut Sweep',
             },
             status: 'confirmed',
@@ -801,11 +819,24 @@ async function finishMatch(room, winner, io, deps) {
             const brWallet = getBRHouseWallet(room.variant, room.entryFeeUsd);
             let user = await User.findById(winner.mongoId);
             user = await ensureUserDepositWallet(user);
-            const solToTransfer = payout / SOL_PRICE_USD;
-            const lamports = Math.round(solToTransfer * solanaWeb3.LAMPORTS_PER_SOL);
+            let lamports = Math.max(0, Math.floor(Number(room.prizeLamports) || 0));
+            let payoutSolPriceUsd = null;
+            if (!lamports) {
+                // Compatibility for a match object created by an older process.
+                // New matches always use the exact funded lamport reserve.
+                payoutSolPriceUsd = typeof deps.getSettlementSolPrice === 'function'
+                    ? await deps.getSettlementSolPrice()
+                    : SOL_PRICE_USD;
+                lamports = Math.ceil((payout / payoutSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
+            }
+            if (lamports <= 0) throw new Error('BR winner reserve is empty');
             const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
                 Uint8Array.from(Buffer.from(brWallet.secret, 'hex'))
             );
+            const walletLamports = await connection.getBalance(houseKeypair.publicKey);
+            if (walletLamports < lamports + 15_000) {
+                throw new Error('BR wallet no longer contains its reserved winner payout');
+            }
             const transaction = new solanaWeb3.Transaction().add(
                 solanaWeb3.SystemProgram.transfer({
                     fromPubkey: houseKeypair.publicKey,
@@ -829,6 +860,10 @@ async function finishMatch(room, winner, io, deps) {
                     variant: room.variant,
                     entryFeeUsd: room.entryFeeUsd,
                     brHouseWallet: brWallet.address,
+                    solAmount: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    payoutSolPriceUsd,
+                    collectedLamports: room.collectedLamports || null,
+                    reservedPrizeLamports: room.prizeLamports || null,
                 },
                 status: 'confirmed',
             });
@@ -1107,7 +1142,22 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps, survivMap = n
     const personalFreePlay = queuedPlayers.some(entry => entry.personalFreePlay);
     const room = createMatchRoom(variant, prizePool, fee, personalFreePlay);
     room.playerCount = queuedPlayers.length;
-    if (variant === 'surviv') room.entryParticipants = queuedPlayers.map(({ mongoId, username, personalFreePlay, isBot }) => ({ mongoId, username, personalFreePlay, isBot }));
+    room.entryParticipants = queuedPlayers.map(({
+        mongoId, username, personalFreePlay, isBot,
+        paidLamports, paymentSolPriceUsd, paymentSignature,
+    }) => ({
+        mongoId, username, personalFreePlay, isBot,
+        paidLamports, paymentSolPriceUsd, paymentSignature,
+    }));
+    if (!personalFreePlay) {
+        room.collectedLamports = room.entryParticipants.reduce(
+            (sum, entry) => sum + Math.max(0, Math.floor(Number(entry.paidLamports) || 0)),
+            0,
+        );
+        const fundedSplit = splitCollectedLamports(room.collectedLamports, Math.round(BR.houseFeePct * 10_000));
+        room.prizeLamports = fundedSplit.prizeLamports;
+        room.ownerCutLamports = fundedSplit.ownerLamports;
+    }
     const countdownMs = (deps.DEV_FREE_PLAY || personalFreePlay) ? 3000 : BR.countdownMs;
     room.countdownEndsAt = Date.now() + countdownMs;
     if (variant === 'surviv') {
@@ -1218,9 +1268,9 @@ function startMatch(queuedPlayers, variant, entryFeeUsd, io, deps, survivMap = n
 async function chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay = false) {
     const { DEV_FREE_PLAY, SOL_PRICE_USD, connection, Transaction } = deps;
     const fee = normalizeBREntryFee(entryFeeUsd);
-    const entryFeeInSol = fee / SOL_PRICE_USD;
 
     if (DEV_FREE_PLAY || personalFreePlay) {
+        const entryFeeInSol = fee / SOL_PRICE_USD;
         await Transaction.create({
             userId: user._id,
             type: 'game',
@@ -1230,14 +1280,19 @@ async function chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay
             status: 'confirmed',
         });
         console.log(`🎮 [FREE PLAY] ${user.username} joined BR ${variant} $${fee} (simulated)`);
-        return true;
+        return { paid: true, paidLamports: 0, paymentSolPriceUsd: SOL_PRICE_USD, paymentSignature: 'simulated' };
     }
+
+    const paymentSolPriceUsd = typeof deps.getSettlementSolPrice === 'function'
+        ? await deps.getSettlementSolPrice()
+        : SOL_PRICE_USD;
+    const entryFeeInSol = fee / paymentSolPriceUsd;
 
     const brWallet = getBRHouseWallet(variant, entryFeeUsd);
     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
     const currentLamports = await connection.getBalance(userPubKey);
     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-    if (currentLamports < feeLamports + 5000) return false;
+    if (currentLamports < feeLamports + 5000) return null;
 
     const userKeypair = solanaWeb3.Keypair.fromSecretKey(
         decryptWalletSecret(user.depositSecret)
@@ -1249,7 +1304,7 @@ async function chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay
             lamports: feeLamports,
         })
     );
-    await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
+    const paymentSignature = await solanaWeb3.sendAndConfirmTransaction(connection, joinTx, [userKeypair]);
     await Transaction.create({
         userId: user._id,
         type: 'game',
@@ -1259,10 +1314,12 @@ async function chargeEntryFee(user, deps, variant, entryFeeUsd, personalFreePlay
             entryFeeUsd: fee,
             variant,
             brHouseWallet: brWallet.address,
+            paymentSolPriceUsd,
+            signature: paymentSignature,
         },
         status: 'confirmed',
     });
-    return true;
+    return { paid: true, paidLamports: feeLamports, paymentSolPriceUsd, paymentSignature };
 }
 
 /** Tick all active BR matches — call at 40Hz from server loop. */
@@ -1345,6 +1402,15 @@ export function findBRPlayerByMongo(mongoId) {
 }
 
 export function setupBattleRoyale(io, deps) {
+    const verifyToken = async (token) => {
+        if (typeof deps.verifyAccountToken === 'function') {
+            return deps.verifyAccountToken(token);
+        }
+        // Isolated tests provide only JWT_SECRET; production always injects
+        // verifyAccountToken so deleted accounts and authVersion revocations
+        // are enforced consistently with the HTTP and normal-game paths.
+        return jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
+    };
     io.on('connection', (socket) => {
         socket.on('brJoinQueue', async ({ variant, token, username, entryFeeUsd: rawEntryFee, skinColor, skinId, publicFreeMode } = {}) => {
             let joiningId = null;
@@ -1354,7 +1420,7 @@ export function setupBattleRoyale(io, deps) {
                     return;
                 }
                 let entryFeeUsd = normalizeBREntryFee(rawEntryFee);
-                const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
+                const decoded = await verifyToken(token);
                 if (pendingQueueJoins.has(String(decoded.id))) return;
                 joiningId = String(decoded.id);
                 pendingQueueJoins.add(joiningId);
@@ -1412,14 +1478,19 @@ export function setupBattleRoyale(io, deps) {
                 if (!socket.connected) return;
 
                 const paymentUser = freePlay ? user : await deps.ensureUserDepositWallet(user);
-                const paid = await chargeEntryFee(paymentUser, deps, variant, entryFeeUsd, personalFreePlay);
-                if (!paid) {
+                const payment = await chargeEntryFee(paymentUser, deps, variant, entryFeeUsd, personalFreePlay);
+                if (!payment?.paid) {
                     socket.emit('error', `Insufficient balance for $${entryFeeUsd} BR entry.`);
                     return;
                 }
 
                 if (!socket.connected) {
-                    await refundBREntryFee({ mongoId: user._id, username: user.username, personalFreePlay }, variant, entryFeeUsd, deps, 'disconnected_during_join');
+                    await refundBREntryFee({
+                        mongoId: user._id,
+                        username: user.username,
+                        personalFreePlay,
+                        ...payment,
+                    }, variant, entryFeeUsd, deps, 'disconnected_during_join');
                     return;
                 }
                 let validatedSkinColor = null;
@@ -1439,6 +1510,7 @@ export function setupBattleRoyale(io, deps) {
                     socket,
                     skinColor: validatedSkinColor,
                     personalFreePlay,
+                    ...payment,
                 });
                 socket.brQueueVariant = variant;
                 socket.brQueueEntryFee = entryFeeUsd;
@@ -1466,7 +1538,7 @@ export function setupBattleRoyale(io, deps) {
 
         socket.on('brRejoinMatch', async ({ token }) => {
             try {
-                const decoded = jwt.verify(token, deps.JWT_SECRET || 'fallback_hemlighet_byt_ut_mig');
+                const decoded = await verifyToken(token);
                 const found = findBRPlayerByMongo(decoded.id);
                 if (!found || found.room.status === 'ended') {
                     socket.emit('error', 'Battle royale match is no longer active.');

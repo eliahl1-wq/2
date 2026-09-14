@@ -93,12 +93,14 @@ import {
     RewardPoolState,
     RewardSecurityAlert,
     addRewardFundingUsd,
+    addRewardFundingUsdOnce,
     completeRewardClaim,
     failAndReleaseRewardClaim,
     getCachedPendingRewardUsd,
     hydrateRewardPoolState,
     markClaimBroadcast,
     recordDepositSource,
+    recordRewardWalletTopUpUsd,
     reducePendingRewardUsd,
     rollbackRewardFundingUsd,
     reserveRewardClaim,
@@ -175,6 +177,12 @@ import {
     shouldReleaseMissingBroadcastClaim,
 } from './reward-claim-reconciliation.js';
 import {
+    DEFAULT_SETTLEMENT_STALE_MS,
+    calculateRewardWalletTopUp,
+    classifySettlement,
+    isFreshPositivePrice,
+} from './solana-settlement-safety.js';
+import {
     decryptWalletSecret,
     encryptWalletSecret,
 } from './wallet-crypto.js';
@@ -199,9 +207,19 @@ const balanceReader = createCachedBalanceReader({
 const DEV_FREE_PLAY = process.env.DEV_FREE_PLAY === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || randomBytes(32).toString('hex');
 if (!process.env.JWT_SECRET) {
+    if (process.env.NODE_ENV === 'production') {
+        throw new Error('JWT_SECRET must be configured in production');
+    }
     console.warn('JWT_SECRET is not configured; using a process-local development secret. Sessions will reset on restart.');
+} else if (process.env.NODE_ENV === 'production' && process.env.JWT_SECRET.length < 32) {
+    throw new Error('JWT_SECRET must contain at least 32 characters in production');
 }
-let SOL_PRICE_USD = 57; // Default fallback price, updated by market scanner
+let SOL_PRICE_USD = 57; // Display-only bootstrap value until a live source succeeds.
+let SOL_PRICE_UPDATED_AT = 0;
+let SOL_PRICE_SOURCE = 'bootstrap';
+let solPriceRefreshInFlight = null;
+const SOL_PRICE_MAX_AGE_MS = Math.max(60_000, Number(process.env.SOL_PRICE_MAX_AGE_MS || 15 * 60_000));
+const SOL_PRICE_FETCH_TIMEOUT_MS = Math.max(2_000, Number(process.env.SOL_PRICE_FETCH_TIMEOUT_MS || 8_000));
 
 if (DEV_FREE_PLAY) {
     console.warn('⚠️ DEV_FREE_PLAY is ON — join/cashout/reset use simulated money (no real Solana).');
@@ -224,28 +242,64 @@ async function logSolanaTransactionError(label, err) {
     console.error(label, err?.message || err, logs ? { logs } : '');
 }
 
-async function updateSolPrice() {
-    try {
-        const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-        if (!response.ok) throw new Error('CoinGecko network error');
-        const data = await response.json();
-        if (data && data.solana && data.solana.usd) {
-            SOL_PRICE_USD = parseFloat(data.solana.usd);
-            console.log(`[PRICE SCANNER] Live SOL price updated to: $${SOL_PRICE_USD} USD`);
-        }
-    } catch (error) {
-        console.error('[PRICE SCANNER ERROR] CoinGecko failed, trying Binance...', error.message);
-        try {
-            const binanceResponse = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
-            const binanceData = await binanceResponse.json();
-            if (binanceData && binanceData.price) {
-                SOL_PRICE_USD = parseFloat(binanceData.price);
-                console.log(`[PRICE SCANNER FALLBACK] Live SOL price updated from Binance: $${SOL_PRICE_USD} USD`);
-            }
-        } catch (binanceError) {
-            console.error('[PRICE SCANNER ERROR] Fallback Binance API also failed:', binanceError.message);
-        }
+function storeSolPrice(value, source) {
+    const price = Number(value);
+    if (!Number.isFinite(price) || price <= 0 || price > 100_000) {
+        throw new Error(`${source} returned an invalid SOL price`);
     }
+    SOL_PRICE_USD = price;
+    SOL_PRICE_UPDATED_AT = Date.now();
+    SOL_PRICE_SOURCE = source;
+    console.log(`[PRICE SCANNER] Live SOL price updated from ${source}: $${SOL_PRICE_USD} USD`);
+}
+
+async function fetchJsonWithTimeout(url) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SOL_PRICE_FETCH_TIMEOUT_MS);
+    try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function updateSolPrice() {
+    if (solPriceRefreshInFlight) return solPriceRefreshInFlight;
+    solPriceRefreshInFlight = (async () => {
+        try {
+            const data = await fetchJsonWithTimeout('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+            storeSolPrice(data?.solana?.usd, 'CoinGecko');
+            return true;
+        } catch (error) {
+            console.error('[PRICE SCANNER ERROR] CoinGecko failed, trying Binance...', error.message);
+            try {
+                const data = await fetchJsonWithTimeout('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT');
+                storeSolPrice(data?.price, 'Binance');
+                return true;
+            } catch (binanceError) {
+                console.error('[PRICE SCANNER ERROR] Fallback Binance API also failed:', binanceError.message);
+                return false;
+            }
+        }
+    })().finally(() => {
+        solPriceRefreshInFlight = null;
+    });
+    return solPriceRefreshInFlight;
+}
+
+async function getSettlementSolPrice() {
+    if (!isFreshPositivePrice(SOL_PRICE_USD, SOL_PRICE_UPDATED_AT, Date.now(), SOL_PRICE_MAX_AGE_MS)) {
+        await updateSolPrice();
+    }
+    if (!isFreshPositivePrice(SOL_PRICE_USD, SOL_PRICE_UPDATED_AT, Date.now(), SOL_PRICE_MAX_AGE_MS)) {
+        const error = new Error('Live SOL price is temporarily unavailable; no USD-denominated transfer was sent');
+        error.status = 503;
+        error.code = 'SOL_PRICE_UNAVAILABLE';
+        throw error;
+    }
+    return SOL_PRICE_USD;
 }
 // Start scanner immediately and refresh every 5 minutes
 updateSolPrice();
@@ -320,7 +374,6 @@ const allowedOrigins = [
     "https://www.agararena.space",
     "https://agararena.space",
     "https://2-production-9e74.up.railway.app",
-    /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/i,
     /^https:\/\/(?:www\.)?arenifi\.fun$/i,
     /^https:\/\/(?:www\.)?agararena\.space$/i,
     PUBLIC_FRONTEND_URL,
@@ -355,6 +408,17 @@ const corsOptions = {
 };
 
 const app = express();
+app.disable('x-powered-by');
+// Railway is the single trusted reverse-proxy hop. This makes per-IP rate
+// limits use the real client IP instead of globally throttling every visitor.
+app.set('trust proxy', 1);
+app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+    next();
+});
 
 // Always answer preflight + attach ACAO even if a route throws (e.g. during Railway restarts)
 app.use((req, res, next) => {
@@ -420,6 +484,9 @@ const UserSchema = new mongoose.Schema({
     tournamentRewardClaimReservedLamports: { type: Number, default: 0 },
     activeTournamentRewardClaimId: { type: mongoose.Schema.Types.ObjectId, default: null },
     tournamentRewardCreditIds: { type: [String], default: [] },
+    releasedWithdrawalIds: { type: [mongoose.Schema.Types.ObjectId], default: [], select: false },
+    releasedTournamentClaimIds: { type: [mongoose.Schema.Types.ObjectId], default: [], select: false },
+    retainedCashoutSettlementIds: { type: [mongoose.Schema.Types.ObjectId], default: [], select: false },
     lastDepositSourceSignature: { type: String, default: null },
     depositHistoryBackfilledAt: { type: Date, default: null },
 }, { timestamps: true });
@@ -427,16 +494,20 @@ const UserSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 
 async function getPersonalFreePlayContext(user) {
-    const adminUsername = process.env.ADMIN_USERNAME;
-    if (!user || !adminUsername) return { enabled: false, ownerId: null };
-    if (user.username === adminUsername) {
+    if (!user || (!process.env.ADMIN_USER_ID && !process.env.ADMIN_USERNAME)) {
+        return { enabled: false, ownerId: null };
+    }
+    if (isAdminUserRecord(user)) {
         return {
             enabled: !!user.personalFreePlay,
             ownerId: user.personalFreePlay ? user._id.toString() : null,
         };
     }
     if (!user.isOwnerAccount) return { enabled: false, ownerId: null };
-    const admin = await User.findOne({ username: adminUsername, personalFreePlay: true }).select('_id').lean();
+    const adminSelector = process.env.ADMIN_USER_ID
+        ? { _id: process.env.ADMIN_USER_ID }
+        : { username: process.env.ADMIN_USERNAME };
+    const admin = await User.findOne({ ...adminSelector, personalFreePlay: true }).select('_id').lean();
     return {
         enabled: !!admin,
         ownerId: admin?._id?.toString() || null,
@@ -492,6 +563,7 @@ const TransactionSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 TransactionSchema.index({ 'meta.cashoutSettlementKey': 1 }, { unique: true, sparse: true });
+TransactionSchema.index({ status: 1, 'meta.event': 1, createdAt: 1 });
 
 TransactionSchema.post('save', async function(doc) {
     if (doc.status !== 'confirmed' || doc.excludedFromReports || doc.meta?.simulated) return;
@@ -1107,37 +1179,200 @@ async function recordCashoutFailure(player, room, reason, error) {
     }).catch(auditError => console.error('Cashout failure audit could not be saved:', auditError.message));
 }
 
-async function persistConfirmedCashoutTransaction(data, context) {
-    let lastError = null;
-    const settlementKey = data?.meta?.cashoutSettlementKey;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-        try {
-            return await Transaction.create(data);
-        } catch (error) {
-            lastError = error;
-            // A timed-out Mongo write may still have committed. Resolve by the
-            // deterministic game-session/signature key before ever inserting
-            // again, otherwise hooks could award rewards/affiliate twice.
-            if (settlementKey) {
-                const existing = await Transaction.findOne({ 'meta.cashoutSettlementKey': settlementKey })
-                    .catch(() => null);
-                if (existing) return existing;
-            }
-            console.error(`[Cashout Audit] ${context} transaction save attempt ${attempt} failed:`, error.message);
-        }
-    }
-    // An already-confirmed Solana transfer must never be reported as failed or
-    // made retryable solely because the reporting database had a later error.
-    console.error(`[Cashout Audit] ${context} transfer is confirmed but its audit record could not be saved:`, lastError?.message);
-    return null;
-}
-
 async function persistCashoutPlaytime(user, player, context) {
     if (!player.personalFreePlay) user.playtime += Math.max(0, Date.now() - player.startTime);
     try {
         await user.save();
     } catch (error) {
         console.error(`[Cashout Audit] ${context} playtime save failed after confirmed transfer:`, error.message);
+    }
+}
+
+async function emitPersistedCashoutResult(record, payload) {
+    const room = accountSocketRoom(record.userId);
+    if (!room) return;
+    io.to(room).emit('cashOutSuccess', {
+        ...payload,
+        gameSessionId: record.meta?.gameSessionId || null,
+        mode: record.meta?.mode || null,
+    });
+}
+
+async function settleTrackedCashoutToRewards(record, reason) {
+    const amountUsd = Math.max(0, Number(record.amount) || 0);
+    const credited = await User.updateOne(
+        {
+            _id: record.userId,
+            retainedCashoutSettlementIds: { $ne: record._id },
+        },
+        {
+            $inc: { rentFallbackBalanceUsd: amountUsd },
+            $addToSet: { retainedCashoutSettlementIds: record._id },
+        },
+    );
+    await addRewardFundingUsdOnce(amountUsd, `cashout-fallback:${record._id}`);
+
+    record.status = 'confirmed';
+    record.meta = {
+        ...(record.meta || {}),
+        attemptedSignature: record.meta?.signature || null,
+        signature: 'house_liquidity_fallback',
+        paidOnChainUsd: 0,
+        retainedWinningsAmountUsd: amountUsd,
+        retainedForClaim: true,
+        isLiquidityFallback: true,
+        settlementError: String(reason || 'On-chain settlement unavailable').slice(0, 500),
+        fallbackCreditedNow: credited.modifiedCount === 1,
+    };
+    await record.save();
+    await emitPersistedCashoutResult(record, {
+        amount: amountUsd,
+        signature: 'house_liquidity_fallback',
+        retainedForClaim: true,
+    });
+    return { playerPayout: amountUsd, signature: 'house_liquidity_fallback', retainedForClaim: true };
+}
+
+async function confirmTrackedCashout(record) {
+    record.status = 'confirmed';
+    record.meta = { ...(record.meta || {}), confirmedAt: new Date().toISOString() };
+    await record.save();
+    await emitPersistedCashoutResult(record, {
+        amount: Number(record.amount) || 0,
+        signature: record.meta?.signature,
+    });
+    return { playerPayout: Number(record.amount) || 0, signature: record.meta?.signature };
+}
+
+async function submitTrackedCashout({
+    transaction,
+    signer,
+    user,
+    player,
+    room,
+    playerPayout,
+    platformFee,
+    logMeta,
+    context,
+    detachPlayer,
+    commitReservation,
+}) {
+    const settlementKey = `cashout:${user._id}:${player.gameSessionId || player.id}`;
+    const latest = await connection.getLatestBlockhash('confirmed');
+    transaction.feePayer = signer.publicKey;
+    transaction.recentBlockhash = latest.blockhash;
+    transaction.sign(signer);
+    const signature = bs58.encode(transaction.signature);
+    const solAmount = Number(logMeta?.payoutLamports || 0) / solanaWeb3.LAMPORTS_PER_SOL;
+
+    let record;
+    try {
+        record = await Transaction.create({
+            userId: user._id,
+            type: 'withdraw',
+            amount: playerPayout,
+            currency: 'USD',
+            meta: {
+                ...logMeta,
+                signature,
+                cashoutSettlementKey: settlementKey,
+                settlementKind: 'game_cashout',
+                blockhash: latest.blockhash,
+                lastValidBlockHeight: latest.lastValidBlockHeight,
+                solAmount,
+                retainedPlatformFeeUsd: platformFee,
+                broadcastPreparedAt: new Date().toISOString(),
+            },
+            excludedFromReports: !!player.personalFreePlay,
+            status: 'pending',
+        });
+    } catch (error) {
+        if (error?.code !== 11000) throw error;
+        record = await Transaction.findOne({ 'meta.cashoutSettlementKey': settlementKey });
+        if (!record) throw error;
+        if (record.status === 'confirmed') {
+            return {
+                playerPayout: Number(record.amount) || playerPayout,
+                platformFee,
+                signature: record.meta?.signature,
+                retainedForClaim: !!record.meta?.retainedForClaim,
+            };
+        }
+        return { playerPayout, platformFee, signature: record.meta?.signature, processing: true };
+    }
+
+    detachPlayer();
+    commitReservation?.();
+    await persistCashoutPlaytime(user, player, context);
+    emitPlayerAccountEvent(player, player.id, user._id, 'cashOutProcessing', {
+        gameSessionId: player.gameSessionId || null,
+        mode: player.mode || null,
+    });
+
+    try {
+        const submitted = await connection.sendRawTransaction(transaction.serialize(), {
+            skipPreflight: false,
+            maxRetries: 3,
+        });
+        if (submitted !== signature) throw new Error('Cashout transaction signature mismatch');
+        const confirmation = await connection.confirmTransaction({
+            signature,
+            blockhash: latest.blockhash,
+            lastValidBlockHeight: latest.lastValidBlockHeight,
+        }, 'confirmed');
+        if (confirmation.value.err) {
+            return {
+                ...(await settleTrackedCashoutToRewards(
+                    record,
+                    `On-chain cashout failed: ${JSON.stringify(confirmation.value.err)}`,
+                )),
+                platformFee,
+            };
+        }
+        return { ...(await confirmTrackedCashout(record)), platformFee };
+    } catch (error) {
+        // The signed transaction may have reached a validator even when this
+        // RPC call failed. Keep it pending; the reconciler will confirm it or
+        // move the full USD amount to Rewards after blockhash expiry.
+        console.warn(`[Cashout Settlement] ${context} awaiting reconciliation:`, error.message);
+        return { playerPayout, platformFee, signature, processing: true };
+    }
+}
+
+async function reconcileTrackedCashouts() {
+    if (mongoose.connection.readyState !== 1) return;
+    const records = await Transaction.find({
+        status: 'pending',
+        'meta.settlementKind': 'game_cashout',
+        'meta.signature': { $ne: null },
+    }).sort({ createdAt: 1 }).limit(50);
+    for (const record of records) {
+        try {
+            // The live cashout path already owns this queue. Reconciliation
+            // enters the same queue so it cannot credit Rewards at the same
+            // instant that a late confirmation is being committed.
+            await houseWalletOperations.run(async () => {
+                const current = await Transaction.findOne({ _id: record._id, status: 'pending' });
+                if (!current) return;
+                const snapshot = await getSettlementChainSnapshot(
+                    current.meta.signature,
+                    current.meta.lastValidBlockHeight,
+                );
+                if (!snapshot.rpcChecked && snapshot.currentBlockHeight == null) return;
+                const state = classifySettlement({
+                    signatureStatus: snapshot.signatureStatus,
+                    currentBlockHeight: snapshot.currentBlockHeight,
+                    lastValidBlockHeight: current.meta.lastValidBlockHeight,
+                    updatedAt: current.meta.broadcastPreparedAt || current.createdAt,
+                });
+                if (state === 'confirmed') await confirmTrackedCashout(current);
+                else if (['failed', 'expired'].includes(state)) {
+                    await settleTrackedCashoutToRewards(current, `Cashout transaction ${state}`);
+                }
+            });
+        } catch (error) {
+            console.error('[Cashout Settlement] Reconciliation failed:', record._id, error.message);
+        }
     }
 }
 
@@ -1438,9 +1673,21 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
-    let solPayout = playerPayout / SOL_PRICE_USD;
+    let cashoutSolPriceUsd;
+    try {
+        cashoutSolPriceUsd = await getSettlementSolPrice();
+    } catch (priceError) {
+        logMeta.priceError = priceError.message;
+        return retainCashoutForLater({
+            player, room, user, requestedPlayerPayout, platformFee, logMeta,
+            keepSpectator: keepCompetitiveCashoutSpectator,
+        });
+    }
+    logMeta.solPriceUsd = cashoutSolPriceUsd;
+    logMeta.solPriceSource = SOL_PRICE_SOURCE;
+    let solPayout = playerPayout / cashoutSolPriceUsd;
     let payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
-    const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeLamports = Math.round((platformFee / cashoutSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
 
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -1449,7 +1696,7 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, SOL_PRICE_USD);
+    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, cashoutSolPriceUsd);
     payoutLamports = liquidity.payoutLamports;
     playerPayout = liquidity.payoutUsd;
     solPayout = payoutLamports / solanaWeb3.LAMPORTS_PER_SOL;
@@ -1475,25 +1722,11 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
     if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
-        const fallbackPayout = payoutLamports <= 0 ? requestedPlayerPayout : playerPayout;
-        console.log(`[Cashout Fallback] Payout unavailable or too small for ${user.username}. Retaining $${fallbackPayout.toFixed(2)} for later claim.`);
-        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        keepCompetitiveCashoutSpectator(room, player);
-        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
-        user.rentFallbackBalanceUsd += fallbackPayout;
-        await user.save();
-        await addRewardFundingUsd(fallbackPayout);
-
-        await Transaction.create({
-            userId: user._id,
-            type: 'withdraw',
-            amount: fallbackPayout,
-            meta: { ...logMeta, playerPayout: fallbackPayout, isRentExemptFallback: true, isLiquidityFallback: payoutLamports <= 0, signature: 'sponsored_rent_fallback' },
-            excludedFromReports: !!player.personalFreePlay,
-            status: 'confirmed',
+        logMeta.isRentExemptFallback = true;
+        return retainCashoutForLater({
+            player, room, user, requestedPlayerPayout, platformFee, logMeta,
+            keepSpectator: keepCompetitiveCashoutSpectator,
         });
-        emitCashoutSuccess(player, playerId, mongoId, { amount: fallbackPayout, signature: 'sponsored_rent_fallback' });
-        return { playerPayout: fallbackPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1514,31 +1747,26 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
         );
     }
 
-    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-
-    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-    keepCompetitiveCashoutSpectator(room, player);
-    await persistCashoutPlaytime(user, player, 'competitive');
-
-    await persistConfirmedCashoutTransaction({
-        userId: user._id,
-        type: 'withdraw',
-        amount: playerPayout,
-        meta: {
+    return submitTrackedCashout({
+        transaction,
+        signer: houseKeypair,
+        user,
+        player,
+        room,
+        playerPayout,
+        platformFee,
+        logMeta: {
             ...logMeta,
-            signature,
-            cashoutSettlementKey: `cashout:${mongoId}:${player.gameSessionId || signature}`,
-            solAmount: solPayout,
+            payoutLamports,
             feeSolAmount: transferredFeeLamports / solanaWeb3.LAMPORTS_PER_SOL,
             feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
-            retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
-        status: 'confirmed',
-    }, 'competitive');
-
-    console.log(`💰 COMPETITIVE CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
-    emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
-    return { playerPayout, platformFee, signature };
+        context: 'competitive',
+        detachPlayer: () => {
+            room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+            keepCompetitiveCashoutSpectator(room, player);
+        },
+    });
 }
 
 async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
@@ -1605,9 +1833,20 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
-    let solPayout = playerPayout / SOL_PRICE_USD;
+    let cashoutSolPriceUsd;
+    try {
+        cashoutSolPriceUsd = await getSettlementSolPrice();
+    } catch (priceError) {
+        logMeta.priceError = priceError.message;
+        return retainCashoutForLater({
+            player, room, user, requestedPlayerPayout, platformFee, logMeta,
+        });
+    }
+    logMeta.solPriceUsd = cashoutSolPriceUsd;
+    logMeta.solPriceSource = SOL_PRICE_SOURCE;
+    let solPayout = playerPayout / cashoutSolPriceUsd;
     let payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
-    const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeLamports = Math.round((platformFee / cashoutSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
 
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -1616,7 +1855,7 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, SOL_PRICE_USD);
+    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, cashoutSolPriceUsd);
     payoutLamports = liquidity.payoutLamports;
     playerPayout = liquidity.payoutUsd;
     solPayout = payoutLamports / solanaWeb3.LAMPORTS_PER_SOL;
@@ -1641,24 +1880,10 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
     if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
-        const fallbackPayout = payoutLamports <= 0 ? requestedPlayerPayout : playerPayout;
-        console.log(`[Cashout Fallback] Payout unavailable or too small for ${user.username}. Retaining $${fallbackPayout.toFixed(2)} for later claim.`);
-        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
-        user.rentFallbackBalanceUsd += fallbackPayout;
-        await user.save();
-        await addRewardFundingUsd(fallbackPayout);
-
-        await Transaction.create({
-            userId: user._id,
-            type: 'withdraw',
-            amount: fallbackPayout,
-            meta: { ...logMeta, playerPayout: fallbackPayout, isRentExemptFallback: true, isLiquidityFallback: payoutLamports <= 0, signature: 'sponsored_rent_fallback' },
-            excludedFromReports: !!player.personalFreePlay,
-            status: 'confirmed',
+        logMeta.isRentExemptFallback = true;
+        return retainCashoutForLater({
+            player, room, user, requestedPlayerPayout, platformFee, logMeta,
         });
-        emitCashoutSuccess(player, playerId, mongoId, { amount: fallbackPayout, signature: 'sponsored_rent_fallback' });
-        return { playerPayout: fallbackPayout, platformFee, signature: 'sponsored_rent_fallback' };
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1679,30 +1904,25 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
         );
     }
 
-    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-
-    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-    await persistCashoutPlaytime(user, player, 'surviv');
-
-    await persistConfirmedCashoutTransaction({
-        userId: user._id,
-        type: 'withdraw',
-        amount: playerPayout,
-        meta: {
+    return submitTrackedCashout({
+        transaction,
+        signer: houseKeypair,
+        user,
+        player,
+        room,
+        playerPayout,
+        platformFee,
+        logMeta: {
             ...logMeta,
-            signature,
-            cashoutSettlementKey: `cashout:${mongoId}:${player.gameSessionId || signature}`,
-            solAmount: solPayout,
+            payoutLamports,
             feeSolAmount: transferredFeeLamports / solanaWeb3.LAMPORTS_PER_SOL,
             feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
-            retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
-        status: 'confirmed',
-    }, 'surviv');
-
-    console.log(`💰 SURVIV CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
-    emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
-    return { playerPayout, platformFee, signature };
+        context: 'surviv',
+        detachPlayer: () => {
+            room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+        },
+    });
 }
 
 async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
@@ -1802,9 +2022,23 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
-    let solPayout = playerPayout / SOL_PRICE_USD;
+    let cashoutSolPriceUsd;
+    try {
+        cashoutSolPriceUsd = await getSettlementSolPrice();
+    } catch (priceError) {
+        logMeta.priceError = priceError.message;
+        const retained = await retainCashoutForLater({
+            player, room, user, requestedPlayerPayout, platformFee, logMeta,
+            keepSpectator: keepArenaCashoutSpectator,
+        });
+        commitArenaCashoutReservation(room, player);
+        return retained;
+    }
+    logMeta.solPriceUsd = cashoutSolPriceUsd;
+    logMeta.solPriceSource = SOL_PRICE_SOURCE;
+    let solPayout = playerPayout / cashoutSolPriceUsd;
     let payoutLamports = Math.round(solPayout * solanaWeb3.LAMPORTS_PER_SOL);
-    const feeLamports = Math.round((platformFee / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+    const feeLamports = Math.round((platformFee / cashoutSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
 
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) throw new Error('House wallet not configured');
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -1813,7 +2047,7 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
     const housePubKey = houseKeypair.publicKey;
 
     const totalLamports = await connection.getBalance(housePubKey);
-    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, SOL_PRICE_USD);
+    const liquidity = calculateAffordableSolanaPayout(playerPayout, totalLamports, cashoutSolPriceUsd);
     payoutLamports = liquidity.payoutLamports;
     playerPayout = liquidity.payoutUsd;
     solPayout = payoutLamports / solanaWeb3.LAMPORTS_PER_SOL;
@@ -1840,32 +2074,13 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
     if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
-        const fallbackPayout = payoutLamports <= 0 ? requestedPlayerPayout : playerPayout;
-        console.log(`[Cashout Fallback] Payout unavailable or too small for ${user.username}. Retaining $${fallbackPayout.toFixed(2)} for later claim.`);
-        room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-        keepArenaCashoutSpectator(room, player);
-        if (!player.personalFreePlay) user.playtime += (Date.now() - player.startTime);
-        user.rentFallbackBalanceUsd += fallbackPayout;
-        await user.save();
-        await addRewardFundingUsd(fallbackPayout);
-
-        await Transaction.create({
-            userId: user._id,
-            type: 'withdraw',
-            amount: fallbackPayout,
-            meta: {
-                ...logMeta,
-                playerPayout: fallbackPayout,
-                isRentExemptFallback: true,
-                isLiquidityFallback: payoutLamports <= 0,
-                signature: 'sponsored_rent_fallback',
-            },
-            excludedFromReports: !!player.personalFreePlay,
-            status: 'confirmed',
+        logMeta.isRentExemptFallback = true;
+        const retained = await retainCashoutForLater({
+            player, room, user, requestedPlayerPayout, platformFee, logMeta,
+            keepSpectator: keepArenaCashoutSpectator,
         });
-        emitCashoutSuccess(player, playerId, mongoId, { amount: fallbackPayout, signature: 'sponsored_rent_fallback' });
         commitArenaCashoutReservation(room, player);
-        return { playerPayout: fallbackPayout, platformFee, signature: 'sponsored_rent_fallback' };
+        return retained;
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -1886,34 +2101,27 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
         );
     }
 
-    const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [houseKeypair]);
-    // The transfer is final even if a later DB/log write fails. Commit now so
-    // this funded value can never be paid twice.
-    commitArenaCashoutReservation(room, player);
-
-    room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
-    keepArenaCashoutSpectator(room, player);
-    await persistCashoutPlaytime(user, player, 'arena');
-
-    await persistConfirmedCashoutTransaction({
-        userId: user._id,
-        type: 'withdraw',
-        amount: playerPayout,
-        meta: {
+    return submitTrackedCashout({
+        transaction,
+        signer: houseKeypair,
+        user,
+        player,
+        room,
+        playerPayout,
+        platformFee,
+        logMeta: {
             ...logMeta,
-            signature,
-            cashoutSettlementKey: `cashout:${mongoId}:${player.gameSessionId || signature}`,
-            solAmount: solPayout,
+            payoutLamports,
             feeSolAmount: canTransferOwnerFee ? feeLamports / solanaWeb3.LAMPORTS_PER_SOL : 0,
             feeDestination: canTransferOwnerFee ? OWNER_VAULT_ADDRESS : null,
-            retainedPlatformFeeUsd: canTransferOwnerFee ? 0 : platformFee,
         },
-        status: 'confirmed',
-    }, 'arena');
-
-    console.log(`💰 ARENA CASHOUT: $${playerPayout.toFixed(2)} to ${user.depositAddress}, fee $${platformFee.toFixed(2)}, sig ${signature}`);
-    emitCashoutSuccess(player, playerId, mongoId, { amount: playerPayout, signature });
-    return { playerPayout, platformFee, signature };
+        context: 'arena',
+        detachPlayer: () => {
+            room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+            keepArenaCashoutSpectator(room, player);
+        },
+        commitReservation: () => commitArenaCashoutReservation(room, player),
+    });
 }
 
 async function cashOutCompetitiveRoomPlayers(room) {
@@ -1933,7 +2141,8 @@ async function cashOutCompetitiveRoomPlayers(room) {
             continue;
         }
         try {
-            await executeCompetitiveCashout(p, room, 'Auto Room Reset');
+            const result = await executeCompetitiveCashout(p, room, 'Auto Room Reset');
+            if (result?.processing) allSettled = false;
         } catch (err) {
             allSettled = false;
             console.error(`Competitive reset cashout failed for ${p.username}:`, err.message);
@@ -1971,7 +2180,8 @@ async function cashOutSurvivRoomPlayers(room) {
             continue;
         }
         try {
-            await executeSurvivCashout(p, room, 'Auto Room Reset');
+            const result = await executeSurvivCashout(p, room, 'Auto Room Reset');
+            if (result?.processing) allSettled = false;
         } catch (err) {
             allSettled = false;
             console.error(`Surviv reset cashout failed for ${p.username}:`, err.message);
@@ -2009,11 +2219,12 @@ async function cashOutRoomPlayers(room) {
                 continue;
             }
             if (DEV_FREE_PLAY || (user.depositAddress && HOUSE_WALLET_SECRET)) {
-                await executeArenaCashout(
+                const result = await executeArenaCashout(
                     p,
                     room,
                     DEV_FREE_PLAY ? 'Auto Room Reset (Free Play)' : 'Auto Room Reset to Account Address',
                 );
+                if (result?.processing) allSettled = false;
             } else {
                 allSettled = false;
                 console.warn(`⚠️ Reset cashout skipped for ${p.username}: no depositAddress or house wallet`);
@@ -2066,9 +2277,26 @@ async function sweepHouseWalletOnResetUnlocked() {
     // Only the main arena house wallet — BR house wallets are separate env keys and never touched here.
     if (DEV_FREE_PLAY || !HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET || !OWNER_VAULT_ADDRESS) return;
 
+    const pendingCashouts = await Transaction.countDocuments({
+        status: 'pending',
+        'meta.settlementKind': 'game_cashout',
+    });
+    if (pendingCashouts > 0) {
+        throw new Error(`House sweep blocked by ${pendingCashouts} unresolved game cashout(s)`);
+    }
+
+    let solPrice;
+    try {
+        solPrice = await getSettlementSolPrice();
+    } catch (error) {
+        // Player cashouts have already settled. Keep all remaining funds in
+        // house and let the room reset continue; a stale price must never lock
+        // gameplay or accidentally sweep too much to the owner.
+        console.warn('[Wallet Sweep] Deferred because the SOL price is unavailable:', error.message);
+        return;
+    }
     const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
     const totalLamports = await connection.getBalance(housePubKey);
-    const solPrice = Number(SOL_PRICE_USD || 64);
     const bufferLamports = Math.round((1.0 / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
     const totalSweepLamports = totalLamports - bufferLamports;
 
@@ -2079,14 +2307,30 @@ async function sweepHouseWalletOnResetUnlocked() {
     const rewardState = await hydrateRewardPoolState();
     const pendingRewardUsd = Math.max(0, Number(rewardState.pendingHouseUsd) || 0);
     let rewardSweepLamports = 0;
+    let rewardPriceRebalanceLamports = 0;
     if (REWARD_WALLET_ADDRESS) {
-        const pendingLamports = Math.round((pendingRewardUsd / solPrice) * solanaWeb3.LAMPORTS_PER_SOL);
-        rewardSweepLamports = Math.min(totalSweepLamports, pendingLamports);
+        const [rewardWalletLamports, rewardLiabilityUsd] = await Promise.all([
+            connection.getBalance(new solanaWeb3.PublicKey(REWARD_WALLET_ADDRESS)),
+            getRewardWalletLiabilityUsd(),
+        ]);
+        const funding = calculateRewardWalletTopUp({
+            liabilityUsd: rewardLiabilityUsd,
+            pendingHouseUsd: pendingRewardUsd,
+            rewardWalletLamports,
+            solPriceUsd: solPrice,
+        });
+        rewardSweepLamports = Math.min(totalSweepLamports, funding.requestedTopUpLamports);
+        rewardPriceRebalanceLamports = Math.max(
+            0,
+            rewardSweepLamports - Math.min(rewardSweepLamports, funding.pendingTargetLamports),
+        );
     }
     
     const reservedRewardSweepLamports = rewardSweepLamports;
     const affiliateLiabilityUsdMicros = await getOutstandingAffiliateLiabilityUsdMicros();
-    const requestedAffiliateReserveLamports = Math.round(
+    // Round liabilities upward: one lamport too much retained is harmless,
+    // while rounding down can make the final affiliate payout unpayable.
+    const requestedAffiliateReserveLamports = Math.ceil(
         (microsToUsd(affiliateLiabilityUsdMicros) / solPrice) * solanaWeb3.LAMPORTS_PER_SOL
     );
     const affiliateReserveLamports = Math.min(
@@ -2139,7 +2383,8 @@ async function sweepHouseWalletOnResetUnlocked() {
 
     if (rewardSweepLamports > 0) {
         const sweptUsd = (rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice;
-        await reducePendingRewardUsd(Math.min(pendingRewardUsd, sweptUsd), { swept: true });
+        const pendingReductionUsd = Math.min(pendingRewardUsd, sweptUsd);
+        await recordRewardWalletTopUpUsd(sweptUsd, pendingReductionUsd);
         await Transaction.create({
             type: 'withdraw',
             amount: rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
@@ -2147,6 +2392,10 @@ async function sweepHouseWalletOnResetUnlocked() {
             meta: {
                 event: 'reward_pool_sweep',
                 amountUsd: sweptUsd,
+                pendingReductionUsd,
+                priceRebalanceUsd: (rewardPriceRebalanceLamports / solanaWeb3.LAMPORTS_PER_SOL) * solPrice,
+                solPriceUsd: solPrice,
+                solPriceSource: SOL_PRICE_SOURCE,
                 signature: sig,
                 reason: 'Room Reset Reward Sweep',
                 solAmount: rewardSweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
@@ -2740,6 +2989,13 @@ async function verifyAccountToken(token) {
     return decoded;
 }
 
+function isAdminUserRecord(user) {
+    if (!user) return false;
+    const configuredId = String(process.env.ADMIN_USER_ID || '').trim();
+    if (configuredId) return String(user._id) === configuredId;
+    return !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+}
+
 const authenticateToken = async (req, res, next) => {
     applyCorsHeaders(req, res);
     const authHeader = req.headers['authorization'];
@@ -2829,7 +3085,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.solPrice = SOL_PRICE_USD;
         userObj.personalFreePlay = await isPersonalFreePlayUser(user);
         userObj.freePlay = DEV_FREE_PLAY || userObj.personalFreePlay;
-        userObj.isAdmin = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+        userObj.isAdmin = isAdminUserRecord(user);
         const affiliateStatus = await getAffiliateStatus(user);
         userObj.affiliateActive = affiliateStatus.active;
         userObj.affiliateRewardsAvailable = affiliateStatus.hasRewards;
@@ -2978,7 +3234,7 @@ app.post('/api/affiliate/payouts', sensitiveRateLimit({ limit: 5, windowMs: 60 *
     }
 });
 
-app.post('/api/update-profile', authenticateToken, async (req, res) => {
+app.post('/api/update-profile', sensitiveRateLimit({ limit: 20, windowMs: 60 * 60_000 }), authenticateToken, async (req, res) => {
     try {
         const user = await User.findById(req.user.id);
         if (!user) return res.status(404).json({ message: 'User not found' });
@@ -3044,7 +3300,7 @@ const authenticateAdmin = (req, res, next) => {
         try {
             const user = await User.findById(req.user.id);
             // Replace with your actual owner/admin identification logic
-            if (user && user.username === process.env.ADMIN_USERNAME) {
+            if (isAdminUserRecord(user)) {
                 req.adminUser = user;
                 next();
             } else {
@@ -3103,6 +3359,8 @@ app.post('/api/admin/affiliate-risk-flags/:flagId/resolve', authenticateAdmin, a
 
 app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, async (req, res) => {
     const action = String(req.body?.action || '');
+    let payout = null;
+    let preparedSignature = null;
     try {
         if (action === 'reject') {
             const payout = await rejectAffiliatePayout(req.params.payoutId, {
@@ -3112,19 +3370,22 @@ app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, asy
             return res.json({ payout });
         }
         if (action !== 'approve') return res.status(400).json({ message: 'Action must be approve or reject' });
-
-        let payout = await beginAffiliatePayout(req.params.payoutId, req.adminUser._id);
-        if (payout.status === 'completed') return res.json({ payout });
         if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
-            return res.status(503).json({ message: 'House wallet is not configured; payout remains processing' });
+            return res.status(503).json({ message: 'House wallet is not configured; payout was not started' });
         }
+
+        payout = await beginAffiliatePayout(req.params.payoutId, req.adminUser._id);
+        if (payout.status === 'completed') return res.json({ payout });
 
         const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
             Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
         );
+        if (houseKeypair.publicKey.toBase58() !== HOUSE_WALLET_ADDRESS) {
+            throw new Error('House wallet address does not match configured secret');
+        }
         const payoutSolPriceUsd = payout.signature && payout.solPriceUsd
             ? payout.solPriceUsd
-            : SOL_PRICE_USD;
+            : await getSettlementSolPrice();
         const lamports = payout.signature && payout.solAmount
             ? Math.round(payout.solAmount * solanaWeb3.LAMPORTS_PER_SOL)
             : Math.round(
@@ -3132,54 +3393,129 @@ app.post('/api/admin/affiliate-payouts/:payoutId/action', authenticateAdmin, asy
             );
         if (lamports <= 0) return res.status(400).json({ message: 'Payout rounds to zero lamports' });
 
-        let signature = payout.signature;
-        if (!signature) {
-            const latest = await connection.getLatestBlockhash('confirmed');
+        const payment = await houseWalletOperations.run(async () => {
+            let signature = payout.signature;
+            let latest = payout.blockhash && payout.lastValidBlockHeight
+                ? { blockhash: payout.blockhash, lastValidBlockHeight: payout.lastValidBlockHeight }
+                : null;
+            if (signature) {
+                const snapshot = await getSettlementChainSnapshot(signature, payout.lastValidBlockHeight);
+                const state = classifySettlement({
+                    signatureStatus: snapshot.signatureStatus,
+                    currentBlockHeight: snapshot.currentBlockHeight,
+                    lastValidBlockHeight: payout.lastValidBlockHeight,
+                    updatedAt: payout.broadcastAt || payout.updatedAt,
+                });
+                if (state === 'confirmed') return { signature, confirmed: true };
+                if (state === 'pending') return { signature, processing: true };
+                await AffiliatePayout.updateOne(
+                    { _id: payout._id, status: 'processing', signature },
+                    { $set: {
+                        status: 'requested',
+                        signature: null,
+                        solAmount: null,
+                        solPriceUsd: null,
+                        blockhash: null,
+                        lastValidBlockHeight: null,
+                        broadcastAt: null,
+                        error: `Prior transaction ${state}; ready for safe retry`,
+                    } },
+                );
+                const error = new Error(`Prior affiliate payment ${state}; click approve again to retry safely`);
+                error.status = 409;
+                throw error;
+            }
+
+            const [houseBalance, rentMinimum] = await Promise.all([
+                connection.getBalance(houseKeypair.publicKey),
+                getSystemAccountRentLamports(),
+            ]);
+            const feeBuffer = 20_000;
+            if (houseBalance < lamports + feeBuffer) {
+                const error = new Error('House wallet lacks affiliate payout liquidity; no transfer was sent');
+                error.status = 409;
+                throw error;
+            }
+            const destination = new solanaWeb3.PublicKey(payout.destinationWallet);
+            const destinationBalance = await connection.getBalance(destination);
+            if (destinationBalance + lamports < rentMinimum) {
+                const error = new Error('Affiliate payout is below the rent minimum for the empty destination wallet');
+                error.status = 409;
+                throw error;
+            }
+
+            latest = await connection.getLatestBlockhash('confirmed');
             const transaction = new solanaWeb3.Transaction({
                 feePayer: houseKeypair.publicKey,
                 recentBlockhash: latest.blockhash,
-            }).add(
-                solanaWeb3.SystemProgram.transfer({
-                    fromPubkey: houseKeypair.publicKey,
-                    toPubkey: new solanaWeb3.PublicKey(payout.destinationWallet),
-                    lamports,
-                })
-            );
+            }).add(solanaWeb3.SystemProgram.transfer({
+                fromPubkey: houseKeypair.publicKey,
+                toPubkey: destination,
+                lamports,
+            }));
             transaction.sign(houseKeypair);
-            signature = await connection.sendRawTransaction(transaction.serialize(), {
-                skipPreflight: false,
-                maxRetries: 3,
-            });
-            await AffiliatePayout.updateOne(
+            signature = bs58.encode(transaction.signature);
+            preparedSignature = signature;
+            const stored = await AffiliatePayout.updateOne(
                 { _id: payout._id, status: 'processing', signature: null },
-                { $set: { signature, solAmount: lamports / solanaWeb3.LAMPORTS_PER_SOL, solPriceUsd: payoutSolPriceUsd } },
+                { $set: {
+                    signature,
+                    solAmount: lamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    solPriceUsd: payoutSolPriceUsd,
+                    blockhash: latest.blockhash,
+                    lastValidBlockHeight: latest.lastValidBlockHeight,
+                    broadcastAt: new Date(),
+                    error: null,
+                } },
             );
+            if (!stored.modifiedCount) throw new Error('Affiliate payout changed before broadcast');
+            try {
+                const submitted = await connection.sendRawTransaction(transaction.serialize(), {
+                    skipPreflight: false,
+                    maxRetries: 3,
+                });
+                if (submitted !== signature) throw new Error('Affiliate payout signature mismatch');
+                const confirmation = await connection.confirmTransaction({
+                    signature,
+                    blockhash: latest.blockhash,
+                    lastValidBlockHeight: latest.lastValidBlockHeight,
+                }, 'confirmed');
+                if (confirmation.value.err) {
+                    const error = new Error('Affiliate payout transaction failed on-chain');
+                    error.onChainFailed = true;
+                    throw error;
+                }
+                return { signature, confirmed: true };
+            } catch (error) {
+                if (!error.onChainFailed) return { signature, processing: true };
+                throw error;
+            }
+        });
+        if (payment.processing) {
+            return res.status(202).json({
+                processing: true,
+                signature: payment.signature,
+                message: 'Affiliate payment is being reconciled automatically.',
+            });
         }
-        const confirmation = await connection.confirmTransaction(signature, 'confirmed');
-        if (confirmation.value.err) throw new Error('Affiliate payout transaction failed on-chain');
+        const signature = payment.signature;
         payout = await completeAffiliatePayout(payout._id, {
             adminUserId: req.adminUser._id,
             signature,
             solAmount: lamports / solanaWeb3.LAMPORTS_PER_SOL,
             solPriceUsd: payoutSolPriceUsd,
         });
-        await Transaction.create({
-            userId: payout.affiliateUserId,
-            type: 'withdraw',
-            amount: microsToUsd(payout.amountUsdMicros),
-            currency: 'USD',
-            meta: {
-                event: 'affiliate_payout',
-                reason: 'Affiliate Commission Payout',
-                destination: payout.destinationWallet,
-                signature,
-                payoutId: payout._id,
-                solAmount: payout.solAmount,
-            },
-            status: 'confirmed',
+        await logAffiliatePayoutTransaction(payout).catch(error => {
+            console.error('[Affiliate Payout] Audit log failed:', error.message);
         });
         return res.json({ payout });
     } catch (error) {
+        if (payout?._id && !preparedSignature && !payout.signature) {
+            await AffiliatePayout.updateOne(
+                { _id: payout._id, status: 'processing', signature: null },
+                { $set: { status: 'requested', error: String(error.message || error).slice(0, 500) } },
+            ).catch(() => {});
+        }
         await logSolanaTransactionError('[Affiliate Payout] Approval failed:', error);
         return res.status(error.status || 500).json({ message: error.message, code: error.code });
     }
@@ -3608,6 +3944,164 @@ async function prepareAccountWithdrawalTransaction({ userKeypair, destination, g
     throw err;
 }
 
+async function getSettlementChainSnapshot(signature, lastValidBlockHeight = null) {
+    let signatureStatus = null;
+    let rpcChecked = false;
+    for (const rpc of [connection, fallbackRpcConnection]) {
+        if (signatureStatus) break;
+        try {
+            const result = await rpc.getSignatureStatuses([signature], { searchTransactionHistory: true });
+            signatureStatus = result.value[0];
+            rpcChecked = true;
+        } catch (error) {
+            console.warn('[Settlement] Signature status RPC failed:', error.message);
+        }
+    }
+    let currentBlockHeight = null;
+    if (!signatureStatus && lastValidBlockHeight != null) {
+        for (const rpc of [connection, fallbackRpcConnection]) {
+            try {
+                currentBlockHeight = await rpc.getBlockHeight('confirmed');
+                break;
+            } catch (error) {
+                console.warn('[Settlement] Block-height RPC failed:', error.message);
+            }
+        }
+    }
+    return { signatureStatus, rpcChecked, currentBlockHeight };
+}
+
+async function logAffiliatePayoutTransaction(payout) {
+    return Transaction.findOneAndUpdate(
+        { 'meta.event': 'affiliate_payout', 'meta.payoutId': payout._id },
+        { $setOnInsert: {
+            userId: payout.affiliateUserId,
+            type: 'withdraw',
+            amount: microsToUsd(payout.amountUsdMicros),
+            currency: 'USD',
+            meta: {
+                event: 'affiliate_payout',
+                reason: 'Affiliate Commission Payout',
+                destination: payout.destinationWallet,
+                signature: payout.signature,
+                payoutId: payout._id,
+                solAmount: payout.solAmount,
+                solPriceUsd: payout.solPriceUsd,
+            },
+            status: 'confirmed',
+        } },
+        { upsert: true, new: true },
+    );
+}
+
+async function reconcileAffiliatePayouts() {
+    if (mongoose.connection.readyState !== 1) return;
+    const payouts = await AffiliatePayout.find({
+        status: 'processing',
+        signature: { $ne: null },
+    }).sort({ updatedAt: 1 }).limit(50);
+    for (const payout of payouts) {
+        try {
+            const snapshot = await getSettlementChainSnapshot(payout.signature, payout.lastValidBlockHeight);
+            if (!snapshot.rpcChecked && snapshot.currentBlockHeight == null) continue;
+            const state = classifySettlement({
+                signatureStatus: snapshot.signatureStatus,
+                currentBlockHeight: snapshot.currentBlockHeight,
+                lastValidBlockHeight: payout.lastValidBlockHeight,
+                updatedAt: payout.broadcastAt || payout.updatedAt,
+            });
+            if (state === 'confirmed') {
+                const completed = await completeAffiliatePayout(payout._id, {
+                    adminUserId: payout.reviewedBy,
+                    signature: payout.signature,
+                    solAmount: payout.solAmount,
+                    solPriceUsd: payout.solPriceUsd,
+                });
+                await logAffiliatePayoutTransaction(completed).catch(error => {
+                    console.error('[Affiliate Payout] Reconciled audit failed:', error.message);
+                });
+            } else if (['failed', 'expired'].includes(state)) {
+                await AffiliatePayout.updateOne(
+                    { _id: payout._id, status: 'processing', signature: payout.signature },
+                    { $set: {
+                        status: 'requested',
+                        signature: null,
+                        solAmount: null,
+                        solPriceUsd: null,
+                        blockhash: null,
+                        lastValidBlockHeight: null,
+                        broadcastAt: null,
+                        error: `Transaction ${state}; safely released for retry`,
+                    } },
+                );
+            }
+        } catch (error) {
+            console.error('[Affiliate Payout] Reconciliation failed:', payout._id, error.message);
+        }
+    }
+}
+
+async function reconcileAccountWithdrawalRecord(recordOrId) {
+    const record = typeof recordOrId === 'object' && recordOrId?._id
+        ? recordOrId
+        : await Transaction.findById(recordOrId);
+    if (!record || record.status !== 'pending' || record.meta?.event !== 'account_withdrawal') {
+        return record?.status || 'missing';
+    }
+    const signature = record.meta?.signature;
+    if (!signature) return 'pending';
+    const snapshot = await getSettlementChainSnapshot(signature, record.meta?.lastValidBlockHeight);
+    if (!snapshot.rpcChecked && snapshot.currentBlockHeight == null) return 'pending';
+    const state = classifySettlement({
+        signatureStatus: snapshot.signatureStatus,
+        currentBlockHeight: snapshot.currentBlockHeight,
+        lastValidBlockHeight: record.meta?.lastValidBlockHeight,
+        updatedAt: record.createdAt,
+        staleMs: Number(process.env.SOLANA_SETTLEMENT_STALE_MS) || DEFAULT_SETTLEMENT_STALE_MS,
+    });
+    if (state === 'confirmed') {
+        await Transaction.updateOne(
+            { _id: record._id, status: 'pending' },
+            { $set: { status: 'confirmed', 'meta.confirmedByReconciler': true } },
+        );
+        return 'confirmed';
+    }
+    if (!['failed', 'expired'].includes(state)) return 'pending';
+
+    const reservedSol = Math.max(0, Number(record.meta?.reservedSol) || 0);
+    if (reservedSol > 0 && record.userId) {
+        await User.updateOne(
+            { _id: record.userId, releasedWithdrawalIds: { $ne: record._id } },
+            { $inc: { balance: reservedSol }, $addToSet: { releasedWithdrawalIds: record._id } },
+        );
+    }
+    await Transaction.updateOne(
+        { _id: record._id, status: 'pending' },
+        { $set: {
+            status: 'failed',
+            'meta.releasedByReconciler': true,
+            'meta.error': state === 'expired'
+                ? 'Signed withdrawal expired before on-chain confirmation; reserved balance restored'
+                : `Withdrawal failed on-chain: ${JSON.stringify(snapshot.signatureStatus?.err)}`,
+        } },
+    );
+    return state;
+}
+
+async function reconcilePendingAccountWithdrawals() {
+    if (mongoose.connection.readyState !== 1) return;
+    const records = await Transaction.find({
+        status: 'pending',
+        'meta.event': 'account_withdrawal',
+        'meta.signature': { $ne: null },
+    }).sort({ createdAt: 1 }).limit(50);
+    for (const record of records) {
+        await reconcileAccountWithdrawalRecord(record).catch(error => {
+            console.error('[Withdrawal Reconciliation] Failed:', record._id, error.message);
+        });
+    }
+}
+
 async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress, adminActorId = null, withdrawAll = false }) {
     const isMaxWithdrawal = withdrawAll === true;
     const amountUsdNumber = Number(amountUSD);
@@ -3637,6 +4131,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
     let record = null;
     let signature = null;
     try {
+        const withdrawalSolPriceUsd = await getSettlementSolPrice();
         const currentUser = await User.findById(userId).select('balance');
         if (!currentUser) {
             const err = new Error('Account not found');
@@ -3645,7 +4140,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         }
         reservedSol = isMaxWithdrawal
             ? Math.max(0, Number(currentUser.balance) || 0)
-            : Math.round((amountUsdNumber / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL)
+            : Math.round((amountUsdNumber / withdrawalSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL)
                 / solanaWeb3.LAMPORTS_PER_SOL;
         if (!Number.isFinite(reservedSol) || reservedSol <= 0) {
             const err = new Error('Insufficient balance');
@@ -3684,7 +4179,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
             throw new Error('Invalid account wallet balance');
         }
         const grossSolAmount = grossLamports / solanaWeb3.LAMPORTS_PER_SOL;
-        const effectiveAmountUsd = grossSolAmount * SOL_PRICE_USD;
+        const effectiveAmountUsd = grossSolAmount * withdrawalSolPriceUsd;
 
         if (grossLamports === 0 && isMaxWithdrawal) {
             record = await Transaction.create({
@@ -3704,7 +4199,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
                 },
                 status: 'confirmed',
             });
-            return { success: true, newBalance: 0, signature: 'already_empty', amountUsd: reservedSol * SOL_PRICE_USD, solAmount: 0, sentSolAmount: 0, networkFeeSol: 0, withdrawAll: true };
+            return { success: true, newBalance: 0, signature: 'already_empty', amountUsd: reservedSol * withdrawalSolPriceUsd, solAmount: 0, sentSolAmount: 0, networkFeeSol: 0, withdrawAll: true };
         }
 
         const prepared = await prepareAccountWithdrawalTransaction({
@@ -3726,7 +4221,13 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
                 amountUsd: effectiveAmountUsd,
                 withdrawAll: isMaxWithdrawal,
                 feePaidByUser: prepared.feePaidByUser,
-                ...(adminActorId ? { event: 'admin_owner_account_withdrawal', adminActorId: String(adminActorId) } : {}),
+                event: 'account_withdrawal',
+                solPriceUsd: withdrawalSolPriceUsd,
+                solPriceSource: SOL_PRICE_SOURCE,
+                reservedSol,
+                lastValidBlockHeight: prepared.latestBlockhash.lastValidBlockHeight,
+                blockhash: prepared.latestBlockhash.blockhash,
+                ...(adminActorId ? { initiatedBy: 'admin', adminActorId: String(adminActorId) } : {}),
             },
             status: 'pending',
         });
@@ -3734,10 +4235,14 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         // replaces the blockhash internally, which can make a full-balance sweep
         // use a fee from a different message and leave dust (or fail).
         prepared.transaction.sign(...prepared.signers);
-        signature = await connection.sendRawTransaction(prepared.transaction.serialize(), { maxRetries: 3 });
-        await Transaction.findByIdAndUpdate(record._id, {
-            $set: { 'meta.signature': signature },
-        }).catch(recordErr => console.error('Withdrawal broadcast audit update failed:', recordErr.message));
+        signature = bs58.encode(prepared.transaction.signature);
+        const signatureStored = await Transaction.updateOne(
+            { _id: record._id, status: 'pending', 'meta.signature': { $in: [null, signature] } },
+            { $set: { 'meta.signature': signature, 'meta.broadcastPreparedAt': new Date().toISOString() } },
+        );
+        if (!signatureStored.matchedCount) throw new Error('Withdrawal audit record became unavailable before broadcast');
+        const submittedSignature = await connection.sendRawTransaction(prepared.transaction.serialize(), { maxRetries: 3 });
+        if (submittedSignature !== signature) throw new Error('Withdrawal transaction signature mismatch');
         const confirmation = await connection.confirmTransaction({
             signature,
             blockhash: prepared.latestBlockhash.blockhash,
@@ -3759,7 +4264,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
             success: true,
             newBalance: reserved.balance,
             signature,
-            amountUsd: isMaxWithdrawal ? reservedSol * SOL_PRICE_USD : amountUsdNumber,
+            amountUsd: isMaxWithdrawal ? reservedSol * withdrawalSolPriceUsd : amountUsdNumber,
             solAmount: grossSolAmount,
             sentSolAmount: prepared.sendLamports / solanaWeb3.LAMPORTS_PER_SOL,
             networkFeeSol: prepared.feeLamports / solanaWeb3.LAMPORTS_PER_SOL,
@@ -3767,11 +4272,42 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
         };
     } catch (err) {
         if ((!signature || err.onChainFailed) && reserved) {
-            await User.findByIdAndUpdate(userId, { $inc: { balance: reservedSol } }).catch(() => { });
+            if (record) {
+                await User.updateOne(
+                    { _id: userId, releasedWithdrawalIds: { $ne: record._id } },
+                    { $inc: { balance: reservedSol }, $addToSet: { releasedWithdrawalIds: record._id } },
+                ).catch(() => { });
+            } else {
+                await User.findByIdAndUpdate(userId, { $inc: { balance: reservedSol } }).catch(() => { });
+            }
             if (record) {
                 await Transaction.findByIdAndUpdate(record._id, {
                     $set: { status: 'failed', 'meta.error': String(err.message || 'Withdrawal failed').slice(0, 300) },
                 }).catch(() => { });
+            }
+        }
+        if (signature && !err.onChainFailed && record) {
+            const state = await reconcileAccountWithdrawalRecord(record._id).catch(() => 'pending');
+            if (state === 'confirmed') {
+                return {
+                    success: true,
+                    newBalance: reserved?.balance ?? 0,
+                    signature,
+                    amountUsd: Number(record.meta?.amountUsd) || 0,
+                    solAmount: Number(record.meta?.solAmount) || 0,
+                    sentSolAmount: Number(record.meta?.sentSolAmount) || 0,
+                    networkFeeSol: Number(record.meta?.networkFeeSol) || 0,
+                    withdrawAll: isMaxWithdrawal,
+                };
+            }
+            if (state === 'pending') {
+                return {
+                    success: false,
+                    processing: true,
+                    newBalance: reserved?.balance ?? 0,
+                    signature,
+                    message: 'Withdrawal was signed and is being reconciled automatically.',
+                };
             }
         }
         throw err;
@@ -3780,7 +4316,7 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
     }
 }
 
-app.post('/api/withdraw', authenticateToken, async (req, res) => {
+app.post('/api/withdraw', sensitiveRateLimit({ limit: 10, windowMs: 15 * 60_000 }), authenticateToken, async (req, res) => {
     try {
         const result = await executeAccountWithdrawal({
             userId: req.user.id,
@@ -3788,21 +4324,21 @@ app.post('/api/withdraw', authenticateToken, async (req, res) => {
             destinationAddress: req.body?.destinationAddress,
             withdrawAll: req.body?.withdrawAll === true,
         });
-        res.json(result);
+        res.status(result.processing ? 202 : 200).json(result);
     } catch (err) {
         console.error('Withdraw Error:', err.message);
         res.status(err.status || 500).json({ message: err.status ? err.message : 'Blockchain transaction failed' });
     }
 });
 
-async function ensureRewardWalletLiquidity(requiredLamports) {
+async function ensureRewardWalletLiquidity(requiredLamports, solPriceUsd) {
     // A reward top-up spends from the same house wallet as game cashouts.
     // Re-check every balance inside the queue so queued operations cannot make
     // this decision stale before the transfer is submitted.
-    return houseWalletOperations.run(() => ensureRewardWalletLiquidityUnlocked(requiredLamports));
+    return houseWalletOperations.run(() => ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd));
 }
 
-async function ensureRewardWalletLiquidityUnlocked(requiredLamports) {
+async function ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd) {
     if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET) {
         throw new Error('Reward wallet not configured');
     }
@@ -3815,14 +4351,32 @@ async function ensureRewardWalletLiquidityUnlocked(requiredLamports) {
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
         throw new Error('Reward wallet lacks liquidity');
     }
-    const pendingRewardLamports = Math.round((getCachedPendingRewardUsd() / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
-    if (shortfall > pendingRewardLamports) {
-        throw new Error('Reward reserve is awaiting the next arena settlement');
-    }
+    const price = Number(solPriceUsd) || await getSettlementSolPrice();
+    const pendingRewardUsd = getCachedPendingRewardUsd();
+    const pendingRewardLamports = Math.ceil((pendingRewardUsd / price) * solanaWeb3.LAMPORTS_PER_SOL);
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
         Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
     );
     const houseBalance = await connection.getBalance(houseKeypair.publicKey);
+    let safelyAvailableLamports = pendingRewardLamports;
+    const activeNormalHumans = [...rooms, ...competitiveSlitherRooms, ...survivRooms]
+        .reduce((total, room) => total + room.players.filter(player => !player.isBot).length, 0);
+    if (activeNormalHumans === 0 && joiningUsers.size === 0) {
+        const affiliateReserveLamports = Math.ceil(
+            (microsToUsd(await getOutstandingAffiliateLiabilityUsdMicros()) / price)
+            * solanaWeb3.LAMPORTS_PER_SOL,
+        );
+        const operatingBufferLamports = Math.ceil((1 / price) * solanaWeb3.LAMPORTS_PER_SOL);
+        safelyAvailableLamports = Math.max(
+            pendingRewardLamports,
+            houseBalance - affiliateReserveLamports - operatingBufferLamports - feeBuffer,
+        );
+    }
+    if (shortfall > safelyAvailableLamports) {
+        throw new Error(activeNormalHumans > 0
+            ? 'Reward reserve is awaiting the next arena settlement'
+            : 'Reward and house wallets lack protected liquidity');
+    }
     if (houseBalance < shortfall + feeBuffer) throw new Error('Reward and house wallets lack liquidity');
 
     const topUpTx = new solanaWeb3.Transaction().add(
@@ -3833,7 +4387,8 @@ async function ensureRewardWalletLiquidityUnlocked(requiredLamports) {
         })
     );
     await solanaWeb3.sendAndConfirmTransaction(connection, topUpTx, [houseKeypair]);
-    await reducePendingRewardUsd((shortfall / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD, { swept: true });
+    const topUpUsd = (shortfall / solanaWeb3.LAMPORTS_PER_SOL) * price;
+    await recordRewardWalletTopUpUsd(topUpUsd, Math.min(pendingRewardUsd, topUpUsd));
 }
 
 
@@ -3948,6 +4503,10 @@ async function reconcileRewardClaims() {
     }
 }
 setInterval(() => reconcileRewardClaims().catch(err => console.error('Claim reconciliation failed:', err.message)), 30_000);
+setInterval(() => reconcileTrackedCashouts().catch(err => console.error('Cashout reconciliation failed:', err.message)), 30_000);
+setInterval(() => reconcilePendingAccountWithdrawals().catch(err => console.error('Withdrawal reconciliation failed:', err.message)), 30_000);
+setInterval(() => reconcileAffiliatePayouts().catch(err => console.error('Affiliate payout reconciliation failed:', err.message)), 30_000);
+setInterval(() => reconcileTournamentRewardClaims().catch(err => console.error('Tournament claim reconciliation failed:', err.message)), 30_000);
 
 app.get('/api/user/reward-claim-status', authenticateToken, async (req, res) => {
     const claim = await RewardClaim.findOne({ userId: req.user.id }).sort({ createdAt: -1 }).lean();
@@ -3993,7 +4552,8 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
             return res.json({ success: true, amount: amountUsd, signature: 'simulated_claim' });
         }
 
-        const solAmount = amountUsd / SOL_PRICE_USD;
+        const rewardSolPriceUsd = await getSettlementSolPrice();
+        const solAmount = amountUsd / rewardSolPriceUsd;
         const payoutLamports = Math.round(solAmount * solanaWeb3.LAMPORTS_PER_SOL);
         if (payoutLamports <= 0) throw new Error('Reward amount is too small');
         if (!REWARD_WALLET_SECRET || !REWARD_WALLET_ADDRESS) throw new Error('Reward wallet not configured');
@@ -4014,7 +4574,7 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
                 error: 'This claim is too small to activate an empty Solana account. Add a small deposit or let rewards accumulate, then claim again.',
             });
         }
-        await ensureRewardWalletLiquidity(payoutLamports);
+        await ensureRewardWalletLiquidity(payoutLamports, rewardSolPriceUsd);
         const latestBlockhash = await connection.getLatestBlockhash('confirmed');
         const transaction = new solanaWeb3.Transaction({
             feePayer: rewardKeypair.publicKey,
@@ -4071,19 +4631,20 @@ app.post('/api/user/claim-rewards', sensitiveRateLimit({ limit: 10, windowMs: 60
         return res.status(500).json({ error: err.message || 'Internal server error' });
     }
 });
-async function releaseTournamentRewardClaim(claim, error) {
+async function releaseTournamentRewardClaim(claim, error, { allowBroadcast = false } = {}) {
     if (!claim) return;
-    await TournamentRewardClaim.updateOne(
-        { _id: claim._id, status: { $in: ['reserving', 'reserved'] } },
-        { $set: { status: 'failed', error: String(error || 'Claim failed') } },
-    );
     await User.updateOne(
-        { _id: claim.userId, activeTournamentRewardClaimId: claim._id },
+        {
+            _id: claim.userId,
+            activeTournamentRewardClaimId: claim._id,
+            releasedTournamentClaimIds: { $ne: claim._id },
+        },
         {
             $inc: {
                 tournamentRewardsBalance: claim.amountUsd,
                 tournamentRewardsLamports: claim.lamports,
             },
+            $addToSet: { releasedTournamentClaimIds: claim._id },
             $set: {
                 tournamentRewardClaimInProgress: false,
                 tournamentRewardClaimReservedUsd: 0,
@@ -4091,6 +4652,13 @@ async function releaseTournamentRewardClaim(claim, error) {
                 activeTournamentRewardClaimId: null,
             },
         },
+    );
+    await TournamentRewardClaim.updateOne(
+        {
+            _id: claim._id,
+            status: { $in: allowBroadcast ? ['reserving', 'reserved', 'broadcast'] : ['reserving', 'reserved'] },
+        },
+        { $set: { status: 'failed', error: String(error || 'Claim failed') } },
     );
 }
 
@@ -4131,6 +4699,49 @@ async function completeTournamentRewardClaim(claim, signature) {
         },
         { upsert: true, new: true },
     );
+}
+
+async function reconcileTournamentRewardClaims() {
+    if (mongoose.connection.readyState !== 1) return;
+
+    const lockedUsers = await User.find({
+        tournamentRewardClaimInProgress: true,
+        activeTournamentRewardClaimId: { $ne: null },
+    }).select('_id activeTournamentRewardClaimId').limit(100).lean();
+    for (const locked of lockedUsers) {
+        const terminal = await TournamentRewardClaim.findById(locked.activeTournamentRewardClaimId);
+        if (terminal?.status === 'confirmed') {
+            await completeTournamentRewardClaim(terminal, terminal.signature);
+        } else if (terminal?.status === 'failed') {
+            await releaseTournamentRewardClaim(terminal, terminal.error);
+        }
+    }
+
+    const claims = await TournamentRewardClaim.find({ status: 'broadcast', signature: { $ne: null } })
+        .sort({ updatedAt: 1 }).limit(50);
+    for (const claim of claims) {
+        try {
+            const snapshot = await getSettlementChainSnapshot(claim.signature, claim.lastValidBlockHeight);
+            if (!snapshot.rpcChecked && snapshot.currentBlockHeight == null) continue;
+            const state = classifySettlement({
+                signatureStatus: snapshot.signatureStatus,
+                currentBlockHeight: snapshot.currentBlockHeight,
+                lastValidBlockHeight: claim.lastValidBlockHeight,
+                updatedAt: claim.broadcastAt || claim.updatedAt,
+            });
+            if (state === 'confirmed') {
+                await completeTournamentRewardClaim(claim, claim.signature);
+            } else if (['failed', 'expired'].includes(state)) {
+                await releaseTournamentRewardClaim(
+                    claim,
+                    `Tournament reward transaction ${state}; reserved winnings restored`,
+                    { allowBroadcast: true },
+                );
+            }
+        } catch (error) {
+            console.error('[Tournament Claim] Reconciliation failed:', claim._id, error.message);
+        }
+    }
 }
 
 app.get('/api/user/tournament-reward-claim-status', authenticateToken, async (req, res) => {
@@ -4205,17 +4816,45 @@ app.post('/api/user/claim-tournament-rewards', sensitiveRateLimit({ limit: 10, w
         const walletLamports = await connection.getBalance(tournamentKeypair.publicKey);
         if (walletLamports < lamports + 15_000) throw new Error('Tournament wallet lacks claim liquidity');
 
-        const transaction = new solanaWeb3.Transaction().add(
+        const latest = await connection.getLatestBlockhash('confirmed');
+        const transaction = new solanaWeb3.Transaction({
+            feePayer: tournamentKeypair.publicKey,
+            recentBlockhash: latest.blockhash,
+        }).add(
             solanaWeb3.SystemProgram.transfer({
                 fromPubkey: tournamentKeypair.publicKey,
                 toPubkey: userPubKey,
                 lamports,
             }),
         );
-        broadcastSignature = await connection.sendTransaction(transaction, [tournamentKeypair], { maxRetries: 3 });
-        await TournamentRewardClaim.updateOne({ _id: claim._id }, { $set: { status: 'broadcast', signature: broadcastSignature } });
-        const confirmation = await connection.confirmTransaction(broadcastSignature, 'confirmed');
-        if (confirmation.value.err) throw new Error(`On-chain tournament claim failed: ${JSON.stringify(confirmation.value.err)}`);
+        transaction.sign(tournamentKeypair);
+        broadcastSignature = bs58.encode(transaction.signature);
+        const marked = await TournamentRewardClaim.updateOne(
+            { _id: claim._id, status: 'reserved' },
+            { $set: {
+                status: 'broadcast',
+                signature: broadcastSignature,
+                blockhash: latest.blockhash,
+                lastValidBlockHeight: latest.lastValidBlockHeight,
+                broadcastAt: new Date(),
+            } },
+        );
+        if (!marked.modifiedCount) throw new Error('Tournament claim changed before broadcast');
+        const submitted = await connection.sendRawTransaction(transaction.serialize(), { maxRetries: 3 });
+        if (submitted !== broadcastSignature) throw new Error('Tournament reward signature mismatch');
+        const confirmation = await connection.confirmTransaction({
+            signature: broadcastSignature,
+            blockhash: latest.blockhash,
+            lastValidBlockHeight: latest.lastValidBlockHeight,
+        }, 'confirmed');
+        if (confirmation.value.err) {
+            await releaseTournamentRewardClaim(
+                claim,
+                `On-chain tournament claim failed: ${JSON.stringify(confirmation.value.err)}`,
+                { allowBroadcast: true },
+            );
+            return res.status(502).json({ error: 'On-chain tournament reward payment failed' });
+        }
         await completeTournamentRewardClaim(claim, broadcastSignature);
         return res.json({ success: true, amount: amountUsd, signature: broadcastSignature });
     } catch (err) {
@@ -4335,7 +4974,7 @@ function isSpecialSlitherSkinColor(value) {
 }
 
 async function hasSkinAccess(user, gameMode, skinId) {
-    if (user && process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME) return true;
+    if (isAdminUserRecord(user)) return true;
     return agarCommerce.hasSkinEntitlement(user?._id || user, gameMode, skinId);
 }
 
@@ -4348,55 +4987,12 @@ app.get('/api/entry-info', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Verify an on-chain entry payment (client should send the transaction signature)
-app.post('/api/entry-pay', authenticateToken, async (req, res) => {
-    const { signature, solAmount } = req.body;
-    const entryUSD = 10.0;
-    try {
-        if (!signature) return res.status(400).json({ message: 'Missing signature' });
-        const user = await User.findById(req.user.id);
-        if (!user) return res.status(404).json({ message: 'User not found' });
-
-        // Check if we've already processed this signature
-        const existing = await Transaction.findOne({ 'meta.signature': signature });
-        if (existing) return res.json({ success: true, message: 'Already processed' });
-
-        const txDetails = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
-        if (!txDetails || txDetails.meta?.err) return res.status(400).json({ message: 'Invalid on-chain transaction' });
-
-        // Ensure the transfer went to our house wallet and amount matches
-        const toPubkey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-        // Find any transfer instructions that credited the house address
-        const accountKeys = getTransactionAccountKeys(txDetails);
-        let credited = false;
-        let creditedLamports = 0;
-        for (let i = 0; i < accountKeys.length; i++) {
-            if (accountKeys[i].equals(toPubkey)) {
-                const pre = txDetails.meta.preBalances[i];
-                const post = txDetails.meta.postBalances[i];
-                if (post > pre) { credited = true; creditedLamports = post - pre; break; }
-            }
-        }
-
-        if (!credited) return res.status(400).json({ message: 'House wallet not credited in this transaction' });
-
-        const solReceived = creditedLamports / solanaWeb3.LAMPORTS_PER_SOL;
-
-        // Logic: Credit received SOL directly to user balance
-        user.balance += solReceived;
-        await user.save();
-
-        await Transaction.create({
-            userId: user._id,
-            type: 'deposit',
-            amount: solReceived,
-            currency: 'SOL',
-            meta: { signature, solAmount: solReceived, entryFor: 'arena-entry' },
-            status: 'confirmed'
-        });
-
-        res.json({ success: true, solReceived });
-    } catch (err) { console.error('Entry pay error', err); res.status(500).json({ error: err.message }); }
+// The old client-submitted payment flow could not prove that the authenticated
+// account was the sender. Paid games now use only server-authoritative joins.
+app.post('/api/entry-pay', authenticateToken, (_req, res) => {
+    res.status(410).json({
+        message: 'This legacy payment endpoint has been disabled. Start paid games through the current join flow.',
+    });
 });
 
 // --- ADMIN DASHBOARD ---
@@ -7028,7 +7624,12 @@ app.post('/api/admin/users/:userId/withdraw', authenticateAdmin, sensitiveRateLi
             adminActorId: req.adminUser._id,
             withdrawAll: req.body?.withdrawAll === true,
         });
-        res.json({ ...result, message: `Withdrawal from ${user.username} was confirmed on-chain.` });
+        res.status(result.processing ? 202 : 200).json({
+            ...result,
+            message: result.processing
+                ? `Withdrawal from ${user.username} is being reconciled automatically.`
+                : `Withdrawal from ${user.username} was confirmed on-chain.`,
+        });
     } catch (err) {
         console.error('Admin owner withdrawal error:', err);
         res.status(err.status || 500).json({ message: err.status ? err.message : 'Blockchain transaction failed' });
@@ -7041,7 +7642,7 @@ app.delete('/api/admin/users/:userId', authenticateAdmin, sensitiveRateLimit({ l
         if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ message: 'Invalid user id' });
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ message: 'User not found' });
-        if (user.username === process.env.ADMIN_USERNAME || String(user._id) === String(req.adminUser._id)) {
+        if (isAdminUserRecord(user) || String(user._id) === String(req.adminUser._id)) {
             return res.status(403).json({ message: 'The active admin account cannot be deleted' });
         }
         if (req.body?.confirmation !== user.username) {
@@ -7052,6 +7653,13 @@ app.delete('/api/admin/users/:userId', authenticateAdmin, sensitiveRateLimit({ l
         }
         if (user.rewardClaimInProgress || user.tournamentRewardClaimInProgress) {
             return res.status(409).json({ message: 'Account has a reward claim in progress and cannot be deleted yet' });
+        }
+        if (await Transaction.exists({
+            userId: user._id,
+            status: 'pending',
+            'meta.event': 'account_withdrawal',
+        })) {
+            return res.status(409).json({ message: 'Account has a withdrawal being reconciled and cannot be deleted yet' });
         }
         const liabilities = [
             user.balance,
@@ -7256,7 +7864,7 @@ app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
     });
 });
 
-app.post('/api/admin/trigger-sweep', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/trigger-sweep', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
     if (globalArenaResetting || rooms.some(r => r.isResetting)) {
         return res.status(409).json({ message: 'Cannot sweep while arena reset is in progress' });
     }
@@ -7337,7 +7945,7 @@ async function sweepTournamentWalletToOwner() {
     return { signature, solAmount, amountUsd };
 }
 
-app.post('/api/admin/tournaments/trigger-sweep', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/tournaments/trigger-sweep', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
     try {
         const result = await sweepTournamentWalletToOwner();
         res.json({
@@ -7381,6 +7989,9 @@ app.post('/api/admin/affiliate-pool/factory-reset', sensitiveRateLimit({ limit: 
 
         const liabilityUsdMicros = await getOutstandingAffiliateLiabilityUsdMicros();
         const liabilityUsd = microsToUsd(liabilityUsdMicros);
+        const resetSolPriceUsd = liabilityUsdMicros > 0
+            ? await getSettlementSolPrice()
+            : SOL_PRICE_USD;
         let signature = null;
         let sweptLamports = 0;
 
@@ -7401,9 +8012,9 @@ app.post('/api/admin/affiliate-pool/factory-reset', sensitiveRateLimit({ limit: 
                 connection.getBalance(houseKeypair.publicKey),
                 connection.getLatestBlockhash('confirmed'),
             ]);
-            const operatingBufferLamports = Math.ceil((1 / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
-            const rewardReserveLamports = Math.ceil((pendingRewardUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
-            sweptLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+            const operatingBufferLamports = Math.ceil((1 / resetSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
+            const rewardReserveLamports = Math.ceil((pendingRewardUsd / resetSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
+            sweptLamports = Math.ceil((liabilityUsd / resetSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
 
             const feeProbe = new solanaWeb3.Transaction({
                 recentBlockhash: blockhashInfo.blockhash,
@@ -7455,7 +8066,8 @@ app.post('/api/admin/affiliate-pool/factory-reset', sensitiveRateLimit({ limit: 
                 reason: 'Admin Affiliate Pool Factory Reset',
                 signature: signature || 'no_transfer_required',
                 solAmount: sweptSol,
-                amountUsd: sweptSol * SOL_PRICE_USD,
+                amountUsd: sweptSol * resetSolPriceUsd,
+                solPriceUsd: resetSolPriceUsd,
                 discardedAffiliateRewardUsd: liabilityUsd,
                 resetCounts: reset,
                 from: HOUSE_WALLET_ADDRESS || null,
@@ -7478,7 +8090,7 @@ app.post('/api/admin/affiliate-pool/factory-reset', sensitiveRateLimit({ limit: 
     }
 });
 
-app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/reward-pool/sweep-surplus', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
     if (rewardPoolAdminResetting) {
         return res.status(409).json({ message: 'Reward pool maintenance is already running.' });
     }
@@ -7489,6 +8101,7 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
         if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET || !OWNER_VAULT_ADDRESS) {
             return res.status(400).json({ message: 'Reward wallet or owner vault is not configured.' });
         }
+        const surplusSolPriceUsd = await getSettlementSolPrice();
         if (await RewardClaim.exists({ status: { $in: ['reserved', 'broadcast'] } })) {
             return res.status(409).json({ message: 'Wait for active reward claims to finish.' });
         }
@@ -7496,18 +8109,29 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
         const currentState = await hydrateRewardPoolState();
         const existingSweep = currentState.ownerSurplusSweep;
         if (existingSweep?.status === 'broadcast' && existingSweep.signature) {
-            const result = await connection.getSignatureStatuses([existingSweep.signature], { searchTransactionHistory: true });
-            const chainStatus = result.value[0];
-            if (!chainStatus) return res.status(409).json({ message: 'The previous surplus withdrawal is still awaiting confirmation.' });
-            if (chainStatus.err) {
+            const snapshot = await getSettlementChainSnapshot(
+                existingSweep.signature,
+                existingSweep.lastValidBlockHeight,
+            );
+            const settlementState = classifySettlement({
+                signatureStatus: snapshot.signatureStatus,
+                currentBlockHeight: snapshot.currentBlockHeight,
+                lastValidBlockHeight: existingSweep.lastValidBlockHeight,
+                updatedAt: existingSweep.createdAt,
+            });
+            if (settlementState === 'pending') return res.status(409).json({ message: 'The previous surplus withdrawal is still awaiting confirmation.' });
+            if (['failed', 'expired'].includes(settlementState)) {
                 await RewardPoolState.updateOne(
                     { key: 'global', 'ownerSurplusSweep.sweepId': existingSweep.sweepId },
-                    { $set: { ownerSurplusReservedUsd: 0, 'ownerSurplusSweep.status': 'failed', 'ownerSurplusSweep.error': JSON.stringify(chainStatus.err) } },
+                    { $set: {
+                        ownerSurplusReservedUsd: 0,
+                        'ownerSurplusSweep.status': 'failed',
+                        'ownerSurplusSweep.error': settlementState === 'expired'
+                            ? 'Signed transaction expired before confirmation'
+                            : JSON.stringify(snapshot.signatureStatus?.err),
+                    } },
                 );
                 return res.status(409).json({ message: 'The previous surplus withdrawal failed on-chain and was released.' });
-            }
-            if (!['confirmed', 'finalized'].includes(chainStatus.confirmationStatus)) {
-                return res.status(409).json({ message: 'The previous surplus withdrawal is still processing.' });
             }
             const completedUsd = Math.max(0, Number(existingSweep.amountUsd) || 0);
             await RewardPoolState.updateOne(
@@ -7558,10 +8182,10 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
             getSystemAccountRentLamports(),
             connection.getLatestBlockhash('confirmed'),
         ]);
-        const liabilityLamports = Math.ceil((liabilityUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+        const liabilityLamports = Math.ceil((liabilityUsd / surplusSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
         const feeBufferLamports = 15_000;
         const onChainSurplusLamports = Math.max(0, walletLamports - rentMinimum - liabilityLamports - feeBufferLamports);
-        const trackedSurplusLamports = Math.floor((trackedSurplusUsd / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+        const trackedSurplusLamports = Math.floor((trackedSurplusUsd / surplusSolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
         const sweepLamports = Math.min(onChainSurplusLamports, trackedSurplusLamports);
         if (sweepLamports <= 0) {
             return res.status(409).json({ message: 'The tracked surplus has not reached the reward wallet yet or is needed as liquidity.' });
@@ -7570,7 +8194,7 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
             return res.status(409).json({ message: 'The surplus is still below the receiving wallet rent minimum.' });
         }
 
-        const amountUsd = (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * SOL_PRICE_USD;
+        const amountUsd = (sweepLamports / solanaWeb3.LAMPORTS_PER_SOL) * surplusSolPriceUsd;
         sweepId = randomBytes(16).toString('hex');
         const reserved = await RewardPoolState.findOneAndUpdate(
             { key: 'global', 'ownerSurplusSweep.status': { $nin: ['reserved', 'broadcast'] } },
@@ -7582,6 +8206,8 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
                     solAmount: sweepLamports / solanaWeb3.LAMPORTS_PER_SOL,
                     status: 'reserved',
                     signature: null,
+                    blockhash: latest.blockhash,
+                    lastValidBlockHeight: latest.lastValidBlockHeight,
                     error: null,
                     createdAt: new Date(),
                 },
@@ -7597,11 +8223,13 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
                 lamports: sweepLamports,
             }));
         transaction.sign(rewardKeypair);
-        signature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: false, maxRetries: 3 });
+        signature = bs58.encode(transaction.signature);
         await RewardPoolState.updateOne(
             { key: 'global', 'ownerSurplusSweep.sweepId': sweepId, 'ownerSurplusSweep.status': 'reserved' },
             { $set: { 'ownerSurplusSweep.status': 'broadcast', 'ownerSurplusSweep.signature': signature } },
         );
+        const submittedSignature = await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: false, maxRetries: 3 });
+        if (submittedSignature !== signature) throw new Error('Reward surplus transaction signature mismatch');
         const confirmation = await connection.confirmTransaction({
             signature,
             blockhash: latest.blockhash,
@@ -7657,7 +8285,7 @@ app.post('/api/admin/reward-pool/sweep-surplus', authenticateAdmin, async (req, 
     }
 });
 
-app.post('/api/admin/reward-pool/factory-reset', authenticateAdmin, async (req, res) => {
+app.post('/api/admin/reward-pool/factory-reset', sensitiveRateLimit({ limit: 3, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
     if (req.body?.confirmation !== 'RESET REWARD POOL') {
         return res.status(400).json({ message: 'Exact confirmation phrase required.' });
     }
@@ -8044,29 +8672,29 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
     }
 });
 // 4. INLOGGNING (Verifiera användare)
-app.post('/api/login', async (req, res) => {
-    console.log("Mottog inloggningsförfrågan:", req.body.username);
+app.post('/api/login', sensitiveRateLimit({ limit: 12, windowMs: 15 * 60_000 }), async (req, res) => {
     try {
-        const { username, password } = req.body;
+        const username = String(req.body?.username || '').trim().slice(0, 254);
+        const password = String(req.body?.password || '');
+        if (!username || !password || password.length > 128) {
+            return res.status(400).json({ message: 'Invalid username/email or password' });
+        }
 
         // Hitta användaren via username ELLER email
-        console.log("Söker efter användare för inloggning:", username);
         const user = await User.findOne({ $or: [{ username: username }, { email: username }] });
-        console.log("Användare hittad i DB:", user ? "JA" : "NEJ");
 
         if (!user) {
-            console.log("❌ FAIL: Användaren hittades inte:", username);
-            return res.status(400).json({ message: "Användaren finns inte" });
+            // Perform comparable password work so missing accounts are harder
+            // to distinguish by response timing.
+            await bcrypt.compare(password, '$2b$10$7EqJtq98hPqEX7fNZaFWoO5kYJgYgBlXk3RmyX7ZzA6jWQeL5uJTu');
+            return res.status(400).json({ message: 'Invalid username/email or password' });
         }
 
         // Jämför lösenordet med det i databasen
-        console.log("Verifierar lösenord...");
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
-            console.log("❌ FAIL: Fel lösenord för:", username);
-            return res.status(400).json({ message: "Fel lösenord" });
+            return res.status(400).json({ message: 'Invalid username/email or password' });
         }
-        console.log("Lösenord matchar!");
         await ensureUserDepositWallet(user);
 
         // Skapa en JWT (Inloggningskvitto). Använd en hemlig nyckel från .env
@@ -8074,7 +8702,6 @@ app.post('/api/login', async (req, res) => {
         const token = jwt.sign({ id: user._id, authVersion: user.authVersion || 0 }, secret, { expiresIn: '7d' });
         const affiliateStatus = await getAffiliateStatus(user);
 
-        console.log("✅ SUCCESS: Inloggning lyckades, skickar token för:", username);
         res.json({
             token,
             user: {
@@ -9153,7 +9780,10 @@ io.on('connection', (socket) => {
                 throw new Error(`You have used all ${TOURNAMENT_MAX_ATTEMPTS} tournament attempts`);
             }
 
-            const feeLamports = Math.round((TOURNAMENT_ENTRY_FEE_USD / SOL_PRICE_USD) * solanaWeb3.LAMPORTS_PER_SOL);
+            const tournamentEntrySolPriceUsd = DEV_FREE_PLAY
+                ? SOL_PRICE_USD
+                : await getSettlementSolPrice();
+            const feeLamports = Math.round((TOURNAMENT_ENTRY_FEE_USD / tournamentEntrySolPriceUsd) * solanaWeb3.LAMPORTS_PER_SOL);
             if (!DEV_FREE_PLAY) {
                 if (!TOURNAMENT_WALLET_ADDRESS || !TOURNAMENT_WALLET_SECRET) throw new Error('Tournament wallet not configured');
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
@@ -9208,7 +9838,7 @@ io.on('connection', (socket) => {
                     console.warn('[tournament join] post-payment balance sync failed:', syncErr.message);
                 }
             } else {
-                const feeSol = TOURNAMENT_ENTRY_FEE_USD / SOL_PRICE_USD;
+                const feeSol = TOURNAMENT_ENTRY_FEE_USD / tournamentEntrySolPriceUsd;
                 user.balance = Math.max(0, user.balance - feeSol);
                 await user.save();
             }
@@ -9373,7 +10003,7 @@ io.on('connection', (socket) => {
             const publicFreePlay = publicFreeMode === true;
             const sessionFreePlay = personalFreePlay || publicFreePlay;
             const freePlay = DEV_FREE_PLAY || sessionFreePlay;
-            const isAdminAccount = !!(process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+            const isAdminAccount = isAdminUserRecord(user);
             const useAdminFreeSurvivEntry = mode === 'surviv'
                 && adminFreeSurvivEntry === true
                 && isAdminAccount
@@ -9454,7 +10084,8 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+                const entrySolPriceUsd = freePlay ? SOL_PRICE_USD : await getSettlementSolPrice();
+                const entryFeeInSol = entryFeeUsd / entrySolPriceUsd;
 
                 if (!freePlay) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
@@ -9629,7 +10260,10 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+                const entrySolPriceUsd = (freePlay || useAdminFreeSurvivEntry)
+                    ? SOL_PRICE_USD
+                    : await getSettlementSolPrice();
+                const entryFeeInSol = entryFeeUsd / entrySolPriceUsd;
 
                 if (!freePlay && !useAdminFreeSurvivEntry) {
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
@@ -9871,7 +10505,10 @@ io.on('connection', (socket) => {
             }
 
             // FINANCIAL: Check SOL balance for entry fee
-            const entryFeeInSol = entryFeeUsd / SOL_PRICE_USD;
+            const entrySolPriceUsd = (!switchingNormalMode && !freePlay && !isFreeTicketPlay)
+                ? await getSettlementSolPrice()
+                : SOL_PRICE_USD;
+            const entryFeeInSol = entryFeeUsd / entrySolPriceUsd;
 
             if (!switchingNormalMode && !freePlay && !isFreeTicketPlay) {
                 // 1. Kontrollera on-chain balans direkt innan start
@@ -10060,7 +10697,7 @@ io.on('connection', (socket) => {
                     Transaction.create({
                         userId: user._id,
                         type: 'game',
-                        amount: rewardContribution / SOL_PRICE_USD,
+                        amount: rewardContribution / entrySolPriceUsd,
                         meta: {
                             event: 'reward_pool_contribution',
                             entryFeeUsd,
@@ -10079,7 +10716,7 @@ io.on('connection', (socket) => {
                     Transaction.create({
                         userId: user._id,
                         type: 'game',
-                        amount: ownerContribution / SOL_PRICE_USD,
+                        amount: ownerContribution / entrySolPriceUsd,
                         meta: {
                             event: 'owner_vault_contribution',
                             entryFeeUsd,
@@ -10372,7 +11009,7 @@ io.on('connection', (socket) => {
                 console.log(`[Admin Spawn] Rejected: User not found for ID ${decoded.id}`);
                 return;
             }
-            const isAdmin = user.isAdmin || (process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+            const isAdmin = isAdminUserRecord(user);
             if (!isAdmin) {
                 console.log(`[Admin Spawn] Rejected: User ${user.username} is not an admin`);
                 return;
@@ -10517,7 +11154,7 @@ io.on('connection', (socket) => {
             const decoded = await verifyAccountToken(token);
             const user = await User.findById(decoded.id);
             if (!user) return;
-            const isAdmin = user.isAdmin || (process.env.ADMIN_USERNAME && user.username === process.env.ADMIN_USERNAME);
+            const isAdmin = isAdminUserRecord(user);
             if (!isAdmin) return;
 
             const room = getArenaRoomById(socket.roomId);
@@ -11086,9 +11723,11 @@ function getBattleRoyaleDeps() {
         calculateCellRadius,
         rooms: [...rooms, ...competitiveSlitherRooms, ...survivRooms],
         JWT_SECRET,
+        verifyAccountToken,
         DEV_FREE_PLAY,
         isPersonalFreePlayUser,
         SOL_PRICE_USD,
+        getSettlementSolPrice,
         connection,
         ensureUserDepositWallet,
         OWNER_VAULT_ADDRESS,

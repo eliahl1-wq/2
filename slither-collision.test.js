@@ -479,6 +479,113 @@ test('Slither bots react quickly but not on every server tick', () => {
     assert.ok(snake._botBrain.nextDecisionAt <= 1382);
 });
 
+test('Slither bots use a faster safety reflex before their next tactical decision', () => {
+    const snake = {
+        id: 'reflex-bot',
+        balance: 5,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 300,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: true,
+        _botBrain: {
+            reactionMs: 170,
+            reflexMs: 95,
+            caution: 1,
+            aimOffset: 8,
+            weaveSpeed: 0.003,
+            phase: 0,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            nextDecisionAt: 1200,
+            nextSafetyScanAt: 1000,
+            nextFoodScanAt: 1300,
+            foodTarget: null,
+        },
+    };
+    const wall = {
+        id: 'sudden-wall',
+        balance: 5,
+        segments: Array.from({ length: 11 }, (_, index) => ({
+            x: 75,
+            y: -150 + index * 30,
+        })),
+    };
+
+    runSlitherBotAI(
+        snake,
+        [{ entity: snake }, { entity: wall }],
+        [],
+        null,
+        { sandboxWorldHalf: SLITHER.worldHalf },
+        1075,
+    );
+
+    assert.ok(Math.abs(snake.targetY) > 90, 'danger reflex should choose a side route immediately');
+    assert.equal(snake.boost, false, 'the bot should release boost while making the emergency turn');
+    assert.equal(snake._botBrain.nextDecisionAt, 1200, 'the tactical decision cadence stays human-like');
+    assert.ok(snake._botBrain.nextSafetyScanAt > 1075);
+});
+
+test('Slither bot play styles use visibly different interception lines', () => {
+    const makeBot = (id, style) => ({
+        id,
+        balance: 8,
+        segments: [{ x: 0, y: 0 }, { x: -10, y: 0 }],
+        targetX: 0,
+        targetY: 0,
+        inputDx: 1,
+        inputDy: 0,
+        angle: 0,
+        boost: false,
+        _botBrain: {
+            style,
+            reactionMs: 160,
+            reflexMs: 75,
+            foodScanMs: 330,
+            foodValueBias: 1,
+            preyChance: 1,
+            bigGameDrive: 0,
+            caution: 1,
+            aimOffset: 10,
+            weaveSpeed: 0.003,
+            phase: 0,
+            wanderDirection: 1,
+            wanderTurn: 0.5,
+            wanderDistance: 300,
+            boostGreed: 0.8,
+            maneuverSide: 1,
+            maneuverStrength: 1,
+            nextManeuverAt: 5000,
+            nextDecisionAt: 0,
+            nextSafetyScanAt: 0,
+            nextFoodScanAt: 0,
+            foodTarget: null,
+        },
+    });
+    const prey = {
+        id: 'moving-prey',
+        balance: 2,
+        angle: 0,
+        inputDx: 1,
+        inputDy: 0,
+        segments: [{ x: 150, y: 0 }],
+    };
+    const hunter = makeBot('hunter-style', 'hunter');
+    const ambusher = makeBot('ambusher-style', 'ambusher');
+
+    runSlitherBotAI(hunter, [{ entity: hunter }, { entity: prey }], [], null, null, 1000);
+    runSlitherBotAI(ambusher, [{ entity: ambusher }, { entity: prey }], [], null, null, 1000);
+
+    assert.ok(ambusher.targetX > hunter.targetX, 'ambusher should lead the moving prey farther');
+    assert.ok(Math.abs(ambusher.targetY) > Math.abs(hunter.targetY), 'ambusher should take a wider cutoff line');
+    assert.equal(hunter._botBrain.preyTargetId, prey.id);
+    assert.equal(ambusher._botBrain.preyTargetId, prey.id);
+});
+
 test('Slither bots immediately boost toward death food before ambient food', () => {
     const snake = {
         id: 'death-food-bot',

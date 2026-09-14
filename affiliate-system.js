@@ -120,6 +120,10 @@ const AffiliatePayoutSchema = new Schema({
     signature: { type: String, default: null, sparse: true },
     solAmount: { type: Number, default: null },
     solPriceUsd: { type: Number, default: null },
+    blockhash: { type: String, default: null },
+    lastValidBlockHeight: { type: Number, default: null },
+    broadcastAt: { type: Date, default: null },
+    error: { type: String, default: null },
 }, { timestamps: true });
 AffiliatePayoutSchema.index({ affiliateProfileId: 1, createdAt: -1 });
 

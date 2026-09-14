@@ -10,12 +10,15 @@ const RewardPoolStateSchema = new mongoose.Schema({
     ownerSurplusUsd: { type: Number, default: 0 },
     ownerSurplusReservedUsd: { type: Number, default: 0 },
     totalOwnerSurplusSweptUsd: { type: Number, default: 0 },
+    fundingKeys: { type: [String], default: [], select: false },
     ownerSurplusSweep: {
         sweepId: { type: String, default: null },
         amountUsd: { type: Number, default: 0 },
         solAmount: { type: Number, default: null },
         status: { type: String, enum: ['reserved', 'broadcast', 'confirmed', 'failed'], default: null },
         signature: { type: String, default: null },
+        blockhash: { type: String, default: null },
+        lastValidBlockHeight: { type: Number, default: null },
         error: { type: String, default: null },
         createdAt: { type: Date, default: null },
     },
@@ -127,6 +130,29 @@ export async function addRewardFundingUsd(amountUsd, { ownerSurplusUsd = 0 } = {
     return cachedPendingHouseUsd;
 }
 
+export async function addRewardFundingUsdOnce(amountUsd, fundingKey) {
+    const amount = Math.max(0, Number(amountUsd) || 0);
+    const key = String(fundingKey || '').trim();
+    if (!amount || !key) return { applied: false, pendingHouseUsd: cachedPendingHouseUsd };
+    let state;
+    try {
+        state = await RewardPoolState.findOneAndUpdate(
+            { key: 'global', fundingKeys: { $ne: key } },
+            {
+                $inc: { pendingHouseUsd: amount, totalFundedUsd: amount },
+                $addToSet: { fundingKeys: key },
+            },
+            { upsert: true, new: true },
+        );
+    } catch (error) {
+        if (error?.code === 11000) return { applied: false, pendingHouseUsd: cachedPendingHouseUsd };
+        throw error;
+    }
+    if (!state) return { applied: false, pendingHouseUsd: cachedPendingHouseUsd };
+    cachedPendingHouseUsd = Math.max(0, Number(state.pendingHouseUsd) || 0);
+    return { applied: true, pendingHouseUsd: cachedPendingHouseUsd };
+}
+
 export async function rollbackRewardFundingUsd(amountUsd, { ownerSurplusUsd = 0 } = {}) {
     const amount = Math.max(0, Number(amountUsd) || 0);
     if (!amount) return cachedPendingHouseUsd;
@@ -161,6 +187,22 @@ export async function reducePendingRewardUsd(amountUsd, { swept = false } = {}) 
     
     await state.save();
     cachedPendingHouseUsd = state.pendingHouseUsd;
+    return cachedPendingHouseUsd;
+}
+
+/** Record an on-chain house -> reward transfer without pretending that every
+ * lamport came from newly pending contributions. Extra funding may be needed
+ * solely because a USD liability now costs more SOL than at the prior sweep. */
+export async function recordRewardWalletTopUpUsd(amountUsd, pendingReductionUsd = amountUsd) {
+    const amount = Math.max(0, Number(amountUsd) || 0);
+    const reduction = Math.min(amount, Math.max(0, Number(pendingReductionUsd) || 0));
+    if (!amount) return cachedPendingHouseUsd;
+    let state = await RewardPoolState.findOne({ key: 'global' });
+    if (!state) state = new RewardPoolState({ key: 'global' });
+    state.pendingHouseUsd = Math.max(0, (Number(state.pendingHouseUsd) || 0) - reduction);
+    state.totalSweptUsd = (Number(state.totalSweptUsd) || 0) + amount;
+    await state.save();
+    cachedPendingHouseUsd = Math.max(0, Number(state.pendingHouseUsd) || 0);
     return cachedPendingHouseUsd;
 }
 

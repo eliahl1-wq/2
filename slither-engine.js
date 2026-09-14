@@ -49,8 +49,8 @@ export const SLITHER = {
     botMaxBalance: 500.0,
     // Fast human-like reactions. Decisions are intentionally not made every
     // 25 ms server tick, which made several bots move in perfect lockstep.
-    botReactionMinMs: 140,
-    botReactionMaxMs: 220,
+    botReactionMinMs: 115,
+    botReactionMaxMs: 190,
     viewRange: 520,
     minimapRange: 1050,
     minimapThreatRange: 1700,
@@ -952,13 +952,35 @@ function ensureSlitherBotBrain(snake) {
     if (snake._botBrain) return snake._botBrain;
 
     const reactionRange = SLITHER.botReactionMaxMs - SLITHER.botReactionMinMs;
+    const styleRoll = Math.random();
+    const style = styleRoll < 0.30
+        ? 'forager'
+        : styleRoll < 0.58
+            ? 'hunter'
+            : styleRoll < 0.80
+                ? 'ambusher'
+                : 'survivor';
+    const stylePreyChance = {
+        forager: 0.025,
+        hunter: 0.20,
+        ambusher: 0.12,
+        survivor: 0.045,
+    }[style];
+    const styleCaution = {
+        forager: 1.00,
+        hunter: 0.90,
+        ambusher: 0.96,
+        survivor: 1.12,
+    }[style];
     snake._botBrain = {
+        style,
         reactionMs: SLITHER.botReactionMinMs + Math.random() * reactionRange,
+        reflexMs: 90 + Math.random() * 55,
         foodScanMs: BOT_FOOD_SCAN_MIN_MS + Math.random() * (BOT_FOOD_SCAN_MAX_MS - BOT_FOOD_SCAN_MIN_MS),
         foodValueBias: 0.7 + Math.random() * 0.8,
-        preyChance: 0.02 + Math.random() * 0.08,
+        preyChance: stylePreyChance * (0.72 + Math.random() * 0.56),
         bigGameDrive: 0.55 + Math.random() * 0.3,
-        caution: 0.86 + Math.random() * 0.24,
+        caution: styleCaution * (0.92 + Math.random() * 0.16),
         aimOffset: 4 + Math.random() * 13,
         weaveSpeed: 0.0025 + Math.random() * 0.0025,
         phase: Math.random() * Math.PI * 2,
@@ -966,7 +988,15 @@ function ensureSlitherBotBrain(snake) {
         wanderTurn: 0.3 + Math.random() * 0.85,
         wanderDistance: 240 + Math.random() * 260,
         boostGreed: Math.random(),
+        maneuverSide: Math.random() < 0.5 ? -1 : 1,
+        maneuverStrength: 0.72 + Math.random() * 0.62,
+        nextManeuverAt: 0,
+        preyTargetId: null,
+        preyCommitUntil: 0,
+        wanderMode: Math.floor(Math.random() * 3),
+        nextWanderModeAt: 0,
         nextDecisionAt: 0,
+        nextSafetyScanAt: 0,
         nextFoodScanAt: 0,
         foodTarget: null,
     };
@@ -1080,16 +1110,52 @@ function aimBotAtFood(snake, head, target, brain, now) {
     snake.targetY = target.y + (dx / distance) * offset;
 }
 
-function chooseBotWanderTarget(snake, head, brain) {
-    if (Math.random() < 0.18) brain.wanderDirection *= -1;
+function chooseBotWanderTarget(snake, head, brain, now) {
+    if (!Number.isFinite(brain.wanderMode) || now >= (brain.nextWanderModeAt || 0)) {
+        brain.wanderMode = Math.floor(Math.random() * 3);
+        brain.nextWanderModeAt = now + 1800 + Math.random() * 3200;
+        if (Math.random() < 0.34) brain.wanderDirection *= -1;
+    }
     const currentAngle = Number.isFinite(snake.angle)
         ? snake.angle
         : Math.atan2(snake.inputDy || 0, snake.inputDx || 1);
-    const angle = currentAngle
-        + brain.wanderDirection * brain.wanderTurn
-        + (Math.random() - 0.5) * 0.38;
-    snake.targetX = head.x + Math.cos(angle) * brain.wanderDistance;
-    snake.targetY = head.y + Math.sin(angle) * brain.wanderDistance;
+    const modeTurnScale = [0.34, 0.78, 1.25][brain.wanderMode];
+    const distanceScale = [1.35, 1.0, 0.72][brain.wanderMode];
+    const angle = currentAngle + brain.wanderDirection * brain.wanderTurn * modeTurnScale
+        + (Math.random() - 0.5) * (brain.wanderMode === 2 ? 0.48 : 0.22);
+    const travel = brain.wanderDistance * distanceScale * (0.86 + Math.random() * 0.28);
+    snake.targetX = head.x + Math.cos(angle) * travel;
+    snake.targetY = head.y + Math.sin(angle) * travel;
+}
+
+function aimBotAtPrey(snake, prey, distance, brain, now, fleeDistance) {
+    const targetHead = prey.segments[0];
+    const targetAngle = Number.isFinite(prey.angle)
+        ? prey.angle
+        : Math.atan2(prey.inputDy || 0, prey.inputDx || 1);
+
+    if (brain.maneuverSide !== -1 && brain.maneuverSide !== 1) {
+        brain.maneuverSide = Math.random() < 0.5 ? -1 : 1;
+    }
+    if (now >= (brain.nextManeuverAt || 0)) {
+        if (Math.random() < 0.44) brain.maneuverSide *= -1;
+        brain.maneuverStrength = 0.72 + Math.random() * 0.62;
+        brain.nextManeuverAt = now + 520 + Math.random() * 1150;
+    }
+
+    const style = brain.style || 'forager';
+    const leadScale = style === 'hunter' ? 1.18 : style === 'ambusher' ? 1.42 : 0.92;
+    const lateralScale = style === 'ambusher' ? 1.55 : style === 'survivor' ? 0.58 : 1;
+    const lead = Math.min(145, (30 + distance * 0.30) * leadScale);
+    const lateral = Math.min(62, (12 + brain.aimOffset * 1.45) * lateralScale)
+        * (brain.maneuverSide || 1) * (brain.maneuverStrength || 1);
+
+    snake.targetX = targetHead.x + Math.cos(targetAngle) * lead - Math.sin(targetAngle) * lateral;
+    snake.targetY = targetHead.y + Math.sin(targetAngle) * lead + Math.cos(targetAngle) * lateral;
+    snake.boost = brain.boostGreed > (style === 'hunter' ? 0.42 : 0.68)
+        && distance < fleeDistance * (style === 'hunter' ? 0.62 : 0.35);
+    brain.preyTargetId = prey.id;
+    brain.preyCommitUntil = now + 650 + brain.maneuverStrength * 620;
 }
 
 function keepBotSteering(snake, head, room) {
@@ -1193,6 +1259,13 @@ function applyBotBodyAvoidance(snake, allSnakes, brain, now) {
     return true;
 }
 
+function runBotSafetyReflex(snake, allSnakes, brain, now) {
+    if (now < (brain.nextSafetyScanAt || 0)) return false;
+    const reflexMs = Number.isFinite(brain.reflexMs) ? brain.reflexMs : 82;
+    brain.nextSafetyScanAt = now + reflexMs * (0.82 + Math.random() * 0.36);
+    return applyBotBodyAvoidance(snake, allSnakes, brain, now);
+}
+
 function aimBotAwayFromThreat(snake, head, threat, fleeDistance, nearestThreatDist, brain) {
     const awayAngle = Math.atan2(head.y - threat.y, head.x - threat.x);
     let steerX = Math.cos(awayAngle); let steerY = Math.sin(awayAngle);
@@ -1234,6 +1307,7 @@ export function runSlitherBotAI(
         brain.deathRushPending = false;
     }
     if (now < brain.nextDecisionAt) {
+        runBotSafetyReflex(snake, allSnakes, brain, now);
         keepBotSteering(snake, head, room);
         return;
     }
@@ -1249,6 +1323,7 @@ export function runSlitherBotAI(
     let targetPrey = null;
     let nearestThreatDist = minDistThreat * brain.caution;
     let nearestPreyDist = minDistPrey;
+    let bestPreyScore = minDistPrey;
 
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
@@ -1258,9 +1333,13 @@ export function runSlitherBotAI(
         if (other.balance > snake.balance * 1.10 && d < nearestThreatDist) {
             nearestThreatDist = d;
             threat = oh;
-        } else if (snake.balance > other.balance * 1.10 && d < nearestPreyDist) {
+        } else if (snake.balance > other.balance * 1.10) {
+            const retained = other.id === brain.preyTargetId && now < (brain.preyCommitUntil || 0);
+            const preyScore = d * (retained ? 0.72 : 1);
+            if (d > minDistPrey * (retained ? 1.30 : 1) || preyScore >= bestPreyScore) continue;
+            bestPreyScore = preyScore;
             nearestPreyDist = d;
-            targetPrey = oh;
+            targetPrey = other;
         }
     }
     const largeHunt = chooseLargeSnakeHuntTarget(
@@ -1322,18 +1401,17 @@ export function runSlitherBotAI(
             aimBotAtFood(snake, head, brain.foodTarget, brain, now);
             snake.boost = false;
         } else if (targetPrey) {
-            snake.targetX = targetPrey.x;
-            snake.targetY = targetPrey.y;
-            snake.boost = brain.boostGreed > 0.72 && nearestPreyDist < fleeDistance * 0.25;
+            aimBotAtPrey(snake, targetPrey, nearestPreyDist, brain, now, fleeDistance);
         } else if (!Number.isFinite(snake.targetX)
             || dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
-            chooseBotWanderTarget(snake, head, brain);
+            chooseBotWanderTarget(snake, head, brain, now);
             snake.boost = false;
         }
         snake.lastTargetUpdate = now;
     }
 
     applyBotBodyAvoidance(snake, allSnakes, brain, now);
+    brain.nextSafetyScanAt = now + (Number.isFinite(brain.reflexMs) ? brain.reflexMs : 82);
     keepBotSteering(snake, head, room);
 }
 
@@ -1429,6 +1507,7 @@ export function runCompetitiveSlitherBotAI(
     }
 
     if (now < brain.nextDecisionAt) {
+        runBotSafetyReflex(snake, allSnakes, brain, now);
         snake.inputDx = snake.targetX - head.x;
         snake.inputDy = snake.targetY - head.y;
         return;
@@ -1444,6 +1523,7 @@ export function runCompetitiveSlitherBotAI(
     let targetPrey = null;
     let nearestThreatDist = minDistThreat * brain.caution;
     let nearestPreyDist = minDistPrey;
+    let bestPreyScore = minDistPrey;
 
     for (const { entity: other } of allSnakes) {
         if (other.id === snake.id) continue;
@@ -1452,9 +1532,13 @@ export function runCompetitiveSlitherBotAI(
         if (other.balance > snake.balance * 1.10 && d < nearestThreatDist) {
             nearestThreatDist = d;
             threat = otherHead;
-        } else if (snake.balance > other.balance * 1.10 && d < nearestPreyDist) {
+        } else if (snake.balance > other.balance * 1.10) {
+            const retained = other.id === brain.preyTargetId && now < (brain.preyCommitUntil || 0);
+            const preyScore = d * (retained ? 0.72 : 1);
+            if (d > minDistPrey * (retained ? 1.30 : 1) || preyScore >= bestPreyScore) continue;
+            bestPreyScore = preyScore;
             nearestPreyDist = d;
-            targetPrey = otherHead;
+            targetPrey = other;
         }
     }
     const largeHunt = chooseLargeSnakeHuntTarget(
@@ -1515,13 +1599,11 @@ export function runCompetitiveSlitherBotAI(
             aimBotAtFood(snake, head, brain.foodTarget, brain, now);
             snake.boost = false;
         } else if (targetPrey) {
-            snake.targetX = targetPrey.x;
-            snake.targetY = targetPrey.y;
-            snake.boost = brain.boostGreed > 0.72 && nearestPreyDist < fleeDistance * 0.25;
+            aimBotAtPrey(snake, targetPrey, nearestPreyDist, brain, now, fleeDistance);
         } else if (!Number.isFinite(snake.targetX)
             || dist(head.x, head.y, snake.targetX, snake.targetY) < 50) {
             const maxTargetRadius = Math.max(0, effectiveRadius - 220);
-            chooseBotWanderTarget(snake, head, brain);
+            chooseBotWanderTarget(snake, head, brain, now);
             const targetDistance = Math.hypot(snake.targetX, snake.targetY);
             if (targetDistance > maxTargetRadius && targetDistance > 1e-6) {
                 snake.targetX *= maxTargetRadius / targetDistance;
@@ -1533,6 +1615,7 @@ export function runCompetitiveSlitherBotAI(
     }
 
     applyBotBodyAvoidance(snake, allSnakes, brain, now);
+    brain.nextSafetyScanAt = now + (Number.isFinite(brain.reflexMs) ? brain.reflexMs : 82);
     snake.inputDx = snake.targetX - head.x;
     snake.inputDy = snake.targetY - head.y;
 }

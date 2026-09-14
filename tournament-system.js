@@ -60,6 +60,9 @@ const TournamentRewardClaimSchema = new mongoose.Schema({
         index: true,
     },
     signature: { type: String, default: null },
+    blockhash: { type: String, default: null },
+    lastValidBlockHeight: { type: Number, default: null },
+    broadcastAt: { type: Date, default: null },
     error: { type: String, default: null },
 }, { timestamps: true });
 
