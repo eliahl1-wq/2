@@ -8663,6 +8663,109 @@ app.put('/api/admin/users/:userId/password', authenticateAdmin, sensitiveRateLim
     }
 });
 
+app.post('/api/admin/users/bulk-withdraw', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
+    try {
+        const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        const ids = [...new Set(rawIds.map(id => String(id)))];
+        if (!ids.length) return res.status(400).json({ message: 'Select at least one account.' });
+        if (ids.length > 25) return res.status(400).json({ message: 'Withdraw from at most 25 accounts at a time.' });
+        if (ids.some(id => !mongoose.Types.ObjectId.isValid(id))) {
+            return res.status(400).json({ message: 'The selection contains an invalid account id.' });
+        }
+        if (req.body?.confirmation !== `WITHDRAW ALL ${ids.length}`) {
+            return res.status(400).json({ message: 'Bulk withdrawal confirmation did not match.' });
+        }
+
+        let destination;
+        try {
+            destination = new solanaWeb3.PublicKey(String(req.body?.destinationAddress || '').trim()).toBase58();
+        } catch {
+            return res.status(400).json({ message: 'Invalid Solana destination address.' });
+        }
+
+        const accounts = await User.find({ _id: { $in: ids } })
+            .select('username balance isOwnerAccount')
+            .lean();
+        if (accounts.length !== ids.length) {
+            return res.status(404).json({ message: 'One or more selected accounts no longer exist.' });
+        }
+        const nonOwnerAccounts = accounts.filter(account => !account.isOwnerAccount);
+        if (nonOwnerAccounts.length) {
+            return res.status(403).json({
+                message: `Only accounts marked as yours can be bulk withdrawn. Remove from selection: ${nonOwnerAccounts.map(account => account.username).join(', ')}`,
+            });
+        }
+
+        const accountById = new Map(accounts.map(account => [String(account._id), account]));
+        const orderedAccounts = ids.map(id => accountById.get(id));
+        const results = new Array(orderedAccounts.length);
+        let cursor = 0;
+        const worker = async () => {
+            while (cursor < orderedAccounts.length) {
+                const index = cursor++;
+                const account = orderedAccounts[index];
+                const userId = String(account._id);
+                if ((Number(account.balance) || 0) <= 0) {
+                    results[index] = { userId, username: account.username, status: 'skipped', message: 'Balance is already empty.' };
+                    continue;
+                }
+                if (isUserJoining(userId) || processingCashouts.has(userId) || findPlayerInArena(userId) || getBRMatchForMongo(userId)) {
+                    results[index] = { userId, username: account.username, status: 'failed', message: 'Account is joining, playing, or cashing out.' };
+                    continue;
+                }
+                try {
+                    const withdrawal = await executeAccountWithdrawal({
+                        userId,
+                        destinationAddress: destination,
+                        adminActorId: req.adminUser._id,
+                        withdrawAll: true,
+                    });
+                    results[index] = {
+                        userId,
+                        username: account.username,
+                        status: withdrawal.processing ? 'processing' : 'confirmed',
+                        signature: withdrawal.signature || null,
+                        sentSolAmount: Number(withdrawal.sentSolAmount) || 0,
+                        networkFeeSol: Number(withdrawal.networkFeeSol) || 0,
+                        message: withdrawal.message || null,
+                    };
+                } catch (error) {
+                    results[index] = {
+                        userId,
+                        username: account.username,
+                        status: 'failed',
+                        message: error?.status ? error.message : 'Blockchain transaction failed.',
+                    };
+                }
+            }
+        };
+
+        await Promise.all(Array.from({ length: Math.min(3, orderedAccounts.length) }, () => worker()));
+
+        const confirmed = results.filter(result => result.status === 'confirmed');
+        const processing = results.filter(result => result.status === 'processing');
+        const skipped = results.filter(result => result.status === 'skipped');
+        const failed = results.filter(result => result.status === 'failed');
+        const sentSolAmount = confirmed.reduce((sum, result) => sum + result.sentSolAmount, 0);
+        const summary = `${confirmed.length} confirmed, ${processing.length} processing, ${skipped.length} empty, ${failed.length} failed.`;
+        return res.status(failed.length ? 207 : 200).json({
+            success: failed.length === 0,
+            partial: failed.length > 0,
+            destinationAddress: destination,
+            confirmed: confirmed.length,
+            processing: processing.length,
+            skipped: skipped.length,
+            failed: failed.length,
+            sentSolAmount: Number(sentSolAmount.toFixed(9)),
+            results,
+            message: `Bulk withdrawal finished: ${summary}`,
+        });
+    } catch (err) {
+        console.error('Admin bulk owner withdrawal error:', err);
+        return res.status(err.status || 500).json({ message: err.status ? err.message : 'Bulk withdrawal failed.' });
+    }
+});
+
 app.post('/api/admin/users/:userId/withdraw', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
         const { userId } = req.params;
