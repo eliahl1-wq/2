@@ -70,6 +70,16 @@ test('normal-room invariant counts every live ledger exactly once', () => {
     assert.equal(result.excessUsd, 0);
 });
 
+test('normal-room invariant counts pending Slither boost value outside the food pool', () => {
+    const result = calculateNormalRoomValue({
+        fundedEntryUsd: 2,
+        players: [{ dollarBalance: 1.99, _boostDollarAcc: 0.01 }],
+    });
+    assert.equal(result.boostPendingUsd, 0.01);
+    assert.equal(result.accountedUsd, 2);
+    assert.equal(result.excessUsd, 0);
+});
+
 test('normal-room invariant exposes duplicated value above paid funding', () => {
     const result = calculateNormalRoomValue({
         fundedEntryUsd: 2,

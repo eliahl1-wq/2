@@ -6,6 +6,7 @@ import {
     processCompetitiveSlitherRoom,
     runSlitherBotAI,
     runCompetitiveSlitherBotAI,
+    flushSlitherBoostReserve,
     trimSlitherBots,
     syncSlitherFood,
     SLITHER,
@@ -137,10 +138,24 @@ test('normal Slither boost recycles exactly the value removed from the snake', (
         snake.boost = true;
         tick(room, 'slither');
         const liveUsd = snake.dollarBalance
+            + (snake._boostDollarAcc || 0)
             + room.foodPoolBalance
             + room.slitherFood.reduce((sum, food) => sum + (food.dollarValue || 0), 0);
         assert.ok(Math.abs(liveUsd - initialUsd) < 1e-9, `tick ${i} changed funded value`);
     }
+});
+
+test('normal Slither boost reserve cannot be spent by the ambient food pool', () => {
+    const snake = makeSnake('slither', false, { boost: true });
+    const room = { ...makeRoom(snake), isSandbox: false };
+    tick(room, 'slither');
+    assert.ok((snake._boostDollarAcc || 0) > 0);
+    assert.equal(room.foodPoolBalance, 0);
+
+    const reserved = snake._boostDollarAcc;
+    assert.equal(flushSlitherBoostReserve(room, snake), reserved);
+    assert.equal(snake._boostDollarAcc, 0);
+    assert.equal(room.foodPoolBalance, reserved);
 });
 
 test('trimming a Slither bot books its full current value as owner profit', () => {

@@ -17,9 +17,47 @@ import {
     calculateAffiliateCommission,
     calculateCashoutMoney,
     calculateAffordableSolanaPayout,
+    calculateRewardTopUpCapacity,
     multiplyMicrosByBps,
     usdToMicros,
 } from './affiliate-money.js';
+
+test('reward top-ups cannot spend SOL backing active games or pending cashouts', () => {
+    assert.deepEqual(calculateRewardTopUpCapacity({
+        houseLamports: 1_000_000_000,
+        pendingRewardLamports: 500_000_000,
+        activeGameLiabilityLamports: 700_000_000,
+        pendingSettlementLamports: 100_000_000,
+        feeBufferLamports: 20_000,
+    }), {
+        protectedLamports: 800_000_000,
+        trackedRewardLamports: 500_000_000,
+        unprotectedLamports: 199_980_000,
+        topUpCapacityLamports: 199_980_000,
+    });
+});
+
+test('reward price rebalancing can use only unprotected House surplus', () => {
+    const result = calculateRewardTopUpCapacity({
+        houseLamports: 1_000_000_000,
+        pendingRewardLamports: 0,
+        activeGameLiabilityLamports: 700_000_000,
+        pendingSettlementLamports: 100_000_000,
+        feeBufferLamports: 20_000,
+    });
+    assert.equal(result.trackedRewardLamports, 0);
+    assert.equal(result.topUpCapacityLamports, 199_980_000);
+});
+
+test('reward top-ups have zero capacity when game liabilities consume house liquidity', () => {
+    const result = calculateRewardTopUpCapacity({
+        houseLamports: 500_000_000,
+        pendingRewardLamports: 100_000_000,
+        activeGameLiabilityLamports: 500_000_000,
+        pendingSettlementLamports: 0,
+    });
+    assert.equal(result.topUpCapacityLamports, 0);
+});
 
 test('cashout liquidity cap pays the full request when sender funds are sufficient', () => {
     const result = calculateAffordableSolanaPayout(1.90, 20_000_000, 100, 20_000);

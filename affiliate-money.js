@@ -83,6 +83,35 @@ export function calculateAffordableSolanaPayout(
     };
 }
 
+/**
+ * House funds backing active games or already-prepared cashouts are never
+ * available for Reward Wallet top-ups. Reward liabilities may use only the
+ * actual surplus left after those reserves and the transaction buffer. This
+ * also preserves the existing ability to rebalance a real reward liability
+ * after SOL/USD moves even when pendingHouseUsd is already zero.
+ */
+export function calculateRewardTopUpCapacity({
+    houseLamports,
+    pendingRewardLamports,
+    activeGameLiabilityLamports,
+    pendingSettlementLamports,
+    feeBufferLamports = DEFAULT_SOLANA_CASHOUT_FEE_BUFFER_LAMPORTS,
+}) {
+    const whole = input => Math.max(0, Math.floor(Number(input) || 0));
+    const house = whole(houseLamports);
+    const rewards = whole(pendingRewardLamports);
+    const games = whole(activeGameLiabilityLamports);
+    const settlements = whole(pendingSettlementLamports);
+    const buffer = whole(feeBufferLamports);
+    const unprotectedLamports = Math.max(0, house - games - settlements - buffer);
+    return {
+        protectedLamports: games + settlements,
+        trackedRewardLamports: rewards,
+        unprotectedLamports,
+        topUpCapacityLamports: unprotectedLamports,
+    };
+}
+
 export function calculateAffiliateCommission(platformFeeUsdMicros, affiliateShareBps) {
     const commissionUsdMicros = multiplyMicrosByBps(platformFeeUsdMicros, affiliateShareBps);
     return {

@@ -454,6 +454,7 @@ export function trimSlitherBots(room, targetCount) {
         if (index === -1) break; // Only admin-spawned bots left
         const [removed] = room.slitherBots.splice(index, 1);
         if (!removed?.freeTicketRewardFunded) {
+            flushSlitherBoostReserve(room, removed);
             const removedValue = removed?.dollarBalance
                 ?? removed?.botStake
                 ?? removed?.balance
@@ -513,6 +514,21 @@ function minDollarsForSnake(snake) {
 /** Normal slither: HUD dollars and snake mass move together. Arena / BR keep them separate. */
 function isCoupledSlitherRoom(room) {
     return !!room && !room.isBattleRoyale && !room.isCompetitiveSlither && !room.isSandbox;
+}
+
+/**
+ * Return boost value that has been debited from a normal Slither player but
+ * has not yet accumulated into a full pellet. Keeping this reserve outside
+ * foodPoolBalance prevents the same dollars being spent as ambient food and
+ * then emitted again as a boost pellet.
+ */
+export function flushSlitherBoostReserve(room, snake) {
+    const pendingUsd = Math.max(0, Number(snake?._boostDollarAcc) || 0);
+    if (pendingUsd > 0 && room) {
+        room.foodPoolBalance = (Number(room.foodPoolBalance) || 0) + pendingUsd;
+    }
+    if (snake) snake._boostDollarAcc = 0;
+    return pendingUsd;
 }
 
 function applySlitherFoodPickup(snake, food, room) {
@@ -838,7 +854,10 @@ function updateSnakeMovement(snake, room = null) {
             poolCredit = dollarCost;
             if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
         }
-        room.foodPoolBalance += poolCredit;
+        // Coupled normal-mode dollars remain reserved on the snake until a
+        // pellet is actually emitted. Other modes retain their visual-mass
+        // pool behavior and are excluded from the paid normal-room ledger.
+        if (!isCoupledSlitherRoom(room)) room.foodPoolBalance += poolCredit;
 
         // Accumulate boost loss and drop food pellets behind the tail
         snake._boostMassAcc = (snake._boostMassAcc || 0) + cost;
@@ -858,9 +877,6 @@ function updateSnakeMovement(snake, room = null) {
             // Spawn pellet at the tail
             const tail = snake.segments[snake.segments.length - 1];
             if (tail) {
-                // Subtract from foodPoolBalance since we spawn a real pellet in the map
-                room.foodPoolBalance = Math.max(0, room.foodPoolBalance - dropDollar);
-
                 const jitter = 5;
                 room.slitherFood.push({
                     id: randId(),
@@ -2104,6 +2120,10 @@ function dropSnakeAsFood(room, snake) {
 
 function eliminateSnake(room, snake, killer, io, User, isHuman, returnToPool = true, Transaction = null) {
     const lostDollars = snake.dollarBalance ?? snake.balance ?? 0;
+
+    // Any sub-pellet boost remainder was already debited from the snake. Put
+    // it back in the funded food pool before the entity disappears.
+    if (isCoupledSlitherRoom(room)) flushSlitherBoostReserve(room, snake);
 
     if (killer && killer.id !== snake.id) {
         killer.kills = (killer.kills || 0) + 1;

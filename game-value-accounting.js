@@ -60,13 +60,15 @@ export function calculateNormalRoomValue(room = {}) {
     const agarFoodUsd = (room.food || []).reduce((sum, food) => sum + itemValue(food), 0);
     const slitherFoodUsd = (room.slitherFood || []).reduce((sum, food) => sum + itemValue(food), 0);
     const ejectedUsd = (room.ejected || []).reduce((sum, item) => sum + itemValue(item), 0);
+    const boostPendingUsd = [...(room.players || []), ...(room.slitherBots || [])]
+        .reduce((sum, snake) => sum + value(snake?._boostDollarAcc), 0);
     const foodPoolUsd = value(room.foodPoolBalance);
     const aiBudgetUsd = value(room.aiBudgetBalance);
     const ownerAllocatedUsd = value(room.ownerBalance);
     const reservedCashoutUsd = value(room.reservedCashoutUsd);
     const paidCashoutUsd = value(room.paidCashoutUsd);
     const fundedEntryUsd = value(room.fundedEntryUsd);
-    const accountedUsd = playersUsd + botsUsd + agarFoodUsd + slitherFoodUsd + ejectedUsd
+    const accountedUsd = playersUsd + botsUsd + agarFoodUsd + slitherFoodUsd + ejectedUsd + boostPendingUsd
         + foodPoolUsd + aiBudgetUsd + ownerAllocatedUsd + reservedCashoutUsd + paidCashoutUsd;
 
     return {
@@ -78,6 +80,7 @@ export function calculateNormalRoomValue(room = {}) {
         agarFoodUsd,
         slitherFoodUsd,
         ejectedUsd,
+        boostPendingUsd,
         foodPoolUsd,
         aiBudgetUsd,
         ownerAllocatedUsd,

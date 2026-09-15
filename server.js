@@ -51,6 +51,7 @@ import {
     isSpawnClear,
     isCompetitiveSpawnClear,
     pickSlitherSpawn,
+    flushSlitherBoostReserve,
 } from './slither-engine.js';
 import {
     ALLOWED_ENTRY_FEES,
@@ -130,7 +131,13 @@ import {
     serializeTournament,
     tournamentSettings,
 } from './tournament-system.js';
-import { calculateAffordableSolanaPayout, calculateCashoutMoney, microsToUsd, usdToMicros } from './affiliate-money.js';
+import {
+    calculateAffordableSolanaPayout,
+    calculateCashoutMoney,
+    calculateRewardTopUpCapacity,
+    microsToUsd,
+    usdToMicros,
+} from './affiliate-money.js';
 import {
     AffiliatePayout,
     activateAffiliateProfile,
@@ -666,11 +673,16 @@ async function recordAdminIssue(details = {}) {
     }
 }
 
-async function resolveAdminIssue(fingerprint) {
+async function resolveAdminIssue(fingerprint, resolution = {}) {
     if (!fingerprint || mongoose.connection.readyState !== 1) return;
+    const set = { status: 'resolved', resolvedAt: new Date() };
+    if (resolution.message) set.message = String(resolution.message).slice(0, 1200);
+    if (resolution.actualUsd != null) set.actualUsd = finiteIssueNumber(resolution.actualUsd);
+    if (resolution.differenceUsd != null) set.differenceUsd = finiteIssueNumber(resolution.differenceUsd);
+    if (resolution.context && typeof resolution.context === 'object') set.context = resolution.context;
     await AdminIssue.updateOne(
         { activeKey: String(fingerprint), status: 'open' },
-        { $set: { status: 'resolved', resolvedAt: new Date() }, $unset: { activeKey: 1 } },
+        { $set: set, $unset: { activeKey: 1 } },
     ).catch(error => console.error('[Admin Issues] Could not auto-resolve issue:', error.message));
 }
 
@@ -1601,7 +1613,12 @@ async function confirmTrackedCashout(record) {
     record.meta = { ...(record.meta || {}), confirmedAt: new Date().toISOString() };
     await record.save();
     await Promise.all([
-        resolveAdminIssue(`cashout-pending:${record._id}`),
+        resolveAdminIssue(`cashout-pending:${record._id}`, {
+            message: 'Cashout confirmed after automatic reconciliation.',
+            actualUsd: Number(record.amount) || 0,
+            differenceUsd: 0,
+            context: { transactionId: String(record._id), signature: record.meta?.signature || null },
+        }),
         resolveAdminIssue(`cashout-chain-failed:${record._id}`),
         resolveAdminIssue(`cashout-retry-failed:${record._id}`),
     ]);
@@ -2449,6 +2466,7 @@ async function executeArenaCashout(player, room, reason = 'Arena Cashout') {
 }
 
 async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout') {
+    if (player?.mode === 'slither') flushSlitherBoostReserve(room, player);
     const requestedDollarBalance = arenaCashoutUsd(player);
     const dollarBalance = reserveArenaCashout(room, player, requestedDollarBalance);
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_ENTRY_FEE;
@@ -5001,6 +5019,64 @@ async function ensureRewardWalletLiquidity(requiredLamports, solPriceUsd) {
     return houseWalletOperations.run(() => ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd));
 }
 
+function getActiveMainHouseGameLiabilityUsd() {
+    let total = 0;
+
+    for (const room of rooms) {
+        if (room.isFreeTicketRoom || room.isPersonalFreePlay || room.isSandbox || room.isTournament) continue;
+        const snapshot = calculateNormalRoomValue(room);
+        total += snapshot.playersUsd
+            + snapshot.botsUsd
+            + snapshot.agarFoodUsd
+            + snapshot.slitherFoodUsd
+            + snapshot.ejectedUsd
+            + snapshot.boostPendingUsd
+            + snapshot.foodPoolUsd
+            + snapshot.aiBudgetUsd
+            + snapshot.reservedCashoutUsd;
+    }
+
+    for (const room of competitiveSlitherRooms) {
+        if (room.isPersonalFreePlay || room.isSandbox || room.isTournament) continue;
+        total += (room.players || []).reduce((sum, player) => (
+            sum + Math.max(0, Number(player?.dollarBalance ?? player?.balance) || 0)
+        ), 0);
+        total += (room.slitherFood || []).reduce((sum, food) => (
+            sum + Math.max(0, Number(food?.dollarValue ?? food?.balance) || 0)
+        ), 0);
+    }
+
+    for (const room of survivRooms) {
+        if (room.isPersonalFreePlay || room.isSandbox || room.isTournament) continue;
+        total += [...(room.players || []), ...(room.bots || [])].reduce((sum, player) => (
+            player?.personalFreePlay || player?.adminFreeSurvivEntry
+                ? sum
+                : sum + Math.max(0, Number(player?.dollarBalance ?? player?.balance) || 0)
+        ), 0);
+        total += (room.loot || []).reduce((sum, item) => (
+            item?.type === 'money'
+                ? sum + Math.max(0, Number(item?.dollarValue ?? item?.amount) || 0)
+                : sum
+        ), 0);
+        total += Math.max(0, Number(room.lootPoolBalance) || 0);
+    }
+
+    return Math.max(0, total);
+}
+
+async function getPendingMainHouseSettlementLamports() {
+    const pending = await Transaction.find({
+        status: 'pending',
+        'meta.settlementKind': { $in: ['game_cashout', 'entry_refund'] },
+    }).select('meta.payoutLamports meta.refundLamports meta.lamports').lean();
+    return pending.reduce((sum, record) => sum + Math.max(0, Math.floor(Number(
+        record.meta?.payoutLamports
+        ?? record.meta?.refundLamports
+        ?? record.meta?.lamports
+        ?? 0
+    ) || 0)), 0);
+}
+
 async function ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd) {
     if (!REWARD_WALLET_ADDRESS || !REWARD_WALLET_SECRET) {
         throw new Error('Reward wallet not configured');
@@ -5011,6 +5087,13 @@ async function ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd
     const shortfall = Math.max(0, requiredLamports + feeBuffer - rewardBalance);
     if (!shortfall) return;
 
+    // A paid entry may already have reached House Wallet while its room value
+    // is still being installed after RPC confirmation. Do not move House funds
+    // during that short join window.
+    if (joiningUsers.size > 0) {
+        throw new Error('Reward reserve is awaiting active game entries; try again shortly');
+    }
+
     if (!HOUSE_WALLET_ADDRESS || !HOUSE_WALLET_SECRET) {
         throw new Error('Reward wallet lacks liquidity');
     }
@@ -5020,21 +5103,28 @@ async function ensureRewardWalletLiquidityUnlocked(requiredLamports, solPriceUsd
     const houseKeypair = solanaWeb3.Keypair.fromSecretKey(
         Uint8Array.from(Buffer.from(HOUSE_WALLET_SECRET, 'hex'))
     );
-    const houseBalance = await connection.getBalance(houseKeypair.publicKey);
-    let safelyAvailableLamports = pendingRewardLamports;
-    const activeNormalHumans = [...rooms, ...competitiveSlitherRooms, ...survivRooms]
-        .reduce((total, room) => total + room.players.filter(player => !player.isBot).length, 0);
-    if (activeNormalHumans === 0 && joiningUsers.size === 0) {
-        const operatingBufferLamports = Math.ceil((1 / price) * solanaWeb3.LAMPORTS_PER_SOL);
-        safelyAvailableLamports = Math.max(
-            pendingRewardLamports,
-            houseBalance - operatingBufferLamports - feeBuffer,
+    const [houseBalance, pendingSettlementLamports] = await Promise.all([
+        connection.getBalance(houseKeypair.publicKey),
+        getPendingMainHouseSettlementLamports(),
+    ]);
+    const activeGameLiabilityUsd = getActiveMainHouseGameLiabilityUsd();
+    const activeGameLiabilityLamports = Math.ceil(
+        (activeGameLiabilityUsd / price) * solanaWeb3.LAMPORTS_PER_SOL,
+    );
+    const capacity = calculateRewardTopUpCapacity({
+        houseLamports: houseBalance,
+        pendingRewardLamports,
+        activeGameLiabilityLamports,
+        pendingSettlementLamports,
+        feeBufferLamports: feeBuffer,
+    });
+    if (shortfall > capacity.topUpCapacityLamports) {
+        console.warn(
+            `[Reward Liquidity] Top-up blocked: ${shortfall} lamports requested, `
+            + `${capacity.protectedLamports} protected for live games/pending cashouts, `
+            + `${capacity.topUpCapacityLamports} safely available.`,
         );
-    }
-    if (shortfall > safelyAvailableLamports) {
-        throw new Error(activeNormalHumans > 0
-            ? 'Reward reserve is awaiting the next arena settlement'
-            : 'Reward and house wallets lack protected liquidity');
+        throw new Error('Reward reserve is awaiting arena settlement; active game and cashout funds are protected');
     }
     if (houseBalance < shortfall + feeBuffer) throw new Error('Reward and house wallets lack liquidity');
 
@@ -11945,6 +12035,7 @@ io.on('connection', (socket) => {
             if (switchingNormalMode) {
                 const oldPlayer = existing.player;
                 switchedDollarBalance = oldPlayer.dollarBalance ?? oldPlayer.balance ?? null;
+                if (oldPlayer.mode === 'slither') flushSlitherBoostReserve(room, oldPlayer);
                 if (oldPlayer.removeTimeout) clearTimeout(oldPlayer.removeTimeout);
                 const oldSocket = io.sockets.sockets.get(oldPlayer.id);
                 if (oldSocket?.connected && oldSocket.id !== socket.id) {
@@ -14066,17 +14157,25 @@ const PORT = process.env.PORT || 5000;
 app.use((err, req, res, next) => {
     applyCorsHeaders(req, res);
     console.error('Unhandled error:', err);
-    void recordAdminIssue({
-        fingerprint: `unhandled-http:${req.method}:${req.route?.path || req.path || 'unknown'}`,
-        severity: 'error',
-        category: 'system',
-        code: 'unhandled_http_error',
-        title: 'Unhandled backend request error',
-        message: String(err?.message || err || 'Unknown backend error'),
-        userId: req.user?.id || null,
-        context: { method: req.method, path: req.route?.path || req.path || '' },
-    });
-    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+    const status = Number(err?.status || err?.statusCode) || 500;
+    // Express reports malformed/aborted client payloads through this handler
+    // as 400s. They are rejected requests, not backend payout failures, and
+    // should not hide real cashout problems in the Issues tab.
+    if (status >= 500) {
+        void recordAdminIssue({
+            fingerprint: `unhandled-http:${req.method}:${req.route?.path || req.path || 'unknown'}`,
+            severity: 'error',
+            category: 'system',
+            code: 'unhandled_http_error',
+            title: 'Unhandled backend request error',
+            message: String(err?.message || err || 'Unknown backend error'),
+            userId: req.user?.id || null,
+            context: { method: req.method, path: req.route?.path || req.path || '' },
+        });
+    }
+    if (!res.headersSent) {
+        res.status(status).json({ error: status >= 500 ? 'Internal server error' : String(err?.message || 'Bad Request') });
+    }
 });
 
 httpServer.listen(PORT, () => console.log(`Servern körs på port ${PORT}`));
