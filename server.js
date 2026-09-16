@@ -188,6 +188,7 @@ import {
 import { getAgarBotCellCenter, planAgarBotEscapeSplit, planAgarBotSplit } from './agar-bot-ai.js';
 import { createSerialOperationQueue } from './serial-operation-queue.js';
 import { calculateRoomCashoutReservation } from './cashout-accounting.js';
+import { waitForActiveSetToDrain } from './reset-safety.js';
 import { calculateReferredCashoutFeeRouting } from './affiliate-fee-routing.js';
 import {
     agarEconomicVisualMass,
@@ -2772,6 +2773,9 @@ async function cashOutRoomPlayers(room) {
 }
 
 function resetRoomEntities(room) {
+    // Every player must have settled before reset. Clearing here is a final
+    // fail-safe so a stale entity can never survive after funding is zeroed.
+    room.players = [];
     room.bots = [];
     room.slitherBots = [];
     room.food = [];
@@ -2956,6 +2960,25 @@ async function performGlobalArenaReset({ scheduled = false } = {}) {
     for (const room of rooms) room.isResetting = true;
     for (const room of competitiveSlitherRooms) room.isResetting = true;
     for (const room of survivRooms) room.isResetting = true;
+
+    // A join can pass the resetting check and then spend several seconds
+    // confirming its Solana transfer. Block new joins above and let every
+    // already-started join finish before inspecting/cashing out the rooms.
+    // Otherwise resetRoomEntities could zero fundedEntryUsd immediately before
+    // that join installs its paid starting balance.
+    const joinsDrained = await waitForActiveSetToDrain(joiningUsers);
+    if (!joinsDrained) {
+        console.error(`[Arena Reset] Deferred because ${joiningUsers.size} player join(s) did not finish safely.`);
+        GLOBAL_ARENA_START = Date.now() - c.roomDuration + 30_000;
+        for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
+            room.startTime = GLOBAL_ARENA_START;
+        }
+        for (const room of rooms) room.isResetting = false;
+        for (const room of competitiveSlitherRooms) room.isResetting = false;
+        for (const room of survivRooms) room.isResetting = false;
+        globalArenaResetting = false;
+        return { success: false, deferred: true, reason: 'active_joins' };
+    }
 
     let scheduledReleaseSha = null;
     if (scheduled) {
@@ -9842,7 +9865,7 @@ async function initializeDatabaseBackedSystems() {
 
     databaseStartupPromise = (async () => {
         console.log('[Startup] Initializing database-backed systems...');
-        const [permanentRewardMigration, , , displaySettings] = await Promise.all([
+        const [permanentRewardMigration, , , displaySettings, rejectedRequestCleanup] = await Promise.all([
             User.updateMany(
                 { permanentRewardModelVersion: { $ne: 4 } },
                 { $set: {
@@ -9854,12 +9877,30 @@ async function initializeDatabaseBackedSystems() {
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
             SiteDisplaySettings.findOne({ key: 'pregame' }).lean(),
+            AdminIssue.updateMany(
+                {
+                    status: 'open',
+                    code: 'unhandled_http_error',
+                    message: /^Bad Request$/i,
+                },
+                {
+                    $set: {
+                        status: 'resolved',
+                        resolvedAt: new Date(),
+                        message: 'Rejected malformed client request; no backend payout failure occurred.',
+                    },
+                    $unset: { activeKey: 1 },
+                },
+            ),
         ]);
         newGameJoinsLocked = !!displaySettings?.newGameJoinsLocked;
         await loadReleaseStateOnStartup();
         serverReady = true;
         emitReleaseState();
-        console.log(`Core startup complete. Permanent reward migration: ${permanentRewardMigration.modifiedCount}.`);
+        console.log(
+            `Core startup complete. Permanent reward migration: ${permanentRewardMigration.modifiedCount}. `
+            + `Rejected-request issues resolved: ${rejectedRequestCleanup.modifiedCount}.`,
+        );
 
         // Historical repair/reconciliation can involve hundreds of sequential
         // database operations. It is idempotent and is not required to safely
@@ -14119,8 +14160,9 @@ function maybeLogNormalRoomValueInvariant(room, now = Date.now()) {
     const toleranceUsd = Math.max(0.0001, snapshot.fundedEntryUsd * 1e-7);
     const fingerprint = `economy-invariant:${room.id}`;
     if (snapshot.excessUsd <= toleranceUsd) {
-        if (room._economyInvariantIssueOpen) {
+        if (room._economyInvariantIssueOpen || !room._economyInvariantHealthySynced) {
             room._economyInvariantIssueOpen = false;
+            room._economyInvariantHealthySynced = true;
             void resolveAdminIssue(fingerprint);
         }
         return;
@@ -14128,6 +14170,7 @@ function maybeLogNormalRoomValueInvariant(room, now = Date.now()) {
     if (now - (room._lastValueInvariantCriticalAt || 0) < 30_000) return;
     room._lastValueInvariantCriticalAt = now;
     room._economyInvariantIssueOpen = true;
+    room._economyInvariantHealthySynced = false;
     console.error(
         `[CRITICAL ECONOMY INVARIANT] ${room.id} contains $${snapshot.accountedUsd.toFixed(6)} `
         + `against $${snapshot.fundedEntryUsd.toFixed(6)} of paid entry funding `
