@@ -160,10 +160,12 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
     )));
 
     assert.equal(SURVIV.worldHalf, 10000);
-    assert.equal(map.landmarks.length, 35);
-    assert.ok(houses.length >= 178 && houses.length <= 188,
+    assert.equal(map.landmarks.length, 36);
+    assert.ok(houses.length >= 172 && houses.length <= 182,
         `expected a deliberate building budget, got ${houses.length}`);
-    assert.ok(chests.length < houses.length);
+    // Each country home retains the loot of the three cottages it replaces.
+    const replacementLootAllowance = houses.filter(house => house.role === 'countryHome').length * 2;
+    assert.ok(chests.length < houses.length + replacementLootAllowance);
     assert.deepEqual(new Set(chests.map(item => item.containerType)), new Set([
         'wood_crate', 'supply_crate', 'ammo_crate', 'medical_crate', 'armory_crate',
     ]));
@@ -174,6 +176,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
         assert.ok(floor, 'loose map loot should belong to a building');
         assert.equal(item.location, 'interior');
         assert.ok(pointInRect(item.x, item.y, floor, -18));
+        assert.ok(pointInHouseFootprint(item.x, item.y, floor), 'indoor loot cannot spawn in a missing L/T-house corner');
     }
     assert.ok(maxExtent <= SURVIV.worldHalf);
 });
@@ -227,6 +230,82 @@ test('Glasshouse Gardens fills the central-west rotation with breakable cover an
         )
     ));
     assert.ok(serviceRoad, 'glasshouse service lane should connect the compound to the west highway');
+});
+
+test('Golden Clover Casino is a connected medium landmark with distinct gaming fixtures and safe circulation', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const landmark = map.landmarks.find(item => item.type === 'casino');
+    const casino = map.obstacles.find(obstacle => (
+        obstacle.kind === 'houseFloor'
+        && obstacle.landmarkType === 'casino'
+        && obstacle.role === 'casinoHall'
+    ));
+
+    assert.ok(landmark);
+    assert.equal(landmark.name, 'Golden Clover Casino');
+    assert.deepEqual([landmark.x, landmark.y], [3500, 2900]);
+    assert.ok(casino);
+    assert.deepEqual([casino.w, casino.h], [920, 640]);
+    assert.equal(casino.blueprint, 'casino-floor');
+
+    const contents = map.obstacles.filter(obstacle => obstacle.houseId === casino.id);
+    const rooms = contents.filter(obstacle => obstacle.kind === 'roomZone');
+    const doors = contents.filter(obstacle => obstacle.kind === 'door');
+    const furniture = contents.filter(obstacle => obstacle.kind === 'furniture');
+    const roomTypes = new Set(rooms.map(room => room.variant));
+    const furnitureTypes = furniture.map(prop => prop.variant);
+
+    assert.deepEqual(roomTypes, new Set(['gaming-floor', 'security-office', 'cashier', 'staff-room']));
+    assert.equal(doors.filter(door => door.entranceRole !== 'interiorDoor').length, 3);
+    assert.equal(doors.filter(door => door.entranceRole === 'interiorDoor').length, 3);
+    assert.equal(furnitureTypes.filter(type => type === 'slotMachine').length, 3);
+    assert.equal(furnitureTypes.filter(type => type === 'cardTable').length, 2);
+    assert.ok(['rouletteTable', 'cashierCounter', 'casinoSafe']
+        .every(type => furnitureTypes.includes(type)));
+    assert.ok(furniture.every(prop => (
+        prop.collidable
+        && prop.destructible
+        && prop.hp === prop.maxHp
+        && (!Number.isFinite(prop.hitboxW) || prop.hitboxW <= prop.w)
+        && (!Number.isFinite(prop.hitboxH) || prop.hitboxH <= prop.h)
+    )));
+
+    for (const prop of furniture) {
+        assert.ok(pointInRect(prop.x, prop.y, casino, -12));
+        for (const door of doors) {
+            const horizontal = door.w >= door.h;
+            const panelLength = Math.max(door.w, door.h) + 8;
+            const clearance = {
+                x: door.x,
+                y: door.y,
+                w: horizontal ? panelLength + 12 : panelLength * 2 + 12,
+                h: horizontal ? panelLength * 2 + 12 : panelLength + 12,
+            };
+            assert.equal(rectsOverlap(
+                prop.x, prop.y, prop.w + 8, prop.h + 8,
+                clearance.x, clearance.y, clearance.w, clearance.h,
+            ), false, `${prop.variant} should not block ${door.entranceRole}`);
+        }
+    }
+
+    const casinoLoot = map.loot.filter(item => item.houseId === casino.id);
+    assert.equal(casinoLoot.length, 2);
+    assert.ok(casinoLoot.some(item => item.tier === 'rare' && item.room === 'security-office'));
+    assert.ok(casinoLoot.every(item => Number(item.dollarValue || item.contents?.money || 0) === 0));
+
+    const drive = map.obstacles.find(obstacle => (
+        obstacle.kind === 'road'
+        && obstacle.role === 'casinoDrive'
+        && obstacle.landmarkType === 'casino'
+    ));
+    const networkRoads = map.obstacles.filter(obstacle => (
+        obstacle.kind === 'road' && obstacle.role === 'networkRoad'
+    ));
+    assert.ok(drive);
+    assert.ok(networkRoads.some(road => rectsOverlap(
+        drive.x, drive.y, drive.w, drive.h,
+        road.x, road.y, road.w, road.h,
+    )), 'casino drive should meet the main highway');
 });
 
 test('airdrop lifecycle lands a tough military crate without minting money', () => {
@@ -370,6 +449,33 @@ test('estate buildings have generous separation and walkable entrances on both s
                 }
             }
         }
+    }
+});
+
+test('three small-house clusters become distinct larger country homes with real outlines', () => {
+    const map = generateSurvivMap(SURVIV.worldHalf);
+    const homes = map.obstacles.filter(o => o.kind === 'houseFloor' && o.role === 'countryHome');
+    assert.equal(homes.length, 3, 'nine cottages should be replaced by three homes');
+    assert.deepEqual(homes.map(o => o.footprint.length).sort(), [4, 6, 8]);
+    assert.equal(new Set(homes.map(o => o.blueprint)).size, 3);
+    for (const home of homes) {
+        assert.ok(home.w * home.h >= 330000);
+        const objects = map.obstacles.filter(o => o.houseId === home.id);
+        const rooms = objects.filter(o => o.kind === 'roomZone');
+        assert.ok(rooms.length >= 5);
+        assert.ok(rooms.every(o => pointInHouseFootprint(o.x, o.y, home)));
+        assert.ok(objects.filter(o => o.kind === 'furniture').length >= 8);
+        assert.equal(objects.filter(o => o.kind === 'door' && o.entranceRole !== 'interiorDoor').length, 2);
+        const chests = map.loot.filter(o => o.type === 'chest' && o.houseId === home.id);
+        assert.equal(chests.length, 3);
+        for (const chest of chests) {
+            assert.ok(pointInHouseFootprint(chest.x, chest.y, home));
+            assert.ok(objects.filter(o => o.collidable !== false).every(o =>
+                !circleRectCollision(chest.x, chest.y, chest.hitRadius + 4, obstacleCollisionRectForTest(o))),
+            `${home.blueprint} crate must not overlap furniture or walls`);
+        }
+        assert.ok(!map.obstacles.some(o => o.role === 'hamletHome'
+            && Math.abs(o.x - home.x) < 520 && Math.abs(o.y - home.y) < 520));
     }
 });
 
@@ -1438,9 +1544,10 @@ test('farm, research campus, and hamlets use purposeful road-facing layouts', ()
     assert.deepEqual(new Set(farmBuildings.map(building => building.role)), new Set(['barn', 'farmhouse', 'shed', 'greenhouse']));
     assert.equal(labBuildings.length, 3);
     assert.deepEqual(new Set(labBuildings.map(building => building.label)), new Set(['LAB A', 'LAB B', 'POWER']));
-    assert.ok(hamletFields.length >= 3);
+    const countryHomes = map.obstacles.filter(o => o.kind === 'houseFloor' && o.role === 'countryHome');
+    assert.ok(hamletFields.length + countryHomes.length >= 3, 'country homes retain the three authored residential sites');
     assert.equal(hamletHomes.length, hamletFields.length * 3);
-    assert.ok([...farmBuildings, ...labBuildings, ...hamletHomes].every(building => doorsByHouse.has(building.id)));
+    assert.ok([...farmBuildings, ...labBuildings, ...hamletHomes, ...countryHomes].every(building => doorsByHouse.has(building.id)));
 
     const farmRoad = map.obstacles.find(obstacle => obstacle.kind === 'road' && obstacle.landmarkType === 'farm' && obstacle.role === 'driveway');
     const labRoad = map.obstacles.find(obstacle => obstacle.kind === 'road' && obstacle.landmarkType === 'lab' && obstacle.role === 'driveway');
@@ -2856,7 +2963,7 @@ test('full-auto fire slows movement while semi-auto fire does not', () => {
     room.players.push(player);
 
     processSurvivRoom(room, silentIo, Date.now() + 600000);
-    assert.ok(Math.abs(player.x - SURVIV.playerSpeed * WEAPONS.smg.firingMoveMultiplier) < 0.001);
+    assert.ok(Math.abs(player.x - SURVIV.playerSpeed * WEAPONS.smg.firingMoveMultiplier * 0.9) < 0.001);
 
     const autoX = player.x;
     player.shooting = false;
@@ -2868,6 +2975,29 @@ test('full-auto fire slows movement while semi-auto fire does not', () => {
     player.shooting = true;
     processSurvivRoom(room, silentIo, Date.now() + 600200);
     assert.ok(Math.abs((player.x - normalX) - SURVIV.playerSpeed) < 0.001);
+
+    for (const type of ['mp5', 'm416', 'm249', 'm134', 'g18c']) {
+        player.weapon = { type, ammo: 20, reloading: false, reloadEndAt: 0, lastShotAt: 0 };
+        const before = player.x;
+        const state = processSurvivRoom(room, silentIo, Date.now() + 600000);
+        const expected = (WEAPONS[type].firingMoveMultiplier || 0.75) * 0.9;
+        assert.ok(Math.abs(player.x - before - SURVIV.playerSpeed * expected) < 0.001, type);
+        let snapshot;
+        broadcastSurvivState(room, { to: () => ({ emit: (event, data) => {
+            if (event === 'survivTick') snapshot = data;
+        } }) }, state, {});
+        assert.equal(snapshot.you.firingMoveMultiplier, expected,
+            `${type} prediction must receive the authoritative slowdown`);
+        for (const reloading of [false, true]) {
+            player.weapon.ammo = reloading ? 20 : 0;
+            player.weapon.reloading = reloading;
+            player.weapon.reloadEndAt = Date.now() + 10000;
+            const idleX = player.x;
+            processSurvivRoom(room, silentIo, Date.now() + 600000);
+            assert.ok(Math.abs(player.x - idleX - SURVIV.playerSpeed) < 0.001,
+                `${type} must not slow movement while empty or reloading`);
+        }
+    }
 });
 
 test('human semi-auto guns fire once per click but accept rapid new clicks', () => {

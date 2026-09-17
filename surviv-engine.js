@@ -233,6 +233,11 @@ const LEGACY_WEAPONS = {
 void LEGACY_WEAPONS;
 export const WEAPONS = SURVIV_WEAPONS;
 
+function getFiringMoveMultiplier(weaponType) {
+    const definition = WEAPONS[weaponType] || WEAPONS.fists;
+    return definition.automatic ? (definition.firingMoveMultiplier || 0.75) * 0.9 : 1;
+}
+
 const WEAPON_RARITY_POOLS = {
     common: SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'common'),
     rare: ['knife', ...SURVIV_STANDARD_FIREARM_IDS.filter(id => WEAPONS[id].rarity === 'rare')],
@@ -2119,8 +2124,61 @@ const LARGE_RESIDENCE_STYLES = Object.freeze([
     { variant: 'residence-teal', hue: 181 }, { variant: 'residence-clay', hue: 18 },
 ]);
 
+// Replace three repetitive three-cottage clusters with one landmark home each.
+// These are actual floor/collision outlines, not rectangular buildings hidden by roofs.
+const COUNTRY_HOME_BLUEPRINTS = Object.freeze([
+    {
+        id: 'orchard-longhouse', w: 480, h: 700,
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'east', offset: -0.02, role: 'gardenEntrance' }],
+        rooms: [
+            [-0.25, -0.32, 0.38, 0.26, 'bedroom'], [0.25, -0.32, 0.38, 0.26, 'bathroom'],
+            [-0.24, -0.02, 0.40, 0.26, 'kitchen'], [0.24, -0.02, 0.40, 0.26, 'dining-room'],
+            [0, 0.28, 0.82, 0.28, 'living-room'], [0, 0.44, 0.28, 0.09, 'entry'],
+        ],
+        walls: [
+            ['h', 0, -0.16, 1, [[-0.25, 60], [0.25, 60]], 'door'],
+            ['v', 0, -0.33, 0.34, [], 'wall'],
+            ['h', 0, 0.14, 1, [[0, 110]], 'arch'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'terrace-house-l', w: 760, h: 470,
+        footprint: [[-0.5, -0.5], [0.04, -0.5], [0.04, -0.08], [0.5, -0.08], [0.5, 0.5], [-0.5, 0.5]],
+        exits: [{ side: 'south', offset: 0.22, role: 'mainEntrance' }, { side: 'west', offset: -0.26, role: 'gardenEntrance' }],
+        rooms: [
+            [-0.24, -0.29, 0.44, 0.32, 'bedroom'], [-0.36, 0.01, 0.21, 0.19, 'bathroom'],
+            [-0.23, 0.30, 0.46, 0.28, 'living-room'], [0.13, 0.21, 0.21, 0.43, 'dining-room'],
+            [0.37, 0.21, 0.18, 0.43, 'kitchen'],
+        ],
+        walls: [
+            ['h', -0.23, -0.10, 0.54, [[-0.12, 60]], 'door'],
+            ['h', -0.37, 0.14, 0.26, [], 'wall'],
+            ['v', -0.24, 0.02, 0.24, [[0.02, 58]], 'door'],
+        ],
+        lootRoom: 0,
+    },
+    {
+        id: 'three-wing-house-t', w: 760, h: 460,
+        footprint: [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.04], [0.20, 0.04], [0.20, 0.5], [-0.20, 0.5], [-0.20, 0.04], [-0.5, 0.04]],
+        exits: [{ side: 'south', offset: 0, role: 'mainEntrance' }, { side: 'east', offset: -0.22, role: 'gardenEntrance' }],
+        rooms: [
+            [-0.35, -0.23, 0.23, 0.42, 'bedroom'], [-0.08, -0.34, 0.23, 0.22, 'bathroom'],
+            [0.17, -0.23, 0.20, 0.42, 'dining-room'], [0.38, -0.23, 0.17, 0.42, 'kitchen'],
+            [0, 0.26, 0.32, 0.32, 'living-room'],
+        ],
+        walls: [
+            ['v', -0.21, -0.23, 0.54, [[-0.16, 60]], 'door'],
+            ['h', -0.075, -0.19, 0.27, [[-0.08, 58]], 'door'],
+            ['v', 0.06, -0.345, 0.31, [], 'wall'],
+            ['h', 0, 0.04, 0.40, [[0, 100]], 'arch'],
+        ],
+        lootRoom: 0,
+    },
+]);
+
 function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
-    const blueprint = LARGE_RESIDENCE_BLUEPRINTS[options.blueprintIndex % LARGE_RESIDENCE_BLUEPRINTS.length];
+    const blueprint = options.blueprint || LARGE_RESIDENCE_BLUEPRINTS[options.blueprintIndex % LARGE_RESIDENCE_BLUEPRINTS.length];
     const style = LARGE_RESIDENCE_STYLES[options.styleIndex % LARGE_RESIDENCE_STYLES.length];
     const mirror = !!options.mirror;
     const wall = 15;
@@ -2144,7 +2202,7 @@ function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
         collidable: false,
         hue: style.hue + (options.instanceIndex % 3) * 3,
         variant: style.variant,
-        role: 'largeResidence',
+        role: options.role || 'largeResidence',
         landmarkType: 'residential',
         orientation: exits[0].side,
         blueprint: blueprint.id,
@@ -2316,6 +2374,36 @@ function addLargeResidence(obstacles, loot, spawnPoints, x, y, options = {}) {
     }
     spawnPoints.push({ x: doorX + outwardX * 90, y: doorY + outwardY * 90 });
     return floor;
+}
+
+function placeCountryHomeLoot(obstacles, loot, home) {
+    const rooms = obstacles.filter(o => o.houseId === home.id && o.kind === 'roomZone');
+    const solids = obstacles.filter(o => o.houseId === home.id && o.collidable !== false);
+    const sweeps = solids.filter(o => o.kind === 'door').map(getInteriorDoorSwingRect);
+    const chests = loot.filter(o => o.houseId === home.id && o.type === 'chest');
+    const placed = [];
+    for (const chest of chests) {
+        const radius = chest.hitRadius + 6;
+        const candidates = [];
+        for (const room of rooms) {
+            for (let y = room.y - room.h / 2 + radius; y <= room.y + room.h / 2 - radius; y += 24) {
+                for (let x = room.x - room.w / 2 + radius; x <= room.x + room.w / 2 - radius; x += 24) {
+                    candidates.push({ x, y, room: room.variant });
+                }
+            }
+        }
+        candidates.sort((a, b) => Math.hypot(a.x - chest.x, a.y - chest.y) - Math.hypot(b.x - chest.x, b.y - chest.y));
+        const position = candidates.find(p => {
+            if (![[0, 0], [-radius, -radius], [radius, -radius], [-radius, radius], [radius, radius]]
+                .every(([dx, dy]) => pointInRect(p.x + dx, p.y + dy, home))) return false;
+            if (solids.some(o => circleRectCollision(p.x, p.y, radius, getObstacleCollisionRect(o)))) return false;
+            if (sweeps.some(rect => circleRectCollision(p.x, p.y, radius, rect))) return false;
+            return placed.every(other => Math.hypot(p.x - other.x, p.y - other.y) > radius + other.hitRadius + 8);
+        });
+        // Authored rooms are tested to provide a valid position for every crate.
+        if (position) Object.assign(chest, position);
+        placed.push(chest);
+    }
 }
 
 function addManorHouse(obstacles, loot, spawnPoints, x, y) {
@@ -4176,8 +4264,8 @@ const WILDERNESS_TRAIL_PLANS = [
         { x: -2480, y: 4470 }, { x: -2210, y: 5060 },
     ], opts: { width: 50, variant: 'forest', label: 'Birch Path' } },
     { points: [
-        { x: 3420, y: 2980 }, { x: 3800, y: 3300 }, { x: 4200, y: 3540 },
-        { x: 4650, y: 3700 }, { x: 5150, y: 3820 },
+        { x: 4050, y: 3270 }, { x: 4200, y: 3450 }, { x: 4450, y: 3600 },
+        { x: 4800, y: 3720 }, { x: 5150, y: 3820 },
     ], opts: { width: 48, label: 'Prison Footpath' } },
 ];
 
@@ -4925,6 +5013,9 @@ function addScatteredGroundLoot(obstacles, loot) {
                 x: floor.x + (Math.random() - 0.5) * Math.max(10, floor.w - insetX * 2),
                 y: floor.y + (Math.random() - 0.5) * Math.max(10, floor.h - insetY * 2),
             };
+            // A concave home's bounding rectangle includes its outdoor notch.
+            // Loose indoor loot must use the same true floor outline as players.
+            if (!pointInRect(pos.x, pos.y, floor)) continue;
             const blocked = obstacles.some(obstacle => (
                 obstacle.collidable !== false
                 && circleRectCollision(pos.x, pos.y, 20, getObstacleCollisionRect(obstacle))
@@ -5432,11 +5523,11 @@ function addCasino(obstacles, loot, spawnPoints, x, y) {
     }
     addFixture(gamingFloor, 'sofa', -338, 214, 96, 38, { role: 'casinoLounge' });
 
-    addFixture(cashier, 'cashierCounter', 292, 25, 126, 38, { hitboxW: 118, hitboxH: 32 });
+    addFixture(cashier, 'cashierCounter', 300, 25, 100, 38, { hitboxW: 92, hitboxH: 32 });
     addFixture(cashier, 'casinoSafe', 403, 26, 34, 70, { hitboxW: 30, hitboxH: 64 });
     addFixture(security, 'controlConsole', 292, -190, 92, 40, { role: 'securityDesk' });
     addFixture(security, 'locker', 402, -226, 30, 62, { role: 'securityLocker' });
-    addFixture(staff, 'storageShelf', 247, 220, 34, 88, { role: 'staffStorage' });
+    addFixture(staff, 'storageShelf', 280, 220, 34, 88, { role: 'staffStorage' });
     addFixture(staff, 'locker', 392, 220, 34, 88, { role: 'staffLocker' });
 
     loot.push(makeChest(x + 360, y - 190, 'rare', null, 'map', {
@@ -5922,8 +6013,8 @@ export function generateSurvivMap(worldHalf) {
     const hamletPlans = [
         { x: -1200, y: 7600, orientation: 'vertical' },
         { x: 1200, y: -6900, orientation: 'horizontal' },
-        { x: 4200, y: -8300, orientation: 'vertical' },
-        { x: 7000, y: 3000, orientation: 'horizontal' },
+        { x: 4200, y: -8300, orientation: 'vertical', countryHome: 0 },
+        { x: 7000, y: 3000, orientation: 'horizontal', countryHome: 1 },
         { x: 700, y: 3600, orientation: 'horizontal' },
         { x: 1500, y: 1000, orientation: 'horizontal' },
         { x: -4000, y: 500, orientation: 'horizontal' },
@@ -5931,13 +6022,27 @@ export function generateSurvivMap(worldHalf) {
         { x: 4000, y: 7000, orientation: 'horizontal' },
         { x: -3500, y: -2000, orientation: 'horizontal' },
         { x: 8500, y: 1000, orientation: 'vertical' },
-        { x: -6500, y: 8500, orientation: 'horizontal' },
+        { x: -6500, y: 8500, orientation: 'horizontal', countryHome: 2 },
     ];
     for (const plan of hamletPlans) {
         const w = plan.orientation === 'horizontal' ? 1040 : 720;
         const h = plan.orientation === 'horizontal' ? 720 : 1040;
         if (isAreaOverlapping(plan.x, plan.y, w, h, 240, placedPositions)) continue;
-        addRoadsideHamlet(obstacles, loot, spawnPoints, plan.x, plan.y, plan.orientation);
+        if (plan.countryHome !== undefined) {
+            const home = addLargeResidence(obstacles, loot, spawnPoints, plan.x, plan.y, {
+                blueprint: COUNTRY_HOME_BLUEPRINTS[plan.countryHome],
+                styleIndex: [7, 0, 3][plan.countryHome], instanceIndex: 30 + plan.countryHome,
+                role: 'countryHome',
+            });
+            // Keep the former cluster's three loot opportunities, spread among rooms.
+            const rooms = obstacles.filter(o => o.houseId === home.id && o.kind === 'roomZone');
+            for (const room of rooms.slice(-2)) {
+                loot.push(makeChest(room.x, room.y, 'common', null, 'map', { houseId: home.id, room: room.variant }));
+            }
+            placeCountryHomeLoot(obstacles, loot, home);
+        } else {
+            addRoadsideHamlet(obstacles, loot, spawnPoints, plan.x, plan.y, plan.orientation);
+        }
         placedPositions.push({ x: plan.x, y: plan.y, w, h });
     }
     // Solo homes and cabins fill the rotations between major destinations.
@@ -8853,7 +8958,7 @@ function processEntity(entity, room, now, effectiveRadius, zone) {
     const movementSurface = getEntitySurfaceKind(room, entity);
     const movementSpeed = SURVIV.playerSpeed
         * (movementSurface === 'water' ? SURVIV.waterMoveMultiplier : 1)
-        * (firingAutomaticWeapon ? activeWeaponDef.firingMoveMultiplier || 0.75 : 1);
+        * (firingAutomaticWeapon ? getFiringMoveMultiplier(entity.weapon?.type) : 1);
     moveEntity(entity, room, entity.inputDx, entity.inputDy, movementSpeed);
     entity.surface = getEntitySurfaceKind(room, entity);
     entity.angle = entity.aimAngle ?? entity.angle;
@@ -8931,6 +9036,7 @@ function serializePlayer(p, isYou) {
         maxHp: p.maxHp,
         vestLevel: normalizeVestLevel(p.vestLevel),
         weapon: p.weapon?.type || 'fists',
+        firingMoveMultiplier: getFiringMoveMultiplier(p.weapon?.type),
         ammo: p.weapon?.ammo ?? 0,
         clipSize: wDef.clipSize,
         reloading: !!p.weapon?.reloading,
