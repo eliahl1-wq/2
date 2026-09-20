@@ -2954,7 +2954,7 @@ async function waitForBattleRoyaleReleaseDrain(maxWaitMs = 8 * 60_000) {
     return false;
 }
 
-async function performGlobalArenaReset({ scheduled = false } = {}) {
+async function performGlobalArenaReset() {
     if (globalArenaResetting) return { success: false, alreadyRunning: true };
     globalArenaResetting = true;
     for (const room of rooms) room.isResetting = true;
@@ -2980,13 +2980,15 @@ async function performGlobalArenaReset({ scheduled = false } = {}) {
         return { success: false, deferred: true, reason: 'active_joins' };
     }
 
-    let scheduledReleaseSha = null;
-    if (scheduled) {
-        try {
-            scheduledReleaseSha = await beginScheduledReleaseReset();
-        } catch (error) {
-            console.error('[Release] Could not inspect the pending release before reset:', error.message);
-        }
+    // A successful global reset is the safe deployment boundary regardless of
+    // whether it was started by the timer, Reset, or Reset + Sweep. Claim a
+    // pending release here so manual maintenance does not have to wait for the
+    // next three-hour reset.
+    let pendingReleaseSha = null;
+    try {
+        pendingReleaseSha = await beginScheduledReleaseReset();
+    } catch (error) {
+        console.error('[Release] Could not inspect the pending release before reset:', error.message);
     }
 
     try {
@@ -3024,8 +3026,8 @@ async function performGlobalArenaReset({ scheduled = false } = {}) {
             for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
                 room.startTime = GLOBAL_ARENA_START;
             }
-            if (scheduledReleaseSha) {
-                await releaseScheduledMaintenance(scheduledReleaseSha, 'Arena reset deferred because cashouts were unsettled.');
+            if (pendingReleaseSha) {
+                await releaseScheduledMaintenance(pendingReleaseSha, 'Arena reset deferred because cashouts were unsettled.');
             }
             return { success: false, deferred: true, reason: 'unsettled_cashouts' };
         }
@@ -3043,8 +3045,8 @@ async function performGlobalArenaReset({ scheduled = false } = {}) {
             for (const room of [...rooms, ...competitiveSlitherRooms, ...survivRooms]) {
                 room.startTime = GLOBAL_ARENA_START;
             }
-            if (scheduledReleaseSha) {
-                await releaseScheduledMaintenance(scheduledReleaseSha, 'Arena reset deferred because the wallet sweep failed.');
+            if (pendingReleaseSha) {
+                await releaseScheduledMaintenance(pendingReleaseSha, 'Arena reset deferred because the wallet sweep failed.');
             }
             return { success: false, deferred: true, reason: 'pool_sweep_failed' };
         }
@@ -3081,31 +3083,31 @@ async function performGlobalArenaReset({ scheduled = false } = {}) {
             meta: { event: 'reset_complete', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
             status: 'confirmed',
         });
-        if (scheduledReleaseSha) {
+        if (pendingReleaseSha) {
             const activeTournamentSession = [...tournamentRooms.values()].some(room =>
                 room.players.some(player => !player.isBot && !player.disconnected),
             );
             if (activeTournamentSession) {
                 await releaseScheduledMaintenance(
-                    scheduledReleaseSha,
+                    pendingReleaseSha,
                     'Deployment deferred because an in-memory tournament session is still active.',
                 );
             } else if (!await waitForBattleRoyaleReleaseDrain()) {
                 await releaseScheduledMaintenance(
-                    scheduledReleaseSha,
+                    pendingReleaseSha,
                     'Deployment deferred because Battle Royale sessions did not drain safely.',
                 );
             } else {
-                await triggerScheduledRailwayDeploy(scheduledReleaseSha);
+                await triggerScheduledRailwayDeploy(pendingReleaseSha);
             }
         }
         return { success: true };
     } catch (error) {
-        if (scheduledReleaseSha && releaseMaintenanceActive) {
-            await releaseScheduledMaintenance(scheduledReleaseSha, error).catch(recoveryError => {
+        if (pendingReleaseSha && releaseMaintenanceActive) {
+            await releaseScheduledMaintenance(pendingReleaseSha, error).catch(recoveryError => {
                 console.error('[Release] Reset failure recovery failed:', recoveryError.message);
                 armReleaseFailureRecovery(
-                    scheduledReleaseSha,
+                    pendingReleaseSha,
                     30_000,
                     'Reset failure recovery was delayed by a database error; release was requeued.',
                 );
@@ -9135,7 +9137,7 @@ app.post('/api/admin/trigger-reset', authenticateAdmin, (req, res) => {
     performGlobalArenaReset();
     res.json({
         success: true,
-        message: 'Global arena reset started. Main house wallet will be swept. BR wallets and active BR matches are not affected.',
+        message: 'Global arena reset started. Main house wallet will be swept and any pending backend release will deploy after the safe drain. BR wallets and active BR matches are not affected.',
     });
 });
 
@@ -9153,7 +9155,7 @@ app.post('/api/admin/trigger-sweep', sensitiveRateLimit({ limit: 5, windowMs: 60
         }
         res.json({
             success: true,
-            message: 'Full arena reset completed: players cashed out, pools cleared, and main house wallet swept. BR wallets were not touched.',
+            message: 'Full arena reset completed: players cashed out, pools cleared, and main house wallet swept. Any pending backend release was handed to Railway after the safe drain. BR wallets were not touched.',
             wallet: HOUSE_WALLET_ADDRESS || null,
         });
     } catch (err) {
@@ -13342,7 +13344,7 @@ setInterval(() => {
     try {
         const age = Date.now() - GLOBAL_ARENA_START;
         if (age > c.roomDuration && !isArenaResetting()) {
-            performGlobalArenaReset({ scheduled: true }).catch(error => {
+            performGlobalArenaReset().catch(error => {
                 console.error('[Arena Reset] Scheduled reset failed:', error.message);
             });
             return;
