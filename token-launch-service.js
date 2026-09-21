@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, getMint, getAccount, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { encryptWalletSecret, decryptWalletSecret } from './wallet-crypto.js';
+import { buildCreatorFeeForwardInstruction, normalizeCreatorFeeLamports } from './pump-creator-fees.js';
 
 // Pump's ESM bundle currently imports named values from Anchor's CommonJS
 // entrypoint, which crashes on some Node 20 Railway runtimes. The package
@@ -40,6 +41,9 @@ const TokenLaunchSchema = new mongoose.Schema({
     operationLockUntil: { type: Date, default: null },
     lastSellSignature: { type: String, default: '' },
     lastSellAt: { type: Date, default: null },
+    lastCreatorFeeClaimSignature: { type: String, default: '' },
+    lastCreatorFeeClaimLamports: { type: String, default: '' },
+    lastCreatorFeeClaimAt: { type: Date, default: null },
 }, { timestamps: true });
 
 const TokenLaunch = mongoose.models.TokenLaunch || mongoose.model('TokenLaunch', TokenLaunchSchema);
@@ -71,6 +75,9 @@ function serialize(record) {
         launchWalletAddress: record.launchWalletAddress || '',
         lastSellSignature: record.lastSellSignature || '',
         lastSellAt: record.lastSellAt || null,
+        lastCreatorFeeClaimSignature: record.lastCreatorFeeClaimSignature || '',
+        lastCreatorFeeClaimLamports: record.lastCreatorFeeClaimLamports || '',
+        lastCreatorFeeClaimAt: record.lastCreatorFeeClaimAt || null,
         launchEnabled: process.env.PUMP_LAUNCH_ENABLED === 'true',
         configuredMint: process.env.AGAR_TOKEN_MINT?.trim() || '',
         mintMatchesEnvironment: process.env.AGAR_TOKEN_MINT?.trim() === record.mintAddress,
@@ -178,6 +185,108 @@ export function createTokenLaunchService({ connection, User, authenticateAdmin, 
                 res.json({ position: await readLaunchPosition(record), symbol: record.symbol, ownerRevenueAddress: process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim() || '' });
             } catch (error) {
                 res.status(error.status || 502).json({ message: error.message || 'Could not read the launch-wallet position.' });
+            }
+        });
+
+        app.get('/api/admin/token-launch/creator-fees', authenticateAdmin, async (_req, res) => {
+            try {
+                const record = await getRecord();
+                if (!record || record.status !== 'launched') return res.status(409).json({ message: 'The token has not been launched yet.' });
+                if (!record.launchWalletAddress) return res.status(409).json({ message: 'This launch did not use the dedicated server creator wallet.' });
+                const destination = process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim() || '';
+                if (!destination) return res.status(503).json({ message: 'AGAR_OWNER_REVENUE_ADDRESS is not configured.' });
+                try { new solanaWeb3.PublicKey(destination); } catch { return res.status(503).json({ message: 'AGAR_OWNER_REVENUE_ADDRESS is not a valid Solana address.' }); }
+                const creator = new solanaWeb3.PublicKey(record.launchWalletAddress);
+                const online = new OnlinePumpSdk(connection);
+                const claimableLamports = BigInt((await online.getCreatorVaultBalanceBothPrograms(creator)).toString());
+                res.json({
+                    creatorAddress: creator.toBase58(),
+                    destination,
+                    claimableLamports: claimableLamports.toString(),
+                    claimableSol: Number(claimableLamports) / solanaWeb3.LAMPORTS_PER_SOL,
+                    lastClaimSignature: record.lastCreatorFeeClaimSignature || '',
+                    lastClaimLamports: record.lastCreatorFeeClaimLamports || '',
+                    lastClaimAt: record.lastCreatorFeeClaimAt || null,
+                });
+            } catch (error) {
+                console.error('[Pump creator fee balance]', error);
+                res.status(error.status || 502).json({ message: error.message || 'Could not read Pump creator fees.' });
+            }
+        });
+
+        app.post('/api/admin/token-launch/claim-creator-fees', sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), authenticateAdmin, async (req, res) => {
+            let record;
+            let lockId;
+            try {
+                const candidate = await getRecord({ secret: true });
+                if (!candidate || candidate.status !== 'launched') throw Object.assign(new Error('The token has not been launched yet.'), { status: 409 });
+                if (!candidate.encryptedLaunchWalletSecret || !candidate.launchWalletAddress) throw Object.assign(new Error('No dedicated creator wallet with a recoverable signing key exists.'), { status: 409 });
+                const destinationText = process.env.AGAR_OWNER_REVENUE_ADDRESS?.trim();
+                if (!destinationText) throw Object.assign(new Error('AGAR_OWNER_REVENUE_ADDRESS is not configured.'), { status: 503 });
+                let destination;
+                try { destination = new solanaWeb3.PublicKey(destinationText); } catch { throw Object.assign(new Error('AGAR_OWNER_REVENUE_ADDRESS is not a valid Solana address.'), { status: 503 }); }
+                if (req.body?.confirmation !== `CLAIM FEES ${candidate.launchWalletAddress}`) throw Object.assign(new Error('The exact creator-fee confirmation does not match.'), { status: 400 });
+
+                lockId = randomUUID();
+                record = await TokenLaunch.findOneAndUpdate({
+                    _id: candidate._id,
+                    $or: [{ operationLockUntil: null }, { operationLockUntil: { $lt: new Date() } }],
+                }, { $set: { operationLockId: lockId, operationLockUntil: new Date(Date.now() + 120_000) } }, { new: true }).select('+encryptedLaunchWalletSecret');
+                if (!record) throw Object.assign(new Error('Another launch-wallet operation is already running.'), { status: 409 });
+
+                const creator = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(record.encryptedLaunchWalletSecret));
+                if (creator.publicKey.toBase58() !== record.launchWalletAddress) throw new Error('Dedicated creator wallet secret does not match its address');
+                const online = new OnlinePumpSdk(connection);
+                const rawClaimableLamports = (await online.getCreatorVaultBalanceBothPrograms(creator.publicKey)).toString();
+                let claimableLamports;
+                try {
+                    claimableLamports = normalizeCreatorFeeLamports(rawClaimableLamports);
+                } catch (error) {
+                    throw Object.assign(error, { status: 409 });
+                }
+
+                // Pump pays the creator wallet first. Appending the owner-vault
+                // transfer makes the claim and forwarding atomic: either both
+                // happen, or neither does. Only the measured creator fees are
+                // forwarded; existing launch-wallet SOL is never swept here.
+                const instructions = await online.collectCoinCreatorFeeInstructions(creator.publicKey, creator.publicKey);
+                instructions.push(buildCreatorFeeForwardInstruction({ creator: creator.publicKey, destination, claimableLamports }));
+                const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                const message = new solanaWeb3.TransactionMessage({
+                    payerKey: creator.publicKey,
+                    recentBlockhash: blockhash,
+                    instructions,
+                }).compileToV0Message();
+                const feeLamports = (await connection.getFeeForMessage(message, 'confirmed')).value;
+                if (feeLamports == null) throw Object.assign(new Error('Solana could not calculate the creator-fee claim transaction fee.'), { status: 502 });
+                const creatorBalanceLamports = await connection.getBalance(creator.publicKey, 'confirmed');
+                if (creatorBalanceLamports < feeLamports) {
+                    throw Object.assign(new Error(`The creator wallet needs at least ${(feeLamports / solanaWeb3.LAMPORTS_PER_SOL).toFixed(9)} SOL for the network fee.`), { status: 409 });
+                }
+                const transaction = new solanaWeb3.VersionedTransaction(message);
+                transaction.sign([creator]);
+                const signature = await connection.sendTransaction(transaction, { maxRetries: 3, skipPreflight: false });
+                await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
+
+                record.lastCreatorFeeClaimSignature = signature;
+                record.lastCreatorFeeClaimLamports = claimableLamports.toString();
+                record.lastCreatorFeeClaimAt = new Date();
+                await record.save();
+                res.json({
+                    success: true,
+                    signature,
+                    creatorAddress: creator.publicKey.toBase58(),
+                    destination: destination.toBase58(),
+                    claimedLamports: claimableLamports.toString(),
+                    claimedSol: Number(claimableLamports) / solanaWeb3.LAMPORTS_PER_SOL,
+                    feeLamports,
+                    launch: serialize(record),
+                });
+            } catch (error) {
+                console.error('[Pump creator fee claim]', error);
+                res.status(error.status || 500).json({ message: error.message || 'Creator-fee claim failed.' });
+            } finally {
+                if (record && lockId) await TokenLaunch.updateOne({ _id: record._id, operationLockId: lockId }, { $set: { operationLockId: '', operationLockUntil: null } }).catch(() => {});
             }
         });
 
