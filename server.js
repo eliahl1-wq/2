@@ -1,6 +1,7 @@
 import express from 'express';
 import { resolveSignatureSkin } from './signature-skins.js';
 import { applySurvivInputPayload } from './surviv-input.js';
+import { createAntiCheatSession } from './anti-cheat.js';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
@@ -514,6 +515,12 @@ const UserSchema = new mongoose.Schema({
     retainedCashoutSettlementIds: { type: [mongoose.Schema.Types.ObjectId], default: [], select: false },
     lastDepositSourceSignature: { type: String, default: null },
     depositHistoryBackfilledAt: { type: Date, default: null },
+    // Privacy-preserving account-link signals. Raw IP addresses, browser ids
+    // and user agents are never stored; these hashes are review context only.
+    securityIpHashes: { type: [String], default: [], select: false },
+    securityDeviceHashes: { type: [String], default: [], select: false },
+    securityUserAgentHashes: { type: [String], default: [], select: false },
+    securityLastSeenAt: { type: Date, default: null, select: false },
 }, { timestamps: true });
 
 const User = mongoose.model('User', UserSchema);
@@ -596,7 +603,7 @@ const AdminIssueSchema = new mongoose.Schema({
     fingerprint: { type: String, required: true, trim: true, maxlength: 240, index: true },
     activeKey: { type: String, trim: true, maxlength: 240 },
     severity: { type: String, enum: ['critical', 'error', 'warning'], default: 'error', index: true },
-    category: { type: String, enum: ['cashout', 'economy', 'wallet', 'solana', 'system'], default: 'system', index: true },
+    category: { type: String, enum: ['anticheat', 'rewards', 'cashout', 'economy', 'wallet', 'solana', 'system'], default: 'system', index: true },
     code: { type: String, required: true, trim: true, maxlength: 100, index: true },
     title: { type: String, required: true, trim: true, maxlength: 180 },
     message: { type: String, required: true, trim: true, maxlength: 1200 },
@@ -632,7 +639,7 @@ async function recordAdminIssue(details = {}) {
     const now = new Date();
     const update = {
         severity: ['critical', 'error', 'warning'].includes(details.severity) ? details.severity : 'error',
-        category: ['cashout', 'economy', 'wallet', 'solana', 'system'].includes(details.category) ? details.category : 'system',
+        category: ['anticheat', 'rewards', 'cashout', 'economy', 'wallet', 'solana', 'system'].includes(details.category) ? details.category : 'system',
         code,
         title: String(details.title || 'Backend issue').slice(0, 180),
         message: String(details.message || 'No details available').slice(0, 1200),
@@ -3410,10 +3417,13 @@ setInterval(() => {
 
 function getReferralRequestSignals(req, deviceId = '') {
     const directIp = req.ip || req.socket?.remoteAddress || '';
+    const userAgent = typeof req.get === 'function'
+        ? req.get('user-agent')
+        : req.headers?.['user-agent'];
     return {
         ipHash: hashReferralSignal(directIp),
         deviceHash: hashReferralSignal(deviceId),
-        userAgentHash: hashReferralSignal(req.get('user-agent') || ''),
+        userAgentHash: hashReferralSignal(userAgent || ''),
         visitorKey: hashReferralSignal(`${deviceId || 'no-device'}|${directIp || 'no-ip'}`),
     };
 }
@@ -6150,6 +6160,119 @@ app.put('/api/admin/pregame/display-settings', authenticateAdmin, async (req, re
     }
 });
 
+function normalizedSecurityName(value) {
+    return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function boundedNameDistance(first, second, maxDistance = 2) {
+    const a = normalizedSecurityName(first);
+    const b = normalizedSecurityName(second);
+    if (!a || !b || Math.abs(a.length - b.length) > maxDistance) return maxDistance + 1;
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let row = 1; row <= a.length; row += 1) {
+        const current = [row];
+        let rowMin = current[0];
+        for (let column = 1; column <= b.length; column += 1) {
+            current[column] = Math.min(
+                current[column - 1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (a[row - 1] === b[column - 1] ? 0 : 1),
+            );
+            rowMin = Math.min(rowMin, current[column]);
+        }
+        if (rowMin > maxDistance) return maxDistance + 1;
+        previous = current;
+    }
+    return previous[b.length];
+}
+
+async function buildAdminAccountSignals(rawUserIds = []) {
+    const userIds = [...new Set(rawUserIds.map(String).filter(id => mongoose.isValidObjectId(id)))];
+    if (userIds.length === 0) return new Map();
+    const directUsers = await User.find({ _id: { $in: userIds } })
+        .select('username email rewardsDisabled +securityIpHashes +securityDeviceHashes +securityLastSeenAt')
+        .lean();
+    const ipHashes = [...new Set(directUsers.flatMap(user => user.securityIpHashes || []).filter(Boolean))];
+    const deviceHashes = [...new Set(directUsers.flatMap(user => user.securityDeviceHashes || []).filter(Boolean))];
+    const linkClauses = [
+        { _id: { $in: userIds } },
+        ...(ipHashes.length ? [{ securityIpHashes: { $in: ipHashes } }] : []),
+        ...(deviceHashes.length ? [{ securityDeviceHashes: { $in: deviceHashes } }] : []),
+    ];
+    const linkedUsers = await User.find({ $or: linkClauses })
+        .select('username email rewardsDisabled +securityIpHashes +securityDeviceHashes +securityLastSeenAt')
+        .limit(500)
+        .lean();
+    const linkedIds = linkedUsers.map(user => user._id);
+    const [issueCounts, rewardCounts] = await Promise.all([
+        AdminIssue.aggregate([
+            { $match: { userId: { $in: linkedIds } } },
+            { $group: {
+                _id: '$userId',
+                total: { $sum: 1 },
+                open: { $sum: { $cond: [{ $eq: ['$status', 'open'] }, 1, 0] } },
+                antiCheat: { $sum: { $cond: [{ $eq: ['$category', 'anticheat'] }, 1, 0] } },
+            } },
+        ]),
+        RewardSecurityAlert.aggregate([
+            { $match: { userIds: { $in: linkedIds } } },
+            { $unwind: '$userIds' },
+            { $match: { userIds: { $in: linkedIds } } },
+            { $group: {
+                _id: '$userIds',
+                total: { $sum: 1 },
+                pending: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+            } },
+        ]),
+    ]);
+    const issueByUser = new Map(issueCounts.map(row => [String(row._id), row]));
+    const rewardByUser = new Map(rewardCounts.map(row => [String(row._id), row]));
+    const result = new Map();
+
+    for (const user of directUsers) {
+        const id = String(user._id);
+        const ownIps = new Set(user.securityIpHashes || []);
+        const ownDevices = new Set(user.securityDeviceHashes || []);
+        const linkedAccounts = linkedUsers
+            .filter(candidate => String(candidate._id) !== id)
+            .map(candidate => {
+                const reasons = [];
+                if ((candidate.securityIpHashes || []).some(hash => ownIps.has(hash))) reasons.push('reused_ip');
+                if ((candidate.securityDeviceHashes || []).some(hash => ownDevices.has(hash))) reasons.push('same_device');
+                const similarName = Math.min(
+                    normalizedSecurityName(user.username).length,
+                    normalizedSecurityName(candidate.username).length,
+                ) >= 5 && boundedNameDistance(user.username, candidate.username) <= 2;
+                if (similarName) reasons.push('similar_name');
+                return reasons.length ? {
+                    userId: String(candidate._id),
+                    username: candidate.username,
+                    reasons,
+                } : null;
+            })
+            .filter(Boolean)
+            .slice(0, 20);
+        const issueStats = issueByUser.get(id) || {};
+        const rewardStats = rewardByUser.get(id) || {};
+        result.set(id, {
+            userId: id,
+            username: user.username,
+            rewardsDisabled: !!user.rewardsDisabled,
+            reusedIp: linkedAccounts.some(account => account.reasons.includes('reused_ip')),
+            reusedDevice: linkedAccounts.some(account => account.reasons.includes('same_device')),
+            similarName: linkedAccounts.some(account => account.reasons.includes('similar_name')),
+            linkedAccounts,
+            priorIssueCount: Number(issueStats.total) || 0,
+            openIssueCount: Number(issueStats.open) || 0,
+            antiCheatIssueCount: Number(issueStats.antiCheat) || 0,
+            rewardAlertCount: Number(rewardStats.total) || 0,
+            pendingRewardAlertCount: Number(rewardStats.pending) || 0,
+            lastSeenAt: user.securityLastSeenAt || null,
+        });
+    }
+    return result;
+}
+
 app.get('/api/admin/issues', authenticateAdmin, async (req, res) => {
     try {
         const query = {};
@@ -6161,23 +6284,61 @@ app.get('/api/admin/issues', authenticateAdmin, async (req, res) => {
             query.severity = String(req.query.severity);
         }
         if (req.query.category) {
-            if (!['cashout', 'economy', 'wallet', 'solana', 'system'].includes(String(req.query.category))) return res.status(400).json({ message: 'Invalid issue category.' });
+            if (!['anticheat', 'rewards', 'cashout', 'economy', 'wallet', 'solana', 'system'].includes(String(req.query.category))) return res.status(400).json({ message: 'Invalid issue category.' });
             query.category = String(req.query.category);
         }
         const limit = Math.min(300, Math.max(1, Number.parseInt(req.query.limit, 10) || 150));
-        const [issues, openCounts] = await Promise.all([
-            AdminIssue.find(query).sort({ status: 1, severity: 1, lastSeenAt: -1 }).limit(limit).lean(),
+        const summaryOnly = String(req.query.summaryOnly || '') === 'true';
+        const includeRewardAlerts = !summaryOnly && (!req.query.category || String(req.query.category) === 'rewards');
+        const rewardStatusQuery = status === 'open' ? { status: 'pending' } : {};
+        const [issues, openCounts, openCategoryCounts, rewardAlerts] = await Promise.all([
+            summaryOnly
+                ? Promise.resolve([])
+                : AdminIssue.find(query).sort({ status: 1, severity: 1, lastSeenAt: -1 }).limit(limit).lean(),
             AdminIssue.aggregate([
                 { $match: { status: 'open' } },
                 { $group: { _id: '$severity', count: { $sum: 1 } } },
             ]),
+            AdminIssue.aggregate([
+                { $match: { status: 'open' } },
+                { $group: { _id: '$category', count: { $sum: 1 } } },
+            ]),
+            includeRewardAlerts
+                ? RewardSecurityAlert.find(rewardStatusQuery)
+                    .sort({ status: -1, createdAt: -1 })
+                    .limit(200)
+                    .populate('userIds', 'username email rewardsDisabled')
+                    .lean()
+                : [],
         ]);
-        const summary = { totalOpen: 0, critical: 0, error: 0, warning: 0 };
+        const pendingRewardAlertCount = await RewardSecurityAlert.countDocuments({ status: 'pending' });
+        const summary = { totalOpen: pendingRewardAlertCount, critical: 0, error: 0, warning: pendingRewardAlertCount, byCategory: { rewards: pendingRewardAlertCount } };
         for (const row of openCounts) {
-            if (Object.hasOwn(summary, row._id)) summary[row._id] = row.count;
+            if (Object.hasOwn(summary, row._id)) summary[row._id] += row.count;
             summary.totalOpen += row.count;
         }
-        return res.json({ issues, summary });
+        for (const row of openCategoryCounts) summary.byCategory[row._id] = (summary.byCategory[row._id] || 0) + row.count;
+
+        const userIds = [
+            ...issues.map(issue => issue.userId).filter(Boolean),
+            ...rewardAlerts.flatMap(alert => (alert.userIds || []).map(user => user?._id || user)).filter(Boolean),
+        ];
+        const accountSignals = await buildAdminAccountSignals(userIds);
+        const enrichedIssues = issues.map(issue => ({
+            ...issue,
+            accountSignals: issue.userId ? accountSignals.get(String(issue.userId)) || null : null,
+        }));
+        const enrichedRewardAlerts = rewardAlerts.map(alert => ({
+            ...alert,
+            accounts: (alert.userIds || []).map(user => ({
+                userId: String(user?._id || user),
+                username: user?.username || '',
+                email: user?.email || '',
+                rewardsDisabled: !!user?.rewardsDisabled,
+                signals: accountSignals.get(String(user?._id || user)) || null,
+            })),
+        }));
+        return res.json({ issues: enrichedIssues, rewardAlerts: enrichedRewardAlerts, summary });
     } catch (err) {
         console.error('Admin issues error:', err);
         return res.status(500).json({ message: 'Could not load admin issues.' });
@@ -11251,6 +11412,16 @@ async function refundTournamentJoin(pending, reason) {
 }
 
 io.on('connection', (socket) => {
+    const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
+    const securitySignals = getReferralRequestSignals(socket.request, presenceId);
+    touchSitePresence(socket.request, presenceId);
+    const antiCheat = createAntiCheatSession({
+        report: details => recordAdminIssue({
+            fingerprint: `anticheat:${details.code}:${details.userId || socket.accountUserId || socket.id}:${details.gameSessionId || details.roomId || 'session'}`,
+            category: 'anticheat',
+            ...details,
+        }),
+    });
     const socketToken = socket.handshake.auth?.token;
     if (typeof socketToken === 'string' && socketToken.length > 0) {
         verifyAccountToken(socketToken)
@@ -11258,14 +11429,25 @@ io.on('connection', (socket) => {
                 if (!socket.connected || !decoded?.id) return;
                 socket.accountUserId = String(decoded.id);
                 socket.join(accountSocketRoom(decoded.id));
+                const addToSet = {};
+                if (securitySignals.ipHash) addToSet.securityIpHashes = securitySignals.ipHash;
+                if (securitySignals.deviceHash) addToSet.securityDeviceHashes = securitySignals.deviceHash;
+                if (securitySignals.userAgentHash) addToSet.securityUserAgentHashes = securitySignals.userAgentHash;
+                User.updateOne(
+                    { _id: decoded.id },
+                    {
+                        ...(Object.keys(addToSet).length ? { $addToSet: addToSet } : {}),
+                        $set: { securityLastSeenAt: new Date() },
+                    },
+                ).catch(error => console.error('[Security signals] Could not update account:', error.message));
             })
             .catch(() => {});
     }
-    const presenceId = socket.handshake.auth?.presenceId || socket.handshake.headers['x-presence-id'] || socket.handshake.address || socket.id;
-    touchSitePresence(socket.request, presenceId);
     const survivInputRate = { windowStartedAt: 0, count: 0 };
     const survivSpectateRate = { windowStartedAt: 0, count: 0 };
     const socialRate = { chatWindowAt: 0, chatCount: 0, emoteWindowAt: 0, emoteCount: 0 };
+    const safeViewportWidth = value => Math.max(320, Math.min(3840, Number(value) || 1920));
+    const safeViewportHeight = value => Math.max(240, Math.min(2160, Number(value) || 1080));
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor, skinId }) => {
         let userKey = null;
@@ -12766,13 +12948,18 @@ io.on('connection', (socket) => {
         if (br) {
             const inputX = Number(data?.x);
             const inputY = Number(data?.y);
-            if (Number.isFinite(inputX)) br.player.mouseX = inputX;
-            if (Number.isFinite(inputY)) br.player.mouseY = inputY;
-            if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
-                br.player.screenWidth = data.screenWidth;
+            antiCheat.observePacketRate({ kind: 'agar_aim', limit: 150, player: br.player, room: br.room, mode: 'br-agar' });
+            if (!Number.isFinite(inputX) || !Number.isFinite(inputY)) {
+                antiCheat.observeInvalidInput({ reason: 'non-finite aim vector', player: br.player, room: br.room, mode: 'br-agar' });
+                return;
             }
-            if (Number.isFinite(data.screenHeight) && data.screenHeight > 0) {
-                br.player.screenHeight = data.screenHeight;
+            br.player.mouseX = Math.max(-8192, Math.min(8192, inputX));
+            br.player.mouseY = Math.max(-8192, Math.min(8192, inputY));
+            if (Number.isFinite(Number(data?.screenWidth)) && Number(data.screenWidth) > 0) {
+                br.player.screenWidth = safeViewportWidth(data.screenWidth);
+            }
+            if (Number.isFinite(Number(data?.screenHeight)) && Number(data.screenHeight) > 0) {
+                br.player.screenHeight = safeViewportHeight(data.screenHeight);
             }
             return;
         }
@@ -12781,14 +12968,19 @@ io.on('connection', (socket) => {
         if (p) {
             const inputX = Number(data?.x);
             const inputY = Number(data?.y);
-            if (Number.isFinite(inputX)) p.mouseX = inputX;
-            if (Number.isFinite(inputY)) p.mouseY = inputY;
-            if (Number.isFinite(inputX) || Number.isFinite(inputY)) p.lastAgarInputAt = Date.now();
-            if (Number.isFinite(data.screenWidth) && data.screenWidth > 0) {
-                p.screenWidth = data.screenWidth;
+            antiCheat.observePacketRate({ kind: 'agar_aim', limit: 150, player: p, room, mode: 'agar' });
+            if (!Number.isFinite(inputX) || !Number.isFinite(inputY)) {
+                antiCheat.observeInvalidInput({ reason: 'non-finite aim vector', player: p, room, mode: 'agar' });
+                return;
             }
-            if (Number.isFinite(data.screenHeight) && data.screenHeight > 0) {
-                p.screenHeight = data.screenHeight;
+            p.mouseX = Math.max(-8192, Math.min(8192, inputX));
+            p.mouseY = Math.max(-8192, Math.min(8192, inputY));
+            p.lastAgarInputAt = Date.now();
+            if (Number.isFinite(Number(data?.screenWidth)) && Number(data.screenWidth) > 0) {
+                p.screenWidth = safeViewportWidth(data.screenWidth);
+            }
+            if (Number.isFinite(Number(data?.screenHeight)) && Number(data.screenHeight) > 0) {
+                p.screenHeight = safeViewportHeight(data.screenHeight);
             }
         }
     });
@@ -12798,6 +12990,7 @@ io.on('connection', (socket) => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p) return;
+        antiCheat.observeActionRate({ action: 'split', limit: 8, windowMs: 1000, player: p, room, mode: 'agar' });
         splitAgarCells(p, Math.atan2(p.mouseY, p.mouseX));
 
     });
@@ -12807,6 +13000,7 @@ io.on('connection', (socket) => {
         const room = rooms.find(r => r.id === socket.roomId);
         const p = room?.players.find(pl => pl.id === socket.id);
         if (!p) return;
+        antiCheat.observeActionRate({ action: 'eject', limit: 40, windowMs: 1000, player: p, room, mode: 'agar' });
         p.cells.forEach(cell => {
             const massStart = playerMassStart(p);
             const totalMass = playerTotalMass(p);
@@ -13082,8 +13276,8 @@ io.on('connection', (socket) => {
         if (!spectator) return;
         if (Number.isFinite(Number(x))) spectator.x = Math.max(0, Math.min(c.worldWidth, Number(x)));
         if (Number.isFinite(Number(y))) spectator.y = Math.max(0, Math.min(c.worldHeight, Number(y)));
-        if (Number.isFinite(Number(screenWidth)) && Number(screenWidth) > 0) spectator.screenWidth = Number(screenWidth);
-        if (Number.isFinite(Number(screenHeight)) && Number(screenHeight) > 0) spectator.screenHeight = Number(screenHeight);
+        if (Number.isFinite(Number(screenWidth)) && Number(screenWidth) > 0) spectator.screenWidth = safeViewportWidth(screenWidth);
+        if (Number.isFinite(Number(screenHeight)) && Number(screenHeight) > 0) spectator.screenHeight = safeViewportHeight(screenHeight);
     });
 
     socket.on('slitherSpectateCam', ({ x, y }) => {
@@ -13108,14 +13302,26 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('slitherInput', ({ dx, dy, boost }) => {
+    socket.on('slitherInput', (payload = {}) => {
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return;
+        const { dx, dy, boost } = payload;
         const br = findBRPlayerBySocket(socket.id);
         if (br) {
             if (br.room.variant !== 'slither' || br.room.status !== 'active') return;
             const p = br.player;
             if (p.isCashingOut) return;
-            p.inputDx = Number(dx) || 0;
-            p.inputDy = Number(dy) || 0;
+            antiCheat.observePacketRate({ kind: 'slither_input', limit: 140, player: p, room: br.room, mode: 'br-slither' });
+            const inputX = Number(dx);
+            const inputY = Number(dy);
+            if (!Number.isFinite(inputX) || !Number.isFinite(inputY)) {
+                antiCheat.observeInvalidInput({ reason: 'non-finite steering vector', player: p, room: br.room, mode: 'br-slither' });
+                return;
+            }
+            const magnitude = Math.hypot(inputX, inputY);
+            if (magnitude > SLITHER.maxInput * 1.05) antiCheat.observeInvalidInput({ reason: 'oversized steering vector', player: p, room: br.room, mode: 'br-slither' });
+            const scale = magnitude > SLITHER.maxInput ? SLITHER.maxInput / magnitude : 1;
+            p.inputDx = inputX * scale;
+            p.inputDy = inputY * scale;
             p.boost = !!boost;
             return;
         }
@@ -13128,8 +13334,19 @@ io.on('connection', (socket) => {
             p.boost = false;
             return;
         }
-        p.inputDx = Number(dx) || 0;
-        p.inputDy = Number(dy) || 0;
+        const slitherMode = p.mode === 'competitive-slither' ? 'competitive-slither' : 'slither';
+        antiCheat.observePacketRate({ kind: 'slither_input', limit: 140, player: p, room, mode: slitherMode });
+        const inputX = Number(dx);
+        const inputY = Number(dy);
+        if (!Number.isFinite(inputX) || !Number.isFinite(inputY)) {
+            antiCheat.observeInvalidInput({ reason: 'non-finite steering vector', player: p, room, mode: slitherMode });
+            return;
+        }
+        const magnitude = Math.hypot(inputX, inputY);
+        if (magnitude > SLITHER.maxInput * 1.05) antiCheat.observeInvalidInput({ reason: 'oversized steering vector', player: p, room, mode: slitherMode });
+        const scale = magnitude > SLITHER.maxInput ? SLITHER.maxInput / magnitude : 1;
+        p.inputDx = inputX * scale;
+        p.inputDy = inputY * scale;
         p.boost = !!boost;
     });
 
@@ -13142,13 +13359,33 @@ io.on('connection', (socket) => {
             survivInputRate.count = 0;
         }
         survivInputRate.count += 1;
-        if (survivInputRate.count > 90) return;
+        const overInputLimit = survivInputRate.count > 90;
 
         const br = findBRPlayerBySocket(socket.id);
         if (br && (br.room.variant !== 'surviv' || br.room.status !== 'active')) return;
         const room = br?.room || getArenaRoomById(socket.roomId);
         const player = br?.player || room?.players.find(candidate => candidate.id === socket.id && candidate.mode === 'surviv');
         if (!player || player.disconnected || player.hp <= 0 || player._eliminated) return;
+        antiCheat.observePacketRate({ kind: 'surviv_input', limit: 90, player, room, mode: br ? 'br-surviv' : 'surviv' });
+        antiCheat.observeSurvivInput({
+            player,
+            room,
+            payload,
+            visibleRange: SURVIV.viewRange,
+            mode: br ? 'br-surviv' : 'surviv',
+        });
+        const discreteActions = [
+            ['reload', payload.reload === true],
+            ['medkit', payload.useMedkit === true],
+            ['grenade', payload.throwGrenade === true],
+            ['pickup', payload.pickupWeapon === true || typeof payload.pickupWeapon === 'string' || typeof payload.pickupVestId === 'string'],
+            ['door', typeof payload.toggleDoorId === 'string'],
+            ['inventory', payload.swapWeaponSlots != null || payload.dropItem != null || payload.closeChest === true],
+        ];
+        for (const [action, active] of discreteActions) {
+            if (active) antiCheat.observeActionRate({ action, limit: 10, windowMs: 1000, player, room, mode: br ? 'br-surviv' : 'surviv' });
+        }
+        if (overInputLimit) return;
         applySurvivInputPayload(player, payload);
     });
 
@@ -14085,6 +14322,7 @@ function processRoom(room) {
         const minimapItems = room.qt.query(minimapRange);
 
         const minimapPlayers = allUsers
+            .filter(u => p.isAgarSpectator || u.id === p.id)
             .filter(u => {
                 const dx = u.x - p.x;
                 const dy = u.y - p.y;

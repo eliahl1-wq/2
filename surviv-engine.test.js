@@ -3720,6 +3720,39 @@ test('surviv expanded map exposes coarse activity areas without exact enemy posi
     assert.equal(tick.fullMap.obstacles.some(obstacle => obstacle.kind === 'door'), false);
 });
 
+test('active Surviv players never receive exact opponents in minimap payloads', () => {
+    const room = makeRoom();
+    room.loot = [];
+    const viewer = createSurvivPlayer('secure-map-viewer', 'mongo-secure-viewer', 'Viewer', '#fff', room);
+    const nearbyEnemy = createSurvivPlayer('secure-map-enemy', 'mongo-secure-enemy', 'Enemy', '#f00', room);
+    viewer.x = 0;
+    viewer.y = 0;
+    nearbyEnemy.x = 700;
+    nearbyEnemy.y = 0;
+    room.players.push(viewer, nearbyEnemy);
+
+    const ticks = new Map();
+    const io = {
+        to(socketId) {
+            return {
+                emit(event, payload) {
+                    if (event === 'survivTick') ticks.set(socketId, payload);
+                },
+            };
+        },
+    };
+    broadcastSurvivState(room, io, {
+        leaderboard: [],
+        aliveCount: 2,
+        zone: { x: 0, y: 0, radius: SURVIV.worldHalf },
+    }, {});
+
+    const tick = ticks.get(viewer.id);
+    assert.ok(tick.players.some(player => player.id === nearbyEnemy.id), 'nearby enemy remains renderable in the normal viewport');
+    assert.deepEqual(tick.minimap.players, [{ x: viewer.x, y: viewer.y, isYou: true, isBot: false }]);
+    assert.equal(tick.minimap.players.some(player => player.x === nearbyEnemy.x && player.y === nearbyEnemy.y), false);
+});
+
 test('surviv alive count and leaderboard use the same active entities', () => {
     const room = makeRoom();
     room.loot = [];

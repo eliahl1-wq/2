@@ -9283,7 +9283,10 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 .slice(0, 90)
                 .map(({ item: l }) => ({ x: l.x, y: l.y, golden: l.type !== 'chest' }));
             const minimapPlayers = allPlayers
-                .filter(p => !room.isBattleRoyale || p.id === youId)
+                // Active players only receive their own exact minimap marker.
+                // Opponent activity is intentionally represented by the
+                // coarse activityZones payload below, never exact coordinates.
+                .filter(p => spectating || p.id === youId)
                 .filter(p => isInView(viewX, viewY, p.x, p.y, minimapRange))
                 .map(p => ({ x: p.x, y: p.y, isYou: p.id === youId, isBot: !!p.isBot }));
             staticPayload.obstacles = visibleObstacles;

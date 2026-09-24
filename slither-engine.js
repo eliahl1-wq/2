@@ -2538,6 +2538,28 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
     return slitherLeaderboard;
 }
 
+export function isSlitherSnakeVisibleToViewer(snake, {
+    viewX,
+    viewY,
+    range,
+    viewerId = null,
+    spectating = false,
+    buffer = 400,
+} = {}) {
+    if (!snake?.segments?.[0]) return false;
+    if (!spectating && snake.id === viewerId) return true;
+    for (let index = 0; index < snake.segments.length; index += 8) {
+        const segment = snake.segments[index];
+        if (isInView(viewX, viewY, segment.x, segment.y, range + buffer)) return true;
+    }
+    const last = snake.segments[snake.segments.length - 1];
+    return !!last && isInView(viewX, viewY, last.x, last.y, range + buffer);
+}
+
+export function shouldExposeExactSlitherMinimapPlayer(entityId, viewerId, spectating = false) {
+    return !!spectating || entityId === viewerId;
+}
+
 export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const allSnakes = getAllSlitherSnakes(room);
     const range = 1800; // Increased view range for normal slither culling
@@ -2600,27 +2622,16 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
         }
 
         const visibleSnakes = allSnakes
-            .filter(({ entity: s }) => {
-                const h = s.segments[0];
-                if (!h) return false;
-
-                // Bypass culling in Arena modes since the map is small
-                if (!room.isBattleRoyale && !meta.battleRoyale) return true;
-
-                // For Battle Royale, check if any segment is in view (with a buffer) so large snakes don't pop out
-                const buffer = 400; // Extra buffer to cover large snake body parts
-                for (let i = 0; i < s.segments.length; i += 8) {
-                    const seg = s.segments[i];
-                    if (isInView(head.x, head.y, seg.x, seg.y, range + buffer)) {
-                        return true;
-                    }
-                }
-                const last = s.segments[s.segments.length - 1];
-                if (last && isInView(head.x, head.y, last.x, last.y, range + buffer)) {
-                    return true;
-                }
-                return false;
-            })
+            // Never send the complete room to an active client. Checking
+            // sampled body segments keeps large snakes from popping while
+            // preventing modified clients from reading off-screen players.
+            .filter(({ entity: s }) => isSlitherSnakeVisibleToViewer(s, {
+                viewX: head.x,
+                viewY: head.y,
+                range,
+                viewerId: r.id,
+                spectating: r.isSpectator,
+            }))
             .map(({ entity: s }) => {
                 const isYou = !r.isSpectator && s.id === r.id;
                 return isYou ? serializedSnakesYou.get(s.id) : serializedSnakesNotYou.get(s.id);
@@ -2649,6 +2660,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
             const minimapPlayers = allSnakes.map(({ entity: s }) => {
                 const h = s.segments[0];
                 if (!h) return null;
+                if (!shouldExposeExactSlitherMinimapPlayer(s.id, r.id, r.isSpectator)) return null;
                 if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange)) return null;
                 return {
                     x: Math.round(h.x),
@@ -3258,7 +3270,13 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         }
 
         const visibleSnakes = allSnakes
-            .filter(({ entity: s }) => s.segments?.[0])
+            .filter(({ entity: s }) => isSlitherSnakeVisibleToViewer(s, {
+                viewX: head.x,
+                viewY: head.y,
+                range,
+                viewerId: youId,
+                spectating,
+            }))
             .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
 
         let visibleFood = null;
@@ -3275,6 +3293,7 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
             const minimapPlayers = allSnakes.map(({ entity: s }) => {
                 const h = s.segments[0];
                 if (!h) return null;
+                if (!shouldExposeExactSlitherMinimapPlayer(s.id, youId, spectating)) return null;
                 if (!isInView(head.x, head.y, h.x, h.y, SLITHER.minimapThreatRange * 0.65)) return null;
                 return { x: Math.round(h.x), y: Math.round(h.y), you: s.id === youId };
             }).filter(Boolean);

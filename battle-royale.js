@@ -1064,6 +1064,7 @@ function processBRAgarMatch(room, io, deps) {
         const minimapItems = room.qt.query(new Rectangle(p.x, p.y, minimapHalf, minimapHalf));
 
         const minimapPlayers = allUsers
+            .filter(u => u.id === p.id)
             .filter(u => {
                 const dx = u.x - p.x;
                 const dy = u.y - p.y;

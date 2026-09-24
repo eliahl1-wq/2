@@ -5,6 +5,7 @@ import {
     bodyCollisionThresholdForApproach,
     COMPETITIVE_SLITHER,
     headRadiusForSegmentCount,
+    isSlitherSnakeVisibleToViewer,
     randomCoordInRoom,
     radiusScaleForSegmentCount,
     resolveAllSnakeCollisions,
@@ -13,9 +14,27 @@ import {
     runSlitherBotAI,
     runCompetitiveSlitherBotAI,
     SLITHER,
+    shouldExposeExactSlitherMinimapPlayer,
     syncCompetitiveSlitherFood,
     syncSlitherFood,
 } from './slither-engine.js';
+
+test('active Slither clients only receive snakes near their viewport', () => {
+    const ownSnake = { id: 'viewer', segments: [{ x: 0, y: 0 }] };
+    const nearbySnake = { id: 'nearby', segments: [{ x: 600, y: 0 }] };
+    const hiddenSnake = { id: 'hidden', segments: [{ x: 6000, y: 0 }, { x: 5900, y: 0 }] };
+    const options = { viewX: 0, viewY: 0, range: 1800, viewerId: 'viewer', spectating: false };
+
+    assert.equal(isSlitherSnakeVisibleToViewer(ownSnake, options), true);
+    assert.equal(isSlitherSnakeVisibleToViewer(nearbySnake, options), true);
+    assert.equal(isSlitherSnakeVisibleToViewer(hiddenSnake, options), false);
+});
+
+test('active Slither minimaps never expose exact opponent positions', () => {
+    assert.equal(shouldExposeExactSlitherMinimapPlayer('viewer', 'viewer', false), true);
+    assert.equal(shouldExposeExactSlitherMinimapPlayer('enemy', 'viewer', false), false);
+    assert.equal(shouldExposeExactSlitherMinimapPlayer('enemy', 'viewer', true), true);
+});
 
 test('Slither body hitbox keeps a small proportional inset at every snake size', () => {
     const desktopVisualThickness = 0.9;
