@@ -14,6 +14,7 @@ import {
     generateSurvivMap,
     getSurvivDoorCollisionRect,
     getSurvivZone,
+    isSurvivEntityVisibleToViewer,
     processSurvivRoom,
     resetSurvivRoomRuntime,
     spawnLootFromPool,
@@ -3723,6 +3724,8 @@ test('surviv expanded map exposes coarse activity areas without exact enemy posi
 test('active Surviv players never receive exact opponents in minimap payloads', () => {
     const room = makeRoom();
     room.loot = [];
+    room.obstacles = [];
+    room._survivObstacleIndex = null;
     const viewer = createSurvivPlayer('secure-map-viewer', 'mongo-secure-viewer', 'Viewer', '#fff', room);
     const nearbyEnemy = createSurvivPlayer('secure-map-enemy', 'mongo-secure-enemy', 'Enemy', '#f00', room);
     viewer.x = 0;
@@ -3751,6 +3754,75 @@ test('active Surviv players never receive exact opponents in minimap payloads', 
     assert.ok(tick.players.some(player => player.id === nearbyEnemy.id), 'nearby enemy remains renderable in the normal viewport');
     assert.deepEqual(tick.minimap.players, [{ x: viewer.x, y: viewer.y, isYou: true, isBot: false }]);
     assert.equal(tick.minimap.players.some(player => player.x === nearbyEnemy.x && player.y === nearbyEnemy.y), false);
+});
+
+test('Surviv network visibility hides roofed and wall-occluded opponents server-side', () => {
+    const floor = {
+        id: 'secure-house',
+        kind: 'houseFloor',
+        x: 0,
+        y: 0,
+        w: 420,
+        h: 320,
+        collidable: false,
+    };
+    const room = {
+        id: 'secure-visibility-room',
+        obstacles: [floor],
+    };
+    const outsideViewer = { id: 'outside', x: -300, y: 0, radius: 14 };
+    const insideTarget = { id: 'inside', x: -100, y: 0, radius: 14 };
+    assert.equal(isSurvivEntityVisibleToViewer(outsideViewer, insideTarget, room), false);
+
+    const insideViewer = { id: 'inside-viewer', x: -120, y: 0, radius: 14 };
+    const sameRoomTarget = { id: 'same-room', x: 120, y: 0, radius: 14 };
+    assert.equal(isSurvivEntityVisibleToViewer(insideViewer, sameRoomTarget, room), true);
+
+    room.obstacles.push({
+        id: 'secure-wall',
+        kind: 'interiorWall',
+        houseId: floor.id,
+        x: 0,
+        y: 0,
+        w: 18,
+        h: 300,
+        collidable: true,
+    });
+    room._survivObstacleIndex = null;
+    assert.equal(isSurvivEntityVisibleToViewer(insideViewer, sameRoomTarget, room), false);
+
+    const outsideTarget = { id: 'outside-target', x: -500, y: 0, radius: 14 };
+    assert.equal(isSurvivEntityVisibleToViewer(outsideViewer, outsideTarget, room), true);
+});
+
+test('Surviv spectators only receive exact targets visible near their camera', () => {
+    const room = makeRoom();
+    room.loot = [];
+    const nearby = createSurvivPlayer('spectate-near', 'mongo-near', 'Nearby', '#fff', room);
+    const distant = createSurvivPlayer('spectate-far', 'mongo-far', 'Distant', '#f00', room);
+    nearby.x = 0;
+    nearby.y = 0;
+    distant.x = SURVIV.viewRange * 2;
+    distant.y = 0;
+    room.players.push(nearby, distant);
+    room.spectators.push({ id: 'spectator-socket', x: 40, y: 0, dollarBalance: 0 });
+
+    let tick = null;
+    const io = {
+        to(socketId) {
+            return { emit(event, payload) {
+                if (socketId === 'spectator-socket' && event === 'survivTick') tick = payload;
+            } };
+        },
+    };
+    broadcastSurvivState(room, io, {
+        leaderboard: [],
+        aliveCount: 2,
+        zone: { x: 0, y: 0, radius: SURVIV.worldHalf },
+    }, {});
+
+    assert.deepEqual(tick.spectateTargets.map(target => target.id), [nearby.id]);
+    assert.deepEqual(tick.minimap.players.map(player => [player.x, player.y]), [[nearby.x, nearby.y]]);
 });
 
 test('surviv alive count and leaderboard use the same active entities', () => {
@@ -3789,7 +3861,7 @@ test('surviv alive count and leaderboard use the same active entities', () => {
     assert.equal(ticks[0].aliveCount, lbData.aliveCount);
 });
 
-test('surviv spectators receive lightweight targets for players outside the rendered view', () => {
+test('surviv spectators receive targets only inside the server-visible view', () => {
     const room = makeRoom();
     room.loot = [];
     const nearby = createSurvivPlayer('nearby-player', 'mongo-nearby', 'Nearby', '#fff', room);
@@ -3824,7 +3896,7 @@ test('surviv spectators receive lightweight targets for players outside the rend
     assert.equal(spectatorTick.players.some(player => player.id === distant.id), false);
     assert.deepEqual(
         new Set(spectatorTick.spectateTargets.map(player => player.id)),
-        new Set([nearby.id, distant.id]),
+        new Set([nearby.id]),
     );
 });
 

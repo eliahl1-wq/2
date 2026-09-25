@@ -11,6 +11,13 @@ function itemValue(item) {
     return value(item?.dollarValue ?? item?.balance);
 }
 
+function survivLootValue(item) {
+    if (!item) return 0;
+    if (item.type === 'money') return value(item.dollarValue ?? item.amount);
+    if (item.type === 'chest' || item.type === 'deathCrate') return value(item.contents?.money);
+    return 0;
+}
+
 /** The USD owned by one Agar cell when the player's USD ledger is shared by mass. */
 export function proportionalAgarCellUsd({ playerUsd, cellMass, totalMass }) {
     const total = value(totalMass);
@@ -84,6 +91,43 @@ export function calculateNormalRoomValue(room = {}) {
         foodPoolUsd,
         aiBudgetUsd,
         ownerAllocatedUsd,
+        reservedCashoutUsd,
+        paidCashoutUsd,
+    };
+}
+
+/** Snapshot every real-value ledger in a paid shared Surviv room. */
+export function calculateSurvivRoomValue(room = {}) {
+    const playersUsd = (room.players || []).reduce((sum, player) => (
+        player?._arenaCashoutReservationUsd > 0 ? sum : sum + entityValue(player)
+    ), 0);
+    const botsUsd = (room.bots || []).reduce((sum, bot) => sum + entityValue(bot), 0);
+    const groundMoneyUsd = (room.loot || []).reduce((sum, item) => (
+        item?.type === 'money' ? sum + survivLootValue(item) : sum
+    ), 0);
+    const containerMoneyUsd = (room.loot || []).reduce((sum, item) => (
+        item?.type === 'chest' || item?.type === 'deathCrate'
+            ? sum + survivLootValue(item)
+            : sum
+    ), 0);
+    const lootPoolUsd = value(room.lootPoolBalance);
+    const reservedCashoutUsd = value(room.reservedCashoutUsd);
+    const paidCashoutUsd = value(room.paidCashoutUsd);
+    const fundedEntryUsd = value(room.fundedEntryUsd);
+    const liveLiabilityUsd = playersUsd + botsUsd + groundMoneyUsd + containerMoneyUsd
+        + lootPoolUsd + reservedCashoutUsd;
+    const accountedUsd = liveLiabilityUsd + paidCashoutUsd;
+
+    return {
+        fundedEntryUsd,
+        accountedUsd,
+        liveLiabilityUsd,
+        excessUsd: Math.max(0, accountedUsd - fundedEntryUsd),
+        playersUsd,
+        botsUsd,
+        groundMoneyUsd,
+        containerMoneyUsd,
+        lootPoolUsd,
         reservedCashoutUsd,
         paidCashoutUsd,
     };

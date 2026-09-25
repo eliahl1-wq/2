@@ -27,6 +27,35 @@ function playerIdentity(player, mode, room) {
     };
 }
 
+function activeSurvivTargets(player, room) {
+    return [
+        ...(Array.isArray(room?.players) ? room.players : []),
+        ...(Array.isArray(room?.bots) ? room.bots : []),
+    ].filter(target => target && target !== player && target.id !== player?.id
+        && !target.disconnected && !target._eliminated && (target.hp == null || target.hp > 0));
+}
+
+function closestAimTarget(player, targets, aim, maxDistance) {
+    const origin = entityPosition(player);
+    if (!origin || !Number.isFinite(aim)) return null;
+    let closest = null;
+    for (const target of targets) {
+        const position = entityPosition(target);
+        if (!position) continue;
+        const dx = position.x - origin.x;
+        const dy = position.y - origin.y;
+        const distance = Math.hypot(dx, dy);
+        if (distance < 60 || distance > maxDistance) continue;
+        const error = Math.abs(angleDelta(aim, Math.atan2(dy, dx)));
+        const angularRadius = Math.atan2(Math.max(10, Number(target.radius) || 14), distance);
+        const centerRatio = error / Math.max(0.0001, angularRadius);
+        if (!closest || centerRatio < closest.centerRatio) {
+            closest = { target, position, distance, error, centerRatio };
+        }
+    }
+    return closest;
+}
+
 /**
  * Per-socket, server-side heuristics. These signals deliberately never ban,
  * kick, change rewards or affect simulation. They only emit throttled review
@@ -46,7 +75,24 @@ export function createAntiCheatSession({ report, now = () => Date.now() } = {}) 
             lastPressId: null,
             samples: [],
             hiddenSamples: [],
+            lastShotSampleAt: 0,
+            targetPositions: new Map(),
+            trace: [],
+            lastTraceAt: 0,
+            visibleRange: 1200,
         },
+    };
+
+    const buildSurvivEvidenceReplay = () => {
+        const frames = state.surviv.trace.slice(-72);
+        if (!frames.length) return null;
+        const startedAt = frames[0].at;
+        return {
+            version: 1,
+            durationMs: Math.max(0, frames[frames.length - 1].at - startedAt),
+            visibleRange: state.surviv.visibleRange,
+            frames: frames.map(({ at, ...frame }) => ({ ...frame, t: at - startedAt })),
+        };
     };
 
     const emit = (code, details, cooldownMs = 10 * 60_000) => {
@@ -55,7 +101,17 @@ export function createAntiCheatSession({ report, now = () => Date.now() } = {}) 
         if (at < (state.reportCooldowns.get(code) || 0)) return false;
         state.reportCooldowns.set(code, at + cooldownMs);
         try {
-            Promise.resolve(report({ code, ...details })).catch(() => {});
+            const replay = String(details?.mode || '').includes('surviv')
+                ? buildSurvivEvidenceReplay()
+                : null;
+            Promise.resolve(report({
+                code,
+                ...details,
+                context: {
+                    ...(details?.context || {}),
+                    ...(replay ? { evidenceReplay: replay } : {}),
+                },
+            })).catch(() => {});
         } catch {
             // Anti-cheat telemetry must never affect live gameplay.
         }
@@ -163,6 +219,50 @@ export function createAntiCheatSession({ report, now = () => Date.now() } = {}) 
             !state.surviv.lastShooting
             || (validPressId && pressId !== state.surviv.lastPressId)
         );
+        state.surviv.visibleRange = Math.max(300, Number(visibleRange) || 1200);
+
+        let targets = null;
+        const getTargets = () => {
+            targets ||= activeSurvivTargets(player, room);
+            return targets;
+        };
+
+        if (!state.surviv.trace.length || at - state.surviv.lastTraceAt >= 90) {
+            const origin = entityPosition(player);
+            const traceTargets = origin
+                ? getTargets().map(target => {
+                    const position = entityPosition(target);
+                    if (!position) return null;
+                    const dx = position.x - origin.x;
+                    const dy = position.y - origin.y;
+                    const distance = Math.hypot(dx, dy);
+                    if (distance > visibleRange * 1.45) return null;
+                    return {
+                        id: String(target.id || '').slice(0, 64),
+                        dx: Math.round(dx),
+                        dy: Math.round(dy),
+                        distance: Math.round(distance),
+                        bot: !!target.isBot,
+                        offscreen: distance > visibleRange,
+                    };
+                }).filter(Boolean).sort((a, b) => a.distance - b.distance).slice(0, 5)
+                : [];
+            const traceClosest = closestAimTarget(player, getTargets(), aim, visibleRange * 1.45);
+            state.surviv.trace.push({
+                at,
+                x: Math.round(Number(player.x) || 0),
+                y: Math.round(Number(player.y) || 0),
+                aim: Number.isFinite(aim) ? Number(aim.toFixed(4)) : 0,
+                shooting,
+                moving: Math.hypot(Number(payload.dx) || 0, Number(payload.dy) || 0) > 0.08,
+                weapon: String(player.weapon?.type || 'fists').slice(0, 40),
+                closestTargetId: traceClosest ? String(traceClosest.target.id || '').slice(0, 64) : null,
+                centerRatio: traceClosest ? Number(traceClosest.centerRatio.toFixed(3)) : null,
+                targets: traceTargets,
+            });
+            state.surviv.trace = state.surviv.trace.filter(frame => at - frame.at <= 10_000).slice(-72);
+            state.surviv.lastTraceAt = at;
+        }
 
         if (!finite(payload.dx) || !finite(payload.dy) || !finite(payload.aimAngle)
             || Math.abs(Number(payload.dx)) > 1.05 || Math.abs(Number(payload.dy)) > 1.05
@@ -170,32 +270,26 @@ export function createAntiCheatSession({ report, now = () => Date.now() } = {}) 
             observeInvalidInput({ reason: 'non-finite or out-of-range movement/aim', player, room, mode });
         }
 
-        if (Number.isFinite(aim) && isNewPress) {
-            const origin = entityPosition(player);
-            const candidates = [
-                ...(Array.isArray(room.players) ? room.players : []),
-                ...(Array.isArray(room.bots) ? room.bots : []),
-            ].filter(target => target && target !== player && target.id !== player.id
-                && !target.disconnected && !target._eliminated && (target.hp == null || target.hp > 0));
-            let closest = null;
-            for (const target of candidates) {
-                const position = entityPosition(target);
-                if (!origin || !position) continue;
-                const dx = position.x - origin.x;
-                const dy = position.y - origin.y;
-                const distance = Math.hypot(dx, dy);
-                if (distance < 60 || distance > visibleRange * 2.6) continue;
-                const error = Math.abs(angleDelta(aim, Math.atan2(dy, dx)));
-                const angularRadius = Math.atan2(Math.max(10, Number(target.radius) || 14), distance);
-                const centerRatio = error / Math.max(0.0001, angularRadius);
-                if (!closest || centerRatio < closest.centerRatio) {
-                    closest = { target, distance, error, centerRatio };
-                }
-            }
+        const heldFireSampleDue = shooting && at - state.surviv.lastShotSampleAt >= 90;
+        if (Number.isFinite(aim) && shooting && (isNewPress || heldFireSampleDue)) {
+            state.surviv.lastShotSampleAt = at;
+            const closest = closestAimTarget(player, getTargets(), aim, visibleRange * 2.6);
 
             if (closest) {
                 const elapsed = at - (state.surviv.lastAimAt || at);
                 const snapDelta = state.surviv.lastAim == null ? 0 : Math.abs(angleDelta(aim, state.surviv.lastAim));
+                const previousTargetPosition = state.surviv.targetPositions.get(closest.target.id);
+                const targetMovement = previousTargetPosition && at - previousTargetPosition.at <= 500
+                    ? Math.hypot(
+                        closest.position.x - previousTargetPosition.x,
+                        closest.position.y - previousTargetPosition.y,
+                    )
+                    : 0;
+                state.surviv.targetPositions.set(closest.target.id, {
+                    at,
+                    x: closest.position.x,
+                    y: closest.position.y,
+                });
                 const sample = {
                     at,
                     targetId: closest.target.id,
@@ -204,15 +298,16 @@ export function createAntiCheatSession({ report, now = () => Date.now() } = {}) 
                     hidden: closest.distance > visibleRange * 1.2,
                     distance: Math.round(closest.distance),
                     centerRatio: Number(closest.centerRatio.toFixed(4)),
+                    movingTarget: targetMovement >= 6,
                 };
                 state.surviv.samples.push(sample);
-                state.surviv.samples = state.surviv.samples.filter(item => at - item.at <= 120_000).slice(-30);
+                state.surviv.samples = state.surviv.samples.filter(item => at - item.at <= 30_000).slice(-36);
                 if (sample.hidden && sample.centerPerfect) {
                     state.surviv.hiddenSamples.push(sample);
                     state.surviv.hiddenSamples = state.surviv.hiddenSamples.filter(item => at - item.at <= 120_000).slice(-20);
                 }
 
-                const recent = state.surviv.samples.slice(-20);
+                const recent = state.surviv.samples.slice(-24);
                 const perfect = recent.filter(item => item.centerPerfect).length;
                 const snaps = recent.filter(item => item.snapped).length;
                 const targetSwitches = recent.reduce((count, item, index) => (
@@ -231,6 +326,35 @@ export function createAntiCheatSession({ report, now = () => Date.now() } = {}) 
                             centerPerfectShots: perfect,
                             rapidSnaps: snaps,
                             targetSwitches,
+                            reviewOnly: true,
+                        },
+                    }, 15 * 60_000);
+                }
+
+                const movingTracking = recent.filter(item => item.movingTarget);
+                const movingPerfect = movingTracking.filter(item => item.centerPerfect);
+                const trackingSpan = movingTracking.length > 1
+                    ? movingTracking[movingTracking.length - 1].at - movingTracking[0].at
+                    : 0;
+                const meanTrackingRatio = movingTracking.length
+                    ? movingTracking.reduce((sum, item) => sum + item.centerRatio, 0) / movingTracking.length
+                    : Infinity;
+                if (movingTracking.length >= 18
+                    && trackingSpan >= 1600
+                    && movingPerfect.length / movingTracking.length >= 0.9
+                    && meanTrackingRatio <= 0.05) {
+                    emit('surviv_automatic_tracking', {
+                        severity: 'warning',
+                        title: 'Potential Surviv automatic tracking',
+                        message: `${player.username || 'An account'} kept its aim almost perfectly centred while targets moved. Review the server evidence playback before taking action.`,
+                        ...playerIdentity(player, mode, room),
+                        context: {
+                            signal: 'moving_target_lock',
+                            riskScore: Math.min(100, Math.round(72 + movingPerfect.length)),
+                            trackingSamples: movingTracking.length,
+                            perfectTrackingSamples: movingPerfect.length,
+                            meanCenterRatio: Number(meanTrackingRatio.toFixed(4)),
+                            trackingSpanMs: trackingSpan,
                             reviewOnly: true,
                         },
                     }, 15 * 60_000);

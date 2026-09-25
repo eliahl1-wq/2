@@ -195,6 +195,7 @@ import {
     agarEconomicVisualMass,
     allocateAgarEjectionValue,
     calculateNormalRoomValue,
+    calculateSurvivRoomValue,
     canAgarCellEat,
     proportionalAgarCellUsd,
 } from './game-value-accounting.js';
@@ -1408,6 +1409,9 @@ function createSurvivRoom(entryFeeUsd) {
         spawnPoints: map.spawnPoints,
         landmarks: map.landmarks,
         lootPoolBalance: 0,
+        fundedEntryUsd: 0,
+        reservedCashoutUsd: 0,
+        paidCashoutUsd: 0,
         sessionPlayerCashoutUsd: 0,
         spectators: [],
         deathMarkers: [],
@@ -2330,7 +2334,11 @@ async function executeSurvivCashout(player, room, reason = 'Arena Cashout') {
 }
 
 async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashout') {
-    const dollarBalance = Number(player.dollarBalance) || 0;
+    const requestedDollarBalance = Math.max(0, Number(player.dollarBalance) || 0);
+    const simulatedCashout = DEV_FREE_PLAY || player.personalFreePlay || player.adminFreeSurvivEntry;
+    const dollarBalance = simulatedCashout
+        ? requestedDollarBalance
+        : reserveArenaCashout(room, player, requestedDollarBalance);
     const entryFeeUsd = room.entryFeeUsd ?? player.entryFeeUsd ?? DEFAULT_SURVIV_ENTRY_FEE;
     const { cashoutFeePct } = getSurvivEconomy(entryFeeUsd);
     const cashoutFeeBps = Math.round(cashoutFeePct * 10_000);
@@ -2349,6 +2357,8 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
         mode: 'surviv',
         entryFeeUsd,
         dollarBalance,
+        requestedDollarBalance,
+        roomLedgerShortfallUsd: Number(player._arenaCashoutLedgerShortfallUsd) || 0,
         playerPayout,
         platformFee,
         cashoutFeePct,
@@ -2360,8 +2370,14 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
         timestamp: new Date().toISOString(),
         ...(player.adminFreeSurvivEntry ? { adminFreeEntry: true, fundedEntryUsd: 0 } : {}),
     };
+    if (logMeta.roomLedgerShortfallUsd > 0) {
+        logMeta.basePlatformFeeUsd = platformFee;
+        logMeta.liquidityFeeUsd = logMeta.roomLedgerShortfallUsd;
+        logMeta.platformFee = platformFee + logMeta.roomLedgerShortfallUsd;
+        logMeta.totalCashoutFeeUsd = logMeta.platformFee;
+    }
 
-    if (DEV_FREE_PLAY || player.personalFreePlay) {
+    if (simulatedCashout) {
         // A free admin in the public room never withdraws value funded by paid
         // players. Put collected dollars back onto the map before ending the
         // simulated session so the public match economy stays conserved.
@@ -2466,6 +2482,7 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
         detachPlayer: () => {
             room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
         },
+        commitReservation: () => commitArenaCashoutReservation(room, player),
     });
 }
 
@@ -2713,6 +2730,7 @@ async function cashOutSurvivRoomPlayers(room) {
             const result = await executeSurvivCashout(p, room, 'Auto Room Reset');
             if (result?.processing) allSettled = false;
         } catch (err) {
+            releaseArenaCashoutReservation(room, p);
             allSettled = false;
             console.error(`Surviv reset cashout failed for ${p.username}:`, err.message);
             await Transaction.create({
@@ -5083,17 +5101,7 @@ function getActiveMainHouseGameLiabilityUsd() {
 
     for (const room of survivRooms) {
         if (room.isPersonalFreePlay || room.isSandbox || room.isTournament) continue;
-        total += [...(room.players || []), ...(room.bots || [])].reduce((sum, player) => (
-            player?.personalFreePlay || player?.adminFreeSurvivEntry
-                ? sum
-                : sum + Math.max(0, Number(player?.dollarBalance ?? player?.balance) || 0)
-        ), 0);
-        total += (room.loot || []).reduce((sum, item) => (
-            item?.type === 'money'
-                ? sum + Math.max(0, Number(item?.dollarValue ?? item?.amount) || 0)
-                : sum
-        ), 0);
-        total += Math.max(0, Number(room.lootPoolBalance) || 0);
+        total += calculateSurvivRoomValue(room).liveLiabilityUsd;
     }
 
     return Math.max(0, total);
@@ -8441,31 +8449,36 @@ app.get('/api/admin/dashboard/main-house-live', authenticateAdmin, async (req, r
         const survivSnapshots = survivRooms
             .filter(room => !room.isPersonalFreePlay && !room.isSandbox)
             .map(room => {
-                const players = (room.players || []).filter(player => !player.personalFreePlay).map(player => ({
+                const economySnapshot = calculateSurvivRoomValue(room);
+                const players = (room.players || []).filter(player => !player.isBot).map(player => ({
                     id: player.mongoId?.toString() || player.id,
                     username: player.username || 'Unknown',
                     mode: 'Surviv',
                     balanceUsd: liveEntityBalance(player),
                     disconnected: !!player.disconnected,
                     cashingOut: !!player.isCashingOut || !!player.cashoutSettling,
+                    simulated: !!player.personalFreePlay || !!player.adminFreeSurvivEntry,
                 })).sort((a, b) => b.balanceUsd - a.balanceUsd);
-                const moneyLoot = (room.loot || []).filter(item => item.type === 'money');
                 return {
                     id: room.id,
                     label: `$${room.entryFeeUsd} Surviv`,
                     entryFeeUsd: room.entryFeeUsd,
                     players,
-                    playerBalanceUsd: sumLiveValues(players, player => player.balanceUsd),
+                    playerBalanceUsd: roundLiveUsd(economySnapshot.playersUsd),
                     activeBotCount: (room.bots || []).length,
-                    activeBotBalanceUsd: sumLiveValues(room.bots, liveEntityBalance),
-                    mapFoodUsd: sumLiveValues(moneyLoot, item => item.dollarValue ?? item.amount),
-                    unspawnedFoodUsd: roundLiveUsd(room.lootPoolBalance),
+                    activeBotBalanceUsd: roundLiveUsd(economySnapshot.botsUsd),
+                    mapFoodUsd: roundLiveUsd(economySnapshot.groundMoneyUsd + economySnapshot.containerMoneyUsd),
+                    unspawnedFoodUsd: roundLiveUsd(economySnapshot.lootPoolUsd),
                     unspawnedBotBudgetUsd: 0,
                     ownerAccruedUsd: 0,
-                    reservedCashoutUsd: 0,
+                    reservedCashoutUsd: roundLiveUsd(economySnapshot.reservedCashoutUsd),
                     playerCashoutsUsd: roundLiveUsd(room.sessionPlayerCashoutUsd),
                     botCashoutCount: 0,
                     botCashoutsUsd: 0,
+                    fundedEntryUsd: roundLiveUsd(economySnapshot.fundedEntryUsd),
+                    paidCashoutUsd: roundLiveUsd(economySnapshot.paidCashoutUsd),
+                    accountedUsd: roundLiveUsd(economySnapshot.accountedUsd),
+                    excessUsd: roundLiveUsd(economySnapshot.excessUsd),
                 };
             });
 
@@ -12164,6 +12177,9 @@ io.on('connection', (socket) => {
                     freePlay,
                 });
                 spawnLootFromPool(room, joinLootFunding);
+                if (!freePlay && !useAdminFreeSurvivEntry) {
+                    room.fundedEntryUsd = (Number(room.fundedEntryUsd) || 0) + joinLootFunding;
+                }
                 const ownerContribution = getSurvivEconomy(entryFeeUsd).entryOwnerCutUsd;
                 if (!freePlay && !useAdminFreeSurvivEntry && ownerContribution > 0) {
                     Transaction.create({
@@ -12182,7 +12198,8 @@ io.on('connection', (socket) => {
                 }
                 newPlayer.personalFreePlay = sessionFreePlay || useAdminFreeSurvivEntry;
                 newPlayer.adminFreeSurvivEntry = useAdminFreeSurvivEntry;
-                newPlayer.fundedEntryUsd = useAdminFreeSurvivEntry ? 0 : entryFeeUsd;
+                newPlayer.fundedEntryUsd = (!freePlay && !useAdminFreeSurvivEntry) ? joinLootFunding : 0;
+                newPlayer.gameSessionId = randomBytes(12).toString('hex');
                 room.players.push(newPlayer);
                 pendingPaidJoin = null;
 
@@ -13165,6 +13182,7 @@ io.on('connection', (socket) => {
                 try {
                     await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
+                    releaseArenaCashoutReservation(activeRoom, activePlayer);
                     await logSolanaTransactionError('❌ Surviv cashout error:', err);
                     await recordCashoutFailure(activePlayer, activeRoom, 'surviv_manual_cashout_failed', err);
                     emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
@@ -13474,10 +13492,33 @@ io.on('connection', (socket) => {
         if (!room?.isSurviv) return;
         const spectator = room.spectators?.find(candidate => candidate.id === socket.id);
         if (!spectator) return;
-        const x = Number(payload.x);
-        const y = Number(payload.y);
-        if (Number.isFinite(x)) spectator.x = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, x));
-        if (Number.isFinite(y)) spectator.y = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, y));
+        const requestedX = Number(payload.x);
+        const requestedY = Number(payload.y);
+        if (!Number.isFinite(requestedX) || !Number.isFinite(requestedY)) return;
+
+        // The official free camera moves at 480 world units/second. Keep a
+        // generous allowance for target switching and network jitter, while
+        // preventing a modified spectator client from teleport-scanning every
+        // part of the map for exact player positions.
+        const previousAt = Number(spectator._lastCameraUpdateAt) || now;
+        const elapsedMs = Math.max(0, Math.min(1_000, now - previousAt));
+        const maxTravel = 120 + elapsedMs * 0.9;
+        const dx = requestedX - (Number(spectator.x) || 0);
+        const dy = requestedY - (Number(spectator.y) || 0);
+        const travel = Math.hypot(dx, dy);
+        const scale = travel > maxTravel ? maxTravel / travel : 1;
+        spectator.x = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, (Number(spectator.x) || 0) + dx * scale));
+        spectator.y = Math.max(-SURVIV.worldHalf, Math.min(SURVIV.worldHalf, (Number(spectator.y) || 0) + dy * scale));
+        spectator._lastCameraUpdateAt = now;
+        if (travel > maxTravel * 2) {
+            antiCheat.observeInvalidInput({
+                reason: 'spectator camera teleport',
+                player: spectator,
+                room,
+                mode: 'surviv-spectator',
+                context: { requestedTravel: Math.round(travel), allowedTravel: Math.round(maxTravel) },
+            });
+        }
     });
 });
 
@@ -13524,6 +13565,7 @@ function processCompetitiveSlitherTick() {
 function processSurvivTick() {
     for (const room of survivRooms) {
         if (room.isResetting) continue;
+        maybeLogSurvivRoomValueInvariant(room);
         const alivePlayerCount = room.players.filter(player => !player._eliminated && player.hp > 0).length;
         const spectatorCount = room.spectators?.length ?? 0;
         if (alivePlayerCount === 0 && spectatorCount === 0) continue;
@@ -14426,6 +14468,53 @@ function maybeLogNormalRoomValueInvariant(room, now = Date.now()) {
         message: `Room ${room.id} contains $${snapshot.accountedUsd.toFixed(6)} against $${snapshot.fundedEntryUsd.toFixed(6)} of paid entry funding.`,
         roomId: room.id,
         mode: room.mode,
+        expectedUsd: snapshot.fundedEntryUsd,
+        actualUsd: snapshot.accountedUsd,
+        differenceUsd: snapshot.excessUsd,
+        context: snapshot,
+    });
+}
+
+function maybeLogSurvivRoomValueInvariant(room, now = Date.now()) {
+    if (!room
+        || DEV_FREE_PLAY
+        || room.isPersonalFreePlay
+        || room.isSandbox
+        || room.isTournament
+        || room.isBattleRoyale) return;
+    if (now - (room._lastValueInvariantCheckAt || 0) < 2_000) return;
+    room._lastValueInvariantCheckAt = now;
+
+    const snapshot = calculateSurvivRoomValue(room);
+    const toleranceUsd = Math.max(0.0001, snapshot.fundedEntryUsd * 1e-7);
+    const fingerprint = `economy-invariant:${room.id}`;
+    if (snapshot.excessUsd <= toleranceUsd) {
+        if (room._economyInvariantIssueOpen || !room._economyInvariantHealthySynced) {
+            room._economyInvariantIssueOpen = false;
+            room._economyInvariantHealthySynced = true;
+            void resolveAdminIssue(fingerprint);
+        }
+        return;
+    }
+    if (now - (room._lastValueInvariantCriticalAt || 0) < 30_000) return;
+    room._lastValueInvariantCriticalAt = now;
+    room._economyInvariantIssueOpen = true;
+    room._economyInvariantHealthySynced = false;
+    console.error(
+        `[CRITICAL SURVIV ECONOMY INVARIANT] ${room.id} contains $${snapshot.accountedUsd.toFixed(6)} `
+        + `against $${snapshot.fundedEntryUsd.toFixed(6)} of paid entry funding `
+        + `(excess $${snapshot.excessUsd.toFixed(6)}).`,
+        snapshot,
+    );
+    void recordAdminIssue({
+        fingerprint,
+        severity: 'critical',
+        category: 'economy',
+        code: 'surviv_live_value_exceeds_funding',
+        title: 'Surviv value exceeds paid funding',
+        message: `Room ${room.id} contains $${snapshot.accountedUsd.toFixed(6)} against $${snapshot.fundedEntryUsd.toFixed(6)} of paid entry funding.`,
+        roomId: room.id,
+        mode: 'surviv',
         expectedUsd: snapshot.fundedEntryUsd,
         actualUsd: snapshot.accountedUsd,
         differenceUsd: snapshot.excessUsd,

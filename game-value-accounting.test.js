@@ -4,6 +4,7 @@ import {
     agarEconomicVisualMass,
     allocateAgarEjectionValue,
     calculateNormalRoomValue,
+    calculateSurvivRoomValue,
     canAgarCellEat,
     proportionalAgarCellUsd,
 } from './game-value-accounting.js';
@@ -87,4 +88,43 @@ test('normal-room invariant exposes duplicated value above paid funding', () => 
         foodPoolBalance: 1,
     });
     assert.equal(result.excessUsd, 0.25);
+});
+
+test('Surviv invariant includes unopened chest money and ground death drops', () => {
+    const result = calculateSurvivRoomValue({
+        fundedEntryUsd: 10,
+        players: [{ dollarBalance: 2 }],
+        bots: [{ dollarBalance: 1 }],
+        loot: [
+            { type: 'chest', contents: { money: 4 } },
+            { type: 'deathCrate', contents: { money: 1 } },
+            { type: 'money', dollarValue: 2 },
+            { type: 'weapon', dollarValue: 999 },
+        ],
+    });
+    assert.equal(result.containerMoneyUsd, 5);
+    assert.equal(result.groundMoneyUsd, 2);
+    assert.equal(result.accountedUsd, 10);
+    assert.equal(result.liveLiabilityUsd, 10);
+    assert.equal(result.excessUsd, 0);
+});
+
+test('Surviv invariant counts a settling player only through the reservation', () => {
+    const result = calculateSurvivRoomValue({
+        fundedEntryUsd: 5,
+        players: [{ dollarBalance: 5, _arenaCashoutReservationUsd: 5 }],
+        reservedCashoutUsd: 5,
+    });
+    assert.equal(result.playersUsd, 0);
+    assert.equal(result.reservedCashoutUsd, 5);
+    assert.equal(result.accountedUsd, 5);
+});
+
+test('Surviv invariant exposes duplicated value above paid funding', () => {
+    const result = calculateSurvivRoomValue({
+        fundedEntryUsd: 5,
+        players: [{ dollarBalance: 3 }],
+        loot: [{ type: 'chest', contents: { money: 3 } }],
+    });
+    assert.equal(result.excessUsd, 1);
 });

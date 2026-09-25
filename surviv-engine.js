@@ -6712,6 +6712,9 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room._nextSurvivBotSyncAt = 0;
     room._nextSurvivAirdropAt = null;
     room._survivAirdropsSpawned = 0;
+    room.fundedEntryUsd = 0;
+    room.reservedCashoutUsd = 0;
+    room.paidCashoutUsd = 0;
     return room;
 }
 export function createSurvivPlayer(socketId, mongoId, username, color, room) {
@@ -6904,6 +6907,24 @@ function buildObstacleIndex(room) {
     return room._survivObstacleIndex;
 }
 
+function removeObstacleFromGrid(grid, obstacle) {
+    const { halfW, halfH } = getObstacleAabbHalfExtents(obstacle);
+    const minX = Math.floor((obstacle.x - halfW) / SURVIV_OBSTACLE_CELL);
+    const maxX = Math.floor((obstacle.x + halfW) / SURVIV_OBSTACLE_CELL);
+    const minY = Math.floor((obstacle.y - halfH) / SURVIV_OBSTACLE_CELL);
+    const maxY = Math.floor((obstacle.y + halfH) / SURVIV_OBSTACLE_CELL);
+    for (let cx = minX; cx <= maxX; cx++) {
+        for (let cy = minY; cy <= maxY; cy++) {
+            const key = obstacleCellKey(cx, cy);
+            const bucket = grid.get(key);
+            if (!bucket) continue;
+            const index = bucket.indexOf(obstacle);
+            if (index >= 0) bucket.splice(index, 1);
+            if (!bucket.length) grid.delete(key);
+        }
+    }
+}
+
 function getObstacleIndex(room) {
     const count = room.obstacles?.length || 0;
     if (!room._survivObstacleIndex
@@ -6983,6 +7004,15 @@ function damageSurvivObstacle(room, obstacle, damage, attacker = null) {
 
     const index = room.obstacles.indexOf(obstacle);
     if (index >= 0) {
+        const spatial = room._survivObstacleIndex;
+        // A barrel chain used to rebuild the entire world between each blast.
+        // Only update a current index; stale/replaced arrays still rebuild through
+        // getObstacleIndex. Revision-driven client snapshots remain unchanged.
+        if (spatial?.source === room.obstacles && spatial.count === room.obstacles.length) {
+            removeObstacleFromGrid(spatial.all, obstacle);
+            removeObstacleFromGrid(spatial.collidable, obstacle);
+            spatial.count--;
+        }
         obstacle._destroyed = true;
         room.obstacles.splice(index, 1);
     }
@@ -7475,9 +7505,12 @@ export function eliminateSurvivPlayer(room, player, io, attacker = null, damageK
         room.spectators.push({
             id: socketId,
             mongoId: player.mongoId,
+            username: player.username,
+            gameSessionId: player.gameSessionId,
             x: player.x,
             y: player.y,
             dollarBalance: player.dollarBalance,
+            _lastCameraUpdateAt: Date.now(),
         });
         io.to(socketId).emit('RIP');
         io.to(socketId).emit('died', {
@@ -8664,6 +8697,68 @@ function botHasLineOfSight(bot, target, room) {
         ) != null);
 }
 
+const SURVIV_NETWORK_LOS_BLOCKERS = new Set(['wall', 'interiorWall', 'door', 'container', 'crate']);
+
+function getSurvivNetworkHouse(room, entity) {
+    if (!entity || !Number.isFinite(entity.x) || !Number.isFinite(entity.y)) return null;
+    return queryObstacles(room, entity.x, entity.y, 4, false)
+        .find(obstacle => obstacle.kind === 'houseFloor' && pointInRect(entity.x, entity.y, obstacle)) || null;
+}
+
+/**
+ * Server-side disclosure boundary for active Surviv snapshots. Rendering an
+ * opponent and transmitting an opponent are deliberately the same decision:
+ * modified clients cannot recover entities hidden by a roof or solid interior
+ * geometry simply by ignoring the normal renderer's fog/roof rules.
+ */
+export function isSurvivEntityVisibleToViewer(viewer, target, room, range = SURVIV.viewRange, prepared = null) {
+    if (!viewer || !target || !room || target.id === viewer.id) return true;
+    const distance = dist(viewer.x, viewer.y, target.x, target.y);
+    if (!Number.isFinite(distance) || distance > range) return false;
+
+    const viewerHouse = prepared && Object.hasOwn(prepared, 'viewerHouse')
+        ? prepared.viewerHouse
+        : getSurvivNetworkHouse(room, viewer);
+    const targetHouse = prepared && Object.hasOwn(prepared, 'targetHouse')
+        ? prepared.targetHouse
+        : getSurvivNetworkHouse(room, target);
+    if ((viewerHouse?.id || null) !== (targetHouse?.id || null)) return false;
+    if (!viewerHouse) return true;
+
+    const midpointX = (viewer.x + target.x) / 2;
+    const midpointY = (viewer.y + target.y) / 2;
+    const blockers = Array.isArray(prepared?.blockers)
+        ? prepared.blockers
+        : queryObstacles(room, midpointX, midpointY, distance / 2 + 70, false)
+            .filter(obstacle => SURVIV_NETWORK_LOS_BLOCKERS.has(obstacle.kind))
+            .filter(obstacle => obstacle.houseId === viewerHouse.id || pointInRect(obstacle.x, obstacle.y, viewerHouse));
+    if (blockers.length === 0) return true;
+
+    const dx = target.x - viewer.x;
+    const dy = target.y - viewer.y;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const targetRadius = Math.max(8, Number(target.radius) || SURVIV.playerRadius);
+    const perpendicularX = -dy / length;
+    const perpendicularY = dx / length;
+    const offsets = [0, -targetRadius * 0.72, targetRadius * 0.72];
+    return offsets.some(offset => {
+        const targetX = target.x + perpendicularX * offset;
+        const targetY = target.y + perpendicularY * offset;
+        return !blockers.some(obstacle => {
+            const hit = segmentRectHitT(
+                viewer.x,
+                viewer.y,
+                targetX,
+                targetY,
+                getObstacleCollisionRect(obstacle),
+            );
+            // Ignore a surface the viewer or target is directly touching. It
+            // avoids one-frame disappearance at door leaves and wall corners.
+            return hit != null && hit > 0.015 && hit < 0.985;
+        });
+    });
+}
+
 function getBotNavigationDirection(bot, room, waypoint, now) {
     const desiredAngle = Math.atan2(waypoint.y - bot.y, waypoint.x - bot.x);
     const direct = normalize(waypoint.x - bot.x, waypoint.y - bot.y);
@@ -9193,6 +9288,10 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     }
 
     const allPlayers = getActiveSurvivEntities(room);
+    const networkHouseByEntityId = new Map(allPlayers.map(player => [
+        player.id,
+        getSurvivNetworkHouse(room, player),
+    ]));
     // The expanded map is intentionally imprecise about opponents. It reports
     // coarse, slowly refreshed activity cells instead of exact player
     // coordinates, so the map is useful for routing without becoming a
@@ -9226,8 +9325,25 @@ export function broadcastSurvivState(room, io, lbData, meta) {
         }
         const sendStaticPayload = shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now);
 
-        const visiblePlayers = allPlayers
-            .filter(p => p.id !== youId && isInView(viewX, viewY, p.x, p.y, range))
+        const viewerEntity = youId
+            ? allPlayers.find(player => player.id === youId)
+            : { id: null, x: viewX, y: viewY, radius: SURVIV.playerRadius };
+        const viewerHouse = youId
+            ? networkHouseByEntityId.get(youId) || null
+            : getSurvivNetworkHouse(room, viewerEntity);
+        const viewerBlockers = viewerHouse
+            ? queryObstacles(room, viewX, viewY, range + 100, false)
+                .filter(obstacle => SURVIV_NETWORK_LOS_BLOCKERS.has(obstacle.kind))
+                .filter(obstacle => obstacle.houseId === viewerHouse.id || pointInRect(obstacle.x, obstacle.y, viewerHouse))
+            : [];
+        const visibleEntities = allPlayers
+            .filter(p => p.id !== youId)
+            .filter(p => isSurvivEntityVisibleToViewer(viewerEntity, p, room, range, {
+                viewerHouse,
+                targetHouse: networkHouseByEntityId.get(p.id) || null,
+                blockers: viewerBlockers,
+            }));
+        const visiblePlayers = visibleEntities
             .map(p => serializePlayer(p, false));
 
         const visibleLoot = querySurvivLoot(room, viewX, viewY, range)
@@ -9282,12 +9398,11 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 .filter(({ item: l }) => l.type === 'chest' || l.type === 'deathCrate' || l.type === 'money')
                 .slice(0, 90)
                 .map(({ item: l }) => ({ x: l.x, y: l.y, golden: l.type !== 'chest' }));
-            const minimapPlayers = allPlayers
+            const minimapPlayers = (spectating ? visibleEntities : allPlayers)
                 // Active players only receive their own exact minimap marker.
                 // Opponent activity is intentionally represented by the
                 // coarse activityZones payload below, never exact coordinates.
                 .filter(p => spectating || p.id === youId)
-                .filter(p => isInView(viewX, viewY, p.x, p.y, minimapRange))
                 .map(p => ({ x: p.x, y: p.y, isYou: p.id === youId, isBot: !!p.isBot }));
             staticPayload.obstacles = visibleObstacles;
             staticPayload.obstaclePatch = {
@@ -9337,7 +9452,6 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             }
         }
 
-        const viewerEntity = youId ? allPlayers.find(player => player.id === youId) : null;
         const activityZones = (room._survivActivitySnapshot?.cells || [])
             .filter(cell => cell.entityIds.some(entityId => entityId !== youId))
             .map(cell => ({
@@ -9380,7 +9494,10 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             ...(viewerEntity?._damageTaken ? { damageTaken: { ...viewerEntity._damageTaken } } : {}),
             ...(viewerEntity?._objectImpact ? { objectImpact: { ...viewerEntity._objectImpact } } : {}),
             ...(spectating ? {
-                spectateTargets: allPlayers.map(p => ({
+                // Only nearby, server-visible targets are offered. Sending the
+                // whole roster with exact coordinates turned an alternate
+                // spectator account into a map-wide radar.
+                spectateTargets: visibleEntities.map(p => ({
                     id: p.id,
                     name: p.username || p.name || 'Player',
                     x: p.x,

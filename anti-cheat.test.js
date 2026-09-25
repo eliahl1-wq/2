@@ -63,7 +63,39 @@ test('repeated centre-perfect rapid target snaps are surfaced for review', () =>
         antiCheat.observeSurvivInput({ player, room, payload: { dx: 0, dy: 0, aimAngle: angle, shooting: false, firePressId: index + 1 } });
     }
     assert.ok(reports.some(report => report.code === 'surviv_aim_automation'));
-    assert.equal(reports.find(report => report.code === 'surviv_aim_automation').context.reviewOnly, true);
+    const report = reports.find(item => item.code === 'surviv_aim_automation');
+    assert.equal(report.context.reviewOnly, true);
+    assert.ok(report.context.evidenceReplay.frames.length > 0);
+    assert.ok(report.context.evidenceReplay.frames.every(frame => Number.isFinite(frame.t)));
+});
+
+test('automatic aim that tracks a moving target while fire is held is surfaced', () => {
+    let clock = 1;
+    const reports = [];
+    const antiCheat = createAntiCheatSession({ now: () => clock, report: issue => reports.push(issue) });
+    const { player } = makeContext();
+    const target = { id: 'moving-target', x: 500, y: 0, hp: 100, radius: 14 };
+    const room = { id: 'surviv-moving-target', players: [player, target], bots: [] };
+    for (let index = 0; index < 24; index++) {
+        target.y += 9;
+        clock += 100;
+        antiCheat.observeSurvivInput({
+            player,
+            room,
+            payload: {
+                dx: 0,
+                dy: 0,
+                aimAngle: Math.atan2(target.y - player.y, target.x - player.x),
+                aimDistance: 500,
+                shooting: true,
+                firePressId: 1,
+            },
+        });
+    }
+    const report = reports.find(item => item.code === 'surviv_automatic_tracking');
+    assert.ok(report);
+    assert.equal(report.context.signal, 'moving_target_lock');
+    assert.ok(report.context.evidenceReplay.frames.some(frame => frame.shooting));
 });
 
 test('sustained packet floods require repeated windows before alerting', () => {
