@@ -476,6 +476,7 @@ const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     email: { type: String, unique: true, sparse: true },
     emailVerifiedAt: { type: Date, default: null, index: true },
+    emailChange: { type: mongoose.Schema.Types.Mixed, select: false },
     emailVerificationTokenHash: { type: String, default: null, select: false, index: true },
     emailVerificationExpiresAt: { type: Date, default: null, select: false },
     emailVerificationLastSentAt: { type: Date, default: null, select: false },
@@ -3975,6 +3976,20 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
+});
+
+app.post('/api/email-change/start', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message: 'Account not found' });
+        res.json(await emailVerificationService.startChange(user, req.body?.email));
+    } catch (error) { sendEmailVerificationError(res, error); }
+});
+
+app.post('/api/email-change/confirm', sensitiveRateLimit({ limit: 20, windowMs: 15 * 60_000 }), async (req, res) => {
+    try {
+        res.json(await emailVerificationService.confirmChange(req.body?.token, req.body?.stage));
+    } catch (error) { sendEmailVerificationError(res, error); }
 });
 
 app.post('/api/email-verification/start', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateToken, async (req, res) => {

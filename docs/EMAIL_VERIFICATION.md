@@ -33,6 +33,8 @@ Cloudflare Email Routing is only needed if replies to `support@arenifi.fun` shou
 
 ## Release and smoke test
 
+Email changes are available in Profile > Account settings. The current inbox must approve each change, even if already verified, then the new inbox must confirm. The current account email remains active until both steps complete. Links expire after 24 hours; a new request replaces the previous pending change. The existing Resend and DNS configuration is reused. Existing linked Google sign-in remains linked to the same account.
+
 1. Deploy the backend after setting the Railway variables.
 2. Deploy the frontend.
 3. Register a new test account with an inbox you control.

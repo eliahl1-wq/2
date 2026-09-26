@@ -74,15 +74,21 @@ export function createEmailVerificationService({
 }) {
     if (!User) throw new Error('Email verification requires a User model');
 
-    async function deliverVerificationEmail({ email, username, token }) {
+    async function deliverVerificationEmail({ email, username, token, changeStage = '', newEmail = '' }) {
         if (!apiKey || !from) {
             const error = new Error('Email delivery is not configured');
             error.code = 'EMAIL_DELIVERY_NOT_CONFIGURED';
             error.status = 503;
             throw error;
         }
-        const verificationUrl = `${String(frontendUrl || '').replace(/\/$/, '')}/verify-email?token=${encodeURIComponent(token)}`;
+        const verificationUrl = `${String(frontendUrl || '').replace(/\/$/, '')}/verify-email?token=${encodeURIComponent(token)}${changeStage ? `&change=${changeStage}` : ''}`;
         const safeUsername = escapeHtml(username || 'player');
+        const title = changeStage === 'old' ? 'Approve email change' : changeStage === 'new' ? 'Confirm your new email' : 'Verify your email';
+        const description = changeStage === 'old'
+            ? `Approve changing your Arenifi email to ${newEmail}. Your current address stays active until the new address is verified.`
+            : changeStage === 'new' ? 'Your current email approved this change. Confirm this new address to finish.'
+                : 'Confirm this email once to secure username changes and withdrawals.';
+        const changeHtml = `<div style="font-family:Arial;padding:32px;max-width:520px"><h1>${title}</h1><p>Hi ${safeUsername}, ${escapeHtml(description)}</p><p><a href="${verificationUrl}">${title}</a></p><p>This link expires in 24 hours. If you did not request this change, ignore this email.</p></div>`;
         const response = await fetchImpl('https://api.resend.com/emails', {
             method: 'POST',
             headers: {
@@ -93,11 +99,13 @@ export function createEmailVerificationService({
             body: JSON.stringify({
                 from,
                 to: [email],
-                subject: 'Verify your Arenifi email',
+                subject: `${title} — Arenifi`,
                 ...(replyTo ? { reply_to: replyTo } : {}),
-                text: `Hi ${username || 'player'}, verify your Arenifi email: ${verificationUrl}\n\nThis link expires in 24 hours. If you did not request it, you can ignore this email.`,
+                text: `Hi ${username || 'player'}, ${description}\n${verificationUrl}\n\nThis link expires in 24 hours. If you did not request it, ignore this email.`,
                 html: `<!doctype html><html><body style="margin:0;background:#09090d;color:#f4f1ff;font-family:Arial,sans-serif"><div style="max-width:520px;margin:0 auto;padding:42px 24px"><div style="color:#a78bfa;font-size:12px;font-weight:800;letter-spacing:.16em;text-transform:uppercase">ARENIFI</div><h1 style="font-size:26px;margin:16px 0 10px">Verify your email</h1><p style="color:#b6b2c2;line-height:1.6">Hi ${safeUsername}, confirm this email once to secure username changes and withdrawals.</p><a href="${verificationUrl}" style="display:inline-block;margin:18px 0;padding:13px 20px;border-radius:10px;background:#8b5cf6;color:white;text-decoration:none;font-weight:800">Verify email</a><p style="color:#777384;font-size:12px;line-height:1.6">This link expires in 24 hours. If you did not request it, ignore this email.</p></div></body></html>`,
+                ...(changeStage ? { html: changeHtml } : {}),
             }),
+            timeout: 15000,
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -116,6 +124,9 @@ export function createEmailVerificationService({
             ? normalizeEmail(user.email)
             : normalizeEmail(requestedEmail);
         if (!requested) throw Object.assign(new Error('Enter a valid email address'), { status: 400, code: 'INVALID_EMAIL' });
+        if (normalizeEmail(user.email) && requested !== normalizeEmail(user.email)) {
+            throw Object.assign(new Error('Use Change email in your profile to approve this change from your current address.'), { status: 409, code: 'EMAIL_CHANGE_REQUIRED' });
+        }
         if (currentStatus === 'verified' && requested === normalizeEmail(user.email)) {
             return { alreadyVerified: true, ...serializeEmailVerification(user) };
         }
@@ -187,5 +198,73 @@ export function createEmailVerificationService({
         return user;
     }
 
-    return { start, confirm };
+    const invalidChange = () => Object.assign(new Error('This email change link is invalid or has expired. Start again from your profile.'), { status: 400 });
+    const changeFields = '+emailChange';
+
+    async function startChange(user, rawEmail) {
+        const oldEmail = normalizeEmail(user?.email);
+        const newEmail = normalizeEmail(rawEmail);
+        if (!oldEmail) throw Object.assign(new Error('Add and verify your first email before changing it.'), { status: 400 });
+        if (!newEmail || newEmail === oldEmail) throw Object.assign(new Error('Enter a different valid email address.'), { status: 400 });
+        if (await User.exists({ email: newEmail, _id: { $ne: user._id } })) {
+            throw Object.assign(new Error('That email address is already connected to another account.'), { status: 409 });
+        }
+        const timestamp = now();
+        const oldToken = randomToken();
+        // Derivation lets a failed new-address delivery be retried with the same old link.
+        const newToken = hashEmailVerificationToken(`email-change-new:${oldToken}`);
+        const state = {
+            oldEmail, newEmail,
+            oldHash: hashEmailVerificationToken(oldToken),
+            newHash: hashEmailVerificationToken(newToken),
+            expiresAt: new Date(timestamp + EMAIL_VERIFICATION_TTL_MS),
+            sentAt: new Date(timestamp), approved: false,
+        };
+        const updated = await User.findOneAndUpdate({
+            _id: user._id, email: user.email,
+            $or: [{ 'emailChange.sentAt': { $exists: false } }, { 'emailChange.sentAt': { $lte: new Date(timestamp - EMAIL_VERIFICATION_RESEND_COOLDOWN_MS) } }],
+        }, { $set: { emailChange: state } }, { new: true });
+        if (!updated) throw Object.assign(new Error('Wait a minute before requesting another email change.'), { status: 429 });
+        try {
+            await deliverVerificationEmail({ email: oldEmail, username: user.username, token: oldToken, changeStage: 'old', newEmail });
+        } catch (error) {
+            await User.updateOne({ _id: user._id, 'emailChange.oldHash': state.oldHash }, { $unset: { emailChange: 1 } });
+            throw error;
+        }
+        return { message: `Approve the change using the email sent to ${maskEmail(oldEmail)}.` };
+    }
+
+    async function confirmChange(rawToken, stage) {
+        if (!/^[a-f0-9]{64}$/.test(String(rawToken || '')) || !['old', 'new'].includes(stage)) throw invalidChange();
+        const hash = hashEmailVerificationToken(rawToken);
+        const filter = { [`emailChange.${stage}Hash`]: hash, 'emailChange.expiresAt': { $gt: new Date(now()) } };
+        const user = await User.findOne(filter).select(changeFields);
+        if (!user || normalizeEmail(user.email) !== user.emailChange.oldEmail) throw invalidChange();
+        const state = user.emailChange;
+        if (stage === 'old') {
+            await deliverVerificationEmail({ email: state.newEmail, username: user.username,
+                token: hashEmailVerificationToken(`email-change-new:${rawToken}`), changeStage: 'new' });
+            const result = await User.updateOne({ ...filter, email: user.email }, { $set: { 'emailChange.approved': true } });
+            if (!result.matchedCount) throw invalidChange();
+            return { complete: false, message: `Current email confirmed. Now open the verification email sent to ${maskEmail(state.newEmail)}.` };
+        }
+        if (!state.approved) throw invalidChange();
+        if (await User.exists({ email: state.newEmail, _id: { $ne: user._id } })) {
+            throw Object.assign(new Error('The new email is already in use. Start again with another address.'), { status: 409 });
+        }
+        let updated;
+        try {
+            updated = await User.findOneAndUpdate({ ...filter, email: user.email, 'emailChange.approved': true }, {
+                $set: { email: state.newEmail, emailVerifiedAt: new Date(now()) },
+                $unset: { emailChange: 1, emailVerificationTokenHash: 1, emailVerificationExpiresAt: 1, emailVerificationLastSentAt: 1 },
+            }, { new: true });
+        } catch (error) {
+            if (error.code === 11000) throw Object.assign(new Error('That email address is already in use.'), { status: 409 });
+            throw error;
+        }
+        if (!updated) throw invalidChange();
+        return { complete: true, message: 'Your email address has been changed and verified.' };
+    }
+
+    return { start, confirm, startChange, confirmChange };
 }
