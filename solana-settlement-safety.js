@@ -18,6 +18,36 @@ export function usdToLamportsCeil(amountUsd, solPriceUsd) {
     return Math.max(0, Math.ceil((amount / price) * 1_000_000_000));
 }
 
+/**
+ * Classify whether a native-SOL game cashout can be submitted. A zero-value
+ * exit is not an error, while sender liquidity and destination rent are two
+ * separate actionable failures and must not be reported as the same problem.
+ */
+export function classifyCashoutTransferReadiness({
+    requestedLamports,
+    payoutLamports,
+    recipientLamports,
+    rentMinimumLamports,
+}) {
+    const requested = Math.max(0, Math.floor(Number(requestedLamports) || 0));
+    const payout = Math.max(0, Math.floor(Number(payoutLamports) || 0));
+    const recipient = Math.max(0, Math.floor(Number(recipientLamports) || 0));
+    const rentMinimum = Math.max(0, Math.floor(Number(rentMinimumLamports) || 0));
+
+    if (requested <= 0) return 'no_value';
+    if (payout <= 0) return 'liquidity_unavailable';
+    if (recipient + payout < rentMinimum) {
+        // If the requested transfer would have activated the destination but
+        // the liquidity cap reduced it below rent, sender liquidity is the
+        // actual blocker rather than the receiving wallet.
+        if (payout < requested && recipient + requested >= rentMinimum) {
+            return 'liquidity_unavailable';
+        }
+        return 'destination_rent_minimum';
+    }
+    return 'ready';
+}
+
 export function splitCollectedLamports(totalLamports, ownerBps) {
     const total = Math.max(0, Math.floor(Number(totalLamports) || 0));
     const bps = Math.min(10_000, Math.max(0, Math.floor(Number(ownerBps) || 0)));

@@ -17,6 +17,13 @@ import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import passport from 'passport';
 import { randomBytes } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
+import {
+    createEmailVerificationRequiredError,
+    createEmailVerificationService,
+    getEmailVerificationStatus,
+    normalizeEmail,
+    serializeEmailVerification,
+} from './email-verification.js';
 import { createTokenLaunchService } from './token-launch-service.js';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import { PUBLIC_FREE_PLAY_ROOM_OWNER, getPublicFreePlayEntryFee } from './public-free-mode.js';
@@ -206,6 +213,7 @@ import {
 import {
     DEFAULT_SETTLEMENT_STALE_MS,
     calculateRewardWalletTopUp,
+    classifyCashoutTransferReadiness,
     classifySettlement,
     isFreshPositivePrice,
 } from './solana-settlement-safety.js';
@@ -467,6 +475,10 @@ app.use(express.json());
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     email: { type: String, unique: true, sparse: true },
+    emailVerifiedAt: { type: Date, default: null, index: true },
+    emailVerificationTokenHash: { type: String, default: null, select: false, index: true },
+    emailVerificationExpiresAt: { type: Date, default: null, select: false },
+    emailVerificationLastSentAt: { type: Date, default: null, select: false },
     googleId: { type: String, unique: true, sparse: true },
     password: { type: String, required: true },
     authVersion: { type: Number, default: 0 },
@@ -525,6 +537,31 @@ const UserSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const User = mongoose.model('User', UserSchema);
+const emailVerificationService = createEmailVerificationService({
+    User,
+    fetchImpl: fetch,
+    frontendUrl: PUBLIC_FRONTEND_URL,
+    apiKey: process.env.RESEND_API_KEY,
+    from: process.env.EMAIL_FROM,
+    replyTo: process.env.EMAIL_REPLY_TO,
+});
+if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+    console.warn('[Email Verification] Delivery is disabled until RESEND_API_KEY and EMAIL_FROM are configured.');
+}
+
+function sendEmailVerificationError(res, error) {
+    return res.status(error?.status || 500).json({
+        message: error?.status ? error.message : 'Email verification failed',
+        code: error?.code || 'EMAIL_VERIFICATION_FAILED',
+        ...(error?.details || {}),
+        ...(error?.retryAfterSeconds ? { retryAfterSeconds: error.retryAfterSeconds } : {}),
+    });
+}
+
+function requireVerifiedEmail(user) {
+    const error = createEmailVerificationRequiredError(user);
+    if (error) throw error;
+}
 
 async function getPersonalFreePlayContext(user) {
     if (!user || (!process.env.ADMIN_USER_ID && !process.env.ADMIN_USERNAME)) {
@@ -644,19 +681,25 @@ async function recordAdminIssue(details = {}) {
         code,
         title: String(details.title || 'Backend issue').slice(0, 180),
         message: String(details.message || 'No details available').slice(0, 1200),
-        userId: details.userId || null,
-        username: String(details.username || '').slice(0, 80),
-        roomId: String(details.roomId || '').slice(0, 160),
-        gameSessionId: String(details.gameSessionId || '').slice(0, 160),
-        mode: String(details.mode || '').slice(0, 80),
-        expectedUsd: finiteIssueNumber(details.expectedUsd),
-        actualUsd: finiteIssueNumber(details.actualUsd),
-        differenceUsd: finiteIssueNumber(details.differenceUsd),
-        context: details.context && typeof details.context === 'object' ? details.context : {},
         status: 'open',
         resolvedAt: null,
         lastSeenAt: now,
     };
+    // Repeated reports must never erase identity or evidence already attached
+    // to an issue just because a later event arrived with a partial payload.
+    const username = String(details.username || '').trim().slice(0, 80);
+    const roomId = String(details.roomId || '').trim().slice(0, 160);
+    const gameSessionId = String(details.gameSessionId || '').trim().slice(0, 160);
+    const mode = String(details.mode || '').trim().slice(0, 80);
+    if (details.userId) update.userId = details.userId;
+    if (username) update.username = username;
+    if (roomId) update.roomId = roomId;
+    if (gameSessionId) update.gameSessionId = gameSessionId;
+    if (mode) update.mode = mode;
+    if (finiteIssueNumber(details.expectedUsd) != null) update.expectedUsd = finiteIssueNumber(details.expectedUsd);
+    if (finiteIssueNumber(details.actualUsd) != null) update.actualUsd = finiteIssueNumber(details.actualUsd);
+    if (finiteIssueNumber(details.differenceUsd) != null) update.differenceUsd = finiteIssueNumber(details.differenceUsd);
+    if (details.context && typeof details.context === 'object' && Object.keys(details.context).length > 0) update.context = details.context;
     try {
         return await AdminIssue.findOneAndUpdate(
             { activeKey: fingerprint },
@@ -1597,7 +1640,11 @@ async function recordCashoutFailure(player, room, reason, error) {
         expectedUsd: Number(arenaCashoutUsd(player)) || 0,
         actualUsd: 0,
         differenceUsd: -(Number(arenaCashoutUsd(player)) || 0),
-        context: { houseWalletQueueDepth: houseWalletOperations.size },
+        context: {
+            houseWalletQueueDepth: houseWalletOperations.size,
+            errorCode: error?.code || null,
+            ...(error?.details || {}),
+        },
     });
 }
 
@@ -1608,6 +1655,54 @@ async function persistCashoutPlaytime(user, player, context) {
     } catch (error) {
         console.error(`[Cashout Audit] ${context} playtime save failed after confirmed transfer:`, error.message);
     }
+}
+
+function createCashoutReadinessError(readiness) {
+    if (readiness === 'liquidity_unavailable') {
+        const error = new Error('House Wallet does not currently have enough available SOL for this cashout; the game balance was not removed');
+        error.code = 'CASHOUT_LIQUIDITY_UNAVAILABLE';
+        return error;
+    }
+    if (readiness === 'destination_rent_minimum') {
+        const error = new Error('Cashout is too small to activate the destination account; the game balance was not removed');
+        error.code = 'CASHOUT_DESTINATION_RENT_MINIMUM';
+        error.expected = true;
+        return error;
+    }
+    return null;
+}
+
+function cashoutClientErrorMessage(error) {
+    if (error?.code === 'CASHOUT_DESTINATION_RENT_MINIMUM') {
+        return 'This cashout is below Solana’s minimum for an empty account. Collect a little more value or deposit a small amount, then try again. Your game balance is still safe.';
+    }
+    if (error?.code === 'CASHOUT_LIQUIDITY_UNAVAILABLE') {
+        return 'Cashout is temporarily unavailable because the House Wallet needs more SOL. Your game balance is still safe; try again shortly.';
+    }
+    return 'Solana transfer failed. Your game balance is still safe; try cashing out again.';
+}
+
+async function completeZeroValueCashout({ user, player, room, logMeta, context, detachPlayer, commitReservation }) {
+    await Transaction.create({
+        userId: user._id,
+        type: 'withdraw',
+        amount: 0,
+        currency: 'USD',
+        meta: {
+            ...logMeta,
+            event: 'zero_value_cashout',
+            signature: 'no_transfer_required',
+            playerPayout: 0,
+            payoutLamports: 0,
+        },
+        excludedFromReports: !!player.personalFreePlay,
+        status: 'confirmed',
+    });
+    await persistCashoutPlaytime(user, player, context);
+    detachPlayer();
+    commitReservation?.();
+    emitCashoutSuccess(player, player.id, user._id, { amount: 0, signature: 'no_transfer_required' });
+    return { playerPayout: 0, platformFee: 0, signature: 'no_transfer_required' };
 }
 
 async function emitPersistedCashoutResult(record, payload) {
@@ -2115,7 +2210,10 @@ function reserveArenaCashout(room, player, requestedUsd) {
             + `$${reservation.ledgerShortfallUsd.toFixed(6)} was converted to a liquidity fee.`,
         );
     }
-    if (amount <= 1e-9) throw new Error('No funded arena value available for cashout');
+    if (amount <= 1e-9) {
+        if (reservation.requestedUsd <= 1e-9) return 0;
+        throw new Error('No funded arena value available for cashout');
+    }
 
     room.reservedCashoutUsd = reservation.nextReservedUsd;
     player._arenaCashoutReservationUsd = amount;
@@ -2245,6 +2343,20 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
         return { playerPayout, platformFee, signature: 'simulated' };
     }
 
+    if (requestedPlayerPayout <= 0) {
+        return completeZeroValueCashout({
+            user,
+            player,
+            room,
+            logMeta,
+            context: 'competitive-zero',
+            detachPlayer: () => {
+                room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+                keepCompetitiveCashoutSpectator(room, player);
+            },
+        });
+    }
+
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
@@ -2284,9 +2396,18 @@ async function executeCompetitiveCashoutUnlocked(player, room, reason = 'Arena C
     const userLamports = await connection.getBalance(userPubKey);
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
-        logMeta.isRentExemptFallback = true;
-        throw new Error('Cashout is too small to activate the destination account; the game balance was not removed');
+    const transferReadiness = classifyCashoutTransferReadiness({
+        requestedLamports: liquidity.requestedLamports,
+        payoutLamports,
+        recipientLamports: userLamports,
+        rentMinimumLamports: rentExemptMinimum,
+    });
+    if (transferReadiness !== 'ready') {
+        logMeta.cashoutReadiness = transferReadiness;
+        logMeta.isRentExemptFallback = transferReadiness === 'destination_rent_minimum';
+        const readinessError = createCashoutReadinessError(transferReadiness);
+        readinessError.details = { requestedLamports: liquidity.requestedLamports, payoutLamports, userLamports, rentExemptMinimum, houseLamports: totalLamports };
+        throw readinessError;
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -2402,6 +2523,20 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
         return { playerPayout, platformFee, signature: 'simulated' };
     }
 
+    if (requestedPlayerPayout <= 0) {
+        return completeZeroValueCashout({
+            user,
+            player,
+            room,
+            logMeta,
+            context: 'surviv-zero',
+            detachPlayer: () => {
+                room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+            },
+            commitReservation: () => commitArenaCashoutReservation(room, player),
+        });
+    }
+
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
@@ -2441,9 +2576,18 @@ async function executeSurvivCashoutUnlocked(player, room, reason = 'Arena Cashou
     const userLamports = await connection.getBalance(userPubKey);
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
-        logMeta.isRentExemptFallback = true;
-        throw new Error('Cashout is too small to activate the destination account; the game balance was not removed');
+    const transferReadiness = classifyCashoutTransferReadiness({
+        requestedLamports: liquidity.requestedLamports,
+        payoutLamports,
+        recipientLamports: userLamports,
+        rentMinimumLamports: rentExemptMinimum,
+    });
+    if (transferReadiness !== 'ready') {
+        logMeta.cashoutReadiness = transferReadiness;
+        logMeta.isRentExemptFallback = transferReadiness === 'destination_rent_minimum';
+        const readinessError = createCashoutReadinessError(transferReadiness);
+        readinessError.details = { requestedLamports: liquidity.requestedLamports, payoutLamports, userLamports, rentExemptMinimum, houseLamports: totalLamports };
+        throw readinessError;
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -2587,6 +2731,21 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
         return { playerPayout, platformFee, signature: 'simulated' };
     }
 
+    if (requestedPlayerPayout <= 0) {
+        return completeZeroValueCashout({
+            user,
+            player,
+            room,
+            logMeta,
+            context: 'arena-zero',
+            detachPlayer: () => {
+                room.players = room.players.filter(pl => pl.mongoId?.toString() !== mongoId);
+                keepArenaCashoutSpectator(room, player);
+            },
+            commitReservation: () => commitArenaCashoutReservation(room, player),
+        });
+    }
+
     user = await ensureUserDepositWallet(user);
     if (!user.depositAddress) throw new Error('No deposit address');
 
@@ -2625,9 +2784,18 @@ async function executeArenaCashoutUnlocked(player, room, reason = 'Arena Cashout
     const userLamports = await connection.getBalance(userPubKey);
     const rentExemptMinimum = await getSystemAccountRentLamports();
 
-    if (payoutLamports <= 0 || userLamports + payoutLamports < rentExemptMinimum) {
-        logMeta.isRentExemptFallback = true;
-        throw new Error('Cashout is too small to activate the destination account; the game balance was not removed');
+    const transferReadiness = classifyCashoutTransferReadiness({
+        requestedLamports: liquidity.requestedLamports,
+        payoutLamports,
+        recipientLamports: userLamports,
+        rentMinimumLamports: rentExemptMinimum,
+    });
+    if (transferReadiness !== 'ready') {
+        logMeta.cashoutReadiness = transferReadiness;
+        logMeta.isRentExemptFallback = transferReadiness === 'destination_rent_minimum';
+        const readinessError = createCashoutReadinessError(transferReadiness);
+        readinessError.details = { requestedLamports: liquidity.requestedLamports, payoutLamports, userLamports, rentExemptMinimum, houseLamports: totalLamports };
+        throw readinessError;
     }
 
     const transaction = new solanaWeb3.Transaction();
@@ -3540,6 +3708,7 @@ passport.use(new GoogleStrategy({
                     googleId: profile.id,
                     username: (profile.displayName || 'Gladiator').replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
                     email: profileEmail,
+                    emailVerifiedAt: profileEmail ? new Date() : null,
                     password: await bcrypt.hash(Math.random().toString(36), 10), // Random lösenord för Google-användare
                     depositAddress: keypair.publicKey.toBase58(),
                     depositSecret: encryptWalletSecret(keypair.secretKey) // Spara secret (bör krypteras i produktion)
@@ -3558,8 +3727,22 @@ passport.use(new GoogleStrategy({
                         deviceHash: signals.deviceHash,
                     });
                 }
-            } else if (!user.depositAddress || !user.depositSecret) {
-                await ensureUserDepositWallet(user);
+            } else {
+                let accountChanged = false;
+                if (!user.googleId) {
+                    user.googleId = profile.id;
+                    accountChanged = true;
+                }
+                if (profileEmail && !user.email) {
+                    user.email = profileEmail.toLowerCase();
+                    accountChanged = true;
+                }
+                if (profileEmail && user.email?.toLowerCase() === profileEmail.toLowerCase() && !user.emailVerifiedAt) {
+                    user.emailVerifiedAt = new Date();
+                    accountChanged = true;
+                }
+                if (accountChanged) await user.save();
+                if (!user.depositAddress || !user.depositSecret) await ensureUserDepositWallet(user);
             }
             return done(null, user);
         } catch (err) {
@@ -3668,7 +3851,7 @@ app.get('/', (req, res) => {
 
 async function verifyAccountToken(token) {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const account = await User.findById(decoded.id).select('authVersion').lean();
+    const account = await User.findById(decoded.id).select('authVersion username').lean();
     if (!account) {
         const err = new Error('Account no longer exists');
         err.name = 'AccountNotFoundError';
@@ -3679,7 +3862,7 @@ async function verifyAccountToken(token) {
         err.name = 'SessionRevokedError';
         throw err;
     }
-    return decoded;
+    return { ...decoded, username: account.username };
 }
 
 function isAdminUserRecord(user) {
@@ -3786,10 +3969,37 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.starterRewardRequirements = getStarterRewardFundingRequirements(userObj.sponsoredRewardsBalance);
         userObj.starterRewardPotentialUsd = Math.max(0, Number(userObj.sponsoredRewardsBalance) || 0);
         userObj.starterRewardOwedUsd = getStarterRewardLiabilityUsd(userObj);
+        Object.assign(userObj, serializeEmailVerification(user));
 
         res.json(userObj);
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/email-verification/start', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), authenticateToken, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id)
+            .select('+emailVerificationLastSentAt +emailVerificationTokenHash +emailVerificationExpiresAt');
+        if (!user) return res.status(404).json({ message: 'Account not found' });
+        const result = await emailVerificationService.start(user, req.body?.email);
+        return res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('[Email Verification] Send failed:', error.message);
+        return sendEmailVerificationError(res, error);
+    }
+});
+
+app.post('/api/email-verification/confirm', sensitiveRateLimit({ limit: 20, windowMs: 15 * 60_000 }), async (req, res) => {
+    try {
+        const user = await emailVerificationService.confirm(req.body?.token);
+        return res.json({
+            success: true,
+            message: 'Email verified successfully.',
+            ...serializeEmailVerification(user),
+        });
+    } catch (error) {
+        return sendEmailVerificationError(res, error);
     }
 });
 
@@ -3936,6 +4146,7 @@ app.post('/api/update-profile', sensitiveRateLimit({ limit: 20, windowMs: 60 * 6
         let changed = false;
 
         if (username !== undefined && username !== user.username) {
+            requireVerifiedEmail(user);
             const trimmed = String(username).trim();
             if (trimmed.length < 3 || trimmed.length > 20) {
                 return res.status(400).json({ message: 'Username must be 3–20 characters' });
@@ -3977,13 +4188,15 @@ app.post('/api/update-profile', sensitiveRateLimit({ limit: 20, windowMs: 60 * 6
         userObj.solPrice = SOL_PRICE_USD;
         userObj.personalFreePlay = await isPersonalFreePlayUser(user);
         userObj.freePlay = DEV_FREE_PLAY || userObj.personalFreePlay;
+        Object.assign(userObj, serializeEmailVerification(user));
 
         res.json({ user: userObj });
     } catch (err) {
         if (err.code === 11000) {
             return res.status(400).json({ message: 'Username already taken' });
         }
-        res.status(500).json({ message: err.message });
+        if (err.code === 'EMAIL_VERIFICATION_REQUIRED') return sendEmailVerificationError(res, err);
+        res.status(err.status || 500).json({ message: err.status ? err.message : 'Could not update profile', code: err.code || null });
     }
 });
 
@@ -5052,6 +5265,9 @@ async function executeAccountWithdrawal({ userId, amountUSD, destinationAddress,
 
 app.post('/api/withdraw', sensitiveRateLimit({ limit: 10, windowMs: 15 * 60_000 }), authenticateToken, async (req, res) => {
     try {
+        const user = await User.findById(req.user.id).select('email emailVerifiedAt');
+        if (!user) return res.status(404).json({ message: 'Account not found' });
+        requireVerifiedEmail(user);
         const result = await executeAccountWithdrawal({
             userId: req.user.id,
             amountUSD: req.body?.amountUSD,
@@ -5061,7 +5277,8 @@ app.post('/api/withdraw', sensitiveRateLimit({ limit: 10, windowMs: 15 * 60_000 
         res.status(result.processing ? 202 : 200).json(result);
     } catch (err) {
         console.error('Withdraw Error:', err.message);
-        res.status(err.status || 500).json({ message: err.status ? err.message : 'Blockchain transaction failed' });
+        if (err.code === 'EMAIL_VERIFICATION_REQUIRED') return sendEmailVerificationError(res, err);
+        res.status(err.status || 500).json({ message: err.status ? err.message : 'Blockchain transaction failed', code: err.code || null });
     }
 });
 
@@ -6332,10 +6549,19 @@ app.get('/api/admin/issues', authenticateAdmin, async (req, res) => {
             ...rewardAlerts.flatMap(alert => (alert.userIds || []).map(user => user?._id || user)).filter(Boolean),
         ];
         const accountSignals = await buildAdminAccountSignals(userIds);
-        const enrichedIssues = issues.map(issue => ({
-            ...issue,
-            accountSignals: issue.userId ? accountSignals.get(String(issue.userId)) || null : null,
-        }));
+        const enrichedIssues = issues.map(issue => {
+            const signals = issue.userId ? accountSignals.get(String(issue.userId)) || null : null;
+            const canonicalUsername = String(signals?.username || '').trim();
+            const reportedUsername = String(issue.username || '').trim();
+            return {
+                ...issue,
+                username: canonicalUsername || reportedUsername,
+                reportedUsername: canonicalUsername && reportedUsername && canonicalUsername !== reportedUsername
+                    ? reportedUsername
+                    : null,
+                accountSignals: signals,
+            };
+        });
         const enrichedRewardAlerts = rewardAlerts.map(alert => ({
             ...alert,
             accounts: (alert.userIds || []).map(user => ({
@@ -7118,8 +7344,40 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
     try {
         const showExcluded = req.query.showExcluded === 'true';
         const sortKey = req.query.sort || 'balance_desc';
-        const userFilter = showExcluded ? {} : USER_REPORTED;
-        const users = await User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardProgressEarnedUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd').lean();
+        const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(10, Number.parseInt(req.query.limit, 10) || 25));
+        const search = String(req.query.search || '').trim().slice(0, 100);
+        const accountType = String(req.query.accountType || 'all');
+        const userFilter = showExcluded ? {} : { ...USER_REPORTED };
+        if (search) {
+            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(escaped, 'i');
+            userFilter.$or = [
+                { username: pattern },
+                { email: pattern },
+                { walletAddress: pattern },
+                { depositAddress: pattern },
+            ];
+        }
+        if (accountType === 'owner') userFilter.isOwnerAccount = true;
+        else if (accountType === 'player') userFilter.isOwnerAccount = { $ne: true };
+        else if (accountType !== 'all') return res.status(400).json({ message: 'Invalid account type.' });
+
+        const databaseSorts = {
+            balance_desc: { balance: -1, _id: -1 },
+            balance_asc: { balance: 1, _id: 1 },
+            last_active_desc: { lastActiveAt: -1, _id: -1 },
+            newest: { _id: -1 },
+            oldest: { _id: 1 },
+            username_asc: { username: 1, _id: 1 },
+        };
+        const databaseSort = databaseSorts[sortKey] || null;
+        const total = await User.countDocuments(userFilter);
+        const totalPages = Math.max(1, Math.ceil(total / limit));
+        const safePage = Math.min(page, totalPages);
+        let userQuery = User.find(userFilter).select('username walletAddress depositAddress balance visualBalanceOverrideUsd excludedFromReports isOwnerAccount playtime lastActiveAt email emailVerifiedAt hasFreeTicket freeTicketUsed freeTicketChallengeCompleted freeTicketChallengeCompletedAt completedFiveDollarNormalGames completedTenDollarNormalGames sponsoredRewardsCompleted sponsoredRewardsUnlocked sponsoredRewardsBalance fundedRewardsUsd permanentRewardProgressVolumeUsdMicros permanentRewardProgressEarnedUsdMicros permanentRewardsBalanceUsdMicros permanentRewardLifetimeVolumeUsdMicros permanentRewardLifetimeEarnedUsdMicros permanentRewardCyclesCompleted rentFallbackBalanceUsd rewardsDisabled rewardClaimInProgress rewardClaimReservedUsd tournamentRewardsBalance tournamentRewardsLamports tournamentRewardClaimInProgress tournamentRewardClaimReservedUsd');
+        if (databaseSort) userQuery = userQuery.sort(databaseSort).skip((safePage - 1) * limit).limit(limit);
+        const users = await userQuery.lean();
         const { depositMap, gameSpendMap, gameReturnMap } = await getAdminUserStats(
             users.map(account => account._id),
             showExcluded,
@@ -7184,6 +7442,9 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
                 id: u._id,
                 username: u.username,
                 email: u.email || null,
+                emailVerificationStatus: getEmailVerificationStatus(u),
+                emailVerified: getEmailVerificationStatus(u) === 'verified',
+                emailVerifiedAt: u.emailVerifiedAt || null,
                 wallet: u.walletAddress || '—',
                 depositAddress: u.depositAddress || '—',
                 balanceSol: Number(balanceSol.toFixed(9)),
@@ -7226,9 +7487,23 @@ app.get('/api/admin/dashboard/users', authenticateAdmin, async (req, res) => {
             };
         });
 
-        const sorted = sortAdminUsers(result, sortKey);
+        // Deposit/game/activity sorts depend on aggregates or live memory. They are
+        // intentionally kept compatible, while the common sorts above only load one
+        // database page and therefore make the normal Users view substantially faster.
+        const sorted = databaseSort ? result : sortAdminUsers(result, sortKey);
+        const pageRows = databaseSort ? sorted : sorted.slice((safePage - 1) * limit, safePage * limit);
 
-        res.json({ users: sorted, total: sorted.length, showExcluded, sort: sortKey });
+        res.json({
+            users: pageRows,
+            total,
+            page: safePage,
+            limit,
+            totalPages,
+            showExcluded,
+            sort: sortKey,
+            search,
+            accountType,
+        });
     } catch (err) {
         console.error('Admin users error:', err);
         res.status(500).json({ error: err.message });
@@ -10041,7 +10316,7 @@ async function initializeDatabaseBackedSystems() {
 
     databaseStartupPromise = (async () => {
         console.log('[Startup] Initializing database-backed systems...');
-        const [permanentRewardMigration, , , displaySettings, rejectedRequestCleanup] = await Promise.all([
+        const [permanentRewardMigration, , , , displaySettings, rejectedRequestCleanup, expectedCashoutCleanup] = await Promise.all([
             User.updateMany(
                 { permanentRewardModelVersion: { $ne: 4 } },
                 { $set: {
@@ -10050,6 +10325,17 @@ async function initializeDatabaseBackedSystems() {
                     permanentRewardModelVersion: 4,
                 } },
             ),
+            // Google only returns account emails after authenticating them.
+            // Backfill legacy Google users so they are not asked to verify the
+            // same address again when changing username or withdrawing.
+            User.updateMany(
+                {
+                    googleId: { $type: 'string', $ne: '' },
+                    email: { $type: 'string', $ne: '' },
+                    emailVerifiedAt: null,
+                },
+                { $set: { emailVerifiedAt: new Date() } },
+            ),
             hydrateRewardPoolState(),
             ensureAffiliateTiers(),
             SiteDisplaySettings.findOne({ key: 'pregame' }).lean(),
@@ -10057,13 +10343,29 @@ async function initializeDatabaseBackedSystems() {
                 {
                     status: 'open',
                     code: 'unhandled_http_error',
-                    message: /^Bad Request$/i,
+                    message: /^(Bad Request|Expected property name|Unexpected token|Unexpected end of JSON input)/i,
                 },
                 {
                     $set: {
                         status: 'resolved',
                         resolvedAt: new Date(),
                         message: 'Rejected malformed client request; no backend payout failure occurred.',
+                    },
+                    $unset: { activeKey: 1 },
+                },
+            ),
+            AdminIssue.updateMany(
+                {
+                    status: 'open',
+                    category: 'cashout',
+                    code: { $in: ['surviv_manual_cashout_failed', 'competitive_manual_cashout_failed', 'arena_manual_cashout_failed'] },
+                    message: /^Cashout is too small to activate the destination account/i,
+                },
+                {
+                    $set: {
+                        status: 'resolved',
+                        resolvedAt: new Date(),
+                        message: 'Expected Solana destination rent constraint; no game balance was removed.',
                     },
                     $unset: { activeKey: 1 },
                 },
@@ -10075,7 +10377,8 @@ async function initializeDatabaseBackedSystems() {
         emitReleaseState();
         console.log(
             `Core startup complete. Permanent reward migration: ${permanentRewardMigration.modifiedCount}. `
-            + `Rejected-request issues resolved: ${rejectedRequestCleanup.modifiedCount}.`,
+            + `Rejected-request issues resolved: ${rejectedRequestCleanup.modifiedCount}. `
+            + `Expected rent-limit cashout issues resolved: ${expectedCashoutCleanup.modifiedCount}.`,
         );
 
         // Historical repair/reconciliation can involve hundreds of sequential
@@ -10138,7 +10441,7 @@ setInterval(() => {
 // 3. REGISTRERING (Spara ny användare)
 app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
-        const email = String(req.body?.email || '').trim().toLowerCase();
+        const email = normalizeEmail(req.body?.email);
         const username = String(req.body?.username || '').trim();
         const password = String(req.body?.password || '');
         const referralCode = String(req.body?.referralCode || '').trim();
@@ -10147,7 +10450,7 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
             : null;
         const referralDeviceId = String(req.body?.referralDeviceId || '').slice(0, 200);
         const referralSource = req.body?.referralSource === 'link' ? 'link' : 'manual';
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: 'Enter a valid email address' });
+        if (!email) return res.status(400).json({ message: 'Enter a valid email address' });
         if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) return res.status(400).json({ message: 'Username must be 3–20 letters, numbers, or underscores' });
         if (password.length < 8 || password.length > 128) return res.status(400).json({ message: 'Password must be at least 8 characters' });
 
@@ -10180,10 +10483,21 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
             });
             referralAttributed = result.created;
         }
+        let verificationEmailSent = false;
+        try {
+            await emailVerificationService.start(newUser, email);
+            verificationEmailSent = true;
+        } catch (verificationError) {
+            console.error('[Registration] Verification email could not be sent:', verificationError.message);
+        }
         return res.status(201).json({
-            message: 'Account created!',
+            message: verificationEmailSent
+                ? 'Account created. Check your inbox to verify your email.'
+                : 'Account created. Log in to resend your verification email.',
             userId: newUser._id.toString(),
             username: newUser.username,
+            email,
+            verificationEmailSent,
             referralAttributed,
         });
     } catch (err) {
@@ -10231,7 +10545,8 @@ app.post('/api/login', sensitiveRateLimit({ limit: 12, windowMs: 15 * 60_000 }),
                 balanceUsd: user.balance * SOL_PRICE_USD,
                 solPrice: SOL_PRICE_USD,
                 affiliateActive: affiliateStatus.active,
-                affiliateRewardsAvailable: affiliateStatus.hasRewards
+                affiliateRewardsAvailable: affiliateStatus.hasRewards,
+                ...serializeEmailVerification(user),
             }
         });
     } catch (err) {
@@ -11429,11 +11744,27 @@ io.on('connection', (socket) => {
     const securitySignals = getReferralRequestSignals(socket.request, presenceId);
     touchSitePresence(socket.request, presenceId);
     const antiCheat = createAntiCheatSession({
-        report: details => recordAdminIssue({
-            fingerprint: `anticheat:${details.code}:${details.userId || socket.accountUserId || socket.id}:${details.gameSessionId || details.roomId || 'session'}`,
-            category: 'anticheat',
-            ...details,
-        }),
+        report: async details => {
+            const userId = details.userId || socket.accountUserId || null;
+            const inGameUsername = String(details.username || '').trim();
+            let username = socket.accountUsername || '';
+            if (!username && userId && mongoose.Types.ObjectId.isValid(String(userId))) {
+                const account = await User.findById(userId).select('username').lean().catch(() => null);
+                username = account?.username || '';
+                if (username) socket.accountUsername = username;
+            }
+            return recordAdminIssue({
+                ...details,
+                fingerprint: `anticheat:${details.code}:${userId || socket.id}:${details.gameSessionId || details.roomId || 'session'}`,
+                category: 'anticheat',
+                userId,
+                username: username || inGameUsername,
+                context: {
+                    ...(details.context || {}),
+                    ...(inGameUsername && username && inGameUsername !== username ? { inGameUsername } : {}),
+                },
+            });
+        },
     });
     const socketToken = socket.handshake.auth?.token;
     if (typeof socketToken === 'string' && socketToken.length > 0) {
@@ -11441,6 +11772,7 @@ io.on('connection', (socket) => {
             .then((decoded) => {
                 if (!socket.connected || !decoded?.id) return;
                 socket.accountUserId = String(decoded.id);
+                socket.accountUsername = decoded.username || '';
                 socket.join(accountSocketRoom(decoded.id));
                 const addToSet = {};
                 if (securitySignals.ipHash) addToSet.securityIpHashes = securitySignals.ipHash;
@@ -12967,7 +13299,18 @@ io.on('connection', (socket) => {
             const inputY = Number(data?.y);
             antiCheat.observePacketRate({ kind: 'agar_aim', limit: 150, player: br.player, room: br.room, mode: 'br-agar' });
             if (!Number.isFinite(inputX) || !Number.isFinite(inputY)) {
-                antiCheat.observeInvalidInput({ reason: 'non-finite aim vector', player: br.player, room: br.room, mode: 'br-agar' });
+                antiCheat.observeInvalidInput({
+                    reason: 'non-finite aim vector',
+                    player: br.player,
+                    room: br.room,
+                    mode: 'br-agar',
+                    context: {
+                        hasX: Object.hasOwn(data || {}, 'x'),
+                        hasY: Object.hasOwn(data || {}, 'y'),
+                        xType: typeof data?.x,
+                        yType: typeof data?.y,
+                    },
+                });
                 return;
             }
             br.player.mouseX = Math.max(-8192, Math.min(8192, inputX));
@@ -12987,7 +13330,18 @@ io.on('connection', (socket) => {
             const inputY = Number(data?.y);
             antiCheat.observePacketRate({ kind: 'agar_aim', limit: 150, player: p, room, mode: 'agar' });
             if (!Number.isFinite(inputX) || !Number.isFinite(inputY)) {
-                antiCheat.observeInvalidInput({ reason: 'non-finite aim vector', player: p, room, mode: 'agar' });
+                antiCheat.observeInvalidInput({
+                    reason: 'non-finite aim vector',
+                    player: p,
+                    room,
+                    mode: 'agar',
+                    context: {
+                        hasX: Object.hasOwn(data || {}, 'x'),
+                        hasY: Object.hasOwn(data || {}, 'y'),
+                        xType: typeof data?.x,
+                        yType: typeof data?.y,
+                    },
+                });
                 return;
             }
             p.mouseX = Math.max(-8192, Math.min(8192, inputX));
@@ -13183,9 +13537,11 @@ io.on('connection', (socket) => {
                     await executeSurvivCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
                     releaseArenaCashoutReservation(activeRoom, activePlayer);
-                    await logSolanaTransactionError('❌ Surviv cashout error:', err);
-                    await recordCashoutFailure(activePlayer, activeRoom, 'surviv_manual_cashout_failed', err);
-                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
+                    if (!err?.expected) {
+                        await logSolanaTransactionError('❌ Surviv cashout error:', err);
+                        await recordCashoutFailure(activePlayer, activeRoom, 'surviv_manual_cashout_failed', err);
+                    }
+                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', cashoutClientErrorMessage(err));
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
                 } finally {
@@ -13198,9 +13554,11 @@ io.on('connection', (socket) => {
                 try {
                     await executeCompetitiveCashout(activePlayer, activeRoom, 'Arena Cashout');
                 } catch (err) {
-                    await logSolanaTransactionError('❌ Competitive cashout error:', err);
-                    await recordCashoutFailure(activePlayer, activeRoom, 'competitive_manual_cashout_failed', err);
-                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
+                    if (!err?.expected) {
+                        await logSolanaTransactionError('❌ Competitive cashout error:', err);
+                        await recordCashoutFailure(activePlayer, activeRoom, 'competitive_manual_cashout_failed', err);
+                    }
+                    emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', cashoutClientErrorMessage(err));
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;
                 } finally {
@@ -13213,9 +13571,11 @@ io.on('connection', (socket) => {
                 await executeArenaCashout(activePlayer, activeRoom, 'Arena Cashout');
             } catch (err) {
                 releaseArenaCashoutReservation(activeRoom, activePlayer);
-                await logSolanaTransactionError('❌ Cashout error:', err);
-                await recordCashoutFailure(activePlayer, activeRoom, 'arena_manual_cashout_failed', err);
-                emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', 'Solana transfer failed. Your game balance is still safe; try cashing out again.');
+                if (!err?.expected) {
+                    await logSolanaTransactionError('❌ Cashout error:', err);
+                    await recordCashoutFailure(activePlayer, activeRoom, 'arena_manual_cashout_failed', err);
+                }
+                emitPlayerAccountEvent(activePlayer, activePlayer.id, playerMongoId, 'error', cashoutClientErrorMessage(err));
                 if (activePlayer) {
                     activePlayer.isCashingOut = false;
                     activePlayer.cashoutSettling = false;

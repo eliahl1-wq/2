@@ -20,7 +20,7 @@ function entityPosition(entity) {
 function playerIdentity(player, mode, room) {
     return {
         userId: player?.mongoId || null,
-        username: String(player?.username || player?.name || '').slice(0, 80),
+        username: String(player?.username || player?.name || '').trim().slice(0, 80),
         roomId: String(room?.id || '').slice(0, 160),
         gameSessionId: String(player?.gameSessionId || '').slice(0, 160),
         mode: String(mode || player?.mode || '').slice(0, 80),

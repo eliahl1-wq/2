@@ -1122,8 +1122,10 @@ export async function getAdminAffiliateOverview() {
         .populate('userId', 'username email walletAddress')
         .sort({ createdAt: -1 })
         .lean();
-    const [attributions, commissions, commissionTotals, payouts, risks, tiers] = await Promise.all([
-        ReferralAttribution.find().lean(),
+    const [attributionCounts, commissions, commissionTotals, payouts, risks, tiers] = await Promise.all([
+        ReferralAttribution.aggregate([
+            { $group: { _id: '$affiliateProfileId', count: { $sum: 1 } } },
+        ]),
         AffiliateCommission.find()
             .sort({ createdAt: -1 })
             .limit(500)
@@ -1140,8 +1142,8 @@ export async function getAdminAffiliateOverview() {
                 },
             },
         ]),
-        AffiliatePayout.find().sort({ createdAt: -1 }).lean(),
-        AffiliateRiskFlag.find({ status: 'open' }).sort({ createdAt: -1 }).lean(),
+        AffiliatePayout.find().sort({ createdAt: -1 }).limit(300).lean(),
+        AffiliateRiskFlag.find({ status: 'open' }).sort({ createdAt: -1 }).limit(300).lean(),
         AffiliateTier.find().sort({ shareBps: 1 }).lean(),
     ]);
     const totalsByProfile = new Map();
@@ -1153,8 +1155,13 @@ export async function getAdminAffiliateOverview() {
             grossCashoutUsdMicros: Number(row.grossCashoutUsdMicros) || 0,
         };
     }
+    const attributionCountByProfile = new Map(attributionCounts.map(row => [String(row._id), Number(row.count) || 0]));
+    const riskCountByProfile = new Map();
+    for (const risk of risks) {
+        const id = String(risk.affiliateProfileId || '');
+        riskCountByProfile.set(id, (riskCountByProfile.get(id) || 0) + 1);
+    }
     const affiliates = profiles.map(profile => {
-        const ownAttributions = attributions.filter(item => sameId(item.affiliateProfileId, profile._id));
         const profileTotals = totalsByProfile.get(String(profile._id)) || {};
         const amountFor = status => Number(profileTotals[status]?.commissionUsdMicros) || 0;
         const referredCashoutVolumeUsdMicros = Object.entries(profileTotals)
@@ -1167,7 +1174,7 @@ export async function getAdminAffiliateOverview() {
             email: profile.userId?.email,
             payoutWallet: profile.userId?.walletAddress || null,
             referralCode: profile.referralCode,
-            referralCount: ownAttributions.length,
+            referralCount: attributionCountByProfile.get(String(profile._id)) || 0,
             referredCashoutVolumeUsd: microsToUsd(referredCashoutVolumeUsdMicros),
             pendingCommissionUsd: microsToUsd(amountFor('pending')),
             availableCommissionUsd: microsToUsd(amountFor('available')),
@@ -1178,7 +1185,7 @@ export async function getAdminAffiliateOverview() {
             suspended: !!profile.suspendedAt,
             suspensionReason: profile.suspensionReason,
             internalNotes: profile.internalNotes,
-            openRiskFlags: risks.filter(item => sameId(item.affiliateProfileId, profile._id)).length,
+            openRiskFlags: riskCountByProfile.get(String(profile._id)) || 0,
             createdAt: profile.createdAt,
         };
     });

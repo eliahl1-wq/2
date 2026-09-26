@@ -127,4 +127,6 @@ test('isolated malformed input is ignored but repetition is surfaced', () => {
     }
     assert.equal(reports.length, 1);
     assert.equal(reports[0].code, 'invalid_game_input');
+    assert.equal(reports[0].userId, player.mongoId);
+    assert.equal(reports[0].username, player.username);
 });

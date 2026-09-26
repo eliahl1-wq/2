@@ -2,11 +2,45 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     calculateRewardWalletTopUp,
+    classifyCashoutTransferReadiness,
     classifySettlement,
     isFreshPositivePrice,
     splitCollectedLamports,
     usdToLamportsCeil,
 } from './solana-settlement-safety.js';
+
+test('cashout readiness separates zero exits, sender liquidity, and destination rent', () => {
+    assert.equal(classifyCashoutTransferReadiness({
+        requestedLamports: 0,
+        payoutLamports: 0,
+        recipientLamports: 0,
+        rentMinimumLamports: 890_880,
+    }), 'no_value');
+    assert.equal(classifyCashoutTransferReadiness({
+        requestedLamports: 1_000_000,
+        payoutLamports: 0,
+        recipientLamports: 0,
+        rentMinimumLamports: 890_880,
+    }), 'liquidity_unavailable');
+    assert.equal(classifyCashoutTransferReadiness({
+        requestedLamports: 100_000,
+        payoutLamports: 100_000,
+        recipientLamports: 0,
+        rentMinimumLamports: 890_880,
+    }), 'destination_rent_minimum');
+    assert.equal(classifyCashoutTransferReadiness({
+        requestedLamports: 1_000_000,
+        payoutLamports: 100_000,
+        recipientLamports: 0,
+        rentMinimumLamports: 890_880,
+    }), 'liquidity_unavailable');
+    assert.equal(classifyCashoutTransferReadiness({
+        requestedLamports: 100_000,
+        payoutLamports: 100_000,
+        recipientLamports: 800_880,
+        rentMinimumLamports: 890_880,
+    }), 'ready');
+});
 
 test('price freshness rejects bootstrap, stale and invalid prices', () => {
     const now = 1_000_000;
