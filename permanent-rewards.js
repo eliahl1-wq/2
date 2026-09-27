@@ -26,6 +26,9 @@ export function permanentProgressReserveUsd(progressRewardUsdMicros = 0) {
 export function getStarterRewardLiabilityUsd(user = {}) {
     const potentialUsd = Math.max(0, Number(user.sponsoredRewardsBalance) || 0);
     if (user.sponsoredRewardsCompleted || user.sponsoredRewardsUnlocked) return potentialUsd;
+    // A free-ticket cashout is only potential reward value. Until paid
+    // challenge games fund it, none of that cashout is owed by the reward
+    // wallet. Each eligible game increases fundedRewardsUsd separately.
     return Math.min(potentialUsd, Math.max(0, Number(user.fundedRewardsUsd) || 0));
 }
 

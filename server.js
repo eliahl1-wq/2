@@ -8325,8 +8325,8 @@ app.post('/api/admin/users/:userId/reset-unfinished-rewards', authenticateAdmin,
                 error.status = 404;
                 throw error;
             }
-            if (req.body?.confirmation !== `RESET ${user.username}`) {
-                const error = new Error(`Type RESET ${user.username} to confirm.`);
+            if (req.body?.confirmed !== true) {
+                const error = new Error('Confirmation is required before resetting unfinished rewards.');
                 error.status = 400;
                 throw error;
             }

@@ -13,6 +13,27 @@ test('unfinished starter rewards reserve only the funded amount', () => {
     assert.equal(getStarterRewardLiabilityUsd({ sponsoredRewardsBalance: 150, fundedRewardsUsd: 0 }), 0);
 });
 
+test('a free-ticket cashout alone does not create reward-wallet liability', () => {
+    assert.equal(getStarterRewardLiabilityUsd({
+        sponsoredRewardsBalance: 2,
+        fundedRewardsUsd: 0,
+        freeTicketUsed: true,
+        sponsoredRewardsCompleted: false,
+        sponsoredRewardsUnlocked: false,
+    }), 0);
+});
+
+test('an unfinished starter reward never reserves more than challenge games funded', () => {
+    assert.equal(getStarterRewardLiabilityUsd({
+        sponsoredRewardsBalance: 2,
+        fundedRewardsUsd: 0.75,
+    }), 0.75);
+    assert.equal(getStarterRewardLiabilityUsd({
+        sponsoredRewardsBalance: 2,
+        fundedRewardsUsd: 10,
+    }), 2);
+});
+
 test('completed starter rewards reserve the full claimable balance', () => {
     assert.equal(getStarterRewardLiabilityUsd({
         sponsoredRewardsBalance: 150,
