@@ -6258,7 +6258,7 @@ function makeWeaponState(typeId) {
 
 export function beginSurvivReload(entity, now = Date.now()) {
     const weapon = entity?.weapon;
-    if (!weapon || weapon.reloading) return false;
+    if (!weapon || weapon.reloading || entity.medkitUseEndAt > now) return false;
     const definition = WEAPONS[weapon.type];
     if (!definition || definition.melee || definition.clipSize <= 0) return false;
     if ((Number(weapon.ammo) || 0) >= definition.clipSize) return false;
@@ -6274,6 +6274,37 @@ export function beginSurvivReload(entity, now = Date.now()) {
     weapon.reloading = true;
     weapon.reloadEndAt = now + definition.reloadMs;
     return true;
+}
+
+function getReservedReloadAmmo(entity, ammoType) {
+    const weapon = entity?.weapon;
+    if (!weapon?.reloading || WEAPONS[weapon.type]?.ammoType !== ammoType) return 0;
+    return Math.max(0, Math.floor(Number(weapon.reloadAmount) || 0));
+}
+
+function cancelSurvivReload(entity) {
+    const weapon = entity?.weapon;
+    if (!weapon?.reloading) return false;
+    const ammoType = WEAPONS[weapon.type]?.ammoType;
+    const amount = getReservedReloadAmmo(entity, ammoType);
+    const inventory = ensureInventory(entity);
+    // Pending rounds still belong to the backpack until they enter the gun.
+    // Pickup capacity includes them, so interrupting cannot overflow or erase
+    // ammunition when the active weapon state is replaced.
+    if (amount > 0 && SURVIV_AMMO[ammoType]) inventory.ammoReserves[ammoType] += amount;
+    weapon.reloading = false;
+    weapon.reloadEndAt = 0;
+    weapon.reloadAmount = 0;
+    return true;
+}
+
+export function cancelSurvivAction(entity) {
+    if (!entity) return false;
+    const canceledReload = cancelSurvivReload(entity);
+    const canceledMedkit = Number(entity.medkitUseEndAt) > 0 || entity.useMedkit === true;
+    entity.medkitUseEndAt = 0;
+    entity.useMedkit = false;
+    return canceledReload || canceledMedkit;
 }
 
 function finishSurvivReload(entity) {
@@ -6308,17 +6339,21 @@ function ensureInventory(entity) {
     if (!entity.inventory) entity.inventory = makeInventory();
     const currentWeapons = Array.isArray(entity.inventory.weapons) ? entity.inventory.weapons : [];
     const currentSlotAmmo = Array.isArray(entity.weaponSlotAmmo) ? entity.weaponSlotAmmo : [];
+    const currentSlotShotAt = Array.isArray(entity.weaponSlotLastShotAt) ? entity.weaponSlotLastShotAt : [];
     const validWeapons = [];
     const validSlotAmmo = [];
+    const validSlotShotAt = [];
     for (let index = 0; index < currentWeapons.length && validWeapons.length < SURVIV_MAX_WEAPONS; index++) {
         const weapon = currentWeapons[index];
         if (weapon === 'fists' || weapon === 'knife' || !WEAPONS[weapon]) continue;
         validWeapons.push(weapon);
         validSlotAmmo.push(currentSlotAmmo[index]);
+        validSlotShotAt.push(currentSlotShotAt[index]);
     }
     entity.inventory.weapons = validWeapons;
     entity.inventory.meleeWeapon = entity.inventory.meleeWeapon === 'knife' ? 'knife' : 'fists';
     if (Array.isArray(entity.weaponSlotAmmo)) entity.weaponSlotAmmo = validSlotAmmo;
+    if (Array.isArray(entity.weaponSlotLastShotAt)) entity.weaponSlotLastShotAt = validSlotShotAt;
     entity.inventory.medkits = Math.max(0, Math.min(SURVIV_MAX_MEDKITS, Number(entity.inventory.medkits) || 0));
     if (!entity.inventory.ammoReserves || typeof entity.inventory.ammoReserves !== 'object') {
         entity.inventory.ammoReserves = makeAmmoReserves();
@@ -6352,6 +6387,17 @@ function ensureWeaponSlotAmmo(entity) {
     return entity.weaponSlotAmmo;
 }
 
+function ensureWeaponSlotShotAt(entity) {
+    const inv = entity.inventory || ensureInventory(entity);
+    const existing = Array.isArray(entity.weaponSlotLastShotAt) ? entity.weaponSlotLastShotAt : [];
+    entity.weaponSlotLastShotAt = inv.weapons.map((weaponType, index) => {
+        const current = entity.activeWeaponSlot === index && entity.weapon?.type === weaponType
+            ? entity.weapon.lastShotAt : existing[index];
+        return Math.max(0, Number(current) || 0);
+    });
+    return entity.weaponSlotLastShotAt;
+}
+
 function syncLegacyWeaponAmmo(entity) {
     const inv = ensureInventory(entity);
     const slotAmmo = ensureWeaponSlotAmmo(entity);
@@ -6372,6 +6418,7 @@ function saveActiveWeaponAmmo(entity) {
     if (index < 0) return;
     entity.activeWeaponSlot = index;
     slotAmmo[index] = Math.max(0, Number(entity.weapon.ammo) || 0);
+    ensureWeaponSlotShotAt(entity)[index] = Math.max(0, Number(entity.weapon.lastShotAt) || 0);
     syncLegacyWeaponAmmo(entity);
 }
 
@@ -6379,8 +6426,10 @@ function addWeaponToInventory(entity, weaponType, ammo = null) {
     const inv = ensureInventory(entity);
     if (!weaponType || !WEAPONS[weaponType] || inv.weapons.length >= SURVIV_MAX_WEAPONS) return false;
     const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const slotShotAt = ensureWeaponSlotShotAt(entity);
     inv.weapons.push(weaponType);
     slotAmmo.push(Number.isFinite(ammo) ? Math.max(0, Number(ammo)) : WEAPONS[weaponType].clipSize);
+    slotShotAt.push(0);
     syncLegacyWeaponAmmo(entity);
     return true;
 }
@@ -6454,7 +6503,8 @@ function applyLootContents(entity, contents = {}, options = {}) {
     }
     if (contents.ammoType && contents.ammoAmount && SURVIV_AMMO[contents.ammoType]) {
         const ammoType = contents.ammoType;
-        const amount = Math.max(0, Math.min(Number(contents.ammoAmount) || 0, SURVIV_AMMO[ammoType].max - inv.ammoReserves[ammoType]));
+        const amount = Math.max(0, Math.min(Number(contents.ammoAmount) || 0,
+            SURVIV_AMMO[ammoType].max - inv.ammoReserves[ammoType] - getReservedReloadAmmo(entity, ammoType)));
         summary.ammoType = ammoType;
         summary.ammoAmount = amount;
         inv.ammoReserves[ammoType] += amount;
@@ -6491,6 +6541,7 @@ function beginInventoryMedkit(entity, now) {
     const inv = ensureInventory(entity);
     if (entity.medkitUseEndAt > now) return false;
     if (inv.medkits <= 0 || entity.hp >= entity.maxHp) return false;
+    cancelSurvivReload(entity);
     entity.medkitUseEndAt = now + SURVIV.medkitUseMs;
     return true;
 }
@@ -6510,6 +6561,8 @@ function pickupGroundWeapon(entity, room, targetId = null) {
     const inv = ensureInventory(entity);
     const nearby = querySurvivLoot(room, entity.x, entity.y, SURVIV.lootPickupRadius + 24)
         .filter(({ item }) => item.type === 'weapon' && item.weaponType && WEAPONS[item.weaponType])
+        .filter(({ item }) => (!item.pickupAfter || Date.now() >= item.pickupAfter)
+            && dist(entity.x, entity.y, item.x, item.y) <= SURVIV.lootPickupRadius + 24)
         .filter(({ item }) => !targetId || item.id === targetId)
         .filter(({ item }) => !entity.isBot || getBotWeaponUpgrade(entity, item.weaponType))
         .sort((a, b) => {
@@ -6528,9 +6581,10 @@ function pickupGroundWeapon(entity, room, targetId = null) {
     const nextType = item.weaponType;
     const nextDef = WEAPONS[nextType];
     const nextAmmo = Number.isFinite(item.ammo) ? Math.max(0, Number(item.ammo)) : nextDef.clipSize;
+    if (nextDef.melee && (nextType !== 'knife' || inv.meleeWeapon === 'knife')) return false;
+    cancelSurvivAction(entity);
     saveActiveWeaponAmmo(entity);
     if (nextDef.melee) {
-        if (nextType !== 'knife' || inv.meleeWeapon === 'knife') return false;
         inv.meleeWeapon = 'knife';
         removeSurvivLootAt(room, candidate.index);
         entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
@@ -6546,12 +6600,14 @@ function pickupGroundWeapon(entity, room, targetId = null) {
         return true;
     }
     const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const slotShotAt = ensureWeaponSlotShotAt(entity);
     let nextSlot;
 
     if (inv.weapons.length < SURVIV_MAX_WEAPONS) {
         nextSlot = inv.weapons.length;
         inv.weapons.push(nextType);
         slotAmmo.push(nextAmmo);
+        slotShotAt.push(0);
         removeSurvivLootAt(room, candidate.index);
     } else {
         const requestedSlot = entity.isBot
@@ -6563,6 +6619,7 @@ function pickupGroundWeapon(entity, room, targetId = null) {
         const oldAmmo = slotAmmo[nextSlot] ?? 0;
         inv.weapons[nextSlot] = nextType;
         slotAmmo[nextSlot] = nextAmmo;
+        slotShotAt[nextSlot] = 0;
         item.weaponType = oldType;
         item.ammo = oldAmmo;
         item.tier = WEAPONS[oldType]?.rarity || 'common';
@@ -6629,8 +6686,10 @@ export function equipSurvivWeaponSlot(entity, slot) {
     const index = Number(slot);
     if (!Number.isInteger(index)) return false;
 
-    saveActiveWeaponAmmo(entity);
     if (index === SURVIV_MELEE_SLOT) {
+        if (entity.activeWeaponSlot === index && entity.weapon?.type === (inv.meleeWeapon || 'fists')) return true;
+        cancelSurvivAction(entity);
+        saveActiveWeaponAmmo(entity);
         entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
         entity.weapon = makeWeaponState(inv.meleeWeapon || 'fists');
         syncLegacyWeaponAmmo(entity);
@@ -6641,6 +6700,12 @@ export function equipSurvivWeaponSlot(entity, slot) {
     const slotAmmo = ensureWeaponSlotAmmo(entity);
     const weaponType = inv.weapons[index];
     if (!weaponType || !WEAPONS[weaponType]) return false;
+    // Re-selecting the current slot is not an equip or action interruption.
+    if (entity.activeWeaponSlot === index && entity.weapon?.type === weaponType) return true;
+
+    cancelSurvivAction(entity);
+    saveActiveWeaponAmmo(entity);
+    const slotShotAt = ensureWeaponSlotShotAt(entity);
 
     const targetAmmo = slotAmmo[index] ?? WEAPONS[weaponType].clipSize;
     entity.activeWeaponSlot = index;
@@ -6649,7 +6714,7 @@ export function equipSurvivWeaponSlot(entity, slot) {
         ammo: targetAmmo,
         reloading: false,
         reloadEndAt: 0,
-        lastShotAt: 0,
+        lastShotAt: slotShotAt[index] || 0,
     };
     syncLegacyWeaponAmmo(entity);
     return true;
@@ -6658,13 +6723,16 @@ export function equipSurvivWeaponSlot(entity, slot) {
 function removeWeaponSlot(entity, index) {
     const inv = ensureInventory(entity);
     if (!Number.isInteger(index) || index < 0 || index >= inv.weapons.length) return null;
+    const wasActive = entity.activeWeaponSlot === index;
+    if (wasActive) cancelSurvivAction(entity);
     saveActiveWeaponAmmo(entity);
     const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const slotShotAt = ensureWeaponSlotShotAt(entity);
     const weaponType = inv.weapons[index];
     const ammo = slotAmmo[index] ?? 0;
-    const wasActive = entity.activeWeaponSlot === index;
     inv.weapons.splice(index, 1);
     slotAmmo.splice(index, 1);
+    slotShotAt.splice(index, 1);
 
     if (wasActive) {
         if (inv.weapons.length > 0) {
@@ -6673,6 +6741,7 @@ function removeWeaponSlot(entity, index) {
             entity.activeWeaponSlot = nextIndex;
             entity.weapon = makeWeaponState(nextType);
             entity.weapon.ammo = slotAmmo[nextIndex] ?? WEAPONS[nextType].clipSize;
+            entity.weapon.lastShotAt = slotShotAt[nextIndex] || 0;
             syncLegacyWeaponAmmo(entity);
         } else {
             entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
@@ -7246,13 +7315,14 @@ function moveEntity(entity, room, dx, dy, speed) {
 }
 
 function tryShoot(entity, room, now) {
-    if (entity.isCashingOut || entity.hp <= 0) return;
+    if (entity.isCashingOut || entity.hp <= 0 || entity.medkitUseEndAt > now) return;
     const wDef = WEAPONS[entity.weapon.type] || WEAPONS.fists;
     const w = entity.weapon;
 
     if (wDef.melee) {
-        if (now - w.lastShotAt < wDef.fireRateMs) return;
+        if (now - Math.max(Number(w.lastShotAt) || 0, Number(entity._lastMeleeShotAt) || 0) < wDef.fireRateMs) return;
         w.lastShotAt = now;
+        entity._lastMeleeShotAt = now;
         entity.meleeStartedAt = now;
         entity.meleeUntil = now + MELEE_ANIMATION_MS;
         entity.meleeAttackId = (Number(entity.meleeAttackId) || 0) + 1;
@@ -7421,6 +7491,7 @@ function applyDamage(target, damage, attacker, source = null) {
 }
 
 function dropDeathLoot(room, entity) {
+    cancelSurvivAction(entity);
     const inventory = ensureInventory(entity);
     const scatter = (index, total, radius = 36) => {
         const angle = (index / Math.max(1, total)) * Math.PI * 2 + Math.random() * 0.35;
@@ -7467,6 +7538,7 @@ function dropDeathLoot(room, entity) {
     entity.vestLevel = 0;
     inventory.weapons = [];
     entity.weaponSlotAmmo = [];
+    entity.weaponSlotLastShotAt = [];
     entity.weaponsAmmo = {};
     inventory.medkits = 0;
     inventory.ammoReserves = makeAmmoReserves();
@@ -7724,8 +7796,10 @@ function takeLootContainerItem(entity, room) {
     if (itemKey === 'weapon' && targetSlot != null && !WEAPONS[contents.weaponType]?.melee) {
         const inv = ensureInventory(entity);
         if (targetSlot >= 0 && targetSlot < inv.weapons.length) {
+            if (entity.activeWeaponSlot === targetSlot) cancelSurvivAction(entity);
             saveActiveWeaponAmmo(entity);
             const slotAmmo = ensureWeaponSlotAmmo(entity);
+            const slotShotAt = ensureWeaponSlotShotAt(entity);
             const outgoingType = inv.weapons[targetSlot];
             const outgoingAmmo = slotAmmo[targetSlot] ?? 0;
             const incomingType = contents.weaponType;
@@ -7735,6 +7809,7 @@ function takeLootContainerItem(entity, room) {
 
             inv.weapons[targetSlot] = incomingType;
             slotAmmo[targetSlot] = incomingAmmo;
+            slotShotAt[targetSlot] = 0;
             contents.weaponType = outgoingType;
             contents.ammo = outgoingAmmo;
             contents.rarity = WEAPONS[outgoingType]?.rarity || 'common';
@@ -7824,7 +7899,10 @@ function putLootContainerItem(entity, room) {
         if (requestedSlot === SURVIV_MELEE_SLOT) {
             if (inv.meleeWeapon === 'knife' && !contents.weaponType) {
                 inv.meleeWeapon = 'fists';
-                if (entity.activeWeaponSlot === SURVIV_MELEE_SLOT) entity.weapon = makeWeaponState('fists');
+                if (entity.activeWeaponSlot === SURVIV_MELEE_SLOT) {
+                    cancelSurvivAction(entity);
+                    entity.weapon = makeWeaponState('fists');
+                }
                 contents.weaponType = 'knife';
                 contents.rarity = WEAPONS.knife.rarity;
             }
@@ -7840,8 +7918,10 @@ function putLootContainerItem(entity, room) {
             return;
         }
         if (contents.weaponType && slotIndex >= 0 && slotIndex < inv.weapons.length) {
+            if (entity.activeWeaponSlot === slotIndex) cancelSurvivAction(entity);
             saveActiveWeaponAmmo(entity);
             const slotAmmo = ensureWeaponSlotAmmo(entity);
+            const slotShotAt = ensureWeaponSlotShotAt(entity);
             const outgoingType = inv.weapons[slotIndex];
             const outgoingAmmo = slotAmmo[slotIndex] ?? 0;
             const incomingType = contents.weaponType;
@@ -7851,6 +7931,7 @@ function putLootContainerItem(entity, room) {
 
             inv.weapons[slotIndex] = incomingType;
             slotAmmo[slotIndex] = incomingAmmo;
+            slotShotAt[slotIndex] = 0;
             contents.weaponType = outgoingType;
             contents.ammo = outgoingAmmo;
             contents.rarity = WEAPONS[outgoingType]?.rarity || 'common';
@@ -7897,6 +7978,7 @@ function throwSurvivGrenade(entity, room, now) {
     if (entity.isCashingOut || entity.hp <= 0) return false;
     const inventory = ensureInventory(entity);
     if (inventory.grenades <= 0) return false;
+    cancelSurvivAction(entity);
     inventory.grenades -= 1;
     const angle = entity.aimAngle ?? entity.angle ?? 0;
     const throwDistance = clamp(
@@ -8001,8 +8083,10 @@ function swapSurvivWeaponSlots(entity) {
     if (fromSlot < 0 || toSlot < 0 || fromSlot >= inv.weapons.length || toSlot >= inv.weapons.length) return;
     saveActiveWeaponAmmo(entity);
     const slotAmmo = ensureWeaponSlotAmmo(entity);
+    const slotShotAt = ensureWeaponSlotShotAt(entity);
     [inv.weapons[fromSlot], inv.weapons[toSlot]] = [inv.weapons[toSlot], inv.weapons[fromSlot]];
     [slotAmmo[fromSlot], slotAmmo[toSlot]] = [slotAmmo[toSlot], slotAmmo[fromSlot]];
+    [slotShotAt[fromSlot], slotShotAt[toSlot]] = [slotShotAt[toSlot], slotShotAt[fromSlot]];
     if (entity.activeWeaponSlot === fromSlot) entity.activeWeaponSlot = toSlot;
     else if (entity.activeWeaponSlot === toSlot) entity.activeWeaponSlot = fromSlot;
     syncLegacyWeaponAmmo(entity);
@@ -8025,9 +8109,12 @@ function dropPlayerItem(entity, room) {
         const idx = Number.isInteger(slotIdx) ? slotIdx : entity.activeWeaponSlot;
         if (idx === SURVIV_MELEE_SLOT) {
             if (inv.meleeWeapon !== 'knife') return;
+            // Dropping a stowed knife must not unexpectedly unequip the gun.
             inv.meleeWeapon = 'fists';
-            entity.activeWeaponSlot = SURVIV_MELEE_SLOT;
-            entity.weapon = makeWeaponState('fists');
+            if (entity.activeWeaponSlot === SURVIV_MELEE_SLOT) {
+                cancelSurvivAction(entity);
+                entity.weapon = makeWeaponState('fists');
+            }
             addSurvivLoot(room, makeGroundLoot('weapon', dropX, dropY, {
                 weaponType: 'knife',
                 tier: WEAPONS.knife.rarity,

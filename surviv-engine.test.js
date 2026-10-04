@@ -3154,7 +3154,7 @@ test('melee hits on solid non-destructible props emit a material impact event', 
     assert.match(player._objectImpact?.id || '', /^solid-impact-player:/);
 });
 
-test('one held human melee press produces only one attack', () => {
+test('one held human melee press produces only one attack', t => {
     const room = makeRoom();
     room.loot = [];
     room.spawnPoints = [];
@@ -3171,21 +3171,23 @@ test('one held human melee press produces only one attack', () => {
     player.shooting = true;
     room.players.push(player);
 
-    const resetAt = Date.now() + 600000;
+    let clock = Date.now();
+    t.mock.method(Date, 'now', () => clock);
+    const resetAt = clock + 600000;
     processSurvivRoom(room, silentIo, resetAt);
-    player.weapon.lastShotAt = 0;
+    clock += WEAPONS.fists.fireRateMs;
     processSurvivRoom(room, silentIo, resetAt);
     assert.equal(room.obstacles[0].hp, 82, 'holding one press must not trigger a second punch');
 
     player.shooting = false;
     processSurvivRoom(room, silentIo, resetAt);
     player.shooting = true;
-    player.weapon.lastShotAt = 0;
+    clock += WEAPONS.fists.fireRateMs;
     processSurvivRoom(room, silentIo, resetAt);
     assert.equal(room.obstacles[0].hp, 64, 'a new press should trigger the next punch');
 });
 
-test('duplicate packets with the same fire press id cannot create a second melee attack', () => {
+test('duplicate packets with the same fire press id cannot create a second melee attack', t => {
     const room = makeRoom();
     room.loot = [];
     room.spawnPoints = [];
@@ -3203,7 +3205,9 @@ test('duplicate packets with the same fire press id cannot create a second melee
     player.shooting = true;
     room.players.push(player);
 
-    const now = Date.now() + 600000;
+    let clock = Date.now();
+    t.mock.method(Date, 'now', () => clock);
+    const now = clock + 600000;
     processSurvivRoom(room, silentIo, now);
     assert.equal(room.obstacles[0].hp, 82);
     assert.equal(player.meleeAttackId, 1);
@@ -3212,21 +3216,21 @@ test('duplicate packets with the same fire press id cannot create a second melee
     player.shooting = false;
     processSurvivRoom(room, silentIo, now + 1);
     player.shooting = true;
-    player.weapon.lastShotAt = 0;
+    clock += 1000;
     processSurvivRoom(room, silentIo, now + 1000);
     assert.equal(room.obstacles[0].hp, 82, 'a delayed duplicate id must be ignored');
     assert.equal(player.meleeAttackId, 1, 'a duplicate packet must not restart the animation');
     assert.equal(player.meleeHand, firstHand);
 
     player.firePressId = 8;
-    player.weapon.lastShotAt = 0;
+    clock += 1;
     processSurvivRoom(room, silentIo, now + 1001);
     assert.equal(room.obstacles[0].hp, 64, 'a genuinely new press id must attack once');
     assert.equal(player.meleeAttackId, 2);
     assert.notEqual(player.meleeHand, firstHand, 'distinct clicks should alternate hands');
 });
 
-test('a delayed final down packet cannot append a melee swing after release', () => {
+test('a delayed final down packet cannot append a melee swing after release', t => {
     const room = makeRoom();
     room.loot = [];
     room.spawnPoints = [];
@@ -3242,9 +3246,11 @@ test('a delayed final down packet cannot append a melee swing after release', ()
     player.aimAngle = 0;
     room.players.push(player);
 
-    const startedAt = Date.now() + 600000;
+    let clock = Date.now();
+    t.mock.method(Date, 'now', () => clock);
+    const startedAt = clock + 600000;
     for (let pressId = 1; pressId <= 5; pressId++) {
-        player.weapon.lastShotAt = 0;
+        clock += 500;
         applySurvivFireInput(player, true, pressId);
         applySurvivFireInput(player, false, pressId);
         processSurvivRoom(room, silentIo, startedAt + pressId * 500);
@@ -3255,6 +3261,7 @@ test('a delayed final down packet cannot append a melee swing after release', ()
     // Simulate a stale volatile down packet arriving after the reliable up for
     // the fifth click. It must not re-arm shooting or queue a sixth punch.
     assert.equal(applySurvivFireInput(player, true, 5), false);
+    clock += 1500;
     processSurvivRoom(room, silentIo, startedAt + 4000);
     assert.equal(player.shooting, false);
     assert.equal(player.meleeAttackId, 5);

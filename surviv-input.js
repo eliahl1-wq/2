@@ -1,7 +1,7 @@
-import { SURVIV, applySurvivFireInput, beginSurvivReload } from './surviv-engine.js';
+import { SURVIV, applySurvivFireInput, beginSurvivReload, cancelSurvivAction } from './surviv-engine.js';
 
 const survivItemKeys = new Set(['weapon', 'money', 'medkits', 'ammo', 'grenades', 'armor']);
-const survivAmmoTypes = new Set(['9mm', '12g', '556', '762']);
+const survivAmmoTypes = new Set(['9mm', '12g', '556', '762', '308']);
 
 // Shared by normal Surviv and BR after server-side room/match authorization.
 export function applySurvivInputPayload(player, payload = {}) {
@@ -22,6 +22,7 @@ export function applySurvivInputPayload(player, payload = {}) {
         shooting,
         firePressId,
         reload,
+        cancelAction,
         useMedkit,
         pickupWeapon,
         pickupVestId,
@@ -51,7 +52,8 @@ export function applySurvivInputPayload(player, payload = {}) {
     player.aimDistance = finiteClamp(aimDistance, SURVIV.grenadeMinRange, SURVIV.grenadeMaxRange, 300);
 
     applySurvivFireInput(player, shooting, firePressId);
-    if (useMedkit === true) player.useMedkit = true;
+    if (cancelAction === true) cancelSurvivAction(player);
+    if (useMedkit === true && cancelAction !== true) player.useMedkit = true;
     if (pickupWeapon === true) player.pickupWeaponPending = true;
     else {
         const requestedWeaponId = safeId(pickupWeapon);
@@ -90,5 +92,5 @@ export function applySurvivInputPayload(player, payload = {}) {
         player.openedContainer = null;
     }
     if (Number.isInteger(equipSlot) && equipSlot >= 0 && equipSlot <= 2) player.equipSlotPending = equipSlot;
-    if (reload === true) beginSurvivReload(player);
+    if (reload === true && cancelAction !== true) beginSurvivReload(player);
 }

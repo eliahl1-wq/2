@@ -38,7 +38,8 @@ io.on('connection', socket => {
 app.get('/fixture', (_req, res) => {
     const room = getBRMatchForMongo(userId);
     const player = room?.players.find(p => p.mongoId === userId);
-    res.json({ token, status: room?.status, matchId: room?.id, player: player && { id: player.id, x: player.x, y: player.y, hp: player.hp, ammo: player.weapon?.ammo, weapon: player.weapon?.type },
+    res.json({ token, status: room?.status, matchId: room?.id, player: player && { id: player.id, x: player.x, y: player.y, hp: player.hp, ammo: player.weapon?.ammo, weapon: player.weapon?.type,
+        reloading: !!player.weapon?.reloading, ammoReserves: player.inventory?.ammoReserves },
         active: getActiveBRMatchesRaw().length, queue: getBRPlayerCountsByFee().surviv, payouts: transactions.filter(tx => tx.meta?.reason === 'BR Victory').length });
 });
 app.post('/fixture/fill', async (_req, res) => {
