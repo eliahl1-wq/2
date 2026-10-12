@@ -7,6 +7,8 @@ import { getSurvivEconomy } from './economy.js';
 import { SURVIV_STANDARD_FIREARM_IDS, SURVIV_WEAPONS } from './surviv-weapons.js';
 import { collectSurvivCombatEvents, recordSurvivBulletImpact, recordSurvivCombatEvent } from './surviv-combat-presentation.js';
 
+import { emitGameSnapshot, isGameTransportReady } from './game-network.js';
+
 const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
 const MELEE_ANIMATION_MS = 280;
@@ -9228,16 +9230,17 @@ function serializePlayer(p, isYou) {
         maxHp: p.maxHp,
         vestLevel: normalizeVestLevel(p.vestLevel),
         weapon: p.weapon?.type || 'fists',
-        firingMoveMultiplier: getFiringMoveMultiplier(p.weapon?.type),
-        ammo: p.weapon?.ammo ?? 0,
-        clipSize: wDef.clipSize,
+        ...(isYou ? {
+            firingMoveMultiplier: getFiringMoveMultiplier(p.weapon?.type),
+            ammo: p.weapon?.ammo ?? 0,
+            clipSize: wDef.clipSize,
+        } : {}),
         reloading: !!p.weapon?.reloading,
-        meleeStartedAt: p.meleeStartedAt || 0,
-        meleeUntil: p.meleeUntil || 0,
+        ...(isYou ? { meleeStartedAt: p.meleeStartedAt || 0, meleeUntil: p.meleeUntil || 0 } : {}),
         meleeRemainingMs: p.meleeUntil > Date.now() ? Math.max(0, p.meleeUntil - Date.now()) : 0,
         meleeHand: p.meleeHand || 'top',
         meleeAttackId: Number(p.meleeAttackId) || 0,
-        reloadEndAt: p.weapon?.reloadEndAt || 0,
+        ...(isYou ? { reloadEndAt: p.weapon?.reloadEndAt || 0 } : {}),
         reloadRemainingMs: p.weapon?.reloading ? Math.max(0, (p.weapon.reloadEndAt || 0) - Date.now()) : 0,
         reloadMs: wDef.reloadMs,
         medkitRemainingMs: p.medkitUseEndAt > Date.now() ? Math.max(0, p.medkitUseEndAt - Date.now()) : 0,
@@ -9253,11 +9256,13 @@ function serializePlayer(p, isYou) {
         surface: p.surface || 'ground',
 
         activeWeaponSlot: Number.isInteger(p.activeWeaponSlot) ? p.activeWeaponSlot : 0,
-        weaponSlotAmmo: ensureWeaponSlotAmmo(p),
-        weaponsAmmo: syncLegacyWeaponAmmo(p),
-        inventory: ensureInventory(p),
-        lastLoot: isYou ? (p.lastLoot || null) : null,
-        openedContainer: null,
+        ...(isYou ? {
+            weaponSlotAmmo: ensureWeaponSlotAmmo(p),
+            weaponsAmmo: syncLegacyWeaponAmmo(p),
+            inventory: ensureInventory(p),
+            lastLoot: p.lastLoot || null,
+            openedContainer: null,
+        } : {}),
     };
 }
 
@@ -9385,6 +9390,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     }
 
     const allPlayers = getActiveSurvivEntities(room);
+    const serializedRemotePlayers = new Map();
     const networkHouseByEntityId = new Map(allPlayers.map(player => [
         player.id,
         getSurvivNetworkHouse(room, player),
@@ -9417,14 +9423,16 @@ export function broadcastSurvivState(room, io, lbData, meta) {
     room.deathMarkers = (room.deathMarkers || []).filter(marker => now - marker.createdAt < 30000).slice(-40);
 
     const emitToViewer = (socketId, viewX, viewY, youId, dollarBalance, spectating) => {
-        if (sendLb) {
-            io.to(socketId).emit('leaderboard', { leaderboard, aliveCount, surviv: true });
-        }
-        const sendStaticPayload = shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now);
-
         const viewerEntity = youId
             ? allPlayers.find(player => player.id === youId)
             : { id: null, x: viewX, y: viewY, radius: SURVIV.playerRadius };
+        // One-shot HUD/kill events remain reliable. Ordinary motion should never
+        // queue stale worlds behind a recorder, a slow client or a slow network.
+        const hasPriorityEvents = pendingKillFeed.length > 0
+            || !!(viewerEntity?._hitConfirm || viewerEntity?._damageTaken || viewerEntity?._objectImpact);
+        if (!hasPriorityEvents && !isGameTransportReady(io, socketId)) return;
+        const sendStaticPayload = shouldSendSurvivStaticPayload(room, socketId, viewX, viewY, now);
+
         const viewerHouse = youId
             ? networkHouseByEntityId.get(youId) || null
             : getSurvivNetworkHouse(room, viewerEntity);
@@ -9441,7 +9449,10 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 blockers: viewerBlockers,
             }));
         const visiblePlayers = visibleEntities
-            .map(p => serializePlayer(p, false));
+            .map(p => {
+                if (!serializedRemotePlayers.has(p.id)) serializedRemotePlayers.set(p.id, serializePlayer(p, false));
+                return serializedRemotePlayers.get(p.id);
+            });
         const visibleCombatOwners = new Set(visibleEntities.map(p => p.id));
         if (youId) visibleCombatOwners.add(youId);
         const combatEvents = collectSurvivCombatEvents(room, now, visibleCombatOwners,
@@ -9563,7 +9574,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 radius: cell.radius,
                 strength: Math.min(1, 0.48 + cell.entityIds.filter(entityId => entityId !== youId).length * 0.12),
             }));
-        io.to(socketId).emit('survivTick', {
+        emitGameSnapshot(io, socketId, 'survivTick', [{
             you: youId ? serializePlayer(
                 viewerEntity || { id: youId, x: viewX, y: viewY, dollarBalance, hp: 0 },
                 true,
@@ -9609,7 +9620,10 @@ export function broadcastSurvivState(room, io, lbData, meta) {
                 })),
             } : {}),
             ...meta,
-        });
+        }], { reliable: sendStaticPayload || hasPriorityEvents });
+        if (sendLb) {
+            io.to(socketId).emit('leaderboard', { leaderboard, aliveCount, surviv: true });
+        }
     };
 
     for (const p of room.players.filter(pl => !pl.disconnected && !pl.cashoutSettling && pl.hp > 0)) {

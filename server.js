@@ -11,7 +11,10 @@ import { Server } from 'socket.io';
 import { createServer } from 'http';
 import 'dotenv/config';
 import * as util from './utils.js';
-import { QuadTree, Rectangle, Point } from './quadtree.js';
+import { QuadTree, Rectangle } from './quadtree.js';
+import { emitGameSnapshot, getAgarSnapshotSchedule, isGameTransportReady, serializeAgarPlayer } from './game-network.js';
+import { rebuildAgarSpatialTree } from './agar-spatial.js';
+import { createSurvivMapGenerator } from './surviv-map-generation.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     TOKEN_2022_PROGRAM_ID,
@@ -92,7 +95,6 @@ import {
     SURVIV,
     createSurvivPlayer,
     eliminateSurvivPlayer,
-    generateSurvivMap,
     getSurvivZone,
     processSurvivRoom,
     resetSurvivRoomRuntime,
@@ -1446,8 +1448,9 @@ function createCompetitiveSlitherRoom(entryFeeUsd) {
 
 const competitiveSlitherRooms = COMPETITIVE_SLITHER_ENTRY_FEES.map(fee => createCompetitiveSlitherRoom(fee));
 
-function createSurvivRoom(entryFeeUsd) {
-    const map = generateSurvivMap(SURVIV.worldHalf);
+const survivMapGenerator = createSurvivMapGenerator();
+async function createSurvivRoom(entryFeeUsd) {
+    const map = await survivMapGenerator.take();
     return {
         id: `surviv-${entryFeeUsd}`,
         entryFeeUsd,
@@ -1489,9 +1492,10 @@ function createSurvivRoom(entryFeeUsd) {
     };
 }
 
-const survivRooms = SURVIV_ENTRY_FEES.map(fee => createSurvivRoom(fee));
+const survivRooms = await Promise.all(SURVIV_ENTRY_FEES.map(fee => createSurvivRoom(fee)));
+const pendingFreePlaySurvivRooms = new Map();
 
-function getPersonalFreePlayRoom(userId, mode, entryFeeUsd) {
+async function getPersonalFreePlayRoom(userId, mode, entryFeeUsd) {
     const ownerId = String(userId);
     if (mode === 'competitive-slither') {
         const fee = normalizeCompetitiveEntryFee(entryFeeUsd);
@@ -1509,11 +1513,18 @@ function getPersonalFreePlayRoom(userId, mode, entryFeeUsd) {
         const fee = normalizeSurvivEntryFee(entryFeeUsd);
         let room = survivRooms.find(candidate => candidate.personalFreePlayOwnerId === ownerId && candidate.entryFeeUsd === fee);
         if (!room) {
-            room = createSurvivRoom(fee);
-            room.id = `personal-freeplay-surviv-${ownerId}-${fee}`;
-            room.isPersonalFreePlay = true;
-            room.personalFreePlayOwnerId = ownerId;
-            survivRooms.push(room);
+            const key = `${ownerId}:${fee}`;
+            if (!pendingFreePlaySurvivRooms.has(key)) {
+                const preparation = createSurvivRoom(fee).then(prepared => {
+                    prepared.id = `personal-freeplay-surviv-${ownerId}-${fee}`;
+                    prepared.isPersonalFreePlay = true;
+                    prepared.personalFreePlayOwnerId = ownerId;
+                    survivRooms.push(prepared);
+                    return prepared;
+                }).finally(() => pendingFreePlaySurvivRooms.delete(key));
+                pendingFreePlaySurvivRooms.set(key, preparation);
+            }
+            room = await pendingFreePlaySurvivRooms.get(key);
         }
         return room;
     }
@@ -2280,11 +2291,15 @@ function keepCompetitiveCashoutSpectator(room, player) {
 }
 
 let cachedSystemAccountRentLamports = null;
+let pendingSystemAccountRent = null;
 async function getSystemAccountRentLamports() {
-    if (cachedSystemAccountRentLamports == null) {
-        cachedSystemAccountRentLamports = await connection.getMinimumBalanceForRentExemption(0);
+    if (cachedSystemAccountRentLamports != null) return cachedSystemAccountRentLamports;
+    if (!pendingSystemAccountRent) {
+        pendingSystemAccountRent = connection.getMinimumBalanceForRentExemption(0)
+            .then(value => { cachedSystemAccountRentLamports = value; return value; })
+            .finally(() => { pendingSystemAccountRent = null; });
     }
-    return cachedSystemAccountRentLamports;
+    return pendingSystemAccountRent;
 }
 
 async function canReceiveSystemTransfer(address, lamports) {
@@ -3252,6 +3267,7 @@ async function performGlobalArenaReset() {
             return { success: false, deferred: true, reason: 'pool_sweep_failed' };
         }
 
+        const replacementSurvivMaps = await Promise.all(survivRooms.map(() => survivMapGenerator.take()));
         for (const room of rooms) {
             resetRoomEntities(room);
         }
@@ -3261,8 +3277,9 @@ async function performGlobalArenaReset() {
             room.competitiveSpectators = [];
             room.sessionPlayerCashoutUsd = 0;
         }
-        for (const room of survivRooms) {
-            resetSurvivRoomRuntime(room);
+        for (let index = 0; index < survivRooms.length; index++) {
+            const room = survivRooms[index];
+            resetSurvivRoomRuntime(room, replacementSurvivMaps[index]);
             room.sessionPlayerCashoutUsd = 0;
         }
 
@@ -3857,9 +3874,10 @@ app.get('/', (req, res) => {
     res.send('<html><body style="font-family:sans-serif;background:#0a0a0c;color:white;text-align:center;padding-top:100px;"><h1>Arenifi Engine v2.0 🎮</h1><p style="color:#8b5cf6;font-size:1.5rem;">Status: Online</p><p>Multiplayer game services are ready.</p></body></html>');
 });
 
-async function verifyAccountToken(token) {
+async function verifyAccountToken(token, { includeUser = false } = {}) {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const account = await User.findById(decoded.id).select('authVersion username').lean();
+    const query = User.findById(decoded.id);
+    const account = includeUser ? await query : await query.select('authVersion username').lean();
     if (!account) {
         const err = new Error('Account no longer exists');
         err.name = 'AccountNotFoundError';
@@ -3870,7 +3888,7 @@ async function verifyAccountToken(token) {
         err.name = 'SessionRevokedError';
         throw err;
     }
-    return { ...decoded, username: account.username };
+    return { ...decoded, username: account.username, ...(includeUser ? { account } : {}) };
 }
 
 function isAdminUserRecord(user) {
@@ -11895,28 +11913,7 @@ function releaseCashoutLock(mongoId) {
 }
 
 function rebuildQuadTree(room, allUsers) {
-    room.qt.clear();
-    room.food.forEach(f => {
-        room.qt.insert(new Point(f.x, f.y, { type: 'food', data: f }));
-    });
-    room.viruses.forEach(v => {
-        room.qt.insert(new Point(v.x, v.y, { type: 'virus', data: v }));
-    });
-    room.ejected.forEach(e => {
-        room.qt.insert(new Point(e.x, e.y, { type: 'ejected', data: e }));
-    });
-    allUsers.forEach(player => {
-        if (!Array.isArray(player.cells)) return;
-        for (const cell of player.cells) {
-            if (!cell || !Number.isFinite(cell.x) || !Number.isFinite(cell.y)) continue;
-            room.qt.insert(new Point(cell.x, cell.y, {
-                type: player.isBot ? 'bot' : 'player',
-                socketId: player.isBot ? undefined : player.id,
-                botId: player.isBot ? player.id : undefined,
-                cell,
-            }));
-        }
-    });
+    rebuildAgarSpatialTree(room.qt, room, allUsers);
 }
 
 function addBots(room, n, botStake = null) {
@@ -12726,9 +12723,9 @@ io.on('connection', (socket) => {
             if (skinColor && typeof skinColor === 'string' && (skinColor === 'random' || skinColor === 'random_color' || isFlagSkinColor(skinColor) || isSpecialSlitherSkinColor(skinColor) || /^#[0-9a-fA-F]{6}$/.test(skinColor))) {
                 validatedSkinColor = skinColor;
             }
-            const decoded = await verifyAccountToken(token);
             reportJoinProgress('Checking your account…');
-            let user = await User.findById(decoded.id);
+            const decoded = await verifyAccountToken(token, { includeUser: true });
+            let user = decoded.account;
             if (!user) {
                 socket.emit('error', 'Account not found — please log in again.');
                 return;
@@ -12799,7 +12796,7 @@ io.on('connection', (socket) => {
                     ? getPublicFreePlayEntryFee('competitive-slither')
                     : normalizeCompetitiveEntryFee(rawEntryFee);
                 const room = sessionFreePlay
-                    ? getPublicFreePlayRoom('competitive-slither')
+                    ? await getPublicFreePlayRoom('competitive-slither')
                     : getCompetitiveSlitherRoom(entryFeeUsd);
                 removeCompetitiveSpectatorsForUser(room, userKey);
                 const existing = findPlayerInArena(userKey);
@@ -12860,9 +12857,10 @@ io.on('connection', (socket) => {
                     reportJoinProgress('Checking your SOL balance…');
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    const [currentLamports, rentLamports] = await Promise.all([
+                    const [currentLamports, rentLamports, entryBlockhash] = await Promise.all([
                         connection.getBalance(userPubKey),
                         getSystemAccountRentLamports(),
+                        connection.getLatestBlockhash('confirmed'),
                     ]);
                     const requiredLamports = feeLamports + 15000 + rentLamports;
                     if (currentLamports < requiredLamports) {
@@ -12873,7 +12871,7 @@ io.on('connection', (socket) => {
                         reportJoinProgress('Confirming your entry on Solana…');
                         const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                        const { blockhash, lastValidBlockHeight } = entryBlockhash;
                         const joinTx = new solanaWeb3.Transaction({
                             recentBlockhash: blockhash,
                             feePayer: userPubKey,
@@ -12981,7 +12979,7 @@ io.on('connection', (socket) => {
                 const room = useAdminFreeSurvivEntry
                     ? getSurvivRoom(entryFeeUsd)
                     : sessionFreePlay
-                    ? getPublicFreePlayRoom('surviv')
+                    ? await getPublicFreePlayRoom('surviv')
                     : getSurvivRoom(entryFeeUsd);
                 removeSurvivSpectator(room, socket.id);
                 const existing = findPlayerInArena(userKey);
@@ -13044,9 +13042,10 @@ io.on('connection', (socket) => {
                     reportJoinProgress('Checking your SOL balance…');
                     const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                     const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
-                    const [currentLamports, rentLamports] = await Promise.all([
+                    const [currentLamports, rentLamports, entryBlockhash] = await Promise.all([
                         connection.getBalance(userPubKey),
                         getSystemAccountRentLamports(),
+                        connection.getLatestBlockhash('confirmed'),
                     ]);
                     const requiredLamports = feeLamports + 15000 + rentLamports;
                     if (currentLamports < requiredLamports) {
@@ -13057,7 +13056,7 @@ io.on('connection', (socket) => {
                         reportJoinProgress('Confirming your entry on Solana…');
                         const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                         const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                        const { blockhash, lastValidBlockHeight } = entryBlockhash;
                         const joinTx = new solanaWeb3.Transaction({
                             recentBlockhash: blockhash,
                             feePayer: userPubKey,
@@ -13243,7 +13242,7 @@ io.on('connection', (socket) => {
             const gameSessionId = existing?.player?.gameSessionId || randomBytes(12).toString('hex');
 
             const room = existing?.room ?? (sessionFreePlay
-                ? getPublicFreePlayRoom(gameMode)
+                ? await getPublicFreePlayRoom(gameMode)
                 : (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd)));
             const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
             let switchedDollarBalance = null;
@@ -13309,9 +13308,10 @@ io.on('connection', (socket) => {
                 const userPubKey = new solanaWeb3.PublicKey(user.depositAddress);
                 const feeLamports = Math.round(entryFeeInSol * solanaWeb3.LAMPORTS_PER_SOL);
 
-                const [currentLamports, rentLamports] = await Promise.all([
+                const [currentLamports, rentLamports, entryBlockhash] = await Promise.all([
                     connection.getBalance(userPubKey),
                     getSystemAccountRentLamports(),
+                    connection.getLatestBlockhash('confirmed'),
                 ]);
                 const requiredLamports = feeLamports + 15000 + rentLamports;
                 if (currentLamports < requiredLamports) {
@@ -13324,7 +13324,7 @@ io.on('connection', (socket) => {
                     reportJoinProgress('Confirming your entry on Solana…');
                     const userKeypair = solanaWeb3.Keypair.fromSecretKey(decryptWalletSecret(user.depositSecret));
                     const housePubKey = new solanaWeb3.PublicKey(HOUSE_WALLET_ADDRESS);
-                    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+                    const { blockhash, lastValidBlockHeight } = entryBlockhash;
                     const joinTx = new solanaWeb3.Transaction({
                         recentBlockhash: blockhash,
                         feePayer: userPubKey,
@@ -15329,8 +15329,11 @@ function processRoom(room) {
         ...room.players.filter(p => p.mode !== 'slither' && !p.disconnected),
         ...(room.agarSpectators || []),
     ];
+    const serializedAgarUsers = new Map(allUsers.map(player => [player.id, serializeAgarPlayer(player)]));
+    const snapshotNow = Date.now();
     agarReceivers.forEach(p => {
-        io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
+        if (!isGameTransportReady(io, p.id)) return;
+        const schedule = getAgarSnapshotSchedule(room, p, snapshotNow);
 
         // Spatial filtering — food range is wider than entity range to reduce edge pop-in.
         const pad = 500;
@@ -15340,7 +15343,7 @@ function processRoom(room) {
         const viewRange = new Rectangle(p.x, p.y, rangeX, rangeY);
         const foodRange = new Rectangle(p.x, p.y, rangeX + foodPad, rangeY + foodPad);
         const visibleItems = room.qt.query(viewRange);
-        const foodItems = room.qt.query(foodRange);
+        const foodItems = schedule.food ? room.qt.query(foodRange) : [];
 
         const visibleFood = [];
         const visibleViruses = [];
@@ -15362,7 +15365,7 @@ function processRoom(room) {
         const minimapHalf = Math.max((p.screenWidth || 1920) / 2, (p.screenHeight || 1080) / 2) * 2.35;
         const threatHalf = minimapHalf * 1.55;
         const minimapRange = new Rectangle(p.x, p.y, minimapHalf, minimapHalf);
-        const minimapItems = room.qt.query(minimapRange);
+        const minimapItems = schedule.minimap ? room.qt.query(minimapRange) : [];
 
         const minimapPlayers = allUsers
             .filter(u => p.isAgarSpectator || u.id === p.id)
@@ -15403,10 +15406,17 @@ function processRoom(room) {
             ejected: minimapEjected,
         };
 
-        io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, visibleEjected, visibleViruses, {
+        emitGameSnapshot(io, p.id, 'serverTellPlayerMove', [
+            serializedAgarUsers.get(p.id) || serializeAgarPlayer(p),
+            Array.from(visibleUsersSet, user => serializedAgarUsers.get(user.id) || serializeAgarPlayer(user)),
+            schedule.food ? visibleFood : null,
+            visibleEjected,
+            visibleViruses,
+            {
+            snapshotAt: snapshotNow,
             resetTime: room.startTime + c.roomDuration,
             solPrice: SOL_PRICE_USD,
-            minimap,
+            ...(schedule.minimap ? { minimap } : {}),
             ...(p.isAgarSpectator ? {
                 spectating: true,
                 spectateTargets: allUsers.map(user => ({
@@ -15424,7 +15434,10 @@ function processRoom(room) {
                     shrinking: room.sandboxZone.shrinking,
                 } : null
             } : {}),
-        });
+        }]);
+        if (schedule.leaderboard) {
+            io.to(p.id).emit('leaderboard', { leaderboard: visualLeaderboard });
+        }
     });
 }
 

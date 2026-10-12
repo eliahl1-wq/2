@@ -4,6 +4,8 @@
  */
 
 import jwt from 'jsonwebtoken';
+import { emitGameSnapshot, getAgarSnapshotSchedule, isGameTransportReady, serializeAgarPlayer } from './game-network.js';
+import { rebuildAgarSpatialTree } from './agar-spatial.js';
 import { decryptWalletSecret } from './wallet-crypto.js';
 import { prepareSurvivBRMap, clonePreparedSurvivBRMap } from './surviv-br-map-cache.js';
 import { SURVIV_BR, initializeSurvivBRRoom, createSurvivBRPlayer, createSurvivBRZonePlan, getSurvivBRZone, survivBRMeta } from './surviv-battle-royale.js';
@@ -17,7 +19,7 @@ import {
     broadcastSlitherState,
     syncBRSlitherFood,
 } from './slither-engine.js';
-import { QuadTree, Rectangle, Point } from './quadtree.js';
+import { QuadTree, Rectangle } from './quadtree.js';
 import { getBRHouseWallet, isBRWalletConfigured, normalizeBREntryFee } from './br-wallets.js';
 import { splitCollectedLamports } from './solana-settlement-safety.js';
 
@@ -894,19 +896,9 @@ function endMatchNoWinner(room, io) {
 }
 
 function rebuildBRQuadTree(room, allUsers) {
-    room.qt.clear();
-    room.food.forEach(f => {
-        room.qt.insert(new Point(f.x, f.y, { type: 'food', data: f }));
-    });
-    allUsers.forEach(player => {
-        for (const cell of player.cells) {
-            room.qt.insert(new Point(cell.x, cell.y, {
-                type: 'player',
-                socketId: player.id,
-                cell,
-            }));
-        }
-    });
+    // BR bots participate in the same 'player' collision path as humans.
+    // Pass the original protocol's ownership here rather than changing game rules.
+    rebuildAgarSpatialTree(room.qt, room, allUsers, true);
 }
 
 function cellBalance(cell) {
@@ -1040,14 +1032,17 @@ function processBRAgarMatch(room, io, deps) {
         }))
         .sort((a, b) => b.kills - a.kills || b.mass - a.mass);
 
+    const serializedUsers = new Map(allUsers.map(player => [player.id, serializeAgarPlayer(player)]));
+    const snapshotNow = Date.now();
     allUsers.forEach(p => {
-        io.to(p.id).emit('leaderboard', { leaderboard: lb, battleRoyale: true });
+        if (!isGameTransportReady(io, p.id)) return;
+        const schedule = getAgarSnapshotSchedule(room, p, snapshotNow);
         const pad = 400;
         const foodPad = 600;
         const rangeX = (p.screenWidth || 1920) / 2 + pad;
         const rangeY = (p.screenHeight || 1080) / 2 + pad;
         const visibleItems = room.qt.query(new Rectangle(p.x, p.y, rangeX, rangeY));
-        const foodItems = room.qt.query(new Rectangle(p.x, p.y, rangeX + foodPad, rangeY + foodPad));
+        const foodItems = schedule.food ? room.qt.query(new Rectangle(p.x, p.y, rangeX + foodPad, rangeY + foodPad)) : [];
         const visibleUsersSet = new Set([p]);
         const visibleFood = [];
         visibleItems.forEach(item => {
@@ -1061,7 +1056,7 @@ function processBRAgarMatch(room, io, deps) {
         });
         const minimapHalf = Math.max((p.screenWidth || 1920) / 2, (p.screenHeight || 1080) / 2) * 2.35;
         const threatHalf = minimapHalf * 1.55;
-        const minimapItems = room.qt.query(new Rectangle(p.x, p.y, minimapHalf, minimapHalf));
+        const minimapItems = schedule.minimap ? room.qt.query(new Rectangle(p.x, p.y, minimapHalf, minimapHalf)) : [];
 
         const minimapPlayers = allUsers
             .filter(u => u.id === p.id)
@@ -1096,7 +1091,10 @@ function processBRAgarMatch(room, io, deps) {
             ejected: [],
         };
 
-        io.to(p.id).emit('serverTellPlayerMove', p, Array.from(visibleUsersSet), visibleFood, [], [], {
+        emitGameSnapshot(io, p.id, 'serverTellPlayerMove', [serializedUsers.get(p.id),
+            Array.from(visibleUsersSet, user => serializedUsers.get(user.id)),
+            schedule.food ? visibleFood : null, [], [], {
+            snapshotAt: snapshotNow,
             unlocked: false,
             unlockTime: 0,
             playerCount: allUsers.length,
@@ -1106,8 +1104,9 @@ function processBRAgarMatch(room, io, deps) {
             zone: room.zone,
             prizePool: room.prizePool,
             aliveCount: allUsers.length,
-            minimap,
-        });
+            ...(schedule.minimap ? { minimap } : {}),
+        }]);
+        if (schedule.leaderboard) io.to(p.id).emit('leaderboard', { leaderboard: lb, battleRoyale: true });
     });
 }
 

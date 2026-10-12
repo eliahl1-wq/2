@@ -58,12 +58,13 @@ class QuadTree {
         this.divided = true;
     }
 
-    insert(point) {
+    insert(point, touchedNodes = null) {
         if (!this.boundary.contains(point)) {
             return false;
         }
 
-        if (this.points.length < this.capacity) {
+        if (this.points.length < this.capacity || this.boundary.w <= 0.001 || this.boundary.h <= 0.001) {
+            if (touchedNodes && !touchedNodes.has(this)) touchedNodes.set(this, this.points.length);
             this.points.push(point);
             return true;
         } else {
@@ -71,10 +72,10 @@ class QuadTree {
                 this.subdivide();
             }
 
-            if (this.northeast.insert(point)) return true;
-            if (this.northwest.insert(point)) return true;
-            if (this.southeast.insert(point)) return true;
-            if (this.southwest.insert(point)) return true;
+            if (this.northeast.insert(point, touchedNodes)) return true;
+            if (this.northwest.insert(point, touchedNodes)) return true;
+            if (this.southeast.insert(point, touchedNodes)) return true;
+            if (this.southwest.insert(point, touchedNodes)) return true;
         }
     }
 

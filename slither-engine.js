@@ -1,4 +1,5 @@
 import * as util from './utils.js';
+import { emitGameSnapshot, isGameTransportReady, packSlitherSnake, usesCompactSlitherSnapshots } from './game-network.js';
 import {
     getEconomy,
     DEFAULT_ENTRY_FEE,
@@ -2572,8 +2573,9 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     const sendFoodThisTick = room._slitherBroadcastTick % SLITHER_FOOD_BROADCAST_INTERVAL === 0;
     const sendMinimapThisTick = room._slitherBroadcastTick % SLITHER_MINIMAP_BROADCAST_INTERVAL === 0;
 
-    const slitherPlayers = room.players.filter(p => p.mode === 'slither' && !p.disconnected);
-    const spectators = room.spectators || [];
+    const slitherPlayers = room.players.filter(p => p.mode === 'slither' && !p.disconnected && isGameTransportReady(io, p.id));
+    const spectators = (room.spectators || []).filter(p => isGameTransportReady(io, p.id));
+    if (!slitherPlayers.length && !spectators.length) return;
 
     const serializedSnakesNotYou = new Map();
     for (const { entity: s } of allSnakes) {
@@ -2583,6 +2585,7 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     for (const p of slitherPlayers) {
         serializedSnakesYou.set(p.id, serializeSnake(p, true));
     }
+    const packedSnakes = new Map();
 
     const needsFoodRefresh = sendFoodThisTick || slitherPlayers.some(p => !room._lastSlitherFoodByPlayer?.[p.id]) || spectators.length > 0;
     const broadcastFoodGrid = needsFoodRefresh && room.slitherFood.length > 80
@@ -2617,10 +2620,6 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
     receivers.forEach(r => {
         const head = { x: r.x, y: r.y };
 
-        if (sendLeaderboard) {
-            io.to(r.id).emit('leaderboard', { leaderboard: slitherLeaderboard, battleRoyale: !!meta.battleRoyale });
-        }
-
         const visibleSnakes = allSnakes
             // Never send the complete room to an active client. Checking
             // sampled body segments keeps large snakes from popping while
@@ -2634,7 +2633,11 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
             }))
             .map(({ entity: s }) => {
                 const isYou = !r.isSpectator && s.id === r.id;
-                return isYou ? serializedSnakesYou.get(s.id) : serializedSnakesNotYou.get(s.id);
+                const snapshot = isYou ? serializedSnakesYou.get(s.id) : serializedSnakesNotYou.get(s.id);
+                if (!usesCompactSlitherSnapshots(io, r.id)) return snapshot;
+                const key = `${s.id}:${isYou}`;
+                if (!packedSnakes.has(key)) packedSnakes.set(key, packSlitherSnake(snapshot));
+                return packedSnakes.get(key);
             });
 
         let visibleFood = null;
@@ -2709,7 +2712,10 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
 
         // State snapshots supersede older snapshots. Volatile delivery prevents
         // a slow client/transport from building an ever-growing latency queue.
-        io.to(r.id).volatile.emit('slitherTick', tickPayload);
+        emitGameSnapshot(io, r.id, 'slitherTick', [tickPayload]);
+        if (sendLeaderboard) {
+            io.to(r.id).emit('leaderboard', { leaderboard: slitherLeaderboard, battleRoyale: !!meta.battleRoyale });
+        }
     });
 }
 
@@ -3250,9 +3256,11 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
 
     // Bots have fake IDs, not sockets. Never build or emit viewer payloads for them.
     const compPlayers = room.players.filter(
-        p => p.mode === 'competitive-slither' && !p.isBot && !p.disconnected
+        p => p.mode === 'competitive-slither' && !p.isBot && !p.disconnected && isGameTransportReady(io, p.id)
     );
-    const compSpecs = room.competitiveSpectators || [];
+    const compSpecs = (room.competitiveSpectators || []).filter(p => isGameTransportReady(io, p.id));
+    if (!compPlayers.length && !compSpecs.length) return;
+    const serializedCompetitiveSnakes = new Map();
     const needsCompFoodRefresh = sendFoodThisTick
         || compPlayers.some(p => !room._lastCompFoodByPlayer?.[p.id])
         || compSpecs.some(s => !room._lastCompFoodByPlayer?.[s.id]);
@@ -3265,10 +3273,6 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         const { socketId, viewX, viewY, youId, dollarBalance, spectating } = viewer;
         const head = { x: viewX, y: viewY };
 
-        if (sendLeaderboard) {
-            io.to(socketId).emit('leaderboard', { leaderboard, competitiveSlither: true });
-        }
-
         const visibleSnakes = allSnakes
             .filter(({ entity: s }) => isSlitherSnakeVisibleToViewer(s, {
                 viewX: head.x,
@@ -3277,7 +3281,16 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
                 viewerId: youId,
                 spectating,
             }))
-            .map(({ entity: s }) => serializeCompetitiveSnake(s, s.id === youId));
+            .map(({ entity: s }) => {
+                const isYou = s.id === youId;
+                const packed = usesCompactSlitherSnapshots(io, socketId);
+                const key = `${s.id}:${isYou}:${packed}`;
+                if (!serializedCompetitiveSnakes.has(key)) {
+                    const snapshot = serializeCompetitiveSnake(s, isYou);
+                    serializedCompetitiveSnakes.set(key, packed ? packSlitherSnake(snapshot) : snapshot);
+                }
+                return serializedCompetitiveSnakes.get(key);
+            });
 
         let visibleFood = null;
         const refreshFood = sendFoodThisTick
@@ -3333,7 +3346,10 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         if (visibleFood) tickPayload.food = visibleFood;
         if (minimap) tickPayload.minimap = minimap;
 
-        io.to(socketId).volatile.emit('slitherTick', tickPayload);
+        emitGameSnapshot(io, socketId, 'slitherTick', [tickPayload]);
+        if (sendLeaderboard) {
+            io.to(socketId).emit('leaderboard', { leaderboard, competitiveSlither: true });
+        }
     };
 
     compPlayers.forEach(p => {
