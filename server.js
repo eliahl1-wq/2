@@ -13,7 +13,13 @@ import 'dotenv/config';
 import * as util from './utils.js';
 import { QuadTree, Rectangle, Point } from './quadtree.js';
 import * as solanaWeb3 from '@solana/web3.js';
-import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import {
+    TOKEN_2022_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
+    createAssociatedTokenAccountIdempotentInstruction,
+    createTransferCheckedInstruction,
+    getAssociatedTokenAddressSync,
+} from '@solana/spl-token';
 import passport from 'passport';
 import { randomBytes } from 'crypto';
 import fetch from 'node-fetch'; // Se till att du kör 'npm install node-fetch'
@@ -536,6 +542,7 @@ const UserSchema = new mongoose.Schema({
     securityUserAgentHashes: { type: [String], default: [], select: false },
     securityLastSeenAt: { type: Date, default: null, select: false },
 }, { timestamps: true });
+UserSchema.index({ excludedFromReports: 1, isOwnerAccount: 1, createdAt: -1 });
 
 const User = mongoose.model('User', UserSchema);
 const emailVerificationService = createEmailVerificationService({
@@ -6670,6 +6677,329 @@ app.patch('/api/admin/bug-reports/:reportId', authenticateAdmin, async (req, res
     }
 });
 
+const ADMIN_OVERVIEW_RANGES = new Set([7, 30, 90]);
+
+function adminOverviewChange(current, previous) {
+    const currentValue = Number(current) || 0;
+    const previousValue = Number(previous) || 0;
+    if (previousValue <= 0) return currentValue > 0 ? null : 0;
+    return Number((((currentValue - previousValue) / previousValue) * 100).toFixed(1));
+}
+
+async function getAdminOverviewAnalytics(requestedDays) {
+    const days = ADMIN_OVERVIEW_RANGES.has(Number(requestedDays)) ? Number(requestedDays) : 30;
+    const now = new Date();
+    const todayUtc = new Date(now);
+    todayUtc.setUTCHours(0, 0, 0, 0);
+    const rangeStart = new Date(todayUtc.getTime() - ((days - 1) * 86_400_000));
+    const previousStart = new Date(rangeStart.getTime() - (days * 86_400_000));
+    const analyticsUserMatch = { ...USER_REPORTED, isOwnerAccount: { $ne: true } };
+    const excludedUserIds = await fetchExcludedUserIds();
+    const visibleGameClauses = [
+        { type: 'game', status: 'confirmed' },
+        { 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } },
+        { createdAt: { $gte: previousStart, $lte: now } },
+        {
+            $or: [
+                { excludedFromReports: { $ne: true } },
+                { 'meta.simulated': true },
+                { 'meta.isFreeTicketPlay': true },
+                { 'meta.event': ADMIN_GAME_JOIN_EVENTS[2] },
+            ],
+        },
+    ];
+    if (excludedUserIds.length) visibleGameClauses.push({ userId: { $nin: excludedUserIds } });
+
+    const numeric = (field, fallback = 0) => ({
+        $convert: { input: { $ifNull: [field, fallback] }, to: 'double', onError: 0, onNull: 0 },
+    });
+    const isCurrent = { $gte: ['$createdAt', rangeStart] };
+    const isPrevious = { $and: [{ $gte: ['$createdAt', previousStart] }, { $lt: ['$createdAt', rangeStart] }] };
+    const isPaid = { $eq: ['$_overviewFreePlay', false] };
+
+    const depositAnalyticsMatch = await reportedTxMatch({
+        type: 'deposit',
+        status: 'confirmed',
+        createdAt: { $gte: previousStart, $lte: now },
+    });
+    const cashoutAnalyticsMatch = await reportedTxMatch({
+        ...buildGameCashoutTxFilter(),
+        status: 'confirmed',
+        createdAt: { $gte: previousStart, $lte: now },
+        'meta.simulated': { $ne: true },
+        'meta.isFreeTicketPlay': { $ne: true },
+    });
+
+    const [
+        playerAccountCount,
+        registrations,
+        newUsers,
+        activeUsersCurrent,
+        activeUsersPrevious,
+        gameAnalytics,
+        depositAnalytics,
+        cashoutAnalytics,
+    ] = await Promise.all([
+        User.countDocuments(analyticsUserMatch),
+        User.aggregate([
+            { $match: { ...analyticsUserMatch, createdAt: { $gte: previousStart, $lte: now } } },
+            {
+                $facet: {
+                    summary: [{
+                        $group: {
+                            _id: null,
+                            current: { $sum: { $cond: [isCurrent, 1, 0] } },
+                            previous: { $sum: { $cond: [isPrevious, 1, 0] } },
+                        },
+                    }],
+                    daily: [
+                        { $match: { createdAt: { $gte: rangeStart } } },
+                        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, registrations: { $sum: 1 } } },
+                        { $sort: { _id: 1 } },
+                    ],
+                },
+            },
+        ]),
+        User.find({ ...analyticsUserMatch, createdAt: { $gte: rangeStart, $lte: now } }).select('_id').lean(),
+        User.countDocuments({ ...analyticsUserMatch, lastActiveAt: { $gte: rangeStart, $lte: now } }),
+        User.countDocuments({ ...analyticsUserMatch, lastActiveAt: { $gte: previousStart, $lt: rangeStart } }),
+        Transaction.aggregate([
+            { $match: { $and: visibleGameClauses } },
+            {
+                $set: {
+                    _overviewFreePlay: {
+                        $or: [
+                            { $eq: [{ $ifNull: ['$meta.simulated', false] }, true] },
+                            { $eq: [{ $ifNull: ['$meta.isFreeTicketPlay', false] }, true] },
+                            { $eq: ['$meta.event', ADMIN_GAME_JOIN_EVENTS[2]] },
+                        ],
+                    },
+                    _overviewEntryUsd: numeric('$meta.entryFeeUsd'),
+                },
+            },
+            {
+                $facet: {
+                    summary: [{
+                        $group: {
+                            _id: null,
+                            currentGames: { $sum: { $cond: [isCurrent, 1, 0] } },
+                            previousGames: { $sum: { $cond: [isPrevious, 1, 0] } },
+                            currentPaidGames: { $sum: { $cond: [{ $and: [isCurrent, isPaid] }, 1, 0] } },
+                            previousPaidGames: { $sum: { $cond: [{ $and: [isPrevious, isPaid] }, 1, 0] } },
+                            currentFreeGames: { $sum: { $cond: [{ $and: [isCurrent, { $not: [isPaid] }] }, 1, 0] } },
+                            previousFreeGames: { $sum: { $cond: [{ $and: [isPrevious, { $not: [isPaid] }] }, 1, 0] } },
+                            currentPaidVolumeUsd: { $sum: { $cond: [{ $and: [isCurrent, isPaid] }, '$_overviewEntryUsd', 0] } },
+                            previousPaidVolumeUsd: { $sum: { $cond: [{ $and: [isPrevious, isPaid] }, '$_overviewEntryUsd', 0] } },
+                        },
+                    }],
+                    daily: [
+                        { $match: { createdAt: { $gte: rangeStart } } },
+                        {
+                            $group: {
+                                _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                                paidGames: { $sum: { $cond: [isPaid, 1, 0] } },
+                                freeGames: { $sum: { $cond: [isPaid, 0, 1] } },
+                                paidVolumeUsd: { $sum: { $cond: [isPaid, '$_overviewEntryUsd', 0] } },
+                                players: { $addToSet: '$userId' },
+                            },
+                        },
+                        { $sort: { _id: 1 } },
+                    ],
+                    modes: [
+                        { $match: { createdAt: { $gte: rangeStart } } },
+                        {
+                            $group: {
+                                _id: { $ifNull: ['$meta.mode', 'unknown'] },
+                                games: { $sum: 1 },
+                                paidGames: { $sum: { $cond: [isPaid, 1, 0] } },
+                                freeGames: { $sum: { $cond: [isPaid, 0, 1] } },
+                                paidVolumeUsd: { $sum: { $cond: [isPaid, '$_overviewEntryUsd', 0] } },
+                                players: { $addToSet: '$userId' },
+                            },
+                        },
+                        { $sort: { games: -1 } },
+                    ],
+                    currentPlayers: [
+                        { $match: { createdAt: { $gte: rangeStart } } },
+                        { $group: { _id: '$userId', paidGames: { $sum: { $cond: [isPaid, 1, 0] } } } },
+                    ],
+                    previousPlayers: [
+                        { $match: { createdAt: { $gte: previousStart, $lt: rangeStart } } },
+                        { $group: { _id: '$userId' } },
+                        { $count: 'count' },
+                    ],
+                },
+            },
+        ]),
+        Transaction.aggregate([
+            { $match: depositAnalyticsMatch },
+            {
+                $facet: {
+                    summary: [{
+                        $group: {
+                            _id: null,
+                            currentCount: { $sum: { $cond: [isCurrent, 1, 0] } },
+                            previousCount: { $sum: { $cond: [isPrevious, 1, 0] } },
+                            currentSol: { $sum: { $cond: [isCurrent, numeric('$amount'), 0] } },
+                            previousSol: { $sum: { $cond: [isPrevious, numeric('$amount'), 0] } },
+                        },
+                    }],
+                    daily: [
+                        { $match: { createdAt: { $gte: rangeStart } } },
+                        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, depositSol: { $sum: numeric('$amount') } } },
+                        { $sort: { _id: 1 } },
+                    ],
+                },
+            },
+        ]),
+        Transaction.aggregate([
+            { $match: cashoutAnalyticsMatch },
+            {
+                $facet: {
+                    summary: [{
+                        $group: {
+                            _id: null,
+                            currentCashoutUsd: { $sum: { $cond: [isCurrent, numeric('$amount'), 0] } },
+                            previousCashoutUsd: { $sum: { $cond: [isPrevious, numeric('$amount'), 0] } },
+                            currentFeesUsd: { $sum: { $cond: [isCurrent, numeric('$meta.platformFee'), 0] } },
+                            previousFeesUsd: { $sum: { $cond: [isPrevious, numeric('$meta.platformFee'), 0] } },
+                        },
+                    }],
+                    daily: [
+                        { $match: { createdAt: { $gte: rangeStart } } },
+                        {
+                            $group: {
+                                _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+                                cashoutUsd: { $sum: numeric('$amount') },
+                                feesUsd: { $sum: numeric('$meta.platformFee') },
+                            },
+                        },
+                        { $sort: { _id: 1 } },
+                    ],
+                },
+            },
+        ]),
+    ]);
+
+    const registrationData = registrations[0] || {};
+    const gameData = gameAnalytics[0] || {};
+    const depositData = depositAnalytics[0] || {};
+    const cashoutData = cashoutAnalytics[0] || {};
+    const registrationSummary = registrationData.summary?.[0] || {};
+    const gameSummary = gameData.summary?.[0] || {};
+    const depositSummary = depositData.summary?.[0] || {};
+    const cashoutSummary = cashoutData.summary?.[0] || {};
+    const currentPlayers = gameData.currentPlayers || [];
+    const uniquePlayers = currentPlayers.length;
+    const uniquePaidPlayers = currentPlayers.filter(row => Number(row.paidGames) > 0).length;
+    const previousUniquePlayers = Number(gameData.previousPlayers?.[0]?.count) || 0;
+    const newUserIds = new Set(newUsers.map(user => String(user._id)));
+    const newUsersWhoPlayed = currentPlayers.filter(row => newUserIds.has(String(row._id))).length;
+    const newUsersWhoPaid = currentPlayers.filter(row => newUserIds.has(String(row._id)) && Number(row.paidGames) > 0).length;
+    const newUserCount = Number(registrationSummary.current) || 0;
+
+    const dailyMap = new Map();
+    for (let index = 0; index < days; index += 1) {
+        const date = new Date(rangeStart.getTime() + (index * 86_400_000)).toISOString().slice(0, 10);
+        dailyMap.set(date, {
+            date,
+            registrations: 0,
+            paidGames: 0,
+            freeGames: 0,
+            uniquePlayers: 0,
+            paidVolumeUsd: 0,
+            cashoutUsd: 0,
+            feesUsd: 0,
+            depositsUsd: 0,
+        });
+    }
+    for (const row of registrationData.daily || []) dailyMap.get(row._id).registrations = Number(row.registrations) || 0;
+    for (const row of gameData.daily || []) Object.assign(dailyMap.get(row._id), {
+        paidGames: Number(row.paidGames) || 0,
+        freeGames: Number(row.freeGames) || 0,
+        paidVolumeUsd: Number((Number(row.paidVolumeUsd) || 0).toFixed(2)),
+        uniquePlayers: Array.isArray(row.players) ? row.players.filter(Boolean).length : 0,
+    });
+    for (const row of cashoutData.daily || []) Object.assign(dailyMap.get(row._id), {
+        cashoutUsd: Number((Number(row.cashoutUsd) || 0).toFixed(2)),
+        feesUsd: Number((Number(row.feesUsd) || 0).toFixed(2)),
+    });
+    for (const row of depositData.daily || []) dailyMap.get(row._id).depositsUsd = Number(((Number(row.depositSol) || 0) * SOL_PRICE_USD).toFixed(2));
+
+    const currentGames = Number(gameSummary.currentGames) || 0;
+    const previousGames = Number(gameSummary.previousGames) || 0;
+    const currentPaidGames = Number(gameSummary.currentPaidGames) || 0;
+    const currentFreeGames = Number(gameSummary.currentFreeGames) || 0;
+    const paidVolumeUsd = Number((Number(gameSummary.currentPaidVolumeUsd) || 0).toFixed(2));
+    const previousPaidVolumeUsd = Number((Number(gameSummary.previousPaidVolumeUsd) || 0).toFixed(2));
+    const depositsUsd = Number(((Number(depositSummary.currentSol) || 0) * SOL_PRICE_USD).toFixed(2));
+    const previousDepositsUsd = Number(((Number(depositSummary.previousSol) || 0) * SOL_PRICE_USD).toFixed(2));
+
+    return {
+        days,
+        from: rangeStart,
+        to: now,
+        playerAccountCount,
+        totals: {
+            newUsers: newUserCount,
+            activeUsers: activeUsersCurrent,
+            games: currentGames,
+            paidGames: currentPaidGames,
+            freeGames: currentFreeGames,
+            uniquePlayers,
+            uniquePaidPlayers,
+            paidVolumeUsd,
+            cashoutUsd: Number((Number(cashoutSummary.currentCashoutUsd) || 0).toFixed(2)),
+            feesUsd: Number((Number(cashoutSummary.currentFeesUsd) || 0).toFixed(2)),
+            depositsUsd,
+            deposits: Number(depositSummary.currentCount) || 0,
+            newUsersWhoPlayed,
+            newUsersWhoPaid,
+        },
+        previous: {
+            newUsers: Number(registrationSummary.previous) || 0,
+            activeUsers: activeUsersPrevious,
+            games: previousGames,
+            uniquePlayers: previousUniquePlayers,
+            paidVolumeUsd: previousPaidVolumeUsd,
+            cashoutUsd: Number((Number(cashoutSummary.previousCashoutUsd) || 0).toFixed(2)),
+            feesUsd: Number((Number(cashoutSummary.previousFeesUsd) || 0).toFixed(2)),
+            depositsUsd: previousDepositsUsd,
+            deposits: Number(depositSummary.previousCount) || 0,
+        },
+        changes: {
+            newUsers: adminOverviewChange(newUserCount, registrationSummary.previous),
+            activeUsers: adminOverviewChange(activeUsersCurrent, activeUsersPrevious),
+            games: adminOverviewChange(currentGames, previousGames),
+            uniquePlayers: adminOverviewChange(uniquePlayers, previousUniquePlayers),
+            paidVolumeUsd: adminOverviewChange(paidVolumeUsd, previousPaidVolumeUsd),
+            depositsUsd: adminOverviewChange(depositsUsd, previousDepositsUsd),
+        },
+        averages: {
+            registrationsPerDay: Number((newUserCount / days).toFixed(1)),
+            gamesPerDay: Number((currentGames / days).toFixed(1)),
+            uniquePlayersPerDay: Number(([...dailyMap.values()].reduce((sum, day) => sum + day.uniquePlayers, 0) / days).toFixed(1)),
+            gamesPerPlayer: Number((uniquePlayers > 0 ? currentGames / uniquePlayers : 0).toFixed(1)),
+            paidEntryUsd: Number((currentPaidGames > 0 ? paidVolumeUsd / currentPaidGames : 0).toFixed(2)),
+        },
+        rates: {
+            activeAccountPct: Number((playerAccountCount > 0 ? (activeUsersCurrent / playerAccountCount) * 100 : 0).toFixed(1)),
+            newUserPlayPct: Number((newUserCount > 0 ? (newUsersWhoPlayed / newUserCount) * 100 : 0).toFixed(1)),
+            newUserPaidPct: Number((newUserCount > 0 ? (newUsersWhoPaid / newUserCount) * 100 : 0).toFixed(1)),
+            paidGamePct: Number((currentGames > 0 ? (currentPaidGames / currentGames) * 100 : 0).toFixed(1)),
+        },
+        daily: [...dailyMap.values()],
+        modes: (gameData.modes || []).map(row => ({
+            mode: row._id,
+            games: Number(row.games) || 0,
+            paidGames: Number(row.paidGames) || 0,
+            freeGames: Number(row.freeGames) || 0,
+            paidVolumeUsd: Number((Number(row.paidVolumeUsd) || 0).toFixed(2)),
+            uniquePlayers: Array.isArray(row.players) ? row.players.filter(Boolean).length : 0,
+        })),
+    };
+}
+
 app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
     try {
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
@@ -6678,7 +7008,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             status: 'confirmed',
             'meta.event': { $nin: ['pool_sweep', 'br_owner_sweep', 'reward_owner_surplus_sweep', 'reward_pool_factory_reset', 'affiliate_pool_factory_reset'] },
         });
-        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, ownerAccountAgg, rewardPoolState, commerceStats] = await Promise.all([
+        const [depositAgg, withdrawAgg, excludedTxCount, excludedUsersCount, ownerEarnings, userBalanceAgg, ownerAccountAgg, rewardPoolState, commerceStats, analytics] = await Promise.all([
             Transaction.aggregate([
                 { $match: depositMatch },
                 { $group: { _id: null, total: { $sum: '$amount' }, count: { $sum: 1 } } },
@@ -6737,6 +7067,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ]),
             RewardPoolState.findOne({ key: 'global' }).lean(),
             agarCommerce.getAdminOverviewStats(),
+            getAdminOverviewAnalytics(req.query.days),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -6789,6 +7120,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             excludedTxCount,
             excludedUsersCount,
             solPrice: SOL_PRICE_USD,
+            analytics,
         });
     } catch (err) {
         console.error('Admin overview error:', err);
@@ -7559,6 +7891,69 @@ app.put('/api/admin/users/:userId/visual-balance', authenticateAdmin, async (req
     }
 });
 
+function formatSplTokenAmount(amountAtomic, decimals) {
+    const amount = BigInt(amountAtomic || 0);
+    const safeDecimals = Math.max(0, Math.min(30, Number(decimals) || 0));
+    const scale = 10n ** BigInt(safeDecimals);
+    const whole = amount / scale;
+    const fraction = (amount % scale).toString().padStart(safeDecimals, '0').replace(/0+$/, '');
+    return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
+async function getParsedTokenAccountsForProgram(owner, programId) {
+    try {
+        return await connection.getParsedTokenAccountsByOwner(owner, { programId }, 'confirmed');
+    } catch (primaryError) {
+        try {
+            return await fallbackRpcConnection.getParsedTokenAccountsByOwner(owner, { programId }, 'confirmed');
+        } catch {
+            throw primaryError;
+        }
+    }
+}
+
+async function scanSplTokenBalances(walletAddress) {
+    const owner = new solanaWeb3.PublicKey(walletAddress);
+    const programs = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID];
+    const responses = await Promise.all(programs.map(programId => getParsedTokenAccountsForProgram(owner, programId)));
+    const balances = new Map();
+    responses.forEach((response, responseIndex) => {
+        const programId = programs[responseIndex].toBase58();
+        for (const entry of response.value) {
+            const info = entry.account.data?.parsed?.info;
+            const amount = BigInt(info?.tokenAmount?.amount || '0');
+            if (amount <= 0n || !info?.mint) continue;
+            const key = `${programId}:${info.mint}`;
+            const current = balances.get(key) || {
+                mint: info.mint,
+                programId,
+                amountAtomic: 0n,
+                decimals: Number(info.tokenAmount.decimals) || 0,
+                tokenAccounts: [],
+            };
+            current.amountAtomic += amount;
+            current.tokenAccounts.push({
+                address: entry.pubkey.toBase58(),
+                amountAtomic: amount.toString(),
+                state: info.state || 'unknown',
+            });
+            balances.set(key, current);
+        }
+    });
+    return [...balances.values()].map(token => ({
+        mint: token.mint,
+        programId: token.programId,
+        amountAtomic: token.amountAtomic.toString(),
+        amount: formatSplTokenAmount(token.amountAtomic, token.decimals),
+        decimals: token.decimals,
+        tokenAccounts: token.tokenAccounts,
+        tokenAccountCount: token.tokenAccounts.length,
+        symbol: token.mint === process.env.AGAR_TOKEN_MINT?.trim()
+            ? (process.env.AGAR_TOKEN_SYMBOL?.trim() || 'ARC')
+            : '',
+    }));
+}
+
 app.get('/api/admin/users/:userId/token-balances', authenticateAdmin, sensitiveRateLimit({ limit: 30, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
         const { userId } = req.params;
@@ -7566,39 +7961,270 @@ app.get('/api/admin/users/:userId/token-balances', authenticateAdmin, sensitiveR
         const user = await User.findById(userId).select('depositAddress username');
         if (!user) return res.status(404).json({ message: 'User not found' });
         if (!user.depositAddress) return res.status(409).json({ message: 'This account has no deposit wallet.' });
-        const owner = new solanaWeb3.PublicKey(user.depositAddress);
-        const responses = await Promise.all([
-            connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, 'confirmed'),
-            connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }, 'confirmed'),
-        ]);
-        const balances = new Map();
-        for (const response of responses) {
-            for (const entry of response.value) {
-                const info = entry.account.data?.parsed?.info;
-                const amount = BigInt(info?.tokenAmount?.amount || '0');
-                if (amount <= 0n || !info?.mint) continue;
-                const current = balances.get(info.mint) || { mint: info.mint, amountAtomic: 0n, decimals: Number(info.tokenAmount.decimals) || 0, tokenAccounts: 0 };
-                current.amountAtomic += amount;
-                current.tokenAccounts += 1;
-                balances.set(info.mint, current);
-            }
-        }
-        const tokens = [...balances.values()].map(token => {
-            const scale = 10n ** BigInt(token.decimals);
-            const whole = token.amountAtomic / scale;
-            const fraction = (token.amountAtomic % scale).toString().padStart(token.decimals, '0').replace(/0+$/, '');
-            return {
-                ...token,
-                amountAtomic: token.amountAtomic.toString(),
-                amount: fraction ? `${whole}.${fraction}` : whole.toString(),
-                symbol: token.mint === process.env.AGAR_TOKEN_MINT?.trim() ? (process.env.AGAR_TOKEN_SYMBOL?.trim() || 'ARENA') : '',
-            };
-        });
+        const tokens = await scanSplTokenBalances(user.depositAddress);
         return res.json({ walletAddress: user.depositAddress, tokens });
     } catch (err) {
         console.error('Admin token balance scan error:', err);
         return res.status(502).json({ message: `Could not scan token balances: ${err.message || 'RPC unavailable'}` });
     }
+});
+
+app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ limit: 200, windowMs: 60 * 60_000 }), async (req, res) => {
+    try {
+        const limit = Math.min(50, Math.max(10, Number.parseInt(req.query.limit, 10) || 40));
+        const cursor = String(req.query.cursor || '').trim();
+        if (cursor && !mongoose.Types.ObjectId.isValid(cursor)) return res.status(400).json({ message: 'Invalid scan cursor.' });
+        const accountFilter = {
+            depositAddress: { $exists: true, $nin: ['', null] },
+            ...(cursor ? { _id: { $gt: new mongoose.Types.ObjectId(cursor) } } : {}),
+        };
+        const [accounts, totalAccounts] = await Promise.all([
+            User.find(accountFilter)
+                .sort({ _id: 1 })
+                .limit(limit)
+                .select('username email walletAddress depositAddress depositSecret isOwnerAccount')
+                .lean(),
+            cursor ? Promise.resolve(null) : User.countDocuments({ depositAddress: { $exists: true, $nin: ['', null] } }),
+        ]);
+        const results = new Array(accounts.length);
+        let workerCursor = 0;
+        const worker = async () => {
+            while (workerCursor < accounts.length) {
+                const index = workerCursor++;
+                const account = accounts[index];
+                try {
+                    const tokens = await scanSplTokenBalances(account.depositAddress);
+                    results[index] = {
+                        userId: String(account._id),
+                        username: account.username,
+                        email: account.email || null,
+                        depositAddress: account.depositAddress,
+                        walletAddress: account.walletAddress || null,
+                        isOwnerAccount: !!account.isOwnerAccount,
+                        hasSigningKey: !!account.depositSecret,
+                        tokens: tokens.map(({ tokenAccounts, ...token }) => ({ ...token, tokenAccountCount: tokenAccounts.length })),
+                        error: null,
+                    };
+                } catch (error) {
+                    results[index] = {
+                        userId: String(account._id),
+                        username: account.username,
+                        email: account.email || null,
+                        depositAddress: account.depositAddress,
+                        walletAddress: account.walletAddress || null,
+                        isOwnerAccount: !!account.isOwnerAccount,
+                        hasSigningKey: !!account.depositSecret,
+                        tokens: [],
+                        error: error.message || 'RPC scan failed',
+                    };
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(6, accounts.length) }, () => worker()));
+        const nextCursor = accounts.length === limit ? String(accounts[accounts.length - 1]._id) : null;
+        return res.json({
+            accounts: results.filter(account => account.tokens.length > 0 || account.error),
+            scannedAccounts: accounts.length,
+            totalAccounts,
+            nextCursor,
+            ownerVaultAddress: OWNER_VAULT_ADDRESS || null,
+        });
+    } catch (error) {
+        console.error('Admin all-account SPL scan error:', error);
+        return res.status(502).json({ message: error.message || 'Could not scan account token balances.' });
+    }
+});
+
+async function transferSplTokenPosition({ user, mint, requestedProgramId, destinationOwner, destinationMode, adminActorId }) {
+    const userId = String(user._id);
+    if (!user.depositAddress || !user.depositSecret) {
+        throw Object.assign(new Error(`Wallet ${user.depositAddress || 'unknown'} has no recoverable signing key.`), { status: 409 });
+    }
+    let secretKey;
+    try {
+        secretKey = decryptWalletSecret(user.depositSecret);
+    } catch (error) {
+        throw Object.assign(new Error(`Wallet signing key could not be decrypted: ${error.message}`), { status: 409 });
+    }
+    const keypair = solanaWeb3.Keypair.fromSecretKey(secretKey);
+    if (keypair.publicKey.toBase58() !== user.depositAddress) throw Object.assign(new Error('Wallet key does not match the deposit address.'), { status: 409 });
+    if (keypair.publicKey.equals(destinationOwner)) return { status: 'skipped', message: 'Source and destination wallet are the same.' };
+
+    const mintKey = new solanaWeb3.PublicKey(mint);
+    const mintInfo = await connection.getAccountInfo(mintKey, 'confirmed');
+    if (!mintInfo) throw Object.assign(new Error('Token mint no longer exists.'), { status: 409 });
+    const programId = mintInfo.owner;
+    const supportedPrograms = new Set([TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58()]);
+    if (!supportedPrograms.has(programId.toBase58())) throw Object.assign(new Error('Mint is not owned by a supported SPL Token program.'), { status: 409 });
+    if (requestedProgramId && requestedProgramId !== programId.toBase58()) throw Object.assign(new Error('Token program changed since the scan. Scan again.'), { status: 409 });
+
+    const tokenResponse = await connection.getParsedTokenAccountsByOwner(keypair.publicKey, { mint: mintKey }, 'confirmed');
+    const entries = tokenResponse.value.map(entry => {
+        const info = entry.account.data?.parsed?.info;
+        return {
+            address: entry.pubkey,
+            amountAtomic: BigInt(info?.tokenAmount?.amount || '0'),
+            decimals: Number(info?.tokenAmount?.decimals) || 0,
+            state: info?.state || 'unknown',
+        };
+    }).filter(entry => entry.amountAtomic > 0n);
+    if (!entries.length) return { status: 'skipped', message: 'Token balance is already empty.' };
+    if (entries.some(entry => entry.state === 'frozen')) throw Object.assign(new Error('One or more source token accounts are frozen.'), { status: 409 });
+
+    const decimals = entries[0].decimals;
+    const destinationTokenAccount = getAssociatedTokenAddressSync(mintKey, destinationOwner, false, programId);
+    const signatures = [];
+    for (let index = 0; index < entries.length; index += 4) {
+        const chunk = entries.slice(index, index + 4);
+        const transaction = new solanaWeb3.Transaction().add(
+            createAssociatedTokenAccountIdempotentInstruction(
+                keypair.publicKey,
+                destinationTokenAccount,
+                destinationOwner,
+                mintKey,
+                programId,
+            ),
+        );
+        for (const entry of chunk) {
+            transaction.add(createTransferCheckedInstruction(
+                entry.address,
+                mintKey,
+                destinationTokenAccount,
+                keypair.publicKey,
+                entry.amountAtomic,
+                decimals,
+                [],
+                programId,
+            ));
+        }
+        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [keypair], { commitment: 'confirmed', maxRetries: 3 });
+        signatures.push(signature);
+    }
+
+    const amountAtomic = entries.reduce((sum, entry) => sum + entry.amountAtomic, 0n);
+    const balanceLamports = await connection.getBalance(keypair.publicKey, 'confirmed');
+    user.balance = balanceLamports / solanaWeb3.LAMPORTS_PER_SOL;
+    await user.save();
+    balanceReader.invalidate(keypair.publicKey);
+    await Transaction.create({
+        userId: user._id,
+        type: 'game',
+        amount: 0,
+        status: 'confirmed',
+        meta: {
+            event: 'admin_action',
+            action: 'spl_token_transferred',
+            mint,
+            programId: programId.toBase58(),
+            amountAtomic: amountAtomic.toString(),
+            decimals,
+            destinationMode,
+            destination: destinationOwner.toBase58(),
+            signatures,
+            adminActorId: String(adminActorId),
+        },
+    }).catch(error => console.error('Admin SPL transfer audit write failed:', error.message));
+    return {
+        status: 'confirmed',
+        amountAtomic: amountAtomic.toString(),
+        amount: formatSplTokenAmount(amountAtomic, decimals),
+        destination: destinationOwner.toBase58(),
+        signatures,
+    };
+}
+
+app.post('/api/admin/spl-tokens/transfer', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
+    const selections = Array.isArray(req.body?.selections) ? req.body.selections : [];
+    const destinationMode = String(req.body?.destinationMode || '');
+    if (!['owner_vault', 'user_wallet'].includes(destinationMode)) return res.status(400).json({ message: 'Choose Owner Vault or each user wallet.' });
+    if (!selections.length) return res.status(400).json({ message: 'Select at least one token balance.' });
+    if (selections.length > 150) return res.status(400).json({ message: 'Transfer at most 150 token balances at a time.' });
+    if (req.body?.confirmation !== `TRANSFER SPL ${selections.length} ${destinationMode}`) return res.status(400).json({ message: 'SPL transfer confirmation did not match.' });
+    if (destinationMode === 'owner_vault' && !OWNER_VAULT_ADDRESS) return res.status(503).json({ message: 'OWNER_VAULT_ADDRESS is not configured.' });
+
+    const normalized = [];
+    const seen = new Set();
+    try {
+        for (const selection of selections) {
+            const userId = String(selection?.userId || '');
+            const mint = new solanaWeb3.PublicKey(String(selection?.mint || '')).toBase58();
+            const programId = String(selection?.programId || '');
+            if (!mongoose.Types.ObjectId.isValid(userId)) throw new Error('Invalid user id in token selection.');
+            if (programId && ![TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58()].includes(programId)) throw new Error('Unsupported token program in selection.');
+            const key = `${userId}:${programId}:${mint}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            normalized.push({ userId, mint, programId, key });
+        }
+    } catch (error) {
+        return res.status(400).json({ message: error.message || 'Invalid token selection.' });
+    }
+
+    const userIds = [...new Set(normalized.map(selection => selection.userId))];
+    const users = await User.find({ _id: { $in: userIds } }).select('username walletAddress depositAddress depositSecret balance');
+    const userMap = new Map(users.map(user => [String(user._id), user]));
+    const groups = userIds.map(userId => ({ userId, user: userMap.get(userId), selections: normalized.filter(selection => selection.userId === userId) }));
+    const results = [];
+    let groupCursor = 0;
+    const worker = async () => {
+        while (groupCursor < groups.length) {
+            const group = groups[groupCursor++];
+            const operationId = `admin-spl-transfer:${group.userId}:${Date.now()}:${randomBytes(4).toString('hex')}`;
+            let locked = false;
+            if (!group.user) {
+                group.selections.forEach(selection => results.push({ ...selection, status: 'failed', message: 'User not found.' }));
+                continue;
+            }
+            if (isUserJoining(group.userId) || processingCashouts.has(group.userId) || findPlayerInArena(group.userId) || getBRMatchForMongo(group.userId)) {
+                group.selections.forEach(selection => results.push({ ...selection, username: group.user.username, status: 'failed', message: 'Account is joining, playing, or cashing out.' }));
+                continue;
+            }
+            try {
+                locked = await acquireWalletOperation(group.userId, 'admin_spl_transfer', operationId);
+                if (!locked) throw Object.assign(new Error('Another wallet operation is already processing.'), { status: 409 });
+                let destinationOwner;
+                if (destinationMode === 'owner_vault') {
+                    destinationOwner = new solanaWeb3.PublicKey(OWNER_VAULT_ADDRESS);
+                } else {
+                    if (!group.user.walletAddress) throw Object.assign(new Error('User has no connected withdrawal wallet.'), { status: 409 });
+                    destinationOwner = new solanaWeb3.PublicKey(group.user.walletAddress);
+                }
+                for (const selection of group.selections) {
+                    try {
+                        const transfer = await transferSplTokenPosition({
+                            user: group.user,
+                            mint: selection.mint,
+                            requestedProgramId: selection.programId,
+                            destinationOwner,
+                            destinationMode,
+                            adminActorId: req.adminUser._id,
+                        });
+                        results.push({ ...selection, username: group.user.username, ...transfer });
+                    } catch (error) {
+                        results.push({ ...selection, username: group.user.username, status: 'failed', message: error.message || 'Token transfer failed.' });
+                    }
+                }
+            } catch (error) {
+                group.selections.forEach(selection => results.push({ ...selection, username: group.user.username, status: 'failed', message: error.message || 'Token transfer failed.' }));
+            } finally {
+                if (locked) await releaseWalletOperation(group.userId, operationId).catch(() => {});
+            }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, groups.length) }, () => worker()));
+    const confirmed = results.filter(result => result.status === 'confirmed').length;
+    const skipped = results.filter(result => result.status === 'skipped').length;
+    const failed = results.filter(result => result.status === 'failed').length;
+    return res.status(failed ? 207 : 200).json({
+        success: failed === 0,
+        partial: failed > 0,
+        destinationMode,
+        confirmed,
+        skipped,
+        failed,
+        results,
+        message: `SPL transfer finished: ${confirmed} confirmed, ${skipped} skipped, ${failed} failed.`,
+    });
 });
 
 app.post('/api/admin/users/:userId/convert-token-to-sol', authenticateAdmin, sensitiveRateLimit({ limit: 20, windowMs: 60 * 60_000 }), async (req, res) => {

@@ -5,6 +5,7 @@
 
 import { getSurvivEconomy } from './economy.js';
 import { SURVIV_STANDARD_FIREARM_IDS, SURVIV_WEAPONS } from './surviv-weapons.js';
+import { collectSurvivCombatEvents, recordSurvivBulletImpact, recordSurvivCombatEvent } from './surviv-combat-presentation.js';
 
 const TICK_RATE = 40;
 const TICK_DT = 1 / TICK_RATE;
@@ -6762,6 +6763,7 @@ export function resetSurvivRoomRuntime(room, nextMap = generateSurvivMap(SURVIV.
     room.deathMarkers = [];
     room.airdrops = [];
     room._survivExplosions = [];
+    room._survivCombatEvents = [];
     room._survivBlastQueue = null;
     room._pendingKillFeed = [];
     room.lootPoolBalance = 0;
@@ -7051,6 +7053,7 @@ function recordSolidObjectImpact(attacker, obstacle) {
     attacker._objectImpactSequence = (Number(attacker._objectImpactSequence) || 0) + 1;
     attacker._objectImpact = {
         id: `${attacker.id}:${attacker._objectImpactSequence}`,
+        objectId: obstacle.id,
         x: obstacle.x,
         y: obstacle.y,
         kind: obstacle.kind || 'object',
@@ -7420,6 +7423,10 @@ function tryShoot(entity, room, now) {
     const pellets = wDef.pellets || 1;
     entity.shotSequence = (Number(entity.shotSequence) || 0) + 1;
     const shotId = `${entity.id}:${entity.shotSequence}`;
+    recordSurvivCombatEvent(room, {
+        type: 'shot', ownerId: entity.id, weaponType: entity.weapon.type,
+        slot: entity.activeWeaponSlot, x: entity.x, y: entity.y, angle: baseAngle,
+    }, now);
     const burstBloom = wDef.automatic ? clamp(w.spreadShotIndex / 9, 0, 1) : 1;
     const effectiveSpread = wDef.spread * (wDef.automatic ? 0.62 + burstBloom * 0.38 : 1);
 
@@ -8343,16 +8350,19 @@ function updateBullets(room, now, effectiveRadius) {
 
         const attacker = entitiesById.get(bullet.ownerId);
         if (nearestObstacle && obstacleHitT <= entityHitT && obstacleHitT <= containerHitT) {
+            recordSurvivBulletImpact(room, bullet, previousX, previousY, obstacleHitT, nearestObstacle, now);
             damageSurvivObstacle(room, nearestObstacle, bullet.damage, attacker);
             room.bullets.splice(i, 1);
             continue;
         }
         if (nearestContainer && containerHitT <= entityHitT) {
+            recordSurvivBulletImpact(room, bullet, previousX, previousY, containerHitT, { ...nearestContainer, kind: nearestContainer.type }, now);
             damageLootContainer(room, nearestContainer, bullet.damage, attacker);
             room.bullets.splice(i, 1);
             continue;
         }
         if (nearestEntity) {
+            recordSurvivBulletImpact(room, bullet, previousX, previousY, entityHitT, { kind: 'player' }, now);
             applyDamage(nearestEntity, bullet.damage, attacker);
             room.bullets.splice(i, 1);
             if (nearestEntity.hp <= 0) {
@@ -9432,6 +9442,12 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             }));
         const visiblePlayers = visibleEntities
             .map(p => serializePlayer(p, false));
+        const visibleCombatOwners = new Set(visibleEntities.map(p => p.id));
+        if (youId) visibleCombatOwners.add(youId);
+        const combatEvents = collectSurvivCombatEvents(room, now, visibleCombatOwners,
+            event => isSurvivEntityVisibleToViewer(viewerEntity, event, room, range, {
+                viewerHouse, blockers: viewerBlockers,
+            }));
 
         const visibleLoot = querySurvivLoot(room, viewX, viewY, range)
             .map(({ item: l }) => {
@@ -9555,6 +9571,7 @@ export function broadcastSurvivState(room, io, lbData, meta) {
             players: visiblePlayers,
             loot: visibleLoot,
             bullets: visibleBullets,
+            combatEvents,
             deathMarkers: visibleDeathMarkers,
             ...staticPayload,
             zone,

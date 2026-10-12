@@ -39,7 +39,8 @@ app.get('/fixture', (_req, res) => {
     const room = getBRMatchForMongo(userId);
     const player = room?.players.find(p => p.mongoId === userId);
     res.json({ token, status: room?.status, matchId: room?.id, player: player && { id: player.id, x: player.x, y: player.y, hp: player.hp, ammo: player.weapon?.ammo, weapon: player.weapon?.type,
-        reloading: !!player.weapon?.reloading, ammoReserves: player.inventory?.ammoReserves },
+        reloading: !!player.weapon?.reloading, ammoReserves: player.inventory?.ammoReserves,
+        healing: player.medkitUseEndAt > Date.now(), medkits: player.inventory?.medkits },
         active: getActiveBRMatchesRaw().length, queue: getBRPlayerCountsByFee().surviv, payouts: transactions.filter(tx => tx.meta?.reason === 'BR Victory').length });
 });
 app.post('/fixture/fill', async (_req, res) => {
@@ -71,6 +72,18 @@ app.post('/fixture/loot', (_req, res) => {
     const player = room?.players.find(p => p.mongoId === userId);
     if (player) {
         room.loot.push({ id: 'fixture-m416', type: 'weapon', weaponType: 'm416', x: player.x + 18, y: player.y, tier: 'common' });
+        room._survivLootIndex = null;
+    }
+    res.json({ ready: !!player });
+});
+app.post('/fixture/healing', (_req, res) => {
+    const room = getBRMatchForMongo(userId);
+    const player = room?.players.find(p => p.mongoId === userId);
+    if (player) {
+        player.hp = 60; player.inventory.medkits = 2;
+        // Isolate the inventory assertion from incidental automatic ground loot.
+        room.loot = room.loot.filter(item => item.type !== 'medkit'
+            || Math.hypot(item.x - player.x, item.y - player.y) > 150);
         room._survivLootIndex = null;
     }
     res.json({ ready: !!player });
