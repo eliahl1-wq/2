@@ -15,6 +15,7 @@ import { QuadTree, Rectangle } from './quadtree.js';
 import { emitGameSnapshot, getAgarSnapshotSchedule, isGameTransportReady, serializeAgarPlayer } from './game-network.js';
 import { rebuildAgarSpatialTree } from './agar-spatial.js';
 import { createSurvivMapGenerator } from './surviv-map-generation.js';
+import { loadSplFeeSponsor, createSplFeeBudget, prepareSponsoredSplTransaction } from './spl-fee-sponsor.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     TOKEN_2022_PROGRAM_ID,
@@ -7987,6 +7988,13 @@ app.get('/api/admin/users/:userId/token-balances', authenticateAdmin, sensitiveR
     }
 });
 
+function getSplFeeSponsor() {
+    return loadSplFeeSponsor(process.env, [HOUSE_WALLET_ADDRESS, REWARD_WALLET_ADDRESS,
+        TOURNAMENT_WALLET_ADDRESS, ...Object.entries(process.env)
+            .filter(([key]) => /^BR_.*HOUSE_WALLET_ADDRESS$/.test(key)).map(([, value]) => value)]);
+}
+let splSponsorOperationActive = false;
+
 app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ limit: 200, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
         const limit = Math.min(50, Math.max(10, Number.parseInt(req.query.limit, 10) || 40));
@@ -8040,12 +8048,20 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
         };
         await Promise.all(Array.from({ length: Math.min(6, accounts.length) }, () => worker()));
         const nextCursor = accounts.length === limit ? String(accounts[accounts.length - 1]._id) : null;
+        let feeSponsor = { configured: false };
+        try {
+            const sponsor = getSplFeeSponsor();
+            if (sponsor) feeSponsor = { configured: true, address: sponsor.address,
+                maxFeeSol: sponsor.maxLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                balanceSol: await connection.getBalance(sponsor.keypair.publicKey, 'confirmed') / solanaWeb3.LAMPORTS_PER_SOL };
+        } catch { feeSponsor = { configured: false, error: 'Fee wallet configuration or RPC is unavailable.' }; }
         return res.json({
             accounts: results.filter(account => account.tokens.length > 0 || account.error),
             scannedAccounts: accounts.length,
             totalAccounts,
             nextCursor,
             ownerVaultAddress: OWNER_VAULT_ADDRESS || null,
+            feeSponsor,
         });
     } catch (error) {
         console.error('Admin all-account SPL scan error:', error);
@@ -8053,7 +8069,7 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
     }
 });
 
-async function transferSplTokenPosition({ user, mint, requestedProgramId, destinationOwner, destinationMode, adminActorId }) {
+async function transferSplTokenPosition({ user, mint, requestedProgramId, destinationOwner, destinationMode, adminActorId, feeSponsor, feeBudget }) {
     const userId = String(user._id);
     if (!user.depositAddress || !user.depositSecret) {
         throw Object.assign(new Error(`Wallet ${user.depositAddress || 'unknown'} has no recoverable signing key.`), { status: 409 });
@@ -8096,7 +8112,7 @@ async function transferSplTokenPosition({ user, mint, requestedProgramId, destin
         const chunk = entries.slice(index, index + 4);
         const transaction = new solanaWeb3.Transaction().add(
             createAssociatedTokenAccountIdempotentInstruction(
-                keypair.publicKey,
+                feeSponsor?.keypair.publicKey || keypair.publicKey,
                 destinationTokenAccount,
                 destinationOwner,
                 mintKey,
@@ -8115,7 +8131,16 @@ async function transferSplTokenPosition({ user, mint, requestedProgramId, destin
                 programId,
             ));
         }
-        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, [keypair], { commitment: 'confirmed', maxRetries: 3 });
+        if (feeSponsor) await prepareSponsoredSplTransaction({ connection, transaction,
+            sponsor: feeSponsor, sourceAddress: keypair.publicKey, destinationTokenAccount,
+            mint: mintKey, programId, budget: feeBudget });
+        else {
+            transaction.feePayer = keypair.publicKey;
+            const sourceBalance = await connection.getBalance(keypair.publicKey, 'confirmed');
+            if (sourceBalance === 0) throw new Error('Source wallet has no SOL for fees. Select Admin fee wallet to sponsor this transfer.');
+        }
+        const signers = feeSponsor ? [feeSponsor.keypair, keypair] : [keypair];
+        const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, signers, { commitment: 'confirmed', maxRetries: 3 });
         signatures.push(signature);
     }
 
@@ -8140,6 +8165,8 @@ async function transferSplTokenPosition({ user, mint, requestedProgramId, destin
             destination: destinationOwner.toBase58(),
             signatures,
             adminActorId: String(adminActorId),
+            feePayer: feeSponsor?.address || user.depositAddress,
+            sponsored: !!feeSponsor,
         },
     }).catch(error => console.error('Admin SPL transfer audit write failed:', error.message));
     return {
@@ -8154,10 +8181,15 @@ async function transferSplTokenPosition({ user, mint, requestedProgramId, destin
 app.post('/api/admin/spl-tokens/transfer', authenticateAdmin, sensitiveRateLimit({ limit: 10, windowMs: 60 * 60_000 }), async (req, res) => {
     const selections = Array.isArray(req.body?.selections) ? req.body.selections : [];
     const destinationMode = String(req.body?.destinationMode || '');
+    const feeMode = String(req.body?.feeMode || 'source');
+    if (!['source', 'admin_sponsor'].includes(feeMode)) return res.status(400).json({ message: 'Invalid fee payer.' });
     if (!['owner_vault', 'user_wallet'].includes(destinationMode)) return res.status(400).json({ message: 'Choose Owner Vault or each user wallet.' });
     if (!selections.length) return res.status(400).json({ message: 'Select at least one token balance.' });
     if (selections.length > 150) return res.status(400).json({ message: 'Transfer at most 150 token balances at a time.' });
     if (req.body?.confirmation !== `TRANSFER SPL ${selections.length} ${destinationMode}`) return res.status(400).json({ message: 'SPL transfer confirmation did not match.' });
+    if (feeMode === 'admin_sponsor' && req.body?.feeConfirmation !== `SPONSOR SPL ${selections.length} ${String(req.body.maxFeeSol)}`) {
+        return res.status(400).json({ message: 'Admin fee sponsorship confirmation did not match.' });
+    }
     if (destinationMode === 'owner_vault' && !OWNER_VAULT_ADDRESS) return res.status(503).json({ message: 'OWNER_VAULT_ADDRESS is not configured.' });
 
     const normalized = [];
@@ -8182,6 +8214,20 @@ app.post('/api/admin/spl-tokens/transfer', authenticateAdmin, sensitiveRateLimit
     const users = await User.find({ _id: { $in: userIds } }).select('username walletAddress depositAddress depositSecret balance');
     const userMap = new Map(users.map(user => [String(user._id), user]));
     const groups = userIds.map(userId => ({ userId, user: userMap.get(userId), selections: normalized.filter(selection => selection.userId === userId) }));
+    let feeSponsor = null;
+    let feeBudget = null;
+    if (feeMode === 'admin_sponsor') {
+        if (splSponsorOperationActive) return res.status(409).json({ message: 'An admin-sponsored transfer is already running. Wait for it to finish.' });
+        try {
+            feeSponsor = getSplFeeSponsor();
+            if (!feeSponsor) return res.status(503).json({ message: 'Configure SPL_FEE_SPONSOR_SECRET with a separate admin fee wallet first.' });
+            if (await User.exists({ depositAddress: feeSponsor.address })) return res.status(400).json({ message: 'The fee wallet must not be a user deposit wallet.' });
+            feeBudget = createSplFeeBudget(req.body.maxFeeSol, feeSponsor.maxLamports);
+        } catch (error) { return res.status(400).json({ message: error.message }); }
+        // Recheck after the database await before claiming the shared sponsor.
+        if (splSponsorOperationActive) return res.status(409).json({ message: 'An admin-sponsored transfer is already running.' });
+        splSponsorOperationActive = true;
+    }
     const results = [];
     let groupCursor = 0;
     const worker = async () => {
@@ -8216,6 +8262,8 @@ app.post('/api/admin/spl-tokens/transfer', authenticateAdmin, sensitiveRateLimit
                             destinationOwner,
                             destinationMode,
                             adminActorId: req.adminUser._id,
+                            feeSponsor,
+                            feeBudget,
                         });
                         results.push({ ...selection, username: group.user.username, ...transfer });
                     } catch (error) {
@@ -8229,7 +8277,11 @@ app.post('/api/admin/spl-tokens/transfer', authenticateAdmin, sensitiveRateLimit
             }
         }
     };
-    await Promise.all(Array.from({ length: Math.min(2, groups.length) }, () => worker()));
+    try {
+        await Promise.all(Array.from({ length: Math.min(feeSponsor ? 1 : 2, groups.length) }, () => worker()));
+    } finally {
+        if (feeSponsor) splSponsorOperationActive = false;
+    }
     const confirmed = results.filter(result => result.status === 'confirmed').length;
     const skipped = results.filter(result => result.status === 'skipped').length;
     const failed = results.filter(result => result.status === 'failed').length;
@@ -8237,6 +8289,8 @@ app.post('/api/admin/spl-tokens/transfer', authenticateAdmin, sensitiveRateLimit
         success: failed === 0,
         partial: failed > 0,
         destinationMode,
+        feePayer: feeSponsor?.address || 'source_wallets',
+        feeBudgetReservedSol: (feeBudget?.reservedLamports || 0) / solanaWeb3.LAMPORTS_PER_SOL,
         confirmed,
         skipped,
         failed,
