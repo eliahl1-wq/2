@@ -6990,6 +6990,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const previousDepositsUsd = Number(((Number(depositSummary.previousSol) || 0) * SOL_PRICE_USD).toFixed(2));
 
     return {
+        schemaVersion: 2,
         days,
         from: rangeStart,
         to: now,
