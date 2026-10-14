@@ -8054,7 +8054,15 @@ function getSplFeeSponsor() {
 }
 let splSponsorOperationActive = false;
 
-app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ limit: 2000, windowMs: 60 * 60_000 }), async (req, res) => {
+const adminSplOnChainScanRateLimit = sensitiveRateLimit({ limit: 1000, windowMs: 60 * 60_000 });
+function rateLimitAdminSplScan(req, res, next) {
+    // Reading already-saved admin balances is a cheap database operation and
+    // can span several pages. Only protect requests that can trigger Solana RPC.
+    if (req.query.cachedOnly === '1' && req.query.force !== '1') return next();
+    return adminSplOnChainScanRateLimit(req, res, next);
+}
+
+app.get('/api/admin/spl-tokens/scan', authenticateAdmin, rateLimitAdminSplScan, async (req, res) => {
     try {
         const cachedOnly = req.query.cachedOnly === '1';
         const force = req.query.force === '1';
