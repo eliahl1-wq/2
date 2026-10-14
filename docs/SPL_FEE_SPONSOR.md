@@ -74,3 +74,10 @@ back off for a minute. Actual transfer amounts are always read on-chain again.
 Each confirmed transfer invalidates the source's saved snapshot and prevents an
 older in-flight scan from republishing it. Background UI responses started before
 a transfer are also discarded. Tests: `node --test spl-scan-cache.test.js`.
+
+**Load token balances** reads saved snapshots quickly. **Rescan all accounts**
+requests `force=1` in smaller ten-account pages, bypasses the freshness TTL and
+waits for actual RPC results before showing completion. In-flight wallet checks
+are still deduplicated. Explicit clicks during an automatic refresh are queued
+with visible feedback, not silently ignored. Request timeouts preserve saved
+data and errors are visible even if the initial automatic load fails.

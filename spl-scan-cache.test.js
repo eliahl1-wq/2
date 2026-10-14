@@ -3,6 +3,26 @@ import assert from 'node:assert/strict';
 import { createSplScanCache } from './spl-scan-cache.js';
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
+test('manual force rescan bypasses a fresh saved balance and waits for the new on-chain result', async () => {
+    let calls = 0, release, saved;
+    const record = { tokens: [{ amountAtomic: '10' }], attemptedAt: new Date(100_000), checkedAt: new Date(100_000) };
+    const cache = createSplScanCache({ now: () => 100_010, scan: async () => {
+        calls++; await new Promise(resolve => { release = resolve; }); return [{ amountAtomic: '50' }];
+    }, save: async (_address, result) => { saved = result; } });
+    assert.equal((await cache.get('wallet', record)).tokens[0].amountAtomic, '10');
+    assert.equal(calls, 0);
+    let completed = false;
+    const forced = cache.get('wallet', record, { force: true }).then(result => { completed = true; return result; });
+    const duplicate = cache.get('wallet', record, { force: true });
+    await settle();
+    assert.equal(completed, false); assert.equal(calls, 1);
+    release();
+    const result = await forced;
+    assert.equal(result.tokens[0].amountAtomic, '50');
+    assert.equal((await duplicate).tokens[0].amountAtomic, '50');
+    assert.equal(saved.tokens[0].amountAtomic, '50');
+    assert.equal(result.cached, false);
+});
 test('saved empty wallets return immediately, revalidate and discover new or changed tokens', async () => {
     let now = 100_000;
     let calls = 0;

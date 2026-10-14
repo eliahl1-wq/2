@@ -37,12 +37,12 @@ export function createSplScanCache({ scan, save, now = Date.now, ttlMs = 60_000,
         return promise;
     }
     return {
-        async get(address, record, { cachedOnly = false } = {}) {
+        async get(address, record, { cachedOnly = false, force = false } = {}) {
             const age = now() - new Date(record?.attemptedAt || 0).getTime();
             const stale = !record || age >= ttlMs;
-            if (stale) {
+            if (stale || force) {
                 const work = refresh(address, record);
-                if (!record && !cachedOnly) return { ...await work, refreshing: false, cached: false };
+                if (force || (!record && !cachedOnly)) return { ...await work, refreshing: false, cached: false };
             }
             return { tokens: record?.tokens || [], checkedAt: record?.checkedAt || null,
                 error: record?.error || null, refreshing: pending.has(address), cached: !!record };

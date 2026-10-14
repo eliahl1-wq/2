@@ -6701,7 +6701,9 @@ app.patch('/api/admin/bug-reports/:reportId', authenticateAdmin, async (req, res
     }
 });
 
-const ADMIN_OVERVIEW_RANGES = new Set([7, 30, 90]);
+const ADMIN_OVERVIEW_RANGES = new Set([1, 7, 30, 90]);
+const ADMIN_OVERVIEW_CACHE_TTL_MS = 20_000;
+const adminOverviewResponseCache = new Map();
 
 function adminOverviewChange(current, previous) {
     const currentValue = Number(current) || 0;
@@ -6753,6 +6755,10 @@ async function getAdminOverviewAnalytics(requestedDays) {
         'meta.simulated': { $ne: true },
         'meta.isFreeTicketPlay': { $ne: true },
     });
+    const ownerSweepAnalyticsMatch = await reportedTxMatch({
+        ...OWNER_EARNING_EVENTS,
+        createdAt: { $gte: previousStart, $lte: now },
+    });
 
     const [
         playerAccountCount,
@@ -6763,6 +6769,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
         gameAnalytics,
         depositAnalytics,
         cashoutAnalytics,
+        ownerSweepTransactions,
     ] = await Promise.all([
         User.countDocuments(analyticsUserMatch),
         User.aggregate([
@@ -6903,6 +6910,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
                 },
             },
         ]),
+        Transaction.find(ownerSweepAnalyticsMatch).select('amount currency meta createdAt').lean(),
     ]);
 
     const registrationData = registrations[0] || {};
@@ -6913,6 +6921,24 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const gameSummary = gameData.summary?.[0] || {};
     const depositSummary = depositData.summary?.[0] || {};
     const cashoutSummary = cashoutData.summary?.[0] || {};
+    let currentOwnerSweepUsd = 0;
+    let previousOwnerSweepUsd = 0;
+    let currentOwnerSweepCount = 0;
+    let previousOwnerSweepCount = 0;
+    const ownerSweepDaily = new Map();
+    for (const tx of ownerSweepTransactions) {
+        const createdAt = new Date(tx.createdAt);
+        const usd = txAmountUsd(tx);
+        if (createdAt >= rangeStart) {
+            currentOwnerSweepUsd += usd;
+            currentOwnerSweepCount += 1;
+            const date = createdAt.toISOString().slice(0, 10);
+            ownerSweepDaily.set(date, (ownerSweepDaily.get(date) || 0) + usd);
+        } else {
+            previousOwnerSweepUsd += usd;
+            previousOwnerSweepCount += 1;
+        }
+    }
     const currentPlayers = gameData.currentPlayers || [];
     const uniquePlayers = currentPlayers.length;
     const uniquePaidPlayers = currentPlayers.filter(row => Number(row.paidGames) > 0).length;
@@ -6935,6 +6961,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
             cashoutUsd: 0,
             feesUsd: 0,
             depositsUsd: 0,
+            ownerSweepUsd: 0,
         });
     }
     for (const row of registrationData.daily || []) dailyMap.get(row._id).registrations = Number(row.registrations) || 0;
@@ -6949,6 +6976,9 @@ async function getAdminOverviewAnalytics(requestedDays) {
         feesUsd: Number((Number(row.feesUsd) || 0).toFixed(2)),
     });
     for (const row of depositData.daily || []) dailyMap.get(row._id).depositsUsd = Number(((Number(row.depositSol) || 0) * SOL_PRICE_USD).toFixed(2));
+    for (const [date, usd] of ownerSweepDaily) {
+        if (dailyMap.has(date)) dailyMap.get(date).ownerSweepUsd = Number(usd.toFixed(2));
+    }
 
     const currentGames = Number(gameSummary.currentGames) || 0;
     const previousGames = Number(gameSummary.previousGames) || 0;
@@ -6975,6 +7005,8 @@ async function getAdminOverviewAnalytics(requestedDays) {
             paidVolumeUsd,
             cashoutUsd: Number((Number(cashoutSummary.currentCashoutUsd) || 0).toFixed(2)),
             feesUsd: Number((Number(cashoutSummary.currentFeesUsd) || 0).toFixed(2)),
+            ownerSweepUsd: Number(currentOwnerSweepUsd.toFixed(2)),
+            ownerSweepCount: currentOwnerSweepCount,
             depositsUsd,
             deposits: Number(depositSummary.currentCount) || 0,
             newUsersWhoPlayed,
@@ -6988,6 +7020,8 @@ async function getAdminOverviewAnalytics(requestedDays) {
             paidVolumeUsd: previousPaidVolumeUsd,
             cashoutUsd: Number((Number(cashoutSummary.previousCashoutUsd) || 0).toFixed(2)),
             feesUsd: Number((Number(cashoutSummary.previousFeesUsd) || 0).toFixed(2)),
+            ownerSweepUsd: Number(previousOwnerSweepUsd.toFixed(2)),
+            ownerSweepCount: previousOwnerSweepCount,
             depositsUsd: previousDepositsUsd,
             deposits: Number(depositSummary.previousCount) || 0,
         },
@@ -6998,6 +7032,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
             uniquePlayers: adminOverviewChange(uniquePlayers, previousUniquePlayers),
             paidVolumeUsd: adminOverviewChange(paidVolumeUsd, previousPaidVolumeUsd),
             depositsUsd: adminOverviewChange(depositsUsd, previousDepositsUsd),
+            ownerSweepUsd: adminOverviewChange(currentOwnerSweepUsd, previousOwnerSweepUsd),
         },
         averages: {
             registrationsPerDay: Number((newUserCount / days).toFixed(1)),
@@ -7005,6 +7040,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
             uniquePlayersPerDay: Number(([...dailyMap.values()].reduce((sum, day) => sum + day.uniquePlayers, 0) / days).toFixed(1)),
             gamesPerPlayer: Number((uniquePlayers > 0 ? currentGames / uniquePlayers : 0).toFixed(1)),
             paidEntryUsd: Number((currentPaidGames > 0 ? paidVolumeUsd / currentPaidGames : 0).toFixed(2)),
+            ownerSweepUsdPerDay: Number((currentOwnerSweepUsd / days).toFixed(2)),
         },
         rates: {
             activeAccountPct: Number((playerAccountCount > 0 ? (activeUsersCurrent / playerAccountCount) * 100 : 0).toFixed(1)),
@@ -7026,6 +7062,11 @@ async function getAdminOverviewAnalytics(requestedDays) {
 
 app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => {
     try {
+        const days = ADMIN_OVERVIEW_RANGES.has(Number(req.query.days)) ? Number(req.query.days) : 30;
+        const cached = adminOverviewResponseCache.get(days);
+        if (req.query.refresh !== '1' && cached && (Date.now() - cached.storedAt) < ADMIN_OVERVIEW_CACHE_TTL_MS) {
+            return res.json({ ...cached.payload, cache: { hit: true, generatedAt: new Date(cached.storedAt).toISOString() } });
+        }
         const depositMatch = await reportedTxMatch({ type: 'deposit', status: 'confirmed' });
         const withdrawMatch = await reportedTxMatch({
             type: 'withdraw',
@@ -7091,7 +7132,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             ]),
             RewardPoolState.findOne({ key: 'global' }).lean(),
             agarCommerce.getAdminOverviewStats(),
-            getAdminOverviewAnalytics(req.query.days),
+            getAdminOverviewAnalytics(days),
         ]);
 
         const totalDepositsSol = depositAgg[0]?.total ?? 0;
@@ -7107,7 +7148,7 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
         const ownerAccountBalanceSol = ownerAccountAgg[0]?.totalBalanceSol ?? 0;
         const ownerAccountCount = ownerAccountAgg[0]?.accountCount ?? 0;
 
-        res.json({
+        const payload = {
             totalDepositsUsd: Number(totalDepositsUsd.toFixed(2)),
             totalDepositsSol: Number(totalDepositsSol.toFixed(6)),
             totalWithdrawalsUsd: Number(totalWithdrawalsUsd.toFixed(2)),
@@ -7145,7 +7186,10 @@ app.get('/api/admin/dashboard/overview', authenticateAdmin, async (req, res) => 
             excludedUsersCount,
             solPrice: SOL_PRICE_USD,
             analytics,
-        });
+        };
+        const storedAt = Date.now();
+        adminOverviewResponseCache.set(days, { storedAt, payload });
+        return res.json({ ...payload, cache: { hit: false, generatedAt: new Date(storedAt).toISOString() } });
     } catch (err) {
         console.error('Admin overview error:', err);
         res.status(500).json({ error: err.message });
@@ -8030,13 +8074,14 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
         const savedScans = await SplScanCache.find({ _id: { $in: accounts.map(account => account.depositAddress) } }).lean();
         const savedByAddress = new Map(savedScans.map(record => [record._id, record]));
         const cachedOnly = req.query.cachedOnly === '1';
+        const force = req.query.force === '1';
         let workerCursor = 0;
         const worker = async () => {
             while (workerCursor < accounts.length) {
                 const index = workerCursor++;
                 const account = accounts[index];
                 try {
-                    const snapshot = await splScanCache.get(account.depositAddress, savedByAddress.get(account.depositAddress), { cachedOnly });
+                    const snapshot = await splScanCache.get(account.depositAddress, savedByAddress.get(account.depositAddress), { cachedOnly, force });
                     const tokens = snapshot.tokens;
                     results[index] = {
                         userId: String(account._id),
@@ -8080,6 +8125,7 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
             accounts: results.filter(account => account.tokens.length > 0 || account.error || account.refreshing),
             refreshingAccounts: results.filter(account => account.refreshing).length,
             cacheRefreshSeconds: 60,
+            forceRescanSupported: true,
             scannedAccounts: accounts.length,
             totalAccounts,
             nextCursor,
