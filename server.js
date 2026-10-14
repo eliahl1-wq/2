@@ -16,6 +16,7 @@ import { emitGameSnapshot, getAgarSnapshotSchedule, isGameTransportReady, serial
 import { rebuildAgarSpatialTree } from './agar-spatial.js';
 import { createSurvivMapGenerator } from './surviv-map-generation.js';
 import { loadSplFeeSponsor, createSplFeeBudget, prepareSponsoredSplTransaction } from './spl-fee-sponsor.js';
+import { createSplScanCache } from './spl-scan-cache.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     TOKEN_2022_PROGRAM_ID,
@@ -548,6 +549,10 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ excludedFromReports: 1, isOwnerAccount: 1, createdAt: -1 });
 
 const User = mongoose.model('User', UserSchema);
+const SplScanCache = mongoose.model('SplScanCache', new mongoose.Schema({
+    _id: String, tokens: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    checkedAt: Date, attemptedAt: Date, error: String,
+}, { versionKey: false }));
 const emailVerificationService = createEmailVerificationService({
     User,
     fetchImpl: fetch,
@@ -7973,6 +7978,15 @@ async function scanSplTokenBalances(walletAddress) {
     }));
 }
 
+const splScanCache = createSplScanCache({ scan: scanSplTokenBalances,
+    save: (address, result) => SplScanCache.updateOne({ _id: address }, { $set: result }, { upsert: true }),
+    onError: error => console.error('SPL background cache refresh failed:', error.message),
+});
+async function invalidateSplScanCache(address) {
+    splScanCache.invalidate(address);
+    await SplScanCache.updateOne({ _id: address }, { $set: { attemptedAt: new Date(0), tokens: [], checkedAt: null, error: null } });
+}
+
 app.get('/api/admin/users/:userId/token-balances', authenticateAdmin, sensitiveRateLimit({ limit: 30, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
         const { userId } = req.params;
@@ -7995,7 +8009,7 @@ function getSplFeeSponsor() {
 }
 let splSponsorOperationActive = false;
 
-app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ limit: 200, windowMs: 60 * 60_000 }), async (req, res) => {
+app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ limit: 2000, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
         const limit = Math.min(50, Math.max(10, Number.parseInt(req.query.limit, 10) || 40));
         const cursor = String(req.query.cursor || '').trim();
@@ -8013,13 +8027,17 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
             cursor ? Promise.resolve(null) : User.countDocuments({ depositAddress: { $exists: true, $nin: ['', null] } }),
         ]);
         const results = new Array(accounts.length);
+        const savedScans = await SplScanCache.find({ _id: { $in: accounts.map(account => account.depositAddress) } }).lean();
+        const savedByAddress = new Map(savedScans.map(record => [record._id, record]));
+        const cachedOnly = req.query.cachedOnly === '1';
         let workerCursor = 0;
         const worker = async () => {
             while (workerCursor < accounts.length) {
                 const index = workerCursor++;
                 const account = accounts[index];
                 try {
-                    const tokens = await scanSplTokenBalances(account.depositAddress);
+                    const snapshot = await splScanCache.get(account.depositAddress, savedByAddress.get(account.depositAddress), { cachedOnly });
+                    const tokens = snapshot.tokens;
                     results[index] = {
                         userId: String(account._id),
                         username: account.username,
@@ -8029,7 +8047,10 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
                         isOwnerAccount: !!account.isOwnerAccount,
                         hasSigningKey: !!account.depositSecret,
                         tokens: tokens.map(({ tokenAccounts, ...token }) => ({ ...token, tokenAccountCount: tokenAccounts.length })),
-                        error: null,
+                        error: snapshot.error,
+                        checkedAt: snapshot.checkedAt,
+                        refreshing: snapshot.refreshing,
+                        cached: snapshot.cached,
                     };
                 } catch (error) {
                     results[index] = {
@@ -8056,7 +8077,9 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
                 balanceSol: await connection.getBalance(sponsor.keypair.publicKey, 'confirmed') / solanaWeb3.LAMPORTS_PER_SOL };
         } catch { feeSponsor = { configured: false, error: 'Fee wallet configuration or RPC is unavailable.' }; }
         return res.json({
-            accounts: results.filter(account => account.tokens.length > 0 || account.error),
+            accounts: results.filter(account => account.tokens.length > 0 || account.error || account.refreshing),
+            refreshingAccounts: results.filter(account => account.refreshing).length,
+            cacheRefreshSeconds: 60,
             scannedAccounts: accounts.length,
             totalAccounts,
             nextCursor,
@@ -8142,6 +8165,7 @@ async function transferSplTokenPosition({ user, mint, requestedProgramId, destin
         const signers = feeSponsor ? [feeSponsor.keypair, keypair] : [keypair];
         const signature = await solanaWeb3.sendAndConfirmTransaction(connection, transaction, signers, { commitment: 'confirmed', maxRetries: 3 });
         signatures.push(signature);
+        await invalidateSplScanCache(user.depositAddress).catch(error => console.error('SPL cache invalidation failed:', error.message));
     }
 
     const amountAtomic = entries.reduce((sum, entry) => sum + entry.amountAtomic, 0n);

@@ -6,6 +6,13 @@ transfer. Neither the token amount nor its market value pays Solana network fees
 
 ## Setup
 
+To create a dedicated wallet locally, from the backend folder run
+`npm run spl:fee-wallet`. It creates/reuses `.local/spl-fee-wallet.json` and prints
+only the public address. Then run `npm run spl:fee-wallet -- --show-secret` in
+your own terminal to display the Railway variable value. The file is Git-ignored;
+back it up securely and never upload or share it. Repeated runs do not rotate the
+key. The script does not fund wallets, send transactions or alter Railway.
+
 1. Create a dedicated operational wallet. Do not use a house, reward, tournament
    wallet or any user's deposit wallet. Keep only a limited SOL amount in it.
 2. In the backend service's server-side variables, set `SPL_FEE_SPONSOR_SECRET`
@@ -48,3 +55,22 @@ Unsupported/frozen token transfers may still fail simulation independently of fe
 
 Checks: `node --test spl-fee-sponsor.test.js`, `node --check server.js`,
 and frontend `npm run build`.
+
+## Saved scans and live refresh
+
+The `SplScanCache` MongoDB collection stores the most recent token snapshot per
+deposit address, including empty wallets, successful check time and RPC error.
+It never stores signing keys. Reload/deploy does not clear it. The admin Users
+tab loads these results automatically and polls cached pages every 15 seconds
+while visible. Expired snapshots (60 seconds) queue a background recheck with
+at most six concurrent RPC scans across all viewers. Duplicate requests share
+one check. New wallets are queued too; first-time loading need not block the UI.
+
+Fresh reads check **both** SPL Token and Token-2022 programs, so added mints,
+increased/decreased amounts and emptied accounts are detected. This is periodic
+refresh, not instant websocket delivery; large queues/RPC outages may take longer.
+Known balances remain visible on RPC failure, marked with the error, and retries
+back off for a minute. Actual transfer amounts are always read on-chain again.
+Each confirmed transfer invalidates the source's saved snapshot and prevents an
+older in-flight scan from republishing it. Background UI responses started before
+a transfer are also discarded. Tests: `node --test spl-scan-cache.test.js`.
