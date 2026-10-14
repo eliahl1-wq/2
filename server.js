@@ -8056,7 +8056,10 @@ let splSponsorOperationActive = false;
 
 app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ limit: 2000, windowMs: 60 * 60_000 }), async (req, res) => {
     try {
-        const limit = Math.min(50, Math.max(10, Number.parseInt(req.query.limit, 10) || 40));
+        const cachedOnly = req.query.cachedOnly === '1';
+        const force = req.query.force === '1';
+        const maxLimit = cachedOnly && !force ? 500 : 50;
+        const limit = Math.min(maxLimit, Math.max(10, Number.parseInt(req.query.limit, 10) || (cachedOnly ? 500 : 40)));
         const cursor = String(req.query.cursor || '').trim();
         if (cursor && !mongoose.Types.ObjectId.isValid(cursor)) return res.status(400).json({ message: 'Invalid scan cursor.' });
         const accountFilter = {
@@ -8074,15 +8077,19 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
         const results = new Array(accounts.length);
         const savedScans = await SplScanCache.find({ _id: { $in: accounts.map(account => account.depositAddress) } }).lean();
         const savedByAddress = new Map(savedScans.map(record => [record._id, record]));
-        const cachedOnly = req.query.cachedOnly === '1';
-        const force = req.query.force === '1';
         let workerCursor = 0;
         const worker = async () => {
             while (workerCursor < accounts.length) {
                 const index = workerCursor++;
                 const account = accounts[index];
                 try {
-                    const snapshot = await splScanCache.get(account.depositAddress, savedByAddress.get(account.depositAddress), { cachedOnly, force });
+                    const snapshot = await splScanCache.get(account.depositAddress, savedByAddress.get(account.depositAddress), {
+                        cachedOnly,
+                        force,
+                        // Loading the admin table must never queue thousands of RPC calls.
+                        // A deliberate on-chain rescan uses force=true instead.
+                        refreshStale: !cachedOnly,
+                    });
                     const tokens = snapshot.tokens;
                     results[index] = {
                         userId: String(account._id),
@@ -8115,13 +8122,16 @@ app.get('/api/admin/spl-tokens/scan', authenticateAdmin, sensitiveRateLimit({ li
         };
         await Promise.all(Array.from({ length: Math.min(6, accounts.length) }, () => worker()));
         const nextCursor = accounts.length === limit ? String(accounts[accounts.length - 1]._id) : null;
-        let feeSponsor = { configured: false };
-        try {
-            const sponsor = getSplFeeSponsor();
-            if (sponsor) feeSponsor = { configured: true, address: sponsor.address,
-                maxFeeSol: sponsor.maxLamports / solanaWeb3.LAMPORTS_PER_SOL,
-                balanceSol: await connection.getBalance(sponsor.keypair.publicKey, 'confirmed') / solanaWeb3.LAMPORTS_PER_SOL };
-        } catch { feeSponsor = { configured: false, error: 'Fee wallet configuration or RPC is unavailable.' }; }
+        let feeSponsor = null;
+        if (!cursor) {
+            feeSponsor = { configured: false };
+            try {
+                const sponsor = getSplFeeSponsor();
+                if (sponsor) feeSponsor = { configured: true, address: sponsor.address,
+                    maxFeeSol: sponsor.maxLamports / solanaWeb3.LAMPORTS_PER_SOL,
+                    balanceSol: await connection.getBalance(sponsor.keypair.publicKey, 'confirmed') / solanaWeb3.LAMPORTS_PER_SOL };
+            } catch { feeSponsor = { configured: false, error: 'Fee wallet configuration or RPC is unavailable.' }; }
+        }
         return res.json({
             accounts: results.filter(account => account.tokens.length > 0 || account.error || account.refreshing),
             refreshingAccounts: results.filter(account => account.refreshing).length,

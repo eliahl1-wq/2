@@ -92,3 +92,15 @@ test('cache-only first load does not wait for RPC; invalidation rejects in-fligh
     cache.invalidate('wallet'); release(); await settle();
     assert.equal(saved.length, 0);
 });
+
+test('saved-balance listing can skip stale RPC refreshes', async () => {
+    let calls = 0;
+    const cache = createSplScanCache({
+        scan: async () => { calls++; return []; },
+        save: async () => {},
+    });
+    const result = await cache.get('wallet', null, { cachedOnly: true, refreshStale: false });
+    assert.equal(calls, 0);
+    assert.equal(result.refreshing, false);
+    assert.deepEqual(result.tokens, []);
+});
