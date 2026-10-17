@@ -16,8 +16,8 @@ if (process.env.NODE_ENV === 'production') throw new Error('Playtest must never 
 const require = createRequire(new URL('../../phantom-game/package.json', import.meta.url));
 const { io: clientIo } = require('socket.io-client');
 const app = express();
-app.get('/ready', (_req, res) => res.json({ ready: true, status: 'ready' }));
 app.use(cors());
+app.get('/ready', (_req, res) => res.json({ ready: true, status: 'ready' }));
 const http = createServer(app);
 const io = new Server(http, { cors: { origin: '*' } });
 const secret = 'local-surviv-br-fixture-not-an-account-secret';

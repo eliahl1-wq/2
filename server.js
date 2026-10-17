@@ -17,6 +17,8 @@ import { rebuildAgarSpatialTree } from './agar-spatial.js';
 import { createSurvivMapGenerator } from './surviv-map-generation.js';
 import { loadSplFeeSponsor, createSplFeeBudget, prepareSponsoredSplTransaction } from './spl-fee-sponsor.js';
 import { createSplScanCache } from './spl-scan-cache.js';
+import { sendAndConfirmEntryTransaction } from './entry-confirmation.js';
+import { createJoinWaiters, requireResumeTarget } from './join-waiters.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     TOKEN_2022_PROGRAM_ID,
@@ -1149,6 +1151,7 @@ const NORMAL_AGAR_MAX_FOOD = Math.max(
     Math.floor(Number(process.env.NORMAL_AGAR_MAX_FOOD || 500)),
 );
 const joiningUsers = new Set();
+const joinWaiters = createJoinWaiters(joiningUsers);
 function isUserJoining(userId) {
     const id = String(userId || '');
     return [...joiningUsers].some(key => key === id || String(key).endsWith(`:${id}`));
@@ -12577,6 +12580,7 @@ io.on('connection', (socket) => {
 
     socket.on('joinTournamentGame', async ({ username, token, tournamentId, skinColor, skinId }) => {
         let userKey = null;
+        let ownsTournamentJoinLock = false;
         let walletOperationUserId = null;
         let walletOperationId = null;
         let paidJoin = null;
@@ -12619,6 +12623,7 @@ io.on('connection', (socket) => {
             userKey = `tournament:${tournamentId}:${user._id}`;
             if (joiningUsers.has(userKey)) throw new Error('Tournament entry is already processing');
             joiningUsers.add(userKey);
+            ownsTournamentJoinLock = true;
             walletOperationUserId = user._id.toString();
             walletOperationId = `tournament_entry:${randomBytes(16).toString('hex')}`;
             if (!await acquireWalletOperation(user._id, 'tournament_entry', walletOperationId, 180_000)) {
@@ -12841,22 +12846,30 @@ io.on('connection', (socket) => {
             if (walletOperationUserId && walletOperationId) {
                 await releaseWalletOperation(walletOperationUserId, walletOperationId).catch(() => {});
             }
-            if (userKey) joiningUsers.delete(userKey);
+            if (ownsTournamentJoinLock) joinWaiters.finish(userKey);
         }
     });
 
-    socket.on('joinGame', async ({ username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket, adminFreeSurvivEntry, publicFreeMode }) => {
+    async function handleJoinGame(payload) {
+        const { username, token, mode, entryFeeUsd: rawEntryFee, skinColor, skinId, useFreeTicket, adminFreeSurvivEntry, publicFreeMode, resumeOnly } = payload || {};
         if (rewardPoolAdminResetting) {
             socket.emit('error', 'Reward pool maintenance is in progress. Try again shortly.');
             return;
         }
         let userKey = null;
+        let ownsJoinLock = false;
         let walletOperationId = null;
         let pendingPaidJoin = null;
         let pendingTicketUserId = null;
         let pendingTicketTransactionId = null;
         let pendingJoinEconomy = null;
-        const reportJoinProgress = (message) => socket.emit('joinProgress', { message });
+        const joinStartedAt = Date.now();
+        const joinStages = [];
+        const reportJoinProgress = (message) => {
+            const elapsedMs = Date.now() - joinStartedAt;
+            joinStages.push({ message, elapsedMs });
+            socket.emit('joinProgress', { message, elapsedMs });
+        };
         try {
             if (mode === 'br-agar' || mode === 'br-slither' || mode === 'br-surviv') {
                 socket.emit('error', 'Use the Battle Royale queue to join.');
@@ -12926,8 +12939,21 @@ io.on('connection', (socket) => {
             }
 
             userKey = user._id.toString();
-            if (joiningUsers.has(userKey)) return;
+            if (joiningUsers.has(userKey)) {
+                reportJoinProgress('Your entry is still processing. Reconnecting when it is ready…');
+                if (!await joinWaiters.wait(userKey)) {
+                    socket.emit('error', 'Your previous entry is still processing. Wait a moment before rejoining.');
+                    return;
+                }
+                if (socket.connected) return await handleJoinGame({ ...payload, resumeOnly: true });
+                return;
+            }
+            if (resumeOnly && !findPlayerInArena(userKey)) {
+                socket.emit('error', 'The previous entry did not produce an active match. Please return to the lobby and try again.');
+                return;
+            }
             joiningUsers.add(userKey);
+            ownsJoinLock = true;
             walletOperationId = `game_entry:${randomBytes(16).toString('hex')}`;
             if (!await acquireWalletOperation(user._id, 'game_entry', walletOperationId, 180_000)) {
                 throw new Error('Another wallet operation is already processing for this account.');
@@ -12955,6 +12981,7 @@ io.on('connection', (socket) => {
                 }
 
                 const existingPlayer = existing?.player ?? null;
+                requireResumeTarget(resumeOnly, existingPlayer);
                 if (existingPlayer) {
                     const oldSocketId = existingPlayer.id;
                     const oldSocket = io.sockets.sockets.get(oldSocketId);
@@ -13026,7 +13053,7 @@ io.on('connection', (socket) => {
                                 lamports: feeLamports,
                             })
                         );
-                        const sig = await solanaWeb3.sendAndConfirmTransaction(
+                        const sig = await sendAndConfirmEntryTransaction(
                             connection,
                             joinTx,
                             [userKeypair],
@@ -13134,6 +13161,7 @@ io.on('connection', (socket) => {
                 }
 
                 const existingPlayer = existing?.player ?? null;
+                requireResumeTarget(resumeOnly, existingPlayer);
                 if (existingPlayer) {
                     const activeRoom = existing.room;
                     const oldSocketId = existingPlayer.id;
@@ -13211,7 +13239,7 @@ io.on('connection', (socket) => {
                                 lamports: feeLamports,
                             })
                         );
-                        const sig = await solanaWeb3.sendAndConfirmTransaction(
+                        const sig = await sendAndConfirmEntryTransaction(
                             connection,
                             joinTx,
                             [userKeypair],
@@ -13388,6 +13416,7 @@ io.on('connection', (socket) => {
                 ? await getPublicFreePlayRoom(gameMode)
                 : (isFreeTicketPlay ? rooms.find(r => r.id === 'arena-free-ticket') : getRoomForEntry(entryFeeUsd)));
             const existingPlayer = switchingNormalMode ? null : (existing?.player ?? null);
+            requireResumeTarget(resumeOnly, existingPlayer);
             let switchedDollarBalance = null;
             if (switchingNormalMode) {
                 const oldPlayer = existing.player;
@@ -13479,7 +13508,7 @@ io.on('connection', (socket) => {
                             lamports: feeLamports,
                         })
                     );
-                    const sig = await solanaWeb3.sendAndConfirmTransaction(
+                    const sig = await sendAndConfirmEntryTransaction(
                         connection,
                         joinTx,
                         [userKeypair],
@@ -13896,9 +13925,16 @@ io.on('connection', (socket) => {
             if (walletOperationId && userKey) {
                 await releaseWalletOperation(userKey, walletOperationId).catch(() => {});
             }
-            if (userKey) joiningUsers.delete(userKey);
+            if (ownsJoinLock) joinWaiters.finish(userKey);
+            if (ownsJoinLock && Date.now() - joinStartedAt >= 5000) {
+                console.warn('[Join latency]', JSON.stringify({
+                    mode: ['agar', 'slither', 'surviv', 'competitive-slither'].includes(mode) ? mode : 'unknown',
+                    elapsedMs: Date.now() - joinStartedAt, stages: joinStages,
+                }));
+            }
         }
-    });
+    }
+    socket.on('joinGame', handleJoinGame);
 
     socket.on('adminSpawnBotNearMe', async ({ token, mode }) => {
         console.log(`[Admin Spawn] Received request. Mode parameter: ${mode}, Socket ID: ${socket.id}, Room ID: ${socket.roomId}`);
