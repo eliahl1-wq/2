@@ -129,6 +129,15 @@ const tick = setInterval(() => {
     // Recording/resize smoke tests inspect rendering and input, not random
     // deaths. Keep the Slither fixture on screen; collisions are unit-tested.
     if (process.env.GAME_FIXTURE_ADMIN === 'true') for (const room of getActiveBRMatchesRaw()) {
+        if (room.variant === 'agar' && !room._fixtureCentered && room.status === 'active') {
+            const player = room.players.find(candidate => candidate.mongoId === userId);
+            if (player) {
+                const dx = room.zone.cx - player.x, dy = room.zone.cy - player.y;
+                for (const cell of player.cells || []) { cell.x += dx; cell.y += dy; }
+                player.x = room.zone.cx; player.y = room.zone.cy;
+                room._fixtureCentered = true;
+            }
+        }
         if (room.variant !== 'slither') continue;
         room.isSandbox = true; room.sandboxInvincible = true; room.sandboxBotAi = true;
         if (!room._fixtureCentered && room.status === 'active') {

@@ -6762,6 +6762,12 @@ async function getAdminOverviewAnalytics(requestedDays) {
         ...OWNER_EARNING_EVENTS,
         createdAt: { $gte: previousStart, $lte: now },
     });
+    const accountWithdrawalAnalyticsMatch = await reportedTxMatch({
+        type: 'withdraw',
+        status: 'confirmed',
+        'meta.event': 'account_withdrawal',
+        createdAt: { $gte: previousStart, $lte: now },
+    });
 
     const [
         playerAccountCount,
@@ -6773,6 +6779,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
         depositAnalytics,
         cashoutAnalytics,
         ownerSweepTransactions,
+        accountWithdrawalAnalytics,
     ] = await Promise.all([
         User.countDocuments(analyticsUserMatch),
         User.aggregate([
@@ -6914,6 +6921,18 @@ async function getAdminOverviewAnalytics(requestedDays) {
             },
         ]),
         Transaction.find(ownerSweepAnalyticsMatch).select('amount currency meta createdAt').lean(),
+        Transaction.aggregate([
+            { $match: accountWithdrawalAnalyticsMatch },
+            {
+                $group: {
+                    _id: null,
+                    currentUsd: { $sum: { $cond: [isCurrent, numeric('$meta.amountUsd'), 0] } },
+                    previousUsd: { $sum: { $cond: [isPrevious, numeric('$meta.amountUsd'), 0] } },
+                    currentCount: { $sum: { $cond: [isCurrent, 1, 0] } },
+                    previousCount: { $sum: { $cond: [isPrevious, 1, 0] } },
+                },
+            },
+        ]),
     ]);
 
     const registrationData = registrations[0] || {};
@@ -6924,6 +6943,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const gameSummary = gameData.summary?.[0] || {};
     const depositSummary = depositData.summary?.[0] || {};
     const cashoutSummary = cashoutData.summary?.[0] || {};
+    const accountWithdrawalSummary = accountWithdrawalAnalytics[0] || {};
     let currentOwnerSweepUsd = 0;
     let previousOwnerSweepUsd = 0;
     let currentOwnerSweepCount = 0;
@@ -6993,7 +7013,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const previousDepositsUsd = Number(((Number(depositSummary.previousSol) || 0) * SOL_PRICE_USD).toFixed(2));
 
     return {
-        schemaVersion: 2,
+        schemaVersion: 3,
         days,
         from: rangeStart,
         to: now,
@@ -7013,6 +7033,8 @@ async function getAdminOverviewAnalytics(requestedDays) {
             ownerSweepCount: currentOwnerSweepCount,
             depositsUsd,
             deposits: Number(depositSummary.currentCount) || 0,
+            accountWithdrawalsUsd: Number((Number(accountWithdrawalSummary.currentUsd) || 0).toFixed(2)),
+            accountWithdrawals: Number(accountWithdrawalSummary.currentCount) || 0,
             newUsersWhoPlayed,
             newUsersWhoPaid,
         },
@@ -7028,6 +7050,8 @@ async function getAdminOverviewAnalytics(requestedDays) {
             ownerSweepCount: previousOwnerSweepCount,
             depositsUsd: previousDepositsUsd,
             deposits: Number(depositSummary.previousCount) || 0,
+            accountWithdrawalsUsd: Number((Number(accountWithdrawalSummary.previousUsd) || 0).toFixed(2)),
+            accountWithdrawals: Number(accountWithdrawalSummary.previousCount) || 0,
         },
         changes: {
             newUsers: adminOverviewChange(newUserCount, registrationSummary.previous),
