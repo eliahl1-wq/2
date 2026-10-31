@@ -212,17 +212,18 @@ export function getCompetitiveEconomy(entryFeeUsd) {
     };
 }
 
-/** Surviv economy - full entry becomes synchronized map loot; players start at $0. */
+/** Surviv conserves the entry across player, one funded bot and map loot. */
 export function getSurvivEconomy(entryFeeUsd) {
     const entry = normalizeSurvivEntryFee(entryFeeUsd);
     const cashoutFeePct = NORMAL_CASHOUT_FEE_PCT;
-    // Surviv funds the full $5 entry as loot; its platform fee is on cashout.
+    // The full $5 stays funded in-game; its platform fee is on cashout.
     const entryOwnerCutUsd = 0;
     return {
         entryFeeUsd: entry,
-        playerStartBalance: 0,
+        playerStartBalance: entry * 0.20,
+        botStartBalance: entry * 0.20,
         entryOwnerCutUsd,
-        lootPoolOnJoin: entry - entryOwnerCutUsd,
+        lootPoolOnJoin: entry * 0.80 - entryOwnerCutUsd,
         cashoutFeePct,
         cashoutPlayerPct: 1 - cashoutFeePct,
     };
@@ -232,6 +233,6 @@ export function getSurvivJoinLootFunding(entryFeeUsd, { adminFreeEntry = false, 
     if (adminFreeEntry) return 0;
     // Only server-validated simulated sessions may mint practice money.
     if (freePlay) return 20;
-    const fundedEntry = getSurvivEconomy(entryFeeUsd).lootPoolOnJoin;
+    const fundedEntry = getSurvivEconomy(entryFeeUsd).entryFeeUsd;
     return Math.round(fundedEntry * 100) / 100;
 }

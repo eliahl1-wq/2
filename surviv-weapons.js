@@ -1,3 +1,4 @@
+import { getWeaponRarity } from './surviv-loot-config.js';
 const FAMILY_DEFAULTS = Object.freeze({
     pistol: { spread: 0.055, bulletSpeed: 42, range: 2900, pellets: 1, automatic: false },
     revolver: { spread: 0.035, bulletSpeed: 46, range: 3300, pellets: 1, automatic: false },
@@ -14,7 +15,7 @@ function gun(id, label, family, ammoType, damage, fireRateMs, clipSize, reloadMs
         id,
         label,
         family,
-        rarity,
+        rarity: getWeaponRarity(id, rarity),
         damage,
         fireRateMs,
         clipSize,
@@ -114,6 +115,7 @@ export const SURVIV_STANDARD_FIREARM_IDS = Object.freeze([
     'm870', 'mp220', 'ak47', 'm416',
     'famas', 'vss', 'mosin', 'awms',
     'dp28', 'm249', 'm4a1s', 'dualm9',
+    'p30l', 'ump9', 'spas12', 'saiga12', 'scarh', 'sv98', 'groza', 'm39emr', 'scoutelite', 'barm1918',
 ]);
 
 export const SURVIV_WEAPONS = Object.freeze({

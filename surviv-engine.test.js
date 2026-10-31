@@ -9,6 +9,7 @@ import {
     beginSurvivReload,
     broadcastSurvivState,
     createSurvivPlayer,
+    fundSurvivEntry,
     eliminateSurvivPlayer,
     equipSurvivWeaponSlot,
     generateSurvivMap,
@@ -171,7 +172,7 @@ test('surviv map keeps its 20k world while concentrating loot inside structures'
         'wood_crate', 'supply_crate', 'ammo_crate', 'medical_crate', 'armory_crate',
     ]));
     assert.ok(chests.every(item => item.hp > 0 && item.hp === item.maxHp && item.hitRadius > 0));
-    assert.equal(groundLoot.length, 22);
+    assert.ok(groundLoot.length >= 10 && groundLoot.length <= 22, 'loose weapons are deliberately sparser');
     for (const item of groundLoot) {
         const floor = houses.find(house => house.id === item.houseId);
         assert.ok(floor, 'loose map loot should belong to a building');
@@ -289,9 +290,9 @@ test('Golden Clover Casino is a connected medium landmark with distinct gaming f
         }
     }
 
-    const casinoLoot = map.loot.filter(item => item.houseId === casino.id);
+    const casinoLoot = map.loot.filter(item => item.houseId === casino.id && item.type === 'chest' && item.source === 'map');
     assert.equal(casinoLoot.length, 2);
-    assert.ok(casinoLoot.some(item => item.tier === 'rare' && item.room === 'security-office'));
+    assert.ok(casinoLoot.some(item => item.room === 'security-office'), 'security-office crate remains, but its quality now uses scarcity rolls');
     assert.ok(casinoLoot.every(item => Number(item.dollarValue || item.contents?.money || 0) === 0));
 
     const drive = map.obstacles.find(obstacle => (
@@ -789,6 +790,7 @@ test('static surviv map loot never creates unfunded money', () => {
     const standardWeapons = new Set([
         'm9', 'ot38', 'mac10', 'mp5', 'm870', 'mp220', 'ak47', 'm416',
         'famas', 'vss', 'mosin', 'awms', 'dp28', 'm249', 'm4a1s', 'dualm9', 'knife',
+        'p30l', 'ump9', 'spas12', 'saiga12', 'scarh', 'sv98', 'groza', 'm39emr', 'scoutelite', 'barm1918',
     ]);
     const standardAmmo = new Set(['9mm', '12g', '556', '762', '308']);
     for (let i = 0; i < 8; i++) {
@@ -854,12 +856,13 @@ test('surviv runtime reset clears old arena state and caches', () => {
     assert.equal(room._nextSurvivAirdropAt, null);
     assert.equal(room._survivAirdropsSpawned, 0);
 });
-test('surviv economy puts the entire paid entry into map loot', () => {
+test('surviv economy reserves player start and the remaining funded bot/map allocation', () => {
     const economy = getSurvivEconomy(5);
     assert.equal(economy.entryFeeUsd, 5);
-    assert.equal(economy.playerStartBalance, 0);
+    assert.equal(economy.playerStartBalance, 1);
+    assert.equal(economy.botStartBalance, 1);
     assert.equal(economy.entryOwnerCutUsd, 0);
-    assert.equal(economy.lootPoolOnJoin, 5);
+    assert.equal(economy.lootPoolOnJoin, 4);
     assert.equal(economy.cashoutFeePct, 0.08);
     assert.equal(economy.cashoutPlayerPct + economy.cashoutFeePct, 1);
 });
@@ -913,34 +916,37 @@ test('free play Surviv adds exactly $20 per entry, without changing paid or admi
     }
     assert.equal(getSurvivJoinLootFunding(5, { freePlay: true, adminFreeEntry: true }), 0);
     assert.equal(getSurvivJoinLootFunding(5, { freePlay: false }), 5);
-    assert.ok(room.loot.some(item => item.type === 'chest' && item.source === 'join' && item.contents.money > 0));
+    assert.ok(room.loot.some(item => item.type === 'chest' && item.contents.money > 0));
 });
-test('surviv join money crates vary amounts while preserving the pool', () => {
+test('surviv funded ground coins vary amounts while preserving the pool', () => {
     const room = makeRoom();
     room.loot = [];
     spawnLootFromPool(room, 8.25);
 
     const amounts = room.loot
-        .filter(item => item.type === 'chest' && item.source === 'join')
-        .map(item => Number(item.contents?.money || 0));
+        .filter(item => item.type === 'money' && item.source === 'join')
+        .map(item => Number(item.dollarValue || 0));
     const total = Number(amounts.reduce((sum, amount) => sum + amount, 0).toFixed(2));
 
     assert.ok(amounts.length >= 5);
     assert.equal(total, 8.25);
-    assert.ok(amounts.every(amount => amount >= 0.2 && amount <= 2));
+    assert.ok(amounts.every(amount => amount >= 0.01 && amount <= .6));
     assert.ok(new Set(amounts.map(amount => amount.toFixed(2))).size > 1);
     assert.equal(room.lootPoolBalance, 0);
 });
 
-test('funded free play money leaves a broken crate and is collected exactly once', () => {
+test('funded free play money leaves a broken crate and is collected exactly once', t => {
     const room = makeRoom();
+    t.mock.method(Math, 'random', () => .1);
     room.obstacles = [];
     room.loot = [];
     room.spawnPoints = [];
     room._nextSurvivBotSyncAt = Number.POSITIVE_INFINITY;
+    room.loot.push({ id: 'funded-crate', type: 'chest', source: 'map', x: 45, y: 0, tier: 'common',
+        containerType: 'wood_crate', hp: 36, maxHp: 36, hitRadius: 24, contents: {} });
     spawnLootFromPool(room, getSurvivJoinLootFunding(5, { freePlay: true }));
     const crate = room.loot.find(item => item.contents?.money > 0);
-    const amount = crate.contents.money;
+    const amount = crate.contents.money + room.lootPoolBalance;
     room.loot = [crate];
     crate.x = 45;
     crate.y = 0;
@@ -1184,7 +1190,9 @@ test('urban expansion adds five dense and distinct road-connected districts', ()
         ['civic-quarter', { buildings: 6, approachRole: 'civicStreet' }],
     ]);
 
-    assert.ok(houses.length >= 178 && houses.length <= 188);
+    // Nine cottages were replaced by three larger country homes. Match the
+    // map's existing overall budget instead of the pre-replacement total.
+    assert.ok(houses.length >= 172 && houses.length <= 182, `expected current building budget, got ${houses.length}`);
     assert.ok(roads.length >= 75);
     assert.ok(junctions.length >= 25);
     for (const [landmarkType, expected] of expectedDistricts) {
@@ -2187,26 +2195,29 @@ test('chests ignore legacy inventory transfer requests', () => {
     assert.equal(chest.contents.weaponType, 'shotgun');
     assert.equal(player.openedContainer, null);
 });
-test('players and automatic bots start with fists and no dollars', () => {
+test('funded players and one entry bot start with fists and one dollar each', () => {
     const room = makeRoom();
     const player = createSurvivPlayer('human-1', 'mongo-1', 'Tester', '#fff', room);
+    fundSurvivEntry(room, player, 5);
     room.players.push(player);
 
     processSurvivRoom(room, silentIo, Date.now() + 600000);
 
     assert.equal(player.weapon.type, 'fists');
     assert.deepEqual(player.inventory.weapons, []);
-    assert.equal(player.dollarBalance, 0);
-    assert.equal(room.bots.length, 2);
+    assert.equal(player.dollarBalance, 1);
+    assert.equal(room.bots.length, 1);
     assert.ok(room.bots.every(bot => bot.weapon.type === 'fists'));
-    assert.ok(room.bots.every(bot => bot.dollarBalance === 0));
+    assert.ok(room.bots.every(bot => bot.dollarBalance === 1));
     assert.ok(room.bots.every(bot => bot.username === ' '), 'Surviv bot names should stay visually blank');
 });
 
-test('automatic surviv bots scale by two up to eight', () => {
+test('automatic surviv bots grow by at most one funded bot per entry', () => {
     const room = makeRoom();
     for (let i = 0; i < 4; i++) {
-        room.players.push(createSurvivPlayer(`human-${i}`, `mongo-${i}`, `Player ${i}`, '#fff', room));
+        const player = createSurvivPlayer(`human-${i}`, `mongo-${i}`, `Player ${i}`, '#fff', room);
+        fundSurvivEntry(room, player, 5);
+        room.players.push(player);
     }
 
     for (let i = 0; i < 5; i++) {
@@ -2214,7 +2225,7 @@ test('automatic surviv bots scale by two up to eight', () => {
         processSurvivRoom(room, silentIo, Date.now() + 600000);
     }
 
-    assert.equal(room.bots.filter(bot => !bot.adminSpawned).length, 8);
+    assert.equal(room.bots.filter(bot => !bot.adminSpawned).length, 4);
 });
 
 test('melee deaths scatter the full inventory instead of making a death crate', () => {
@@ -2817,7 +2828,7 @@ for (const isBot of [false, true]) {
 
             player.x = SURVIV.worldHalf;
             player._lastZoneDamageAt = Date.now() - 200;
-            processSurvivRoom(room, silentIo, Date.now() + 1000);
+            processSurvivRoom(room, silentIo, Date.now() + 2000);
             assert.ok(player.hp < player.maxHp, 'cashout must still take zone damage');
 
             player[flag] = false;
@@ -3917,7 +3928,7 @@ test('safe zone covers the map before shrinking and closes before reset', () => 
     assert.equal(beforeShrink.progress, 0);
     assert.ok(halfway.radius < beforeShrink.radius);
     assert.ok(halfway.radius > SURVIV.minZoneRadius);
-    assert.equal(closed.radius, SURVIV.minZoneRadius);
+    assert.equal(closed.radius, 0);
     assert.equal(closed.progress, 1);
 });
 

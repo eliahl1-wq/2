@@ -2320,6 +2320,8 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
  */
 export function processSlitherRoom(room, io, User, Transaction = null) {
     const isBR = room.isBattleRoyale === true;
+    const resetZone = !isBR && !room.isSandbox && !room.isTournament && Number.isFinite(room.resetAt)
+        ? getArenaResetZone(room.resetAt, Date.now(), { radius: SLITHER.worldHalf }) : null;
     const slitherHumans = room.players.filter(p => !p.disconnected && p.mode === 'slither');
     const humanCount = slitherHumans.length;
 
@@ -2480,7 +2482,8 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
         if (toRemove.some(item => item.snake.id === snake.id)) continue;
 
         if (!sandboxSkipDeathCollisions) {
-            if (checkWallCollision(snake, room) || checkSelfCollision(snake)) {
+            if (isResetZoneLethal(snake, snake.segments[0].x, snake.segments[0].y, resetZone, Date.now())
+                || checkWallCollision(snake, room) || checkSelfCollision(snake)) {
                 toRemove.push({ snake, isHuman, killer: null });
                 continue;
             }
@@ -2692,6 +2695,9 @@ export function broadcastSlitherState(room, io, slitherLeaderboard, meta) {
             minimap = {
                 players: minimapPlayers,
                 food: minimapFood,
+                warnings: directionalWarnings({ id: r.id, x: head.x, y: head.y },
+                    allSnakes.map(({ entity: s }) => ({ id: s.id, x: s.segments[0]?.x, y: s.segments[0]?.y })),
+                    { minDistance: SLITHER.viewRange, maxDistance: SLITHER.minimapThreatRange }),
             };
             if (!r.isSpectator) {
                 if (!room._lastSlitherMinimapByPlayer) room._lastSlitherMinimapByPlayer = {};
@@ -2762,7 +2768,7 @@ export function createSlitherPlayer(socketId, mongoId, username, color, room, st
 
 export const COMPETITIVE_SLITHER = {
     worldHalf: SLITHER.worldHalf * 0.3,
-    shrinkBeforeResetMs: 2 * 60 * 1000,
+    shrinkBeforeResetMs: RESET_ZONE_DURATION_MS,
     foodRadius: SLITHER.foodRadius,
     deathFoodRadius: SLITHER.foodRadius * 1.35,
     foodDensityPerHuman: 125,
@@ -2840,12 +2846,7 @@ function pickCompetitiveSpawn(room) {
 }
 
 export function getCompetitiveEffectiveRadius(resetTime) {
-    const worldHalf = COMPETITIVE_SLITHER.worldHalf;
-    const msUntilReset = resetTime - Date.now();
-    const shrinkMs = COMPETITIVE_SLITHER.shrinkBeforeResetMs;
-    if (msUntilReset >= shrinkMs) return worldHalf;
-    if (msUntilReset <= 0) return 0;
-    return worldHalf * (msUntilReset / shrinkMs);
+    return getArenaResetZone(resetTime, Date.now(), { radius: COMPETITIVE_SLITHER.worldHalf })?.radius ?? COMPETITIVE_SLITHER.worldHalf;
 }
 
 export function clampCompetitiveSpawnToZone(x, y, effectiveRadius, balance) {
@@ -2905,14 +2906,7 @@ export function createCompetitiveSlitherAdminBot(room, effectiveRadius, nearX = 
 }
 
 export function getCompetitiveZone(resetTime) {
-    const radius = getCompetitiveEffectiveRadius(resetTime);
-    const msUntilReset = resetTime - Date.now();
-    return {
-        cx: 0,
-        cy: 0,
-        radius,
-        shrinking: msUntilReset < COMPETITIVE_SLITHER.shrinkBeforeResetMs,
-    };
+    return getArenaResetZone(resetTime, Date.now(), { radius: COMPETITIVE_SLITHER.worldHalf });
 }
 
 function getCompetitiveSnakes(room) {
@@ -3212,7 +3206,7 @@ export function processCompetitiveSlitherRoom(room, io, User, Transaction, reset
     for (const { entity: snake } of allSnakes) {
         if (toRemove.some(item => item.snake.id === snake.id)) continue;
 
-        if (checkCompetitiveBoundary(snake, effectiveRadius) || checkSelfCollision(snake)) {
+        if (effectiveRadius <= 0 || checkCompetitiveBoundary(snake, effectiveRadius) || checkSelfCollision(snake)) {
             toRemove.push({ snake, killer: null });
             continue;
         }
@@ -3376,3 +3370,5 @@ export function broadcastCompetitiveSlitherState(room, io, leaderboard, meta) {
         });
     });
 }
+import { getArenaResetZone, isResetZoneLethal, RESET_ZONE_DURATION_MS } from './arena-reset-zone.js';
+import { directionalWarnings } from './directional-warnings.js';

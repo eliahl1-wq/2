@@ -1,6 +1,8 @@
 import express from 'express';
 import { resolveSignatureSkin } from './signature-skins.js';
 import { applySurvivInputPayload } from './surviv-input.js';
+import { applyAgarResetZone, getArenaResetZone } from './arena-reset-zone.js';
+import { directionalWarnings } from './directional-warnings.js';
 import { createAntiCheatSession } from './anti-cheat.js';
 import mongoose from 'mongoose';
 import cors from 'cors';
@@ -104,6 +106,7 @@ import {
     resetSurvivRoomRuntime,
     broadcastSurvivState,
     spawnLootFromPool,
+    fundSurvivEntry,
     spawnSurvivBotNear,
 } from './surviv-engine.js';
 import {
@@ -1464,6 +1467,7 @@ async function createSurvivRoom(entryFeeUsd) {
         id: `surviv-${entryFeeUsd}`,
         entryFeeUsd,
         isSurviv: true,
+        resetAt: GLOBAL_ARENA_START + c.roomDuration,
         players: [],
         bots: [],
         bullets: [],
@@ -3301,6 +3305,7 @@ async function performGlobalArenaReset() {
         }
         for (const room of survivRooms) {
             room.startTime = GLOBAL_ARENA_START;
+            room.resetAt = GLOBAL_ARENA_START + c.roomDuration;
         }
 
         console.log('✅ GLOBAL ARENA RESET COMPLETE');
@@ -13343,7 +13348,7 @@ io.on('connection', (socket) => {
                     adminFreeEntry: useAdminFreeSurvivEntry,
                     freePlay,
                 });
-                spawnLootFromPool(room, joinLootFunding);
+                fundSurvivEntry(room, newPlayer, joinLootFunding);
                 if (!freePlay && !useAdminFreeSurvivEntry) {
                     room.fundedEntryUsd = (Number(room.fundedEntryUsd) || 0) + joinLootFunding;
                 }
@@ -14827,6 +14832,12 @@ setInterval(() => {
     try {
         const age = Date.now() - GLOBAL_ARENA_START;
         if (age > c.roomDuration && !isArenaResetting()) {
+            // A delayed final tick must not turn a closed-zone survivor into
+            // an automatic reset cashout. Settle normal deaths first; pending
+            // cashout reservations are excluded by their existing guards.
+            rooms.forEach(room => processRoom(room));
+            processCompetitiveSlitherTick();
+            processSurvivTick();
             performGlobalArenaReset().catch(error => {
                 console.error('[Arena Reset] Scheduled reset failed:', error.message);
             });
@@ -14880,6 +14891,23 @@ function processRoom(room) {
     if (room.isResetting) return; // Pause during global reset
 
     const isSandbox = room.isSandbox === true;
+    room.resetZone = !isSandbox && !room.isBattleRoyale && !room.isTournament
+        ? getArenaResetZone(room.startTime + c.roomDuration, Date.now(), {
+            cx: c.worldWidth / 2, cy: c.worldHeight / 2, radius: Math.hypot(c.worldWidth, c.worldHeight) / 2,
+        }) : null;
+    applyAgarResetZone(room, room.resetZone, Date.now(), (player, dollars) => {
+        if (player.isBot) return;
+        keepAgarSpectator(room, player);
+        io.to(player.id).emit('RIP');
+        if (!player.personalFreePlay) User.findByIdAndUpdate(player.mongoId, { $inc: { playtime: Date.now() - player.startTime } })
+            .catch(error => console.error('Reset zone playtime:', error.message));
+        Transaction.create({ userId: player.mongoId, type: 'game', amount: dollars, status: 'confirmed',
+            excludedFromReports: !!player.personalFreePlay,
+            meta: { event: 'death', reason: 'Arena Death', damageKind: 'reset_zone', mode: 'agar',
+                entryFeeUsd: player.entryFeeUsd, inGameBalanceUsd: dollars,
+                gameSessionId: player.gameSessionId || null, ...(player.personalFreePlay ? { simulated: true } : {}) },
+        }).catch(error => console.error('Reset zone death log:', error.message));
+    });
     const agarHumans = countActiveHumansByMode(room, 'agar');
     const slitherHumans = countActiveHumansByMode(room, 'slither');
 
@@ -15495,9 +15523,11 @@ function processRoom(room) {
     rebuildQuadTree(room, allUsers);
 
     // Slither server-side physics tick (40Hz) — network broadcast at 40Hz
+    room.resetAt = room.startTime + c.roomDuration;
     const slitherLeaderboard = processSlitherRoom(room, io, User, Transaction);
 
     const slitherMeta = {
+        zone: room.isSandbox ? room.sandboxZone || null : getArenaResetZone(room.startTime + c.roomDuration, Date.now(), { radius: SLITHER.worldHalf }),
         resetTime: room.startTime + c.roomDuration,
         solPrice: SOL_PRICE_USD,
         isResetting: room.isResetting,
@@ -15603,6 +15633,7 @@ function processRoom(room) {
         if (minimapFood.length > 220) minimapFood.length = 220;
 
         const minimap = {
+            warnings: schedule.minimap ? directionalWarnings(p, allUsers, { minDistance: Math.max(p.screenWidth || 1920, p.screenHeight || 1080) / 2, maxDistance: threatHalf }) : [],
             players: minimapPlayers,
             food: minimapFood,
             viruses: minimapViruses,
@@ -15619,6 +15650,7 @@ function processRoom(room) {
             snapshotAt: snapshotNow,
             resetTime: room.startTime + c.roomDuration,
             solPrice: SOL_PRICE_USD,
+            zone: room.resetZone,
             ...(schedule.minimap ? { minimap } : {}),
             ...(p.isAgarSpectator ? {
                 spectating: true,
