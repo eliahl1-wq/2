@@ -21,6 +21,7 @@ import { loadSplFeeSponsor, createSplFeeBudget, prepareSponsoredSplTransaction }
 import { createSplScanCache } from './spl-scan-cache.js';
 import { sendAndConfirmEntryTransaction } from './entry-confirmation.js';
 import { createJoinWaiters, requireResumeTarget } from './join-waiters.js';
+import { visitorKey, createVisitorTracker, depositGrowthPipeline, summarizeDepositGrowth, getVisitorAnalytics } from './platform-analytics.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     TOKEN_2022_PROGRAM_ID,
@@ -505,6 +506,7 @@ const UserSchema = new mongoose.Schema({
     depositSecret: { type: String },
     playtime: { type: Number, default: 0 },
     lastActiveAt: { type: Date, default: null, index: true },
+    analyticsVisitorKey: { type: String, default: null, select: false },
     excludedFromReports: { type: Boolean, default: false },
     isOwnerAccount: { type: Boolean, default: false, index: true },
     personalFreePlay: { type: Boolean, default: false },
@@ -554,6 +556,18 @@ const UserSchema = new mongoose.Schema({
 UserSchema.index({ excludedFromReports: 1, isOwnerAccount: 1, createdAt: -1 });
 
 const User = mongoose.model('User', UserSchema);
+const SiteVisitSchema = new mongoose.Schema({
+    _id: String,
+    day: { type: Date, required: true, index: true },
+    visitorKey: { type: String, required: true },
+    firstSeenAt: Date, lastSeenAt: Date, device: String,
+    userIds: [{ type: mongoose.Schema.Types.ObjectId }],
+    expiresAt: { type: Date, expires: 0 },
+}, { versionKey: false });
+SiteVisitSchema.index({ day: 1, visitorKey: 1 }, { unique: true });
+const SiteVisit = mongoose.model('SiteVisit', SiteVisitSchema);
+const AnalyticsState = mongoose.model('AnalyticsState', new mongoose.Schema({ _id: String, since: Date }, { versionKey: false }));
+const trackVisitor = createVisitorTracker({ Visit: SiteVisit, State: AnalyticsState, secret: JWT_SECRET });
 const SplScanCache = mongoose.model('SplScanCache', new mongoose.Schema({
     _id: String, tokens: { type: [mongoose.Schema.Types.Mixed], default: [] },
     checkedAt: Date, attemptedAt: Date, error: String,
@@ -3657,13 +3671,15 @@ function createGoogleReferralState(req) {
     const referralCode = String(req.query.ref || '').trim();
     const referralClickId = String(req.query.clickId || '').trim();
     const referralDeviceId = String(req.query.deviceId || '').trim().slice(0, 200);
-    if (!referralCode) return undefined;
+    const visitorId = String(req.query.visitorId || '').trim().slice(0, 200);
+    if (!referralCode && !visitorId) return undefined;
     return jwt.sign(
         {
             purpose: 'google_referral',
             referralCode,
             referralClickId: mongoose.isValidObjectId(referralClickId) ? referralClickId : null,
             referralDeviceId,
+            visitorId,
         },
         JWT_SECRET,
         { expiresIn: '15m' },
@@ -3745,6 +3761,7 @@ passport.use(new GoogleStrategy({
                 const keypair = solanaWeb3.Keypair.generate();
                 user = new User({
                     googleId: profile.id,
+                    analyticsVisitorKey: visitorKey(readGoogleReferralState(req)?.visitorId, JWT_SECRET),
                     username: (profile.displayName || 'Gladiator').replace(/\s+/g, '').toLowerCase() + Math.floor(Math.random() * 1000),
                     email: profileEmail,
                     emailVerifiedAt: profileEmail ? new Date() : null,
@@ -6728,15 +6745,20 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const rangeStart = new Date(todayUtc.getTime() - ((days - 1) * 86_400_000));
     const previousStart = new Date(rangeStart.getTime() - (days * 86_400_000));
     const analyticsUserMatch = { ...USER_REPORTED, isOwnerAccount: { $ne: true } };
-    const excludedUserIds = await fetchExcludedUserIds();
+    const excludedUserIds = await User.find({ $or: [{ excludedFromReports: true }, { isOwnerAccount: true }] }).distinct('_id');
+    const customerScope = { userId: { $nin: excludedUserIds } };
     const visibleGameClauses = [
         { type: 'game', status: 'confirmed' },
+        { userId: { $ne: null } },
         { 'meta.event': { $in: ADMIN_GAME_JOIN_EVENTS } },
         { createdAt: { $gte: previousStart, $lte: now } },
         {
             $or: [
                 { excludedFromReports: { $ne: true } },
                 { 'meta.simulated': true },
+                ...['freePlay', 'freeMode', 'publicFreeMode', 'personalFreePlay'].map(key => ({ [`meta.${key}`]: true })),
+                { 'meta.signature': /^simulated(?:_|$)/i },
+                { 'meta.roomId': /^(?:personal-)?freeplay-/i },
                 { 'meta.isFreeTicketPlay': true },
                 { 'meta.event': ADMIN_GAME_JOIN_EVENTS[2] },
             ],
@@ -6752,11 +6774,14 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const isPaid = { $eq: ['$_overviewFreePlay', false] };
 
     const depositAnalyticsMatch = await reportedTxMatch({
+        ...customerScope,
         type: 'deposit',
         status: 'confirmed',
+        amount: { $gt: 0 },
         createdAt: { $gte: previousStart, $lte: now },
     });
     const cashoutAnalyticsMatch = await reportedTxMatch({
+        ...customerScope,
         ...buildGameCashoutTxFilter(),
         status: 'confirmed',
         createdAt: { $gte: previousStart, $lte: now },
@@ -6768,6 +6793,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
         createdAt: { $gte: previousStart, $lte: now },
     });
     const accountWithdrawalAnalyticsMatch = await reportedTxMatch({
+        ...customerScope,
         type: 'withdraw',
         status: 'confirmed',
         'meta.event': 'account_withdrawal',
@@ -6806,7 +6832,7 @@ async function getAdminOverviewAnalytics(requestedDays) {
                 },
             },
         ]),
-        User.find({ ...analyticsUserMatch, createdAt: { $gte: rangeStart, $lte: now } }).select('_id').lean(),
+        User.find({ ...analyticsUserMatch, createdAt: { $gte: rangeStart, $lte: now } }).select('_id +analyticsVisitorKey').lean(),
         User.countDocuments({ ...analyticsUserMatch, lastActiveAt: { $gte: rangeStart, $lte: now } }),
         User.countDocuments({ ...analyticsUserMatch, lastActiveAt: { $gte: previousStart, $lt: rangeStart } }),
         Transaction.aggregate([
@@ -6816,6 +6842,9 @@ async function getAdminOverviewAnalytics(requestedDays) {
                     _overviewFreePlay: {
                         $or: [
                             { $eq: [{ $ifNull: ['$meta.simulated', false] }, true] },
+                            ...['freePlay', 'freeMode', 'publicFreeMode', 'personalFreePlay'].map(key => ({ $eq: [{ $ifNull: [`$meta.${key}`, false] }, true] })),
+                            { $regexMatch: { input: { $convert: { input: '$meta.signature', to: 'string', onError: '', onNull: '' } }, regex: '^simulated(?:_|$)', options: 'i' } },
+                            { $regexMatch: { input: { $convert: { input: '$meta.roomId', to: 'string', onError: '', onNull: '' } }, regex: '^(?:personal-)?freeplay-', options: 'i' } },
                             { $eq: [{ $ifNull: ['$meta.isFreeTicketPlay', false] }, true] },
                             { $eq: ['$meta.event', ADMIN_GAME_JOIN_EVENTS[2]] },
                         ],
@@ -6872,7 +6901,6 @@ async function getAdminOverviewAnalytics(requestedDays) {
                     previousPlayers: [
                         { $match: { createdAt: { $gte: previousStart, $lt: rangeStart } } },
                         { $group: { _id: '$userId' } },
-                        { $count: 'count' },
                     ],
                 },
             },
@@ -6970,11 +6998,20 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const currentPlayers = gameData.currentPlayers || [];
     const uniquePlayers = currentPlayers.length;
     const uniquePaidPlayers = currentPlayers.filter(row => Number(row.paidGames) > 0).length;
-    const previousUniquePlayers = Number(gameData.previousPlayers?.[0]?.count) || 0;
+    const previousPlayerIds = new Set((gameData.previousPlayers || []).map(row => String(row._id)));
+    const previousUniquePlayers = previousPlayerIds.size;
     const newUserIds = new Set(newUsers.map(user => String(user._id)));
     const newUsersWhoPlayed = currentPlayers.filter(row => newUserIds.has(String(row._id))).length;
     const newUsersWhoPaid = currentPlayers.filter(row => newUserIds.has(String(row._id)) && Number(row.paidGames) > 0).length;
     const newUserCount = Number(registrationSummary.current) || 0;
+    const growthWindow = { from: rangeStart, previousFrom: previousStart, to: now };
+    const [visitorData, depositGrowthData] = await Promise.all([
+        getVisitorAnalytics(SiteVisit, AnalyticsState, { ...growthWindow, excludedUserIds }),
+        Transaction.aggregate(depositGrowthPipeline(await reportedTxMatch({ type: 'deposit', status: 'confirmed', ...customerScope }), growthWindow)),
+    ]);
+    const depositGrowth = summarizeDepositGrowth(depositGrowthData[0]?.accounts || [], { ...growthWindow, newUserIds: [...newUserIds] });
+    const signupBrowserKeys = newUsers.map(user => user.analyticsVisitorKey).filter(Boolean);
+    const returningPlayers = currentPlayers.filter(row => previousPlayerIds.has(String(row._id))).length;
 
     const dailyMap = new Map();
     for (let index = 0; index < days; index += 1) {
@@ -6990,6 +7027,8 @@ async function getAdminOverviewAnalytics(requestedDays) {
             feesUsd: 0,
             depositsUsd: 0,
             ownerSweepUsd: 0,
+            visitors: visitorData.since ? 0 : null,
+            depositors: 0,
         });
     }
     for (const row of registrationData.daily || []) dailyMap.get(row._id).registrations = Number(row.registrations) || 0;
@@ -7004,6 +7043,10 @@ async function getAdminOverviewAnalytics(requestedDays) {
         feesUsd: Number((Number(row.feesUsd) || 0).toFixed(2)),
     });
     for (const row of depositData.daily || []) dailyMap.get(row._id).depositsUsd = Number(((Number(row.depositSol) || 0) * SOL_PRICE_USD).toFixed(2));
+    for (const row of visitorData.daily) if (dailyMap.has(row._id)) dailyMap.get(row._id).visitors = row.visitors;
+    for (const row of depositGrowthData[0]?.daily || []) if (dailyMap.has(row._id)) dailyMap.get(row._id).depositors = row.depositors;
+    // Missing historical traffic is unknown, not a fictional zero.
+    for (const day of dailyMap.values()) if (!visitorData.since || day.date < new Date(visitorData.since).toISOString().slice(0, 10)) day.visitors = null;
     for (const [date, usd] of ownerSweepDaily) {
         if (dailyMap.has(date)) dailyMap.get(date).ownerSweepUsd = Number(usd.toFixed(2));
     }
@@ -7018,7 +7061,24 @@ async function getAdminOverviewAnalytics(requestedDays) {
     const previousDepositsUsd = Number(((Number(depositSummary.previousSol) || 0) * SOL_PRICE_USD).toFixed(2));
 
     return {
-        schemaVersion: 3,
+        schemaVersion: 4,
+        growth: {
+            ...depositGrowth,
+            visitorTrackingSince: visitorData.since,
+            visitorPeriodComplete: visitorData.complete,
+            visitorPreviousComplete: visitorData.previousComplete,
+            visitors: visitorData.since ? visitorData.visitors : null,
+            previousVisitors: visitorData.since ? visitorData.previousVisitors : null,
+            devices: visitorData.devices,
+            signupBrowsers: newUserCount === 0 ? 0 : signupBrowserKeys.length ? new Set(signupBrowserKeys).size : null,
+            attributedSignups: signupBrowserKeys.length,
+            unattributedSignups: newUserCount - signupBrowserKeys.length,
+            returningPlayers,
+            returningPlayerPct: uniquePlayers > 0 ? Number((returningPlayers / uniquePlayers * 100).toFixed(1)) : 0,
+            signupDepositPct: newUserCount > 0 ? Number((depositGrowth.newUsersWhoDeposited / newUserCount * 100).toFixed(1)) : 0,
+            averageDepositUsd: depositGrowth.deposits > 0 ? Number((depositGrowth.depositSol * SOL_PRICE_USD / depositGrowth.deposits).toFixed(2)) : 0,
+            netDepositsUsd: Number((depositsUsd - (Number(accountWithdrawalSummary.currentUsd) || 0)).toFixed(2)),
+        },
         days,
         from: rangeStart,
         to: now,
@@ -11301,6 +11361,7 @@ app.post('/api/register', sensitiveRateLimit({ limit: 5, windowMs: 60 * 60_000 }
             balance: 0,
             depositAddress: keypair.publicKey.toBase58(),
             depositSecret: encryptWalletSecret(keypair.secretKey),
+            analyticsVisitorKey: visitorKey(req.headers['x-presence-id'], JWT_SECRET),
         });
         await newUser.save();
         await ensureAffiliateProfile(newUser);
@@ -11486,9 +11547,11 @@ function getSiteUsersOnline() {
     return Math.max(1, uniqueIps.size);
 }
 
-app.post('/api/presence/ping', (req, res) => {
+app.post('/api/presence/ping', sensitiveRateLimit({ limit: 180, windowMs: 60_000 }), (req, res) => {
     try {
         touchSitePresence(req);
+        void trackVisitor({ id: req.headers['x-presence-id'], userId: optionalAuthenticatedUserId(req),
+            userAgent: String(req.headers['user-agent'] || '') });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
