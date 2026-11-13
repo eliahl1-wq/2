@@ -72,6 +72,8 @@ import {
     getCompetitiveZone,
     addSlitherFood,
     createSegments,
+    growSnakeSegments,
+    segmentSpacingForSegmentCount,
     isSpawnClear,
     isCompetitiveSpawnClear,
     pickSlitherSpawn,
@@ -12010,8 +12012,8 @@ function countNormalAgarFood(room) {
 }
 
 function trimNormalAgarFood(room, targetCount) {
-    const golden = room.food.filter(f => f.golden);
-    const normal = room.food.filter(f => !f.golden);
+    const golden = room.food.filter(f => f.golden || f.adminSpawned);
+    const normal = room.food.filter(f => !f.golden && !f.adminSpawned);
     while (normal.length > targetCount) {
         const removed = normal.pop();
         room.foodPoolBalance += agarFoodDollarValue(removed);
@@ -14177,6 +14179,64 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('adminFreePlayAction', async (payload = {}) => {
+        try {
+            if (!payload || typeof payload !== 'object') return;
+            const { token, action } = payload;
+            if (action !== 'food' && action !== 'grow') return;
+            const decoded = await verifyAccountToken(token);
+            const user = await User.findById(decoded.id);
+            if (!user || !isAdminUserRecord(user)) return;
+            const room = getArenaRoomById(socket.roomId);
+            if (!room || (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox)
+                || room.isSurviv || room.isBattleRoyale) return;
+            const player = room.players.find(p => p.id === socket.id && !p.isBot);
+            if (!player || player.hp === 0 || player.cashoutSettling) return;
+            const now = Date.now();
+            if (now - (player._adminWorldActionAt || 0) < 500) return;
+            player._adminWorldActionAt = now;
+            const slither = player.mode === 'slither' || player.mode === 'competitive-slither';
+            if (!slither && player.mode !== 'agar') return;
+            if (action === 'food') {
+                const food = slither ? room.slitherFood : room.food;
+                // Fixed batch and budget: repeated clicks cannot exhaust the server.
+                const count = Math.min(250, Math.max(0, 5000 - food.length));
+                const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+                for (let i = 0; i < count; i++) {
+                    const limit = room.isCompetitiveSlither
+                        ? getCompetitiveEffectiveRadius(room.startTime + c.roomDuration) - 40
+                        : SLITHER.worldHalf - 40;
+                    const angle = Math.random() * Math.PI * 2;
+                    const radius = Math.sqrt(Math.random()) * Math.max(0, limit);
+                    food.push({
+                        id: `admin_food_${socket.id}_${now}_${i}`,
+                        x: slither ? Math.cos(angle) * radius : Math.random() * c.worldWidth,
+                        y: slither ? Math.sin(angle) * radius : Math.random() * c.worldHeight,
+                        radius: slither ? SLITHER.foodRadius : 5,
+                        hue: Math.floor(Math.random() * 360), balance: eco.massPerPellet,
+                        dollarValue: 0, adminSpawned: true,
+                    });
+                }
+            } else if (slither && player.segments?.length) {
+                const target = Math.min(SLITHER.maxSegments, player.segments.length + 100);
+                const added = target - player.segments.length;
+                growSnakeSegments(player.segments, target, segmentSpacingForSegmentCount(target));
+                player.fam = (player.fam || 0) + (100 - added);
+                player.balance += 5;
+                if (player.cells?.[0]) player.cells[0].balance = player.balance;
+            } else if (player.cells?.length) {
+                const total = playerTotalMass(player) * 1.5;
+                for (const cell of player.cells) {
+                    cell.balance *= 1.5;
+                    cell.radius = calculateCellRadius(cell.balance, total, player.cells.length, playerMassStart(player));
+                }
+            }
+            socket.emit('adminFreePlayActionOk', { action });
+        } catch (err) {
+            console.error('[Admin Free Play]', err.message);
+        }
+    });
+
     socket.on('adminClearBots', async ({ token }) => {
         try {
             const decoded = await verifyAccountToken(token);
@@ -15160,7 +15220,7 @@ function processRoom(room) {
                     - (Number(room.reservedCashoutUsd) || 0),
                 );
             const botMax = Math.min(getEconomy(room.entryFeeUsd).botMaxBalance, fundedRoomRemaining);
-            if (botWealth > botMax) {
+            if (botWealth > botMax && !player.adminSpawned) {
                 if (player.freeTicketRewardFunded) room.foodPoolBalance += botWealth;
                 else room.ownerBalance = (Number(room.ownerBalance) || 0) + botWealth;
                 room.bots = room.bots.filter(b => b.id !== player.id);
@@ -15172,7 +15232,7 @@ function processRoom(room) {
 
             // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
             const isFreePlay = room.isSandbox || room.isFreeTicketRoom || process.env.DEV_FREE_PLAY === 'true';
-            if (!isFreePlay) {
+            if (!isFreePlay && !player.adminSpawned) {
                 const head = botCells[0];
                 const cashoutThreat = allUsers.some(other => {
                     if (other.id === player.id || !Array.isArray(other.cells)) return false;

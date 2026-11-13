@@ -490,6 +490,7 @@ export function createAgarCommerceService({
     }
 
     async function hasSkinEntitlement(userId, gameMode, skinId) {
+        if (skinId === 'tide' || skinId === 'sorbet') return false;
         if (skinId === 'prism' || skinId === 'leviathan') return false;
         skinId = canonicalSignatureSkinId(skinId);
         if (skinId === 'flags') {

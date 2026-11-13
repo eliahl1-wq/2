@@ -1,6 +1,6 @@
 import { getAgarShopProduct, isHiddenShopSkin } from './agar-economy.js';
 
-const MODES = Object.freeze({ prism: 'agar', leviathan: 'slither', farmer: 'surviv' });
+const MODES = Object.freeze({ prism: 'agar', leviathan: 'slither', farmer: 'surviv', tide: 'slither', sorbet: 'slither' });
 const getMode = value => typeof value === 'string' && Object.hasOwn(MODES, value) ? MODES[value] : null;
 
 export const canonicalSignatureSkinId = value => value === 'warden' ? 'farmer' : value;
@@ -25,7 +25,7 @@ export async function resolveSignatureSkin({ mode, skinId, skinColor, hasAccess 
     // Saved selections from older clients fall back without deleting ownership.
     if (isHiddenShopSkin(id)) return '#c080ff';
     const gameMode = mode === 'competitive-slither' ? 'slither' : mode;
-    const product = getAgarShopProduct(`${getMode(id)}:${id}`);
+    const product = getAgarShopProduct(`${getMode(id)}:${id}`) || { gameMode: getMode(id), name: 'Private skin' };
     if (gameMode !== product.gameMode) throw new Error(`${product.name} is only available in ${product.gameMode}.`);
     if (!await hasAccess(product.gameMode, id)) throw new Error(`${product.name} must be unlocked in the shop first.`);
     return id;

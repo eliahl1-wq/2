@@ -1,4 +1,5 @@
 import * as util from './utils.js';
+import { slitherDropTint, tintHue } from './slither-drop-colors.js';
 import { emitGameSnapshot, isGameTransportReady, packSlitherSnake, usesCompactSlitherSnapshots } from './game-network.js';
 import {
     getEconomy,
@@ -115,8 +116,8 @@ function clearSlitherFood(room) {
 }
 
 export function trimSlitherFood(room, targetCount) {
-    const protectedFood = room.slitherFood.filter(f => f.golden || f.deathDrop);
-    let normal = room.slitherFood.filter(f => !f.golden && !f.deathDrop);
+    const protectedFood = room.slitherFood.filter(f => f.golden || f.deathDrop || f.adminSpawned);
+    let normal = room.slitherFood.filter(f => !f.golden && !f.deathDrop && !f.adminSpawned);
 
     // Remove farthest pellets first so visible/nearby food stays stable
     const heads = [];
@@ -152,9 +153,9 @@ export function trimSlitherFood(room, targetCount) {
 export function enforceSlitherFoodCap(room, maxTotal = MAX_SLITHER_FOOD_TOTAL) {
     if (!room.slitherFood?.length || room.slitherFood.length <= maxTotal) return;
 
-    const protectedCount = room.slitherFood.filter(f => f.golden || f.deathDrop).length;
+    const protectedCount = room.slitherFood.filter(f => f.golden || f.deathDrop || f.adminSpawned).length;
     const maxNormal = Math.max(0, maxTotal - protectedCount);
-    const normalCount = room.slitherFood.filter(f => !f.golden && !f.deathDrop).length;
+    const normalCount = room.slitherFood.filter(f => !f.golden && !f.deathDrop && !f.adminSpawned).length;
     if (normalCount > maxNormal) {
         trimSlitherFood(room, maxNormal);
     }
@@ -651,7 +652,7 @@ function ensurePathArcLength(path, segments, spacing, angle = 0) {
     }
 }
 
-function growSnakeSegments(segments, targetCount, spacing) {
+export function growSnakeSegments(segments, targetCount, spacing) {
     while (segments.length < targetCount) {
         const tail = segments[segments.length - 1];
         const prev = segments.length >= 2 ? segments[segments.length - 2] : tail;
@@ -885,7 +886,8 @@ function updateSnakeMovement(snake, room = null) {
                     y: tail.y + (Math.random() - 0.5) * jitter,
                     balance: dropMass,
                     dollarValue: dropDollar,
-                    hue: hueFromColor(snake.color),
+                    hue: tintHue(slitherDropTint(snake.color, 1, snake.segments.length - 1)),
+                    tint: slitherDropTint(snake.color, 1, snake.segments.length - 1),
                     radius: SLITHER.foodRadius * (1 + Math.random() * 0.4),
                     // boost pellets render exactly like normal food, just colored
                 });
@@ -1991,6 +1993,7 @@ function serializeVisibleSlitherFood(f, radius = SLITHER.foodRadius) {
         x: f.x,
         y: f.y,
         hue: f.hue,
+        tint: f.tint,
         radius: f.radius || radius,
         golden: !!f.golden,
         deathDrop: !!f.deathDrop,
@@ -2097,12 +2100,6 @@ function dropSnakeAsFood(room, snake) {
     const massEach = mass / pelletCount;
     const dollarEach = dollars / pelletCount;
 
-    const hueMap = [20, 45, 110, 150, 200, 240, 280, 320, 350];
-    const defaultColors = ['#c080ff', '#9099ff', '#80d0d0', '#80ff80', '#eeee70', '#ffa060', '#ff9050', '#ff4040', '#e030e0'];
-    let cIdx = defaultColors.indexOf(snake.color);
-    if (cIdx === -1 && typeof snake.color === 'number') cIdx = snake.color % hueMap.length;
-    const snakeHue = cIdx >= 0 ? hueMap[cIdx] : 0;
-
     for (let i = 0; i < pelletCount; i++) {
         const seg = segs[i];
         const jitter = 4; // Very small jitter to retain snake shape
@@ -2112,7 +2109,8 @@ function dropSnakeAsFood(room, snake) {
             y: seg.y + (Math.random() - 0.5) * jitter,
             balance: massEach,
             dollarValue: dollarEach,
-            hue: snakeHue,
+            hue: tintHue(slitherDropTint(snake.color, i / Math.max(1, pelletCount - 1), i)),
+            tint: slitherDropTint(snake.color, i / Math.max(1, pelletCount - 1), i),
             radius: SLITHER.foodRadius + 0.5,
             deathDrop: true,
         });
@@ -2418,14 +2416,14 @@ export function processSlitherRoom(room, io, User, Transaction = null) {
             if (!isBR && !room.isSandbox) {
                 const botMax = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE).botMaxBalance;
                 const botWealth = snake.dollarBalance ?? snake.balance;
-                if (botWealth > botMax) {
+                if (botWealth > botMax && !snake.adminSpawned) {
                     toRemove.push({ snake, isHuman, killer: null, returnToPool: false, botRemovedForProfit: true });
                     continue;
                 }
 
                 // BOT CASHOUT LOGIC (Only in real rooms, not sandbox/freeplay)
                 const isFreePlay = room.isSandbox || room.isFreeTicketRoom || process.env.DEV_FREE_PLAY === 'true';
-                if (!isFreePlay) {
+                if (!isFreePlay && !snake.adminSpawned) {
                     const head = snake.segments?.[0];
                     const cashoutThreat = !!head && allSnakes.some(({ entity: other }) => {
                         if (other.id === snake.id || !other.segments?.[0]) return false;
@@ -3039,9 +3037,8 @@ function dropCompetitiveSnakeAsFood(room, snake) {
             y: seg.y + (Math.random() - 0.5) * jitter,
             balance: massEach,
             dollarValue: dollarEach,
-            // Render with the normal dead-snake food shape and clustering,
-            // while hue 48 keeps the arena payout unmistakably golden.
-            hue: 48,
+            hue: tintHue(slitherDropTint(snake.color, (i % segs.length) / Math.max(1, segs.length - 1), i)),
+            tint: slitherDropTint(snake.color, (i % segs.length) / Math.max(1, segs.length - 1), i),
             deathDrop: true,
             competitiveDeathDrop: true,
             radius: COMPETITIVE_SLITHER.deathFoodRadius,

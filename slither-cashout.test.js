@@ -120,6 +120,23 @@ test('normal Slither bot starts the same three-second hold and clears it before 
     assert.notEqual(snake.angle, 0, 'AI can steer only after canceling the hold');
 });
 
+test('only manually admin-spawned Slither bots skip automatic cashout', (t) => {
+    t.mock.method(Date, 'now', () => 100000);
+    const previous = process.env.DEV_FREE_PLAY;
+    process.env.DEV_FREE_PLAY = 'false';
+    t.after(() => {
+        if (previous === undefined) delete process.env.DEV_FREE_PLAY;
+        else process.env.DEV_FREE_PLAY = previous;
+    });
+    for (const adminSpawned of [false, true]) {
+        const snake = makeSnake('slither', true, { adminSpawned, cashOutThreshold: 3 });
+        const room = { ...makeRoom(snake), isSandbox: false };
+        tick(room, 'slither');
+        assert.equal(!!snake.isCashingOut, !adminSpawned);
+        assert.equal(!!snake.cashoutHoldActive, !adminSpawned);
+    }
+});
+
 test('Slither cashout does not grant immunity from the arena boundary', () => {
     const snake = makeSnake('competitive-slither', true, {
         cashoutHoldActive: true, dollarBalance: 0,
