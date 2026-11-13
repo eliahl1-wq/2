@@ -569,6 +569,33 @@ function famVolumeForSegment(sct) {
     return 0.09 + spawnSc * 0.022 + SLITHER.spawnSegments * 0.0016;
 }
 
+/** Free-play admin grant, expressed in the same fullness units as pickups. */
+export function grantAdminSlitherGrowth(snake, room, segments = 100) {
+    const count = Math.max(0, Math.min(100, Math.floor(segments)));
+    const fullness = count * famVolumeForSegment(snake.segments.length);
+    let massGain;
+    let dollarGain;
+    if (snake.mode === 'competitive-slither') {
+        // Arena's ordinary food has no dollars. For this explicit practice
+        // grant, pair growth with the starting stake/mass ratio.
+        const eco = getCompetitiveEconomy(room.entryFeeUsd);
+        massGain = fullness;
+        dollarGain = massGain * eco.dollarStart / eco.playerStartBalance;
+        snake.balance += massGain;
+        snake.dollarBalance = (snake.dollarBalance || 0) + dollarGain;
+        snake.fam = (snake.fam || 0) + fullness / famVolumeForSegment(snake.segments.length);
+        applyFamGrowth(snake, count);
+    } else {
+        const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
+        dollarGain = fullness;
+        massGain = dollarGain * eco.massPerPellet / eco.foodBlobValue;
+        applySlitherFoodPickup(snake, { balance: massGain, dollarValue: dollarGain }, room);
+        applyFamGrowth(snake, Math.max(0, count - 1));
+    }
+    if (snake.cells?.[0]) snake.cells[0].balance = snake.balance;
+    return { massGain, dollarGain };
+}
+
 function applyFamGrowth(snake, maxAdd = 1) {
     if (snake.fam == null) snake.fam = 0;
     let added = 0;

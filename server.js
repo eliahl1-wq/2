@@ -72,8 +72,7 @@ import {
     getCompetitiveZone,
     addSlitherFood,
     createSegments,
-    growSnakeSegments,
-    segmentSpacingForSegmentCount,
+    grantAdminSlitherGrowth,
     isSpawnClear,
     isCompetitiveSpawnClear,
     pickSlitherSpawn,
@@ -14268,12 +14267,7 @@ io.on('connection', (socket) => {
                     });
                 }
             } else if (slither && player.segments?.length) {
-                const target = Math.min(SLITHER.maxSegments, player.segments.length + 100);
-                const added = target - player.segments.length;
-                growSnakeSegments(player.segments, target, segmentSpacingForSegmentCount(target));
-                player.fam = (player.fam || 0) + (100 - added);
-                player.balance += 5;
-                if (player.cells?.[0]) player.cells[0].balance = player.balance;
+                grantAdminSlitherGrowth(player, room);
             } else if (player.cells?.length) {
                 const total = playerTotalMass(player) * 1.5;
                 for (const cell of player.cells) {
