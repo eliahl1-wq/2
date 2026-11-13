@@ -1211,6 +1211,7 @@ function isNewGameJoinLocked() {
 
 const deployRailwayCommit = createRailwayDeployer({
     fetchImpl: fetch,
+    verifyStatus: true,
     token: process.env.RAILWAY_API_TOKEN,
     projectToken: process.env.RESET_DEPLOY_PROJECT_TOKEN || process.env.RAILWAY_PROJECT_TOKEN,
     serviceId: process.env.RAILWAY_SERVICE_ID,

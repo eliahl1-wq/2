@@ -36,6 +36,7 @@ export function createRailwayDeployer({
     environmentId,
     endpoint = 'https://backboard.railway.com/graphql/v2',
     requestTimeoutMs = 20_000,
+    verifyStatus = false,
 }) {
     return async function deployCommit(commitSha) {
         const normalizedSha = normalizeCommitSha(commitSha);
@@ -79,6 +80,48 @@ export function createRailwayDeployer({
         }
         const deploymentId = payload.data?.serviceInstanceDeployV2;
         if (!deploymentId) throw new Error('Railway did not return a deployment id');
-        return { deploymentId, commitSha: normalizedSha };
+        if (!verifyStatus) return { deploymentId, commitSha: normalizedSha };
+        const request = async (query, variables) => {
+            const response = await fetchImpl(endpoint, {
+                method: 'POST', headers: projectToken
+                    ? { 'Project-Access-Token': projectToken, 'Content-Type': 'application/json' }
+                    : { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+                signal: AbortSignal.timeout(requestTimeoutMs),
+                body: JSON.stringify({ query, variables }),
+            });
+            const body = await response.json();
+            if (!response.ok || body.errors?.length) throw new Error(body.errors?.map(e => e.message).join('; ') || `Railway HTTP ${response.status}`);
+            return body.data;
+        };
+        const startedId = await ensureRailwayDeploymentStarted(request, deploymentId);
+        return { deploymentId: startedId, commitSha: normalizedSha };
     };
+}
+
+// Watch paths suppress GitHub pushes, and may also skip an explicit commit
+// build. At the already-drained reset boundary, force that SAME deployment's
+// commit to build. Never redeploy whichever older commit happened to be live.
+export async function ensureRailwayDeploymentStarted(request, deploymentId, {
+    delay = ms => new Promise(resolve => setTimeout(resolve, ms)),
+    now = Date.now, timeoutMs = 180_000,
+} = {}) {
+    const deadline = now() + timeoutMs;
+    let id = deploymentId;
+    let forced = false;
+    while (now() < deadline) {
+        const data = await request('query ResetDeploymentStatus($id: String!) { deployment(id: $id) { id status } }', { id });
+        const status = data?.deployment?.status;
+        if (status === 'DEPLOYING' || status === 'SUCCESS') return id;
+        if (status === 'SKIPPED') {
+            if (forced) throw new Error('Railway skipped the forced reset deployment');
+            const result = await request('mutation ForceResetDeployment($id: String!) { deploymentRedeploy(id: $id, usePreviousImageTag: false) { id } }', { id });
+            id = result?.deploymentRedeploy?.id;
+            if (!id) throw new Error('Railway did not return a forced deployment id');
+            forced = true;
+        } else if (['FAILED', 'CRASHED', 'REMOVED'].includes(status)) {
+            throw new Error(`Railway reset deployment ${id} ${status.toLowerCase()}`);
+        }
+        await delay(2000);
+    }
+    throw new Error(`Railway reset deployment ${id} did not start before the deadline`);
 }

@@ -2,12 +2,29 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     createRailwayDeployer,
+    ensureRailwayDeploymentStarted,
     currentReleaseSha,
     normalizeCommitSha,
     secretsMatch,
 } from './release-coordinator.js';
 
 const SHA = 'a'.repeat(40);
+
+test('reset forces the newly queued skipped commit rather than redeploying the old live build', async () => {
+    const ids = [];
+    let calls = 0;
+    const id = await ensureRailwayDeploymentStarted(async (query, variables) => {
+        ids.push(variables.id);
+        if (query.includes('deploymentRedeploy')) return { deploymentRedeploy: { id: 'forced-new-commit' } };
+        return { deployment: { status: calls++ === 0 ? 'SKIPPED' : 'DEPLOYING' } };
+    }, 'queued-new-commit', { delay: async () => {} });
+    assert.equal(id, 'forced-new-commit');
+    assert.deepEqual(ids, ['queued-new-commit', 'queued-new-commit', 'forced-new-commit']);
+});
+
+test('reset reports a failed Railway build instead of claiming deployment started', async () => {
+    await assert.rejects(() => ensureRailwayDeploymentStarted(async () => ({ deployment: { status: 'FAILED' } }), 'new-commit'), /failed/);
+});
 
 test('normalizes only full Git commit SHAs', () => {
     assert.equal(normalizeCommitSha(` ${SHA.toUpperCase()} `), SHA);
