@@ -15,7 +15,8 @@ required new SHA. Redeploying the last successful deployment reuses OLD source
 and may reuse its configuration snapshot. It does not update to main HEAD.
 Always verify `/ready.version`, not just Railway's SUCCESS status.
 
-`RAILWAY_PROJECT_TOKEN` (sealed) or `RAILWAY_API_TOKEN`, `RAILWAY_SERVICE_ID`,
+`RESET_DEPLOY_PROJECT_TOKEN` (a service reference to the existing sealed
+`RAILWAY_PROJECT_TOKEN`) or `RAILWAY_API_TOKEN`, `RAILWAY_SERVICE_ID`,
 and `RAILWAY_ENVIRONMENT_ID` must be present in the running process. Startup
 logs report presence only. Never overwrite a sealed token based on redacted
 variable-list output.
