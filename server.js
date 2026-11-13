@@ -1216,6 +1216,13 @@ const deployRailwayCommit = createRailwayDeployer({
     serviceId: process.env.RAILWAY_SERVICE_ID,
     environmentId: process.env.RAILWAY_ENVIRONMENT_ID,
 });
+// Log presence only; deployment credentials must never appear in logs.
+console.info('[Release] Runtime deployment configuration:', JSON.stringify({
+    hasApiToken: !!String(process.env.RAILWAY_API_TOKEN || '').trim(),
+    hasProjectToken: !!String(process.env.RAILWAY_PROJECT_TOKEN || '').trim(),
+    hasServiceId: !!String(process.env.RAILWAY_SERVICE_ID || '').trim(),
+    hasEnvironmentId: !!String(process.env.RAILWAY_ENVIRONMENT_ID || '').trim(),
+}));
 
 async function loadReleaseStateOnStartup() {
     const release = await ScheduledRelease.findOne({ key: 'production' }).lean();
