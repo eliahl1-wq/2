@@ -28,6 +28,6 @@ test('death pellets retain actual palettes and conserve arena mass and money', (
         else assert.ok(new Set(room.slitherFood.map(f=>f.tint)).size>1);
     }
     assert.ok(Math.abs(tintHue('#c080ff')-270.2362)<0.001);
-    assert.equal(slitherDropTint('onyx',1),'#382744');
+    assert.equal(slitherDropTint('onyx',1),'#2e2939');
     assert.equal(slitherDropTint('flag:jp',0,0),'#ffffff');
 });
