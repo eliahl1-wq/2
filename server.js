@@ -1,4 +1,5 @@
 import express from 'express';
+import { queueAdminFood } from './admin-food-pool.js';
 import { resolveSignatureSkin, applyValidatedSlitherSkin } from './signature-skins.js';
 import { applySurvivInputPayload } from './surviv-input.js';
 import { applyAgarResetZone, getArenaResetZone } from './arena-reset-zone.js';
@@ -3025,6 +3026,7 @@ async function cashOutRoomPlayers(room) {
 }
 
 function resetRoomEntities(room) {
+    room.adminFoodExtraTargets = {};
     // Every player must have settled before reset. Clearing here is a final
     // fail-safe so a stale entity can never survive after funding is zeroed.
     room.players = [];
@@ -3310,6 +3312,7 @@ async function performGlobalArenaReset() {
         for (const room of competitiveSlitherRooms) {
             room.players = [];
             room.slitherFood = [];
+            room.adminFoodExtraTargets = {};
             room.competitiveSpectators = [];
             room.sessionPlayerCashoutUsd = 0;
         }
@@ -13999,7 +14002,8 @@ io.on('connection', (socket) => {
                 } else {
                     const agarInArena = countHumansInMode(room, 'agar');
                     const pelletValue = foodBlobValueForRoom(room);
-                    const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), budgets.agar);
+                    const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room)
+                        + (room.adminFoodExtraTargets?.agar || 0) * pelletValue, budgets.agar);
                     const agarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
                     const normalCount = countNormalAgarFood(room);
                     if (normalCount < agarTargetFoodCount) {
@@ -14238,34 +14242,8 @@ io.on('connection', (socket) => {
             const slither = player.mode === 'slither' || player.mode === 'competitive-slither';
             if (!slither && (player.mode || 'agar') !== 'agar') return reply({ ok: false, message: 'Unsupported game mode.' });
             if (action === 'food') {
-                const food = slither ? room.slitherFood : room.food;
-                // Fixed batch and budget: repeated clicks cannot exhaust the server.
-                const count = Math.min(250, Math.max(0, 5000 - food.length));
-                if (!count) return reply({ ok: false, message: 'Food limit reached (5000).' });
-                const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
-                for (let i = 0; i < count; i++) {
-                    const limit = room.isCompetitiveSlither
-                        ? getCompetitiveEffectiveRadius(room.startTime + c.roomDuration) - 40
-                        : SLITHER.worldHalf - 40;
-                    const angle = Math.random() * Math.PI * 2;
-                    const radius = 80 + Math.sqrt(Math.random()) * 420;
-                    let x = (slither ? player.x : player.cells?.[0]?.x) + Math.cos(angle) * radius;
-                    let y = (slither ? player.y : player.cells?.[0]?.y) + Math.sin(angle) * radius;
-                    if (slither) {
-                        const d = Math.hypot(x, y);
-                        if (d > limit && d > 0) { x *= Math.max(0, limit) / d; y *= Math.max(0, limit) / d; }
-                    } else {
-                        x = Math.max(10, Math.min(c.worldWidth - 10, x));
-                        y = Math.max(10, Math.min(c.worldHeight - 10, y));
-                    }
-                    food.push({
-                        id: `admin_food_${socket.id}_${now}_${i}`,
-                        x, y,
-                        radius: slither ? SLITHER.foodRadius : 5,
-                        hue: Math.floor(Math.random() * 360), balance: eco.massPerPellet,
-                        dollarValue: 0, adminSpawned: true,
-                    });
-                }
+                const queued = queueAdminFood(room, player.mode || 'agar');
+                if (!queued) return reply({ ok: false, message: 'Food queue limit reached.' });
             } else if (slither && player.segments?.length) {
                 grantAdminSlitherGrowth(player, room);
             } else if (player.cells?.length) {
@@ -14276,7 +14254,7 @@ io.on('connection', (socket) => {
                 }
             }
             socket.emit('adminFreePlayActionOk', { action });
-            reply({ ok: true, message: action === 'food' ? 'Food spawned nearby.' : 'Size increased.' });
+            reply({ ok: true, message: action === 'food' ? 'Food pool topped up. Normal food spawns queued; map limits apply.' : 'Size increased.' });
         } catch (err) {
             console.error('[Admin Free Play]', err.message);
             reply({ ok: false, message: 'Admin action failed. Rejoin the match or sign in again.' });
@@ -15201,7 +15179,8 @@ function processRoom(room) {
         const foodBudgets = getModeFoodBudgets(room, agarHumans, slitherHumans);
 
         const pelletValue = foodBlobValueForRoom(room);
-        const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room), foodBudgets.agar);
+        const agarFoodTarget = Math.min(agarInArena * foodDensityForRoom(room)
+            + (room.adminFoodExtraTargets?.agar || 0) * pelletValue, foodBudgets.agar);
         const rawAgarTargetFoodCount = Math.floor(agarFoodTarget / pelletValue);
         const protectedAgarFoodCount = room.food.filter(food => food.golden).length;
         const agarTargetFoodCount = cappedAmbientFoodTarget(

@@ -2335,7 +2335,9 @@ export function syncSlitherFood(room, foodBlobValue, budget, humansInArena, dens
         if (f.golden) goldenValueOnMap += slitherFoodDollarValue(f);
         else if (!f.deathDrop) normalCount++;
     }
-    const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale, budget) - goldenValueOnMap);
+    const extraTarget = Math.max(0, room.adminFoodExtraTargets?.slither || 0);
+    const foodValueTarget = Math.max(0, Math.min(humansInArena * densityPerHuman * densityScale
+        + extraTarget * foodBlobValue, budget) - goldenValueOnMap);
     const rawTargetFoodCount = Math.floor(foodValueTarget / foodBlobValue);
     const maxFoodTotal = room.isTournament ? TOURNAMENT_SLITHER_FOOD_TOTAL : MAX_SLITHER_FOOD_TOTAL;
     const protectedFoodCount = room.slitherFood.length - normalCount;
@@ -3157,7 +3159,8 @@ export function syncCompetitiveSlitherFood(room, playerCount) {
     room._lastCompetitiveFoodSync = now;
 
     const densityScale = competitiveFoodDensityScale();
-    const target = Math.max(80, Math.floor(playerCount * COMPETITIVE_SLITHER.foodDensityPerHuman * densityScale * 2));
+    const target = Math.min(5000, Math.max(80, Math.floor(playerCount * COMPETITIVE_SLITHER.foodDensityPerHuman * densityScale * 2))
+        + Math.max(0, room.adminFoodExtraTargets?.['competitive-slither'] || 0));
     const normalCount = room.slitherFood.filter(f => !f.competitiveDeathDrop).length;
 
     if (normalCount < target * 0.94) {
