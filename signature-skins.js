@@ -1,9 +1,15 @@
 import { getAgarShopProduct, isHiddenShopSkin } from './agar-economy.js';
 
-const MODES = Object.freeze({ prism: 'agar', leviathan: 'slither', farmer: 'surviv', tide: 'slither', sorbet: 'slither' });
+const MODES = Object.freeze({ prism: 'agar', leviathan: 'slither', farmer: 'surviv', onyx: 'slither', sorbet: 'slither' });
 const getMode = value => typeof value === 'string' && Object.hasOwn(MODES, value) ? MODES[value] : null;
 
-export const canonicalSignatureSkinId = value => value === 'warden' ? 'farmer' : value;
+export const canonicalSignatureSkinId = value => value === 'warden' ? 'farmer' : value === 'tide' ? 'onyx' : value;
+
+// Only pass a color which has already gone through join ownership validation.
+export function applyValidatedSlitherSkin(player, mode, color) {
+    if (!player || !['slither', 'competitive-slither'].includes(mode) || !color) return;
+    player.color = color;
+}
 
 // Preserve purchased ownership without rewriting historical orders or requiring a DB migration.
 export function presentSkinEntitlement(entry) {

@@ -1,5 +1,5 @@
 import express from 'express';
-import { resolveSignatureSkin } from './signature-skins.js';
+import { resolveSignatureSkin, applyValidatedSlitherSkin } from './signature-skins.js';
 import { applySurvivInputPayload } from './surviv-input.js';
 import { applyAgarResetZone, getArenaResetZone } from './arena-reset-zone.js';
 import { directionalWarnings } from './directional-warnings.js';
@@ -12737,6 +12737,7 @@ io.on('connection', (socket) => {
                 }
                 socket.roomId = room.id;
                 const participant = tournament.participants.find(p => p.userId.toString() === user._id.toString());
+                applyValidatedSlitherSkin(existingPlayer, tournamentMode, tournamentSkinColor);
                 socket.emit('welcome', existingPlayer, {
                     width: tournamentMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
                     height: tournamentMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
@@ -13093,6 +13094,7 @@ io.on('connection', (socket) => {
                     if (existingPlayer.isCashingOut && existingPlayer.cashOutEndTime) {
                         remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
                     }
+                    applyValidatedSlitherSkin(existingPlayer, 'competitive-slither', validatedSkinColor);
                     socket.emit('welcome', existingPlayer, {
                         width: COMPETITIVE_SLITHER.worldHalf * 2,
                         height: COMPETITIVE_SLITHER.worldHalf * 2,
@@ -13201,6 +13203,7 @@ io.on('connection', (socket) => {
                     }
                     raced.id = socket.id;
                     raced.disconnected = false;
+                    applyValidatedSlitherSkin(raced, 'competitive-slither', validatedSkinColor);
                     socket.emit('welcome', raced, {
                         width: COMPETITIVE_SLITHER.worldHalf * 2,
                         height: COMPETITIVE_SLITHER.worldHalf * 2,
@@ -13548,6 +13551,7 @@ io.on('connection', (socket) => {
                     remaining = Math.max(0, Math.ceil((existingPlayer.cashOutEndTime - Date.now()) / 1000));
                 }
                 const rejoinMode = existingPlayer.mode || 'agar';
+                applyValidatedSlitherSkin(existingPlayer, rejoinMode, validatedSkinColor);
                 socket.emit('welcome', existingPlayer, {
                     width: rejoinMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
                     height: rejoinMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
@@ -13931,6 +13935,7 @@ io.on('connection', (socket) => {
                     delete raced.removeTimeout;
                 }
                 const racedMode = raced.mode || 'agar';
+                applyValidatedSlitherSkin(raced, racedMode, validatedSkinColor);
                 socket.emit('welcome', raced, {
                     width: racedMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldWidth,
                     height: racedMode === 'slither' ? SLITHER.worldHalf * 2 : c.worldHeight,
@@ -14030,29 +14035,30 @@ io.on('connection', (socket) => {
     }
     socket.on('joinGame', handleJoinGame);
 
-    socket.on('adminSpawnBotNearMe', async ({ token, mode }) => {
+    socket.on('adminSpawnBotNearMe', async ({ token, mode }, ack) => {
+        const reply = (result) => { if (typeof ack === 'function') ack(result); };
         console.log(`[Admin Spawn] Received request. Mode parameter: ${mode}, Socket ID: ${socket.id}, Room ID: ${socket.roomId}`);
         try {
             const decoded = await verifyAccountToken(token);
             const user = await User.findById(decoded.id);
             if (!user) {
                 console.log(`[Admin Spawn] Rejected: User not found for ID ${decoded.id}`);
-                return;
+                return reply({ ok: false, message: 'Account not found. Sign in again.' });
             }
             const isAdmin = isAdminUserRecord(user);
             if (!isAdmin) {
                 console.log(`[Admin Spawn] Rejected: User ${user.username} is not an admin`);
-                return;
+                return reply({ ok: false, message: 'Admin access required.' });
             }
 
             const room = getArenaRoomById(socket.roomId);
             if (!room) {
                 console.log(`[Admin Spawn] Rejected: Room ${socket.roomId} not found`);
-                return;
+                return reply({ ok: false, message: 'Join a match first.' });
             }
             if (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox) {
                 console.log(`[Admin Spawn] Rejected: free play is disabled for this room`);
-                return;
+                return reply({ ok: false, message: 'Bot controls require Free Play.' });
             }
 
             const p = room.players.find(pl => pl.id === socket.id);
@@ -14174,44 +14180,56 @@ io.on('connection', (socket) => {
                     }],
                 });
             }
+            reply({ ok: true, message: 'Bot spawned nearby.' });
         } catch (err) {
             console.error('[Admin Spawn] Error:', err);
+            reply({ ok: false, message: 'Bot spawn failed. Sign in again and rejoin.' });
         }
     });
 
-    socket.on('adminFreePlayAction', async (payload = {}) => {
+    socket.on('adminFreePlayAction', async (payload = {}, ack) => {
+        const reply = (result) => { if (typeof ack === 'function') ack(result); };
         try {
             if (!payload || typeof payload !== 'object') return;
             const { token, action } = payload;
             if (action !== 'food' && action !== 'grow') return;
             const decoded = await verifyAccountToken(token);
             const user = await User.findById(decoded.id);
-            if (!user || !isAdminUserRecord(user)) return;
+            if (!user || !isAdminUserRecord(user)) return reply({ ok: false, message: 'Admin access required.' });
             const room = getArenaRoomById(socket.roomId);
             if (!room || (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox)
-                || room.isSurviv || room.isBattleRoyale) return;
+                || room.isSurviv || room.isBattleRoyale) return reply({ ok: false, message: 'Join an Agar or Slither Free Play match first.' });
             const player = room.players.find(p => p.id === socket.id && !p.isBot);
-            if (!player || player.hp === 0 || player.cashoutSettling) return;
+            if (!player || player.hp === 0 || player.cashoutSettling) return reply({ ok: false, message: 'You must be alive in the match.' });
             const now = Date.now();
-            if (now - (player._adminWorldActionAt || 0) < 500) return;
+            if (now - (player._adminWorldActionAt || 0) < 500) return reply({ ok: false, message: 'Wait a moment before trying again.' });
             player._adminWorldActionAt = now;
             const slither = player.mode === 'slither' || player.mode === 'competitive-slither';
-            if (!slither && player.mode !== 'agar') return;
+            if (!slither && (player.mode || 'agar') !== 'agar') return reply({ ok: false, message: 'Unsupported game mode.' });
             if (action === 'food') {
                 const food = slither ? room.slitherFood : room.food;
                 // Fixed batch and budget: repeated clicks cannot exhaust the server.
                 const count = Math.min(250, Math.max(0, 5000 - food.length));
+                if (!count) return reply({ ok: false, message: 'Food limit reached (5000).' });
                 const eco = getEconomy(room.entryFeeUsd ?? DEFAULT_ENTRY_FEE);
                 for (let i = 0; i < count; i++) {
                     const limit = room.isCompetitiveSlither
                         ? getCompetitiveEffectiveRadius(room.startTime + c.roomDuration) - 40
                         : SLITHER.worldHalf - 40;
                     const angle = Math.random() * Math.PI * 2;
-                    const radius = Math.sqrt(Math.random()) * Math.max(0, limit);
+                    const radius = 80 + Math.sqrt(Math.random()) * 420;
+                    let x = (slither ? player.x : player.cells?.[0]?.x) + Math.cos(angle) * radius;
+                    let y = (slither ? player.y : player.cells?.[0]?.y) + Math.sin(angle) * radius;
+                    if (slither) {
+                        const d = Math.hypot(x, y);
+                        if (d > limit && d > 0) { x *= Math.max(0, limit) / d; y *= Math.max(0, limit) / d; }
+                    } else {
+                        x = Math.max(10, Math.min(c.worldWidth - 10, x));
+                        y = Math.max(10, Math.min(c.worldHeight - 10, y));
+                    }
                     food.push({
                         id: `admin_food_${socket.id}_${now}_${i}`,
-                        x: slither ? Math.cos(angle) * radius : Math.random() * c.worldWidth,
-                        y: slither ? Math.sin(angle) * radius : Math.random() * c.worldHeight,
+                        x, y,
                         radius: slither ? SLITHER.foodRadius : 5,
                         hue: Math.floor(Math.random() * 360), balance: eco.massPerPellet,
                         dollarValue: 0, adminSpawned: true,
@@ -14232,22 +14250,25 @@ io.on('connection', (socket) => {
                 }
             }
             socket.emit('adminFreePlayActionOk', { action });
+            reply({ ok: true, message: action === 'food' ? 'Food spawned nearby.' : 'Size increased.' });
         } catch (err) {
             console.error('[Admin Free Play]', err.message);
+            reply({ ok: false, message: 'Admin action failed. Rejoin the match or sign in again.' });
         }
     });
 
-    socket.on('adminClearBots', async ({ token }) => {
+    socket.on('adminClearBots', async ({ token }, ack) => {
+        const reply = (result) => { if (typeof ack === 'function') ack(result); };
         try {
             const decoded = await verifyAccountToken(token);
             const user = await User.findById(decoded.id);
-            if (!user) return;
+            if (!user) return reply({ ok: false, message: 'Account not found.' });
             const isAdmin = isAdminUserRecord(user);
-            if (!isAdmin) return;
+            if (!isAdmin) return reply({ ok: false, message: 'Admin access required.' });
 
             const room = getArenaRoomById(socket.roomId);
-            if (!room) return;
-            if (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox) return;
+            if (!room) return reply({ ok: false, message: 'Join a match first.' });
+            if (!DEV_FREE_PLAY && !room.isPersonalFreePlay && !room.isSandbox) return reply({ ok: false, message: 'Bot controls require Free Play.' });
 
             if (room.isCompetitiveSlither) {
 
@@ -14258,8 +14279,10 @@ io.on('connection', (socket) => {
             }
             console.log(`[Admin Clear] All bots removed from room ${room.id} by ${user.username}`);
             socket.emit('adminClearBotsOk');
+            reply({ ok: true, message: 'Bots cleared.' });
         } catch (err) {
             console.error('[Admin Clear] Error:', err);
+            reply({ ok: false, message: 'Could not clear bots. Sign in again and rejoin.' });
         }
     });
 

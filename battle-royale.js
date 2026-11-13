@@ -10,7 +10,7 @@ import { decryptWalletSecret } from './wallet-crypto.js';
 import { prepareSurvivBRMap, clonePreparedSurvivBRMap } from './surviv-br-map-cache.js';
 import { SURVIV_BR, initializeSurvivBRRoom, createSurvivBRPlayer, createSurvivBRZonePlan, getSurvivBRZone, survivBRMeta } from './surviv-battle-royale.js';
 import { processSurvivRoom, broadcastSurvivState } from './surviv-engine.js';
-import { resolveSignatureSkin } from './signature-skins.js';
+import { resolveSignatureSkin, applyValidatedSlitherSkin } from './signature-skins.js';
 import * as solanaWeb3 from '@solana/web3.js';
 import {
     SLITHER,
@@ -1555,7 +1555,7 @@ export function setupBattleRoyale(io, deps) {
             emitQueueStatus(io, found.variant, found.entryFeeUsd, deps, !!found.entry.personalFreePlay);
         });
 
-        socket.on('brRejoinMatch', async ({ token }) => {
+        socket.on('brRejoinMatch', async ({ token, skinId, skinColor }) => {
             try {
                 const decoded = await verifyToken(token);
                 const found = findBRPlayerByMongo(decoded.id);
@@ -1564,6 +1564,12 @@ export function setupBattleRoyale(io, deps) {
                     return;
                 }
                 const { room, player } = found;
+                if (room.variant === 'slither' && (skinId || skinColor)) {
+                    const user = await deps.User.findById(decoded.id);
+                    if (!user) throw new Error('Account unavailable.');
+                    const validatedSkin = await resolveSignatureSkin({ mode: 'slither', skinId, skinColor, hasAccess: (mode, id) => deps.hasSkinEntitlement?.(user, mode, id) });
+                    applyValidatedSlitherSkin(player, 'slither', validatedSkin);
+                }
                 const previousId = player.id;
                 socketToMatch.delete(previousId);
                 if (previousId !== socket.id) {

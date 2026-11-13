@@ -1,5 +1,5 @@
 const palettes = {
-    tide: ['#526db8','#6e9fd2','#78d5d0','#a0e2bc'],
+    onyx: ['#121118','#34263f','#15121e','#382744'],
     sorbet: ['#ae82ba','#db9db9','#f0b09a','#f2d18e'],
     aurora: ['#31206f','#236bb5','#26d8d0','#91ffd2','#a372ff'],
     eclipse: ['#07080d','#ff8738','#ffe295','#ff7a32','#a91f35'],
@@ -12,11 +12,12 @@ const flags = {
     br:['#009c3b','#ffdf00','#002776'],ca:['#d80621','#ffffff'],jp:['#ffffff','#bc002d'],no:['#ba0c2f','#ffffff','#00205b'],fi:['#ffffff','#003580'],dk:['#c8102e','#ffffff'],nl:['#ae1c28','#ffffff','#21468b'],pl:['#ffffff','#dc143c'],ua:['#0057b7','#ffd700'],
 };
 export function slitherDropTint(value, progress = 0, index = 0) {
-    const raw = typeof value === 'object' && value ? value.fill : value;
+    const selected = typeof value === 'object' && value ? value.fill : value;
+    const raw = selected === 'tide' ? 'onyx' : selected;
     if (typeof raw === 'string' && /^#[0-9a-f]{6}$/i.test(raw)) return raw;
     const palette = flags[String(raw).replace('flag:','')] || palettes[raw];
     if (!palette) return '#c080ff';
-    if (raw === 'tide' || raw === 'sorbet') {
+    if (raw === 'onyx' || raw === 'sorbet') {
         const p=Math.max(0,Math.min(1,progress))*(palette.length-1), n=Math.min(palette.length-2,Math.floor(p)), t=p-n;
         return '#'+[1,3,5].map(k=>Math.round(parseInt(palette[n].slice(k,k+2),16)*(1-t)+parseInt(palette[n+1].slice(k,k+2),16)*t).toString(16).padStart(2,'0')).join('');
     }

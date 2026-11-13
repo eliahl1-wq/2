@@ -6,7 +6,7 @@ import { resolveSignatureSkin } from './signature-skins.js';
 import { getAgarShopProduct } from './agar-economy.js';
 
 test('private fades require access, stay Slither-only, and cannot be bought', async () => {
-    for (const skin of ['tide','sorbet']) for (const field of ['skinId','skinColor']) {
+    for (const skin of ['onyx','sorbet']) for (const field of ['skinId','skinColor']) {
         assert.equal(getAgarShopProduct(`slither:${skin}`), null);
         await assert.rejects(resolveSignatureSkin({mode:'slither',[field]:skin,hasAccess:async()=>false}), /unlocked/);
         for (const mode of ['slither','competitive-slither']) assert.equal(await resolveSignatureSkin({mode,[field]:skin,hasAccess:async()=>true}),skin);
@@ -15,7 +15,7 @@ test('private fades require access, stay Slither-only, and cannot be bought', as
 });
 
 test('death pellets retain actual palettes and conserve arena mass and money', () => {
-    for (const skin of ['#c080ff','#80d0d0','tide','sorbet','flag:ca','flag:jp','flag:se','random','aurora','eclipse']) {
+    for (const skin of ['#c080ff','#80d0d0','onyx','sorbet','flag:ca','flag:jp','flag:se','random','aurora','eclipse']) {
         const segments=Array.from({length:20},(_,i)=>({x:i*9,y:0}));
         const snake={id:'test',isBot:true,color:skin,balance:5,dollarBalance:3,segments};
         const room={players:[snake],slitherFood:[],entryFeeUsd:5};
@@ -28,6 +28,6 @@ test('death pellets retain actual palettes and conserve arena mass and money', (
         else assert.ok(new Set(room.slitherFood.map(f=>f.tint)).size>1);
     }
     assert.ok(Math.abs(tintHue('#c080ff')-270.2362)<0.001);
-    assert.equal(slitherDropTint('tide',1),'#a0e2bc');
+    assert.equal(slitherDropTint('onyx',1),'#382744');
     assert.equal(slitherDropTint('flag:jp',0,0),'#ffffff');
 });
