@@ -40,9 +40,12 @@ export function createRailwayDeployer({
     return async function deployCommit(commitSha) {
         const normalizedSha = normalizeCommitSha(commitSha);
         if (!normalizedSha) throw new Error('Pending release has an invalid commit SHA');
-        if (!fetchImpl || (!token && !projectToken) || !serviceId || !environmentId) {
-            throw new Error('Railway release variables are incomplete');
-        }
+        const missing = [];
+        if (!fetchImpl) missing.push('HTTP client');
+        if (!String(token || '').trim() && !String(projectToken || '').trim()) missing.push('RAILWAY_PROJECT_TOKEN or RAILWAY_API_TOKEN');
+        if (!String(serviceId || '').trim()) missing.push('RAILWAY_SERVICE_ID');
+        if (!String(environmentId || '').trim()) missing.push('RAILWAY_ENVIRONMENT_ID');
+        if (missing.length) throw new Error(`Railway deployment configuration missing: ${missing.join(', ')}. Apply these variables to the running deployment.`);
 
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);

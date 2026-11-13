@@ -3331,25 +3331,33 @@ async function performGlobalArenaReset() {
             meta: { event: 'reset_complete', roomId: 'all', tiers: ALLOWED_ENTRY_FEES },
             status: 'confirmed',
         });
+        // A GitHub queue request can arrive while cashouts/sweep are running.
+        // Pick it up at this same safe boundary rather than waiting three hours.
+        if (!pendingReleaseSha) pendingReleaseSha = await beginScheduledReleaseReset();
+        let deployment = { status: 'not_pending' };
         if (pendingReleaseSha) {
             const activeTournamentSession = [...tournamentRooms.values()].some(room =>
                 room.players.some(player => !player.isBot && !player.disconnected),
             );
             if (activeTournamentSession) {
+                deployment = { status: 'deferred', commitSha: pendingReleaseSha, reason: 'active_tournament' };
                 await releaseScheduledMaintenance(
                     pendingReleaseSha,
                     'Deployment deferred because an in-memory tournament session is still active.',
                 );
             } else if (!await waitForBattleRoyaleReleaseDrain()) {
+                deployment = { status: 'deferred', commitSha: pendingReleaseSha, reason: 'active_battle_royale' };
                 await releaseScheduledMaintenance(
                     pendingReleaseSha,
                     'Deployment deferred because Battle Royale sessions did not drain safely.',
                 );
             } else {
-                await triggerScheduledRailwayDeploy(pendingReleaseSha);
+                const result = await triggerScheduledRailwayDeploy(pendingReleaseSha);
+                deployment = { ...result, commitSha: pendingReleaseSha,
+                    status: result.failed ? 'failed' : result.skipped ? 'already_running' : 'started' };
             }
         }
-        return { success: true };
+        return { success: true, deployment };
     } catch (error) {
         if (pendingReleaseSha && releaseMaintenanceActive) {
             await releaseScheduledMaintenance(pendingReleaseSha, error).catch(recoveryError => {
@@ -10435,12 +10443,13 @@ app.post('/api/admin/set-bot-balance', authenticateAdmin, (req, res) => {
     res.status(404).send("Bot not found");
 });
 
-app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
+app.get('/api/admin/dashboard/server-status', authenticateAdmin, async (req, res) => {
     const now = Date.now();
     const resetAt = GLOBAL_ARENA_START + c.roomDuration;
     const msUntilReset = Math.max(0, resetAt - now);
     const resetting = isArenaResetting();
 
+    const queuedRelease = await ScheduledRelease.findOne({ key: 'production' }).lean();
     res.json({
         serverTime: now,
         arenaStartedAt: GLOBAL_ARENA_START,
@@ -10452,7 +10461,13 @@ app.get('/api/admin/dashboard/server-status', authenticateAdmin, (req, res) => {
         newGameJoinsLocked: isNewGameJoinLocked(),
         manualJoinLock: newGameJoinsLocked,
         serverReady,
-        release: publicReleaseState(),
+        release: publicReleaseState({
+            runningSha: currentReleaseSha(),
+            pendingSha: queuedRelease?.pendingSha || null,
+            deployingSha: queuedRelease?.deployingSha || null,
+            deploymentId: queuedRelease?.deploymentId || null,
+            lastError: queuedRelease?.lastError || null,
+        }),
         devFreePlay: DEV_FREE_PLAY,
         sweepScope: 'main_house_wallet_only',
         brUntouchedOnArenaReset: true,
@@ -10498,9 +10513,18 @@ app.post('/api/admin/trigger-sweep', sensitiveRateLimit({ limit: 5, windowMs: 60
                 reason: result?.reason || 'reset_in_progress',
             });
         }
+        if (result.deployment?.status === 'failed' || result.deployment?.status === 'deferred') {
+            return res.status(result.deployment.status === 'failed' ? 502 : 409).json({
+                success: false, resetCompleted: true, deployment: result.deployment,
+                message: `Reset and sweep completed, but backend deployment ${result.deployment.status}: ${result.deployment.error || result.deployment.reason}. The release remains queued.`,
+            });
+        }
         res.json({
             success: true,
-            message: 'Full arena reset completed: players cashed out, pools cleared, and main house wallet swept. Any pending backend release was handed to Railway after the safe drain. BR wallets were not touched.',
+            deployment: result.deployment,
+            message: result.deployment?.status === 'started'
+                ? 'Reset and sweep completed. Backend deployment started in Railway; waiting for the new version to become ready.'
+                : 'Reset and sweep completed. No new backend deployment was needed.',
             wallet: HOUSE_WALLET_ADDRESS || null,
         });
     } catch (err) {

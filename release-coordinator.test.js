@@ -70,3 +70,24 @@ test('uses the environment-scoped Railway project token when configured', async 
     assert.equal(headers['Project-Access-Token'], 'project-token');
     assert.equal(headers.Authorization, undefined);
 });
+
+test('missing deployment configuration names the exact missing inputs without exposing secrets', async () => {
+    for (const [overrides, expected] of [
+        [{ serviceId: '' }, 'RAILWAY_SERVICE_ID'],
+        [{ environmentId: undefined }, 'RAILWAY_ENVIRONMENT_ID'],
+        [{ projectToken: '' }, 'RAILWAY_PROJECT_TOKEN or RAILWAY_API_TOKEN'],
+    ]) {
+        let requested = false;
+        const deploy = createRailwayDeployer({
+            fetchImpl: async () => { requested = true; },
+            projectToken: 'never-print-this-token', serviceId: 'service', environmentId: 'environment',
+            ...overrides,
+        });
+        await assert.rejects(() => deploy(SHA), error => {
+            assert.ok(error.message.includes(expected));
+            assert.ok(!error.message.includes('never-print-this-token'));
+            return true;
+        });
+        assert.equal(requested, false);
+    }
+});
