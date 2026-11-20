@@ -1,4 +1,5 @@
 import express from 'express';
+import { createExternalGames } from './external-games/service.js';
 import { queueAdminFood } from './admin-food-pool.js';
 import { resolveSignatureSkin, applyValidatedSlitherSkin } from './signature-skins.js';
 import { applySurvivInputPayload } from './surviv-input.js';
@@ -3979,6 +3980,18 @@ async function ensureUserDepositWallet(user) {
     return user;
 }
 
+const externalGames = createExternalGames({ connection: mongoose.connection, User, isAdmin: isAdminUserRecord });
+externalGames.registerRoutes(app, { authenticateToken, rateLimit: sensitiveRateLimit });
+if (externalGames.policy.enabled) {
+    let lastWorkerWarning = 0;
+    setInterval(() => externalGames.tick().catch(() => {
+        if (Date.now() - lastWorkerWarning >= 60_000) {
+            lastWorkerWarning = Date.now();
+            console.warn('[External Games] Worker temporarily unavailable; check MongoDB transaction and index support.');
+        }
+    }), 4000).unref();
+}
+
 app.get('/api/me', authenticateToken, async (req, res) => {
     try {
         let user = await User.findById(req.user.id).select('-password');
@@ -4039,6 +4052,7 @@ app.get('/api/me', authenticateToken, async (req, res) => {
         userObj.personalFreePlay = await isPersonalFreePlayUser(user);
         userObj.freePlay = DEV_FREE_PLAY || userObj.personalFreePlay;
         userObj.isAdmin = isAdminUserRecord(user);
+        if (externalGames.policy.enabled && externalGames.policy.allow(String(user._id), userObj.isAdmin)) userObj.externalGamesAccess = true;
         const affiliateStatus = await getAffiliateStatus(user);
         userObj.affiliateActive = affiliateStatus.active;
         userObj.affiliateRewardsAvailable = affiliateStatus.hasRewards;
